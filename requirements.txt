@@ -1,0 +1,16 @@
+## 2. `requirements.txt`
+
+# Core AI & ML
+google-generativeai>=0.8.0
+spacy>=3.7.0
+
+# Document Processing
+PyMuPDF>=1.24.0  # fitz
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+
+# Data Processing
+numpy>=1.24.0
+
+# Image Processing
+Pillow>=10.0.0

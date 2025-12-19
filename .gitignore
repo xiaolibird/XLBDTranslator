@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Project specific
+***REMOVED*** (IMPORTANT: Never commit your real API key!)
+API_KEY = "your-key-here"
+
+# Generated content
+**/page_images/
+**/Full_Book.md
+**/structure_map.json
+**/*.cropped.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test files
+test_*.pdf
+test_*.epub
+*_test.py
+
+# Temporary files
+*.tmp
+*.temp
