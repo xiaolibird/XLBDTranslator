@@ -1,298 +1,277 @@
-import os
-import time
-import json
-import utils
-from translator import GEMINITranslator
+#!/usr/bin/env python3
+"""
+主程序入口点。
+
+该脚本负责：
+1. 初始化配置和日志。
+2. 获取用户输入（翻译模式、文档处理策略）。
+3. 调用文档处理流水线（pipeline）生成结构化文本。
+4. 启动翻译循环，处理文本并保存结果。
+5. 统一的错误处理和程序退出逻辑。
+"""
+import os, time, json
+import sys
 import traceback
-# ✅ 关键修改：引入新的统一工厂函数
-from pipeline import compile_structure 
+from pathlib import Path
+from tqdm import tqdm
+from dataclasses import asdict
+from typing import List, Dict, Any
 
-# ================= ⚙️ 配置 =================
-API_KEY = "YOUR_GOOGLE_API_KEY_HERE" # 替换 Key
-FILE_PATH = ' '
-config_template = {
-    # === 1. 风格配置 (来自 MODES) ===
-    "name": "Zizek Expert",
-    "role_desc": "你是一位...",
-    "style": "...",
-    "context_len": "high",
-
-    # === 2. 策略配置 (来自用户交互) ===
-    
-    # [Vision] 是否强制开启视觉模式？
-    # True: 强制图片模式; False: 强制文本模式; None: 自动检测
-    "use_vision_mode": None, 
-
-    # [Layout] PDF 边距 (仅 Native 模式有效)
-    # 具体的数字: 手动指定; None: 自动扫描
-    "margin_top": None,    
-    "margin_bottom": None,
-
-    # [Dependency] 外部 TOC 文件路径
-    # 路径字符串: 使用外部 CSV; None: 使用内置目录
-    "custom_toc_path": None 
-}
-
-# 模式定义 
-MODES = {
-    "1": {
-        "name": "Zizek Expert",
-        "role_desc": "你是一位专门研究斯拉沃热·齐泽克、拉康精神分析和黑格尔哲学的顶级学者，同时也是一位酷酷的导师。",
-        "style": "学术深度解析，擅长解释黑话和哲学梗，语言通俗幽默。",
-        "context_len": "high"
-    },
-    "2": {
-        "name": "Biography Journalist",
-        "role_desc": "你是一位拥有深厚历史学背景的资深文学翻译家，精通中文、英文和法文。你擅长翻译人物传记和历史非虚构作品（Non-fiction）。你的翻译风格典雅、流畅，能够精准捕捉原著的文学性，同时确保历史事实的严谨性。",
-        "style": f"""
-                    # Guidelines & Constraints
-
-                    ## 1. 翻译风格 (Style & Tone)
-                    * **流畅自然：** 拒绝“翻译腔”。请使用地道的中文表达习惯，调整语序以适应中文逻辑。长难句应适当拆分或重组，确保阅读时的呼吸感。
-                    * **文学性：** 传记不仅是记录，也是文学。请保留原文的叙事张力和情感色彩，用词需考究（例如：避免使用过于现代或口语化的网络流行语，除非原文如此）。
-                    * **上下文连贯：** 必须基于上下文理解代词（he/she/it）的指代对象，避免指代不清。
-
-                    ## 2. 专有名词处理 (Proper Nouns)
-                    * **统一性：** 这是重中之重。所有人名、地名、机构名、历史事件名必须保持前后一致。
-                    * **标准译名：** 对于历史上已有的著名人物或地点（如历史皇室成员、战役、条约等），**必须使用中文通用的官方/学术标准译名**（参考新华社译名表或通用的历史学界译法），不可随意音译。
-                    * **首次出现：** 如果遇到生僻或容易混淆的专有名词，请在中文译名后保留英文原词，格式为：`中文译名 (English Name)`。
-
-                    ## 3. 法语词汇与特殊文化词 (French & Cultural Terms)
-                    * **精准识别：** 文本中可能混杂法语词汇（如贵族头衔、特定地名、军事术语、当时的风尚词汇等）。请务必精准识别，不要将其误当作错误的英语拼写。
-                    * **处理策略：**
-                        * 如果是**常用词**（如 bourgeois, genre），直接翻译成对应的精准中文。
-                        * 如果是**特有文化概念/头衔**（如 Ancien Régime, Chargé d'affaires），请翻译为标准中文术语，并备注法语原文。
-                        * 如果是**引用语**，请翻译出含义，并尽量保留原文的修辞风味。
-
-                    ## 4. 格式要求
-                    * 请按段落输出，不要合并段落。
-                    * 如果原文中有斜体（通常用于强调或外语词），译文中请使用*粗体*或“引号”来体现强调。
-
-                    # Workflow
-                    1.  **阅读与分析：** 先通读整段文本，理解历史背景和人物关系。
-                    2.  **翻译：** 执行翻译工作。
-                    3.  **校对：** 检查文中出现的专有名词是否与前文一致，检查法语词汇是否翻译准确。
-
-                """,
-        "context_len": "medium"
-    },
-    "3": {
-        "name": "Sociology Researcher",
-        "role_desc": "你是一位拥有博士学位的资深学术翻译家，专精于批判理论（Critical Theory）、欧洲大陆哲学、拉康精神分析、以及社会学/文化评论领域。你的目标是产出符合学术出版标准的中文译文。",
-        "style": f"""
-                    # Guidelines & Constraints
-
-                    ## 1. 翻译风格与基调 (Style & Tone)
-                    * **严谨与精确：** 译文必须**极其严谨**，拒绝任何会造成歧义的模糊翻译。保留原文的专业性和思辨性。
-                    * **学术流畅性：** 保持中文行文的逻辑清晰和流畅，但应**保留原文本的学术密度和复杂度**，避免过度简化。长句和复杂结构需进行合理拆分与重组。
-                    * **上下文意识：** 必须基于全文语境理解作者的论述，特别是对于具有多重含义的关键词（如 *drive*, *gaze*, *ideology*, *affect*），确保译文与上下文的主题保持一致。
-
-                    ## 2. 专有名词与理论溯源 (Terminology & Philosophical Tracing)
-                    * **高阶术语统一性：** 对待核心理论术语（如：Signifier, Phallocentric, Hegemony, Simulacra, Subaltern, Jouissance, Apparatus, Différance, Episteme 等），必须使用**中文学术界公认的标准译法**，并保持全文统一。不可随意创造译名。
-                    * **理论溯源：** 必须准确识别理论术语的来源。例如，当翻译 “The Real” 时，必须根据上下文判断其是否为**拉康精神分析**中的“实在界”；当翻译 “discourse” 时，需考虑其是否指**福柯**的“话语”理论。
-                    * **首次出现标注：** 对于关键的、具有理论深度的专有名词，请在首次翻译后以括号形式附注英文原词，如：`所指 (Signified)`。
-
-                    ## 3. 电影/书籍名称处理 (Titles Accuracy - Critical Requirement)
-                    * **查证要求：** 所有在文本中提及的**电影名、书名、或艺术作品名称**，你必须将其翻译为**中文世界中最准确、最常用、且被广泛接受的官方译名**。
-                    * **查找来源：** 译者须主动进行查证，参照来源包括但不限于**豆瓣 (Douban)、IMDb、或国内权威出版社的引进译本**。
-                    * **格式：** 译文中，书名和电影名需用书名号《》括起来，并在书名号后附注原始英文名，如：《公民凯恩》(Citizen Kane)。
-
-                    ## 4. 格式要求
-                    * 翻译内容应与原文段落结构严格对应。
-                    * 译文中应使用标准的简体中文标点符号。
-
-                    # Workflow
-                    1.  **全局阅读：** 阅读整段文本，确定其所属的理论流派和讨论主题。
-                    2.  **词汇查证：** 查证所有电影/书名，以及核心理论术语的标准译名。
-                    3.  **执行翻译：** 翻译时兼顾**信、达、雅**，侧重于**信**（准确性）和**达**（表达的清晰度）。
-                    4.  **最终校对：** 检查理论术语的译法是否统一，检查电影/书名译名是否准确。
-
-                """,
-        "context_len": "high"
-    },
-    "4": {
-        "name": "AI Data Scientist",
-        "role_desc": "你是一位顶尖的大数据科学家和人工智能研究员，同时非常理解脑科学和健康科学，擅长提取关键信息、模式识别和逻辑归纳。",
-        "style": "使用子弹式列表和要点，注重逻辑密度和信息熵，注重阅读效率和理解程度的平衡。",
-        "context_len": "high"
-    },
-    "5": {
-        "name": "Novel Translator",
-        "role_desc": "你是一位熟读各种英文世情/耽美/言情小说，精通英译中、日译中的资深翻译家。",
-        "style": "注重人物情感和生活细节的细腻描写，对于露骨情节也不作任何掩饰和删减力求满足读者的幻想。力求信达雅，同时符合现代（2020年代）汉语的阅读习惯。",
-        "context_len": "low"
-    },
-    "6":{
-        "name": "Nietzsche Interpreter",
-        "role_desc": f"""
-            You are a profound Nietzschean scholar and a master literary translator. 
-            You are translating Friedrich Nietzsche's "Thus Spoke Zarathustra".
-            
-            YOUR CORE MISSION:
-            To translate the text into **Chinese** that is not only poetically beautiful but also **philosophically concrete and accessible**.
-            
-            THE PROBLEM:
-            Nietzsche uses dense metaphors (e.g., "the rope", "the lion", "the hour of noon"). A literal translation often leaves the reader confused.
-            
-            YOUR SOLUTION - "CONCRETE INTERPRETATION":
-            1. **Deconstruct Metaphors**: When you encounter a metaphor, translate the image but phrase it in a way that reveals its philosophical meaning.
-            - *Bad:* "Man is a rope." (人是一根绳子。)
-            - *Good:* "Humanity is a perilous rope stretched between the beast and the Overman." (人类是一根系在野兽与超人之间、充满危险的绳索。)
-            2. **Tone**: Use a style that is **"Solemn yet Visceral"** (庄重而直击人心). Mimic the prophetic tone of the original (Biblical cadence) but avoid overly obscure archaic Chinese words. Use modern, powerful literary Chinese.
-            3. **Clarify Concepts**: If a sentence is extremely abstract, you are allowed to slightly expand it to make the **"Will to Power"** or **"Eternal Recurrence"** explicit within the context.
-            """,
-            "style": f"""
-            - **Vocabulary**: Majestic, forceful, piercing. Avoid academic dryness. Use words like "在此刻" (at this moment), "看哪" (Behold), "当知" (You must know).
-            - **Rhythm**: Keep the sentence rhythmic and chant-like (Dithyrambic).
-            - **Explicitness**: Do not hide the meaning behind vague words. If Zarathustra mocks the "herd", translate it as "群氓" or "随波逐流者" rather than just "人群".
-            - **Punctuation**: Use punctuation to create pauses for breath, mimicking a speech.
-        """
-    }
-}
-
-# 初始化翻译器
-translator = GEMINITranslator(API_KEY)
-
-# ================= 🚀 业务逻辑 =================
-
-def process_document_flow(file_path, project_config):
-    """
-    统一文档处理流 (Unified Document Flow)
-    不再区分 PDF/EPUB 函数，由 pipeline.compile_structure 自动分发。
-    """
-    print(f"🚀 [Start] Processing: {os.path.basename(file_path)}")
-    print(f"   🎭 Mode: {project_config['name']}")
-    # 1. 准备工作区
-    project_dir = utils.create_output_directory(file_path, project_config['name'])
-    cache_path = os.path.join(project_dir, "structure_map.json") # 统一命名
-    final_md = os.path.join(project_dir, "Full_Book.md")
-    
-    # 2. 编译结构 (Phase 1: Compile)
-    all_segments = []
-    if os.path.exists(cache_path):
-        print(f"   📦 Found existing structure cache. Loading...")
-        with open(cache_path, "r", encoding="utf-8") as f:
-            all_segments = json.load(f)
-        print(f"   ✅ Loaded {len(all_segments)} segments.")
-    else:
-        # 🏭 调用工厂函数 (核心修改点)
-        # 它会自动识别是 EPUB 还是 PDF，执行对应的清洗、注入和切分
-        all_segments = compile_structure(file_path, cache_path, project_config=project_config)
-
-    # 3. 初始化输出文件
-    if not os.path.exists(final_md):
-        with open(final_md, "w", encoding="utf-8") as f:
-            f.write(f"# Original: {os.path.basename(file_path)}\n")
-            f.write(f"> Translated by **{project_config['name']}** Mode\n\n---\n\n")
-
-    # 4. 进入翻译循环 (Phase 2: Translate)
-    run_translation_loop(all_segments, final_md, project_config, append_mode=True)
+# 导入自定义模块
+from src.config import Settings, modes
+from src.errors import TranslationError
+from src.logging_config import setup_logging
+from src.ui import get_mode_selection, get_user_strategy
+from src.file_io import get_last_checkpoint_id, create_output_directory, recover_context_from_file, is_likely_chinese
+from src.translator import GEMINITranslator
+from src.pipeline import ContentSegment, compile_structure, MarkdownRenderer
 
 
-def run_translation_loop(all_segments, output_file, project_config, append_mode=False):
-    """
-    翻译主循环 (逻辑：断点续传 + 智能渲染)
-    """
-    # --- 1. 断点检测 ---
-    last_id = utils.get_last_checkpoint_id(output_file)
-    todo = [s for s in all_segments if s['id'] > last_id]
-    
-    if not todo:
-        print("🎉 All segments translated!")
-        return
-
-    print(f"🔄 Resuming from ID {last_id + 1}. Remaining: {len(todo)}")
-    
-    # 恢复上下文
-    context_buffer = utils.recover_context_from_file(output_file) if last_id >= 0 else ""
-
-    # --- 2. 生产循环 ---
-    BATCH_SIZE = 5
-    total_batches = (len(todo) + BATCH_SIZE - 1) // BATCH_SIZE
-    
-    for i in range(0, len(todo), BATCH_SIZE):
-        batch = todo[i : i + BATCH_SIZE]
-        current_batch_idx = i // BATCH_SIZE + 1
-        
-        print(f"   🤖 Batch {current_batch_idx}/{total_batches} (IDs {batch[0]['id']}-{batch[-1]['id']})...")
-        
-        # 调用翻译
-        translations = translator.translate_batch(batch, project_config, context=context_buffer)
-        
-        # --- 3. 实时写入 ---
-        with open(output_file, "a", encoding="utf-8") as f:
-            for idx, trans_text in enumerate(translations):
-                original_seg = batch[idx]
-                seg_id = original_seg['id']
-                
-                # === 🔮 智能渲染 (适配新的 pipeline 标记) ===
-                # Pipeline 现在会生成 "\n\n## [Chapter: ...]\n\n"
-                # 我们需要提取这个标题，把它变成真正的 Markdown H2
-                # 对json dump出来的换行符进行最终矫正
-                trans_text = trans_text.replace('\\\\n', '\n').replace('\\n', '\n').replace('\\"', '"')
-                original_text = original_seg['text']
-                header_line = None
-                body_lines = []
-                
-                # 简单的逐行清洗
-                for line in original_text.split('\n'):
-                    strip = line.strip()
-                    if strip.startswith("## [Chapter:") or strip.startswith("## [Section:"):
-                        # 提取标题内容
-                        header_line = strip.replace("##", "").replace("[Chapter:", "").replace("[Section:", "").replace("]", "").strip()
-                    elif strip:
-                        body_lines.append(line)
-                
-                clean_body = "\n".join(body_lines).strip()
-                
-                # 写入逻辑
-                # A. 如果有章节标题，先写标题
-                if header_line:
-                    # f.write(f"\n\n## {header_line}\n\n")
-                    f.write(f"\n\n> 📂 **原文章节：{header_line}**\n\n")
-                
-                # B. 写入元数据和原文引用 (引用块)
-                f.write(f"> 🔖 **Segment {seg_id}**\n") 
-                if clean_body:
-                    preview = clean_body[:100].replace('\n', ' ') + "..."
-                    f.write(f"> *{preview}*\n\n")
-                
-                # C. 写入译文
-                f.write(f"{trans_text}\n\n")
-                f.write("---\n\n")
-                
-            f.flush() # 物理落盘
-        
-        # --- 4. 后处理 ---
-        print(f"      💾 Saved Batch {current_batch_idx}")
-        
-        # 更新上下文 (滑动窗口)
-        if translations:
-            # 简单的上下文更新：取这一批最后一段译文
-            # 如果需要更强连贯性，可以拼接 batch 内所有译文
-            context_buffer = translations[-1][-800:]
-        
-        time.sleep(1) # 避免 API 限制
-
-    print("✅ Translation Task Complete.")
+# 初始化日志记录器
+logger = setup_logging()
 
 def main():
-    file_path = FILE_PATH
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return 
-    # 翻译风格选择
-    selected_style = utils.get_mode_selection(MODES)
-    #输入翻译配置
-    user_strategy = utils.get_user_strategy(file_path)
-    #组合成项目配置
-    project_config = {**selected_style, **user_strategy}
-    
+    """主函数，协调整个翻译流程。"""
     try:
-        process_document_flow(file_path, project_config)
+        logger.info("=" * 60)
+        logger.info("📚 文档翻译系统启动")
+        logger.info("=" * 60)
+        
+        # --- 1. 加载配置 ---
+        # Settings() 会自动从 .env 文件和环境变量中加载配置
+        settings = Settings()
+        logger.info(f"📄 文档路径: {settings.document_path}")
+        logger.info(f"🎭 默认翻译模式ID: {settings.translation_mode}")
+        logger.info(f"📁 输出目录: {settings.output_base_dir}")
+        
+        # --- 2. 获取用户选择 ---
+        selected_mode = get_mode_selection(modes)
+        user_strategy = get_user_strategy(str(settings.document_path), settings)
+
+        # --- 3. 组合最终配置 ---
+        project_config = {
+            **selected_mode.model_dump(),  # 使用 Pydantic V2 的 model_dump()
+            **user_strategy
+        }
+        
+        # --- 4. 统一处理流程 ---
+        process_document_flow(settings, project_config)
+        
+        logger.info("=" * 60)
+        logger.info("🎉 翻译任务成功完成！")
+        logger.info("=" * 60)
+        
+    except TranslationError as e:
+        logger.error(f"❌ 翻译流程出现已知错误: {e}", exc_info=True)
+        logger.error(f"💡 建议: {e.suggestion}" if e.suggestion else "请检查上述错误详情。")
+        sys.exit(1)
     except Exception as e:
-        print(f"❌ Critical Error: {e}")
-        traceback.print_exc()
+        logger.critical(f"💥 发生未预期的严重错误: {e}", exc_info=True)
+        logger.critical(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        logger.info("系统关闭。")
+
+def process_document_flow(settings: Settings, project_config: dict):
+    """
+    协调文档从解析到翻译的整个流程。
+    适配 ContentSegment 对象架构。
+    """
+    file_path = str(settings.document_path)
+    logger.info(f"🚀 开始处理文档: {os.path.basename(file_path)}")
+    logger.info(f"   - 翻译模式: {project_config['name']}")
+    
+    # --- 准备工作区 ---
+    project_dir = create_output_directory(
+        file_path, 
+        project_config['name'],
+        settings.output_base_dir
+    )
+    cache_path = os.path.join(project_dir, "structure_map.json")
+    final_md_path = os.path.join(project_dir, "Full_Book.md")
+    
+    # --- 编译文档结构 (如果缓存不存在) ---
+    all_segments: list[ContentSegment] = [] # 类型提示更新
+    
+    if settings.enable_cache and os.path.exists(cache_path):
+        logger.info("📦 发现结构缓存，正在加载...")
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+                # 【关键修改】: 将字典列表转换回 ContentSegment 对象列表
+                all_segments = [ContentSegment(**item) for item in raw_data]
+            logger.info(f"   ✅ 成功加载 {len(all_segments)} 个文本片段。")
+        except (json.JSONDecodeError, IOError, TypeError) as e:
+            logger.warning(f"   ⚠️ 缓存文件损坏或格式不匹配: {e}。将重新编译文档。")
+            all_segments = []
+
+    if not all_segments:
+        logger.info("⚙️ 未找到缓存或缓存已禁用，开始编译文档结构...")
+        # compile_structure 现在直接返回 List[ContentSegment]
+        all_segments = compile_structure(
+            file_path=file_path,
+            cache_path=cache_path,
+            settings=settings,
+            project_config=project_config
+        )
+    
+    if not all_segments:
+        raise TranslationError("文档编译后未生成任何文本片段，无法继续。")
+    
+    # --- 初始化输出文件 ---
+    if not os.path.exists(final_md_path):
+        logger.info(f"📝 创建新的输出文件: {final_md_path}")
+        with open(final_md_path, "w", encoding="utf-8") as f:
+            f.write(f"# 原文: {os.path.basename(file_path)}\n")
+            f.write(f"> 使用 **{project_config['name']}** 模式翻译\n\n---\n\n")
+    
+    # --- 启动翻译循环 ---
+    translator = GEMINITranslator(settings)
+    pre_translate_chapter_titles(all_segments, translator, project_config)
+
+    try:
+        logger.info("💾 正在更新结构缓存（保存已翻译的章节标题）...")
+        # 将对象列表转回字典列表
+        data_to_save = [asdict(seg) for seg in all_segments]
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+        logger.info("✅ 缓存更新成功。")
+    except Exception as e:
+        logger.warning(f"⚠️ 无法更新缓存，但不影响后续流程: {e}")
+
+    run_translation_loop(all_segments, 
+        final_md_path, 
+        translator,
+        project_config)
+
+def run_translation_loop(
+    all_segments: list[ContentSegment], # 类型提示更新
+    output_file: str,
+    translator: GEMINITranslator,
+    project_config: dict
+):
+    """
+    执行翻译主循环。
+    适配 ContentSegment 对象属性访问和新的 MarkdownRenderer。
+    """
+    # --- 0. 实例化渲染器 ---
+    renderer = MarkdownRenderer(translator.settings)
+
+    # --- 1. 断点续传 --- 
+    last_id = get_last_checkpoint_id(output_file)
+    
+    # 【关键修改】: 使用 .segment_id 访问属性
+    segments_to_do = [s for s in all_segments if s.segment_id > last_id]
+    
+    if not segments_to_do:
+        logger.info("🎉 所有片段均已翻译完成！")
+        return
+
+    logger.info(f"🔄 从片段 ID {last_id + 1} 继续，剩余 {len(segments_to_do)} 个片段待处理。")
+    
+    # --- 2. 恢复上下文 ---
+    context_length = translator.settings.max_context_length
+    context_buffer = recover_context_from_file(output_file, context_length)
+
+    # --- 3. 分批处理 ---
+    batch_size = translator.settings.batch_size
+    progress_bar = tqdm(range(0, len(segments_to_do), batch_size), desc="Translating Batches")
+    
+    for i in progress_bar:
+        batch = segments_to_do[i : i + batch_size]
+        
+        # 【关键修改】: 使用 .segment_id
+        progress_bar.set_postfix({
+            "Batch": f"{i // batch_size + 1}/{len(progress_bar)}",
+            "IDs": f"{batch[0].segment_id}-{batch[-1].segment_id}"
+        })
+        
+        try:
+            # --- 调用翻译 ---
+            # 这里的 translate_batch 内部需要适配：它会接收 List[ContentSegment]
+            # 如果你的 translator 还没改，可能需要在这里提取 batch_texts = [s.original_text for s in batch]
+            translations = translator.translate_batch(batch, project_config, context=context_buffer)
+            
+            # --- 健壮性检查 ---
+            if len(translations) != len(batch):
+                logger.error(f"      ❌ 批次 {i // batch_size + 1} 数量不匹配 (Req: {len(batch)}, Res: {len(translations)})")
+                continue
+
+            # --- 实时写入 ---
+            with open(output_file, "a", encoding="utf-8") as f:
+                for idx, trans_text in enumerate(translations):
+                    seg = batch[idx]
+                    
+                    # 【关键修改】: 将翻译结果填入对象
+                    seg.translated_text = trans_text
+                    
+                    # 【关键修改】: 调用新的渲染器类
+                    # 注意：Metadata (Chapter/Page) 已经在 seg 对象里了，渲染器会自动处理
+                    markdown_chunk = renderer.render_segment(seg)
+                    f.write(markdown_chunk)
+                f.flush()
+            
+            # --- 更新上下文 ---
+            if translations:
+                full_translation_text = " ".join(t.replace('\n', ' ') for t in translations)
+                context_buffer = full_translation_text[-context_length:]
+
+        except Exception as e: # 捕获更宽泛的异常以防对象属性错误
+            logger.error(f"      ❌ 批次处理失败: {e}", exc_info=True)
+            continue
+        
+        # --- 速率控制 ---
+        time.sleep(translator.settings.rate_limit_delay)
+
+def pre_translate_chapter_titles(all_segments: List[ContentSegment], 
+        translator, 
+        project_config):
+    
+    """
+    [预处理] 提取所有章节标题，批量翻译，并更新 Segment 对象。
+    优化：只处理真正的章节开头 (is_new_chapter=True)。
+    """
+    logger.info("--- 开始章节标题预翻译 ---")
+    
+    # 1. 提取标题 (仅针对章节起始点)
+    # 【优化点】增加 if seg.is_new_chapter 判断
+    # raw_titles = [
+    #     seg.chapter_title 
+    #     for seg in all_segments 
+    #     if seg.is_new_chapter and seg.chapter_title and seg.chapter_title.strip()
+    # ]
+    raw_titles = []
+    for seg in all_segments:
+        if seg.is_new_chapter and seg.chapter_title and seg.chapter_title.strip():
+            # 【简单检测】如果标题里包含中文字符，大概率是已经翻译过了，跳过
+            # 或者你可以根据自己的需求，决定是否要重新翻译
+            if is_likely_chinese(seg.chapter_title):
+                continue
+            raw_titles.append(seg.chapter_title)
+    
+    # 2. 有序去重
+    unique_titles = list(dict.fromkeys(raw_titles))
+    
+    if not unique_titles:
+        logger.info("No new chapter headers found to translate.")
+        return
+
+    logger.info(f"Found {len(unique_titles)} unique headers. Translating...")
+
+    # 3. 批量翻译
+    translation_map = translator.translate_plain_text_list(unique_titles, project_config)
+    
+    # 4. 回填结果
+    update_count = 0
+    for seg in all_segments:
+        # 【优化点】只修改作为新章节开头的那个 segment
+        if seg.is_new_chapter and seg.chapter_title in translation_map:
+            translated = translation_map[seg.chapter_title]
+            if translated:
+                seg.chapter_title = translated
+                update_count += 1
+    
+    logger.info(f"Updated {update_count} chapter headers.")
 
 if __name__ == "__main__":
     main()

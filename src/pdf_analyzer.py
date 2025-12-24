@@ -1,100 +1,6 @@
-import os, re, datetime, random
-from collections import Counter
-import numpy as np
-
 import fitz  # PyMuPDF
-from bs4 import BeautifulSoup
-
-
-def clean_filename(filename):
-    """清理文件名，去除特殊字符"""
-    return re.sub(r'[\\/*?:"<>|]', "", filename).replace(" ", "_")
-
-def get_mode_selection(modes):
-    """交互式选择模式"""
-    print("\n🎭 请选择翻译模式 (Personas):")
-
-    for key, val in modes.items():
-        print(f"  [{key}] {val['name']}")
-    
-    choice = input("\n请输入数字 (默认 1): ").strip()
-    if choice not in modes:
-        choice = "1"
-    
-    print(f"✅ 已选择: {modes[choice]['name']}\n")
-    return modes[choice]
-
-def create_output_directory(input_file_path, mode_name):
-    """创建工程文件夹"""
-    date_str = datetime.datetime.now().strftime("%Y%m%d")
-    base_name = os.path.splitext(os.path.basename(input_file_path))[0]
-    safe_name = clean_filename(base_name)
-    safe_mode = clean_filename(mode_name)
-    
-    folder_name = f"{date_str}_{safe_name}_{safe_mode}"
-    project_path = os.path.join(os.getcwd(), folder_name)
-    
-    if not os.path.exists(project_path):
-        os.makedirs(project_path)
-        print(f"📂 创建工程文件夹: {folder_name}")
-    else:
-        print(f"📂 使用已有文件夹: {folder_name}")
-        
-    return project_path
-
-def get_last_checkpoint_id(md_path):
-    """
-    读取 Markdown 文件，找到最后一个已完成的 Segment ID。
-    支持新旧两种格式的兼容。
-    """
-    if not os.path.exists(md_path):
-        return -1
-        
-    try:
-        with open(md_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            
-        # 1. 尝试匹配新格式: > 🔖 **Segment 101**
-        ids = re.findall(r'> 🔖 \*\*Segment (\d+)\*\*', content)
-        
-        # 2. 如果没找到，尝试匹配旧格式 (兼容旧文件): ### Segment 101
-        if not ids:
-            ids = re.findall(r'### Segment (\d+)', content)
-        
-        if ids:
-            return int(ids[-1]) # 返回最后一个找到的 ID
-        return -1
-        
-    except Exception as e:
-        print(f"⚠️ 读取进度文件失败: {e}")
-        return -1
-
-def recover_context_from_file(md_path):
-    """从文件恢复上下文"""
-    if not os.path.exists(md_path): return ""
-    try:
-        with open(md_path, 'r', encoding='utf-8') as f:
-            f.seek(0, 2)
-            file_size = f.tell()
-            read_size = min(1000, file_size)
-            if read_size == 0: return ""
-            f.seek(file_size - read_size)
-            return f.read()
-    except: return ""
-
-def extract_text_from_epub_item(item):
-    """从 EPUB Item 提取文本"""
-    try:
-        soup = BeautifulSoup(item.get_content(), 'html.parser')
-        for script in soup(["script", "style"]):
-            script.extract()
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        return '\n'.join(chunk for chunk in chunks if chunk)
-    except Exception as e:
-        print(f"   ⚠️ Error extracting text from EPUB item: {e}")
-        return ""
+import numpy as np
+import random
 
 def inspect_pdf_structure(pdf_path):
     """
@@ -208,6 +114,70 @@ def calculate_robust_margin(values, margin_type="top"):
     # 决策：返回最接近的中位数整数
     return int(round(median_val))
 
+def detect_page_numbers(blocks, page_height):
+    """
+    检测页码位置，返回页码区域的边界框列表
+    """
+    import re
+    
+    page_number_patterns = [
+        r'^\d+$',                    # 纯数字: 123
+        r'^-\s*\d+\s*-$',           # 带横线的页码: - 123 -
+        r'^\d+\s*/\s*\d+$',         # 分页格式: 123/456
+        r'^Page\s+\d+$',            # Page 123
+        r'^\d+\s*页$',              # 中文页码: 123页
+        r'^第\s*\d+\s*页$',         # 第123页
+    ]
+    
+    page_number_zones = []
+    
+    for block in blocks:
+        if not isinstance(block, dict) or 'bbox' not in block:
+            continue
+            
+        bbox = block['bbox']  # [x0, y0, x1, y1]
+        text_height = bbox[3] - bbox[1]
+        
+        # 只考虑很小的文本块（可能是页码）
+        # 页码通常小于页面高度的5%
+        if text_height > page_height * 0.05:
+            continue
+            
+        # 提取文本内容
+        block_text = ""
+        if 'lines' in block:
+            for line in block['lines']:
+                if 'spans' in line:
+                    for span in line['spans']:
+                        block_text += span.get('text', '')
+        
+        block_text = block_text.strip()
+        
+        # 检查是否匹配页码模式
+        for pattern in page_number_patterns:
+            if re.match(pattern, block_text, re.IGNORECASE):
+                page_number_zones.append(bbox)
+                print(f"      📄 检测到页码: '{block_text}' at y={bbox[1]:.1f}-{bbox[3]:.1f}")
+                break
+    
+    return page_number_zones
+
+def is_bbox_overlap(bbox1, bbox2, tolerance=5):
+    """
+    检查两个边界框是否重叠（带容差）
+    """
+    x0_1, y0_1, x1_1, y1_1 = bbox1
+    x0_2, y0_2, x1_2, y1_2 = bbox2
+    
+    # 添加容差
+    x0_1 -= tolerance
+    y0_1 -= tolerance
+    x1_1 += tolerance
+    y1_1 += tolerance
+    
+    # 检查重叠
+    return not (x1_1 < x0_2 or x0_1 > x1_2 or y1_1 < y0_2 or y0_1 > y1_2)
+
 def analyze_pdf_margins_by_scan(pdf_path):
     """
     智能扫描分析 PDF，采用随机分块抽样 + 鲁棒统计学估算切除值。
@@ -268,6 +238,9 @@ def analyze_pdf_margins_by_scan(pdf_path):
             
             blocks = page.get_text("blocks")
             
+            # 🎯 新增：检测页码位置
+            page_numbers = detect_page_numbers(blocks, h)
+            
             # --- 寻找 Top Margin ---
             # 规则：Top 15% 区域内，最靠下的岛屿底部 + 1
             limit_top = h * 0.15
@@ -280,6 +253,10 @@ def analyze_pdf_margins_by_scan(pdf_path):
                 # 过滤掉极小的噪点 (高度<3点)
                 if (b[3] - b[1]) < 3: continue 
                 
+                # 🎯 新增：跳过页码区域
+                if any(is_bbox_overlap(b, pn_bbox) for pn_bbox in page_numbers):
+                    continue
+
                 # 如果这个块完全在 limit_top 区域内
                 if b[3] < limit_top:
                     if b[3] > max_y1_in_zone:
@@ -307,6 +284,10 @@ def analyze_pdf_margins_by_scan(pdf_path):
                 if len(b) < 4: continue
                 if (b[3] - b[1]) < 3: continue
                 
+                # 🎯 新增：跳过页码区域
+                if any(is_bbox_overlap(b, pn_bbox) for pn_bbox in page_numbers):
+                    continue
+
                 # 如果这个块完全在 limit_bottom 区域下方
                 if b[1] > limit_bottom:
                     if b[1] < min_y0_in_zone:
@@ -331,8 +312,15 @@ def analyze_pdf_margins_by_scan(pdf_path):
     print("-" * 50)
     suggested_bottom_pts = calculate_robust_margin(raw_bottom_margins, "bottom")
     print("-" * 50)
-    sample_h = calculate_robust_margin(raw_page_height, "top")
+    sample_h = calculate_robust_margin(raw_page_height, "height")
     
+    # ✅ 为页码留出安全区域
+    # 如果检测到页码，给边距增加10%的安全缓冲
+    page_number_detected = any(raw_top_margins) or any(raw_bottom_margins)
+    if page_number_detected:
+        suggested_top_pts = int(suggested_top_pts * 1.1)  # 多裁10%作为缓冲
+        print(f"   📄 检测到页码，增加安全缓冲: Top +10% -> {suggested_top_pts}")
+
     # ✅ 关键修改：转换为比例 (0.0 到 1.0 之间)
     # 这样无论是 72 DPI 还是 200 DPI，直接乘高度即可
     margin_top_ratio = round(suggested_top_pts / sample_h, 4)
@@ -354,6 +342,7 @@ def detect_pdf_type(file_path, sample_pages=5):
     """
     返回 PDF 类型：'native', 'ocr', 'image_only'
     """
+    import fitz
     doc = fitz.open(file_path)
     max_pages = min(len(doc), sample_pages)
     
@@ -391,171 +380,3 @@ def detect_pdf_type(file_path, sample_pages=5):
     # 如果用户觉得 OCR 质量烂，那是策略选择问题 (Part C)
     
     return "native_or_ocr"
-
-def flatten_toc(toc, parent_titles=None):
-    """
-    递归解析 EPUB TOC (目录)，构建 {文件名: '父标题 > 子标题'} 的映射。
-    实现'面包屑导航' (Breadcrumb) 效果，保留层级语义。
-    """
-    if parent_titles is None:
-        parent_titles = []
-        
-    mapping = {}
-    
-    for item in toc:
-        # 1. 提取节点与子节点
-        node = None
-        children = []
-        
-        # EbookLib 的 item 可能是 (Link, [Children]) 的元组，也可能是单独的 Link 对象
-        if isinstance(item, (list, tuple)):
-            node = item[0]
-            children = item[1]
-        elif hasattr(item, 'href'):
-            node = item
-            
-        if not node: continue
-        
-        # 2. 构建面包屑标题 (Cleaning & Joining)
-        # 去除标题中的换行符和多余空格
-        raw_title = node.title if node.title else "Untitled"
-        # clean_title = raw_title.replace('\n', ' ').strip()
-        clean_title = raw_title.replace('\n', ' ').replace('\\n', ' ').strip()
-        
-        # 组合路径：Part 1 > Chapter 1
-        full_breadcrumb = " > ".join(parent_titles + [clean_title])
-        
-        # 3. 记录映射 (Key = 纯文件名，不带锚点)
-        # href 可能是 'chap01.xhtml#section1' -> 取 'chap01.xhtml'
-        file_path = node.href.split('#')[0]
-        
-        # 策略：如果文件已存在（即一个文件包含多个小节），优先保留第一次出现的（通常是最高层级）
-        if file_path not in mapping:
-            mapping[file_path] = full_breadcrumb
-            
-        # 4. 递归下钻 (Drill down)
-        if children:
-            child_map = flatten_toc(children, parent_titles + [clean_title])
-            mapping.update(child_map)
-            
-    return mapping
-
-def get_user_strategy(file_path):
-    """
-    交互式配置向导：根据文件类型获取处理策略。
-    
-    Returns:
-        strategy (dict): 包含以下键值:
-            - use_vision_mode (bool|None): True=强制开启, False=强制关闭, None=自动
-            - margin_top (float|None): 顶部裁切比例 (0.0 - 1.0)
-            - margin_bottom (float|None): 底部裁切比例 (0.0 - 1.0)
-            - custom_toc_path (str|None): 自定义 CSV 目录文件路径
-    """
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    # 初始化默认策略
-    strategy = {
-        "use_vision_mode": None,   # 默认 Auto
-        "margin_top": None,        # 默认 Auto (通常为 0.08)
-        "margin_bottom": None,     # 默认 Auto (通常为 0.05)
-        "custom_toc_path": None    # 默认无
-    }
-    
-    print("\n" + "="*60)
-    print(f"🛠️  STRATEGY SETUP (项目策略配置)")
-    print(f"   Target File: {os.path.basename(file_path)}")
-    print("="*60)
-    
-    # ==========================================
-    # 1. 章节目录 (TOC) 配置
-    # ==========================================
-    if ext == '.pdf':
-        # 仅 PDF 需要询问 CSV，因为 EPUB 自带结构
-        print("\n[1/3] 📚 Table of Contents (章节目录)")
-        print("      PDFs often lack a readable TOC. Do you have a CSV mapping?")
-        print("      (Format: 'Page,Title,Level')")
-        
-        use_toc = input("      Load custom TOC CSV? (y/n) [n]: ").strip().lower()
-        if use_toc == 'y':
-            while True:
-                path = input("      Enter CSV path: ").strip().strip("'").strip('"') # 去除误复制的引号
-                if os.path.exists(path):
-                    strategy["custom_toc_path"] = path
-                    print(f"      ✅ Loaded: {os.path.basename(path)}")
-                    break
-                else:
-                    print("      ❌ File not found. Please try again.")
-    else:
-        # EPUB 逻辑
-        print(f"\n[1/3] 📚 File Structure")
-        print(f"      ✅ Detected {ext.upper()} format. Using internal structure.")
-        print("      (Skipping custom TOC setup)")
-
-    # 如果不是 PDF，无需配置 Vision 和 Crop，直接返回
-    if ext != '.pdf':
-        print("\n✅ Setup Complete for EPUB.")
-        print("="*60 + "\n")
-        return strategy
-
-    # ==========================================
-    # 2. Vision 模式配置 (仅 PDF)
-    # ==========================================
-    print("\n[2/3] 👁️  Vision Mode (视觉/图片模式)")
-    print("      Auto  = Let code detect (Recommended for most files)")
-    print("      Force = Force ENABLE (Best for scans, complex layouts)")
-    print("      Off   = Force DISABLE (Only use text extraction)")
-    
-    v_choice = input("      Selection (a/f/o) [a]: ").strip().lower()
-    
-    if v_choice == 'f':
-        strategy["use_vision_mode"] = True
-        print("      🔵 Mode: FORCED VISION (Slower but more accurate)")
-    elif v_choice == 'o':
-        strategy["use_vision_mode"] = False
-        print("      🔵 Mode: TEXT ONLY (Fast)")
-    else:
-        # strategy["use_vision_mode"] stays None
-        print("      🔵 Mode: AUTO DETECT")
-
-    # ==========================================
-    # 3. 裁切/边距配置 (仅 PDF)
-    # ==========================================
-    # 只有当 vision 模式没有被强制关闭时，裁切才最重要
-    if strategy["use_vision_mode"] is not False:
-        print("\n[3/3] ✂️  Image Cropping (Remove Headers/Footers)")
-        print("      CRITICAL for Vision to avoid translating running titles.")
-        print("      Format: 'top,bottom' ratio (0.0 to 1.0)")
-        print("      Example: '0.1,0.05' (Crops top 10% and bottom 5%)")
-        print("      Enter '0,0' to disable cropping.")
-        print("      Press ENTER to use Defaults (Top~8%, Bottom~5%)")
-        
-        m_input = input("      Margins: ").strip()
-        
-        if "," in m_input:
-            try:
-                parts = m_input.split(",")
-                t_val = float(parts[0].strip())
-                b_val = float(parts[1].strip())
-                
-                # 简单的合法性检查
-                if 0 <= t_val < 1.0 and 0 <= b_val < 1.0:
-                    strategy["margin_top"] = t_val
-                    strategy["margin_bottom"] = b_val
-                    print(f"      🔵 Manual Crop: Top={t_val*100}%, Bottom={b_val*100}%")
-                else:
-                    print("      ⚠️ Values out of range (0-1). Using Defaults.")
-            except ValueError:
-                print("      ⚠️ Invalid format. Using Defaults.")
-        else:
-            if m_input == "0": # 用户可能只输入了一个0
-                strategy["margin_top"] = 0.0
-                strategy["margin_bottom"] = 0.0
-                print("      🔵 Cropping: DISABLED")
-            else:
-                print("      🔵 Cropping: AUTO DEFAULTS")
-    else:
-        print("\n[3/3] ✂️  Image Cropping")
-        print("      Skipped (Vision mode disabled).")
-
-    print("="*60 + "\n")
-    return strategy
