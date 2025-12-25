@@ -21,15 +21,13 @@ wheels/
 *.egg
 MANIFEST
 
-# Project specific
-***REMOVED*** (IMPORTANT: Never commit your real API key!)
-API_KEY = "your-key-here"
 
 # Generated content
 **/page_images/
 **/Full_Book.md
 **/structure_map.json
 **/*.cropped.jpg
+output/
 
 # IDE
 .vscode/
@@ -47,7 +45,7 @@ Thumbs.db
 logs/
 
 # Test files
-test_*.pdf
+# test_*.pdf
 test_*.epub
 *_test.py
 
