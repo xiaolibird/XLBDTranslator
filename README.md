@@ -41,8 +41,8 @@
 
 - 克隆本仓库到本地:
   ```bash
-  git clone https://github.com/xiaolibird/XLBDTranslator-dev.git
-  cd XLBDTranslator-dev
+  git clone https://github.com/xiaolibird/XLBDTranslator.git
+  cd XLBDTranslator
   ```
 - 推荐使用 `conda` 创建并激活一个 Python 虚拟环境:
   ```bash

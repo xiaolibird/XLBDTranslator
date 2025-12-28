@@ -87,3 +87,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+*.sh
+bfg-report/
+..bfg-report/
