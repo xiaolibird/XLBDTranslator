@@ -1,9 +1,13 @@
 # Python
 __pycache__/
+*/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.bak
+*.backup
+*~
 build/
 develop-eggs/
 dist/
@@ -21,13 +25,50 @@ wheels/
 *.egg
 MANIFEST
 
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+env002_reader/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+config/config.env
+
+# Project Specific
+logs/
+output/
+test/
+!test/test_toc.csv
+!test/test_pdf.pdf
+
+# Development files
+digest_project.py
+migrating_instructions.md
 
 # Generated content
 **/page_images/
 **/Full_Book.md
 **/structure_map.json
+**/checkpoint.json
+**/cache_glossary.json
+**/cache_metadata.json
+**/glossary.json
 **/*.cropped.jpg
-output/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Cache
+cache/
+*.cache
+.cache/
 
 # IDE
 .vscode/
@@ -42,12 +83,6 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
-
-# Test files
-# test_*.pdf
-test_*.epub
-*_test.py
 
 # Temporary files
 *.tmp

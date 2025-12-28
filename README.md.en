@@ -1,0 +1,277 @@
+# 📚 XLBD Translator - eXtra Large Book/Document Translator
+
+An intelligent document translation tool powered by Google Gemini and state-driven architecture, designed for academic papers, technical books, and professional documents.
+
+[![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+
+## ✨ Core Features
+
+### 🎯 Industrial-Grade Stability
+- **State-Driven Architecture**: Entire translation pipeline driven by in-memory data structures with file persistence
+- **Resume Support**: Perfect recovery after interruptions, auto-skip translated segments
+- **Atomic Saves**: Auto-save progress after each batch, minimizing data loss
+- **Robust Error Handling**: Built-in API retry and JSON repair mechanisms
+
+### 🤖 Multi-Modal Translation
+- **Text Mode (Native)**: Direct text extraction for clean PDFs/EPUBs, fast processing
+- **Vision Mode**: Renders pages as images for scanned documents or complex layouts
+- **Smart Strategy**: Auto-detection or manual control via interactive setup
+
+### 🎭 Professional Translation Personas
+- **Highly Customizable**: Edit `config/modes.json` to modify or create new expert roles
+- **Built-in Personas**:
+  - **Academic Expert**: Specializes in philosophical and theoretical texts
+  - **Sociology Researcher**: Critical theory and continental philosophy
+  - **Biography Journalist**: Literary biographies and historical non-fiction
+  - **AI Expert**: Technology and AI domain expertise
+  - **Fiction Translator**: Literary fiction and novels
+  - **Philosophy Interpreter**: Poetic translation of philosophical metaphors
+
+### ⚙️ Highly Configurable
+- **`.env` Driven**: All core settings managed via `config/.env` for non-interactive runs
+- **Custom TOC**: Inject chapter structure via external CSV files for better semantic segmentation
+- **Custom PDF Styling**: Full control over fonts, margins, colors via `config/pdf_style.css`
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- Google Gemini API Key ([Get one here](https://makersuite.google.com/app/apikey))
+
+### 1. Environment Setup
+
+- Clone the repository:
+  ```bash
+  git clone https://github.com/developer/XLBDTranslator-dev.git
+  cd XLBDTranslator-dev
+  ```
+- Create and activate a Python virtual environment (recommended: `conda`):
+  ```bash
+  conda create -n xlbd-translator python=3.12
+  conda activate xlbd-translator
+  ```
+
+### 2. Install Dependencies
+
+- Install all required Python packages:
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+- **PDF Output Support** (recommended):
+  
+  The project outputs both **Markdown (.md)** and **PDF (.pdf)** formats by default. PDF generation requires the `weasyprint` library.
+  
+  - **macOS users**: Install additional system dependencies
+    ```bash
+    brew install cairo pango gdk-pixbuf
+    ```
+  
+  - **Ubuntu/Debian users**:
+    ```bash
+    sudo apt-get install libpango1.0-dev libcairo2-dev libgdk-pixbuf2.0-dev
+    ```
+  
+  - **Windows users**: Recommended to use GTK3 Runtime
+    1. Download and install [GTK3 Runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer/releases)
+    2. Or install via conda:
+       ```bash
+       conda install -c conda-forge weasyprint
+       ```
+  
+  - If `weasyprint` installation fails, the program will automatically skip PDF generation and still output Markdown files.
+
+### 3. Configuration
+
+All core configurations are in the `config/config.env` file (note: filename is `config.env`, not `.env`). Configure as follows:
+
+1.  **API Key (Required)**:
+    ```dotenv
+    # Google AI Studio API Key
+    API__GEMINI_API_KEY="YOUR_API_KEY_HERE"
+    ```
+
+2.  **Document Path (Required)**:
+    ```dotenv
+    # Full path to the EPUB or PDF file to translate
+    FILES__DOCUMENT_PATH="/path/to/your/document.pdf"
+    ```
+
+3.  **Gemini Model (Optional)**:
+    - Run `python check_models.py` to see available models.
+    ```dotenv
+    # Default is gemini-2.5-flash
+    API__GEMINI_MODEL="gemini-2.5-flash"
+    ```
+
+4.  **Other Common Configurations (Optional, for non-interactive mode)**:
+    - If set in the `.env` file, the program will use these values and skip corresponding interactive prompts.
+    ```dotenv
+    # --- Document-Specific Strategy ---
+    # Custom TOC file path
+    DOCUMENT__CUSTOM_TOC_PATH="./test/my_toc.csv"
+    # Page range (e.g., "10-50" or "[10, 50]")
+    DOCUMENT__PAGE_RANGE="10,50"
+
+    # --- Processing Strategy ---
+    # Whether to retain original text for bilingual output (true/false)
+    PROCESSING__RETAIN_ORIGINAL=true
+    # Whether to enable vision mode by default (true/false/not set for auto)
+    PROCESSING__USE_VISION_MODE=true
+    ```
+
+### 4. Run Translation
+
+Once everything is ready, run the main program:
+
+```bash
+python main.py
+```
+
+After starting, the program will guide you through configuration via interactive CLI (any steps already set in `.env` will be automatically skipped):
+
+1.  **Select Translation Mode (Persona)**: Choose the most suitable expert identity for your text type.
+2.  **Configure Processing Strategy**:
+    - **Custom TOC**: (PDF only) Whether to load an external CSV-format table of contents.
+        - **Format Requirement**: CSV file must contain `Page`, `Title`, `Level` headers.
+    - **Vision Mode**: (PDF only) Choose auto-detect, force enable, or force disable.
+    - **Page Range**: (PDF only) Specify start and end page numbers for translation.
+    - **Margin Cropping**: (Vision mode only) Set cropping ratio to remove headers/footers.
+    - **Retain Original**: Whether to generate bilingual output.
+
+After configuration, the translation process will automatically begin. You can see real-time progress logs in the terminal.
+
+## 📖 Advanced Configuration Guide
+
+### Available Translation Modes (Personas)
+
+Built-in expert modes in `config/modes.json`:
+- **Zizek Expert**: Specializes in Hegelian philosophy and Lacanian psychoanalysis
+- **Sociology Researcher**: Expert in critical theory and continental philosophy
+- **Biography Journalist**: Specializes in literary biographies and historical non-fiction
+- **AI Data Scientist**: Technology and AI domain expertise with data science perspective
+- **Novel Translator**: Literary fiction and romance/BL novels expert
+- **Nietzsche-ish Interpretive**: Poetic translation of philosophical metaphors
+- **Lazy Genius Digest**: Brilliant compression and summarization of complex texts
+
+### Environment Variables Reference
+
+Full configuration example in `config/config.env`:
+
+```dotenv
+# Core Configuration
+API__GEMINI_API_KEY=your_api_key_here
+API__GEMINI_MODEL=gemini-2.5-flash
+
+# Document Path
+FILES__DOCUMENT_PATH=path/to/your/document.pdf
+
+# Translation Mode (optional - will prompt if not set)
+PROCESSING__TRANSLATION_MODE=1
+
+# Processing Strategy
+PROCESSING__USE_ASYNC=true
+PROCESSING__RETAIN_ORIGINAL=true
+PROCESSING__USE_VISION_MODE=auto
+
+# Custom TOC (optional - for PDF)
+DOCUMENT__CUSTOM_TOC_PATH=./test/my_toc.csv
+DOCUMENT__PAGE_RANGE=10,50
+
+# Vision Mode Settings (optional)
+DOCUMENT__MARGIN_TOP=0.1
+DOCUMENT__MARGIN_BOTTOM=0.1
+DOCUMENT__MARGIN_LEFT=0.05
+DOCUMENT__MARGIN_RIGHT=0.05
+
+# Advanced Settings
+TRANSLATION__MAX_RETRIES=3
+TRANSLATION__BATCH_SIZE=10
+```
+
+### Custom Table of Contents Format
+
+For PDF documents, you can provide a custom table of contents in CSV format:
+
+```csv
+Page,Title,Level
+1,Introduction,1
+5,Chapter 1: Background,1
+8,1.1 Historical Context,2
+15,Chapter 2: Methodology,1
+```
+
+**Format Requirements**: CSV file must contain `Page`, `Title`, `Level` columns.
+
+## 📁 Project Structure
+
+```
+XLBDTranslator/
+├── main.py                 # Main entry point
+├── requirements.txt        # Python dependencies
+├── config/                 # Configuration files
+│   ├── config.env.template # Environment template
+│   ├── modes.json         # Translation persona definitions
+│   ├── pdf_style.css      # PDF output styling
+│   └── prompts/           # Prompt templates
+├── src/                   # Source code
+│   ├── core/             # Core modules (Schema, Exceptions)
+│   ├── parser/           # Document parsers (PDF, EPUB)
+│   ├── translator/       # Translation engine (sync/async)
+│   ├── renderer/         # Renderers (Markdown, PDF)
+│   └── utils/            # Utility functions
+├── output/               # Translation outputs (auto-generated)
+│   └── <file_md5>/      # Per-document cache and results
+├── logs/                 # Log files
+└── test/                 # Test scripts and data
+```
+
+## 📁 Output Files
+
+- **Intermediate Files**: All cache, images, and state files are saved in `output/<file_hash>/`
+  - `structure_map.json`: Core state file tracking all segments and translations
+  - `checkpoint.json`: Resume checkpoint data
+  - `glossary.json`: Extracted terminology for consistency
+- **Final Files**: Translated `_Translated.md` and `_Translated.pdf` saved in the same directory as source file
+
+## 🎨 Advanced Customization
+
+### Modify Translation Personas
+
+Edit `config/modes.json` to adjust existing personas or add new ones:
+
+```json
+{
+  "custom_expert": {
+    "name": "Custom Expert",
+    "system_instruction": "You are an expert in...",
+    "style_guide": "Translate with..."
+  }
+}
+```
+
+### Customize PDF Styling
+
+Edit `config/pdf_style.css` to change fonts, sizes, margins, colors:
+
+```css
+body {
+  font-family: 'Your Preferred Font';
+  font-size: 12pt;
+  line-height: 1.8;
+}
+```
+
+## � Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+**Note**: This tool requires a valid Google Gemini API key. Usage may incur costs depending on your API plan.

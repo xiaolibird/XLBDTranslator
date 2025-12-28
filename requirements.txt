@@ -1,36 +1,62 @@
-# XLBD Translator - Modern Python Stack
-# Updated for Python 3.10+ with state-driven architecture
+# XLBD Translator - Python Dependencies
+# Python 3.12+ required
 
-# Core AI & ML
-google-generativeai>=0.8.3
+# ============================================================
+# Core AI & Translation
+# ============================================================
+google-generativeai>=0.8.6
+google-auth>=2.45.0
 
-# Data Validation & Settings
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+# ============================================================
+# Data Validation & Configuration
+# ============================================================
+pydantic>=2.12.5
+pydantic-settings>=2.12.0
+python-dotenv>=1.0.0
 
+# ============================================================
 # Document Processing
-PyMuPDF>=1.24.0  # fitz
-ebooklib>=0.18
-beautifulsoup4>=4.12.0
+# ============================================================
+PyMuPDF>=1.26.7
+ebooklib>=0.20
+beautifulsoup4>=4.14.3
+lxml>=6.0.2
 
+# ============================================================
 # Data Processing
-numpy>=1.24.0
+# ============================================================
+numpy>=2.4.0
+pandas>=2.3.3
 
+# ============================================================
 # Image Processing
-Pillow>=10.0.0
+# ============================================================
+Pillow>=12.0.0
 
-# Modern Logging
-loguru>=0.7.0
-
-# Retry Management
-tenacity>=8.0.0
-
-# Progress Bars
-tqdm>=4.65.0
-
+# ============================================================
 # PDF Generation
-weasyprint>=61.0
-markdown2>=2.4.0
+# ============================================================
+weasyprint>=67.0
+markdown2>=2.5.4
 
-# Type Hints (for older Python versions)
-typing-extensions>=4.5.0
+# ============================================================
+# Logging & Monitoring
+# ============================================================
+loguru>=0.7.3
+
+# ============================================================
+# Async & Retry Management
+# ============================================================
+tenacity>=9.1.2
+aiohttp>=3.9.0
+
+# ============================================================
+# Progress Display & UI
+# ============================================================
+tqdm>=4.67.1
+rich>=13.0.0
+
+# ============================================================
+# Type Hints
+# ============================================================
+typing-extensions>=4.15.0

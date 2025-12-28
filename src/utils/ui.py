@@ -1,13 +1,72 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Dict, TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .core.schema import TranslationMode
+    from src.core.schema import TranslationMode
 
-from .core.schema import Settings
+from src.core.schema import Settings, TranslationMode
+from src.core.exceptions import ConfigError, MissingConfigError
+
+
+def get_default_modes() -> Dict[str, TranslationMode]:
+    """返回默认的翻译模式（精简为用户背景）"""
+    default_modes_data = {
+        "999": {
+            "name": "Biomedical AI Researcher",
+            "role_desc": "你是一位具有生物技术和电子工程及端机背景的研究人员，专注于数据分析和人工智能应用。你对医疗AI、大模型应用、文本处理有深入理解。",
+            "style": "保持学术严谨性，用中文表达时追求精准和专业，避免翻译腔。特别关注医学术语、AI算法名称的准确性。",
+            "context_len": "high"
+        }
+    }
+    return {k: TranslationMode(**v) for k, v in default_modes_data.items()}
+
+
+def load_modes_config(config_path: Path) -> Dict[str, TranslationMode]:
+    """加载翻译模式配置"""
+    if not config_path.exists():
+        print(f"Modes config not found at {config_path}. Creating default one.")
+        default_modes = get_default_modes()
+        default_modes_dict = {k: v.model_dump() for k, v in default_modes.items()}
+
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_modes_dict, f, ensure_ascii=False, indent=2)
+            return default_modes
+        except Exception as e:
+            print(f"Failed to create default modes config: {e}")
+            return get_default_modes()
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            modes_data = json.load(f)
+        
+        validated_modes = {}
+        for mode_id, mode_config in modes_data.items():
+            try:
+                validated_modes[mode_id] = TranslationMode(**mode_config)
+            except Exception as e:
+                print(f"Skipping invalid mode configuration for mode {mode_id}: {e}")
+                continue
+        
+        if not validated_modes:
+            print("No valid translation modes found. Using defaults.")
+            return get_default_modes()
+            
+        return validated_modes
+        
+    except Exception as e:
+        print(f"Failed to load modes config: {e}. Using defaults.")
+        return get_default_modes()
+
+
+# ========================================================================
+# UI 交互函数
+# ========================================================================
 
 def get_user_strategy(settings: Settings):
     """
@@ -190,7 +249,21 @@ def get_user_strategy(settings: Settings):
     return
 
 def get_mode_selection(modes: Dict[str, 'TranslationMode']) -> 'TranslationMode':
-    """交互式地从用户那里获取翻译模式选择。"""
+    """
+    交互式地从用户那里获取翻译模式选择。
+    
+    Args:
+        modes: 可用的翻译模式字典 {mode_id: TranslationMode}
+    
+    Returns:
+        TranslationMode: 用户选择的翻译模式对象
+    
+    Raises:
+        ValueError: 如果 modes 为空或无效
+    """
+    if not modes:
+        raise ValueError("❌ 没有可用的翻译模式！请检查 modes.json 配置文件。")
+    
     print("\n🎭 请选择翻译模式 (Personas):")
 
     for key, mode_obj in modes.items():
@@ -199,7 +272,11 @@ def get_mode_selection(modes: Dict[str, 'TranslationMode']) -> 'TranslationMode'
     choice = input("\n请输入数字 (默认 1): ").strip()
     if not choice or choice not in modes:
         choice = "1"
+        if choice not in modes:
+            # 如果默认值 "1" 也不存在，使用第一个可用的模式
+            choice = list(modes.keys())[0]
+            print(f"⚠️  模式 '1' 不存在，使用第一个可用模式。")
     
-    selected_mode = modes[choice]
-    print(f"✅ 已选择: {selected_mode.name}\n") # 使用 .name 访问属性
-    return selected_mode
+    selected_mode_obj = modes[choice]
+    print(f"✅ 已选择: {selected_mode_obj.name}\n")
+    return selected_mode_obj
