@@ -44,7 +44,7 @@ An intelligent document translation tool powered by Google Gemini and state-driv
 
 - Clone the repository:
   ```bash
-  git clone https://github.com/developer/XLBDTranslator-dev.git
+  git clone https://github.com/xiaolibird/XLBDTranslator-dev.git
   cd XLBDTranslator-dev
   ```
 - Create and activate a Python virtual environment (recommended: `conda`):
@@ -85,7 +85,20 @@ An intelligent document translation tool powered by Google Gemini and state-driv
 
 ### 3. Configuration
 
-All core configurations are in the `config/config.env` file (note: filename is `config.env`, not `.env`). Configure as follows:
+#### 3.1 Create Configuration File
+
+Core configurations are managed through environment variable files. The project provides a configuration template `config/config.env.template`. Create the actual configuration file before first use:
+
+```bash
+# Create configuration file from template
+cp config/config.env.template config/config.env
+```
+
+**Note**: The `config/config.env` file contains sensitive information (such as API keys) and is excluded by `.gitignore`, so it won't be committed to version control.
+
+#### 3.2 Edit Configuration File
+
+Open the `config/config.env` file and modify according to the following instructions:
 
 1.  **API Key (Required)**:
     ```dotenv
@@ -124,13 +137,27 @@ All core configurations are in the `config/config.env` file (note: filename is `
 
 ### 4. Run Translation
 
+#### 4.1 Basic Usage
+
 Once everything is ready, run the main program:
 
 ```bash
 python main.py
 ```
 
-After starting, the program will guide you through configuration via interactive CLI (any steps already set in `.env` will be automatically skipped):
+#### 4.2 Specify Custom Configuration File (Optional)
+
+If you need to use a different configuration file (e.g., for different projects), you can specify it via command-line argument:
+
+```bash
+python main.py --config /path/to/your/custom.env
+```
+
+This is useful for managing multiple translation projects, each with its own configuration file.
+
+#### 4.3 Interactive Configuration
+
+After starting, the program will guide you through configuration via interactive CLI (any steps already set in the configuration file will be automatically skipped):
 
 1.  **Select Translation Mode (Persona)**: Choose the most suitable expert identity for your text type.
 2.  **Configure Processing Strategy**:

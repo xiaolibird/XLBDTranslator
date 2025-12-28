@@ -13,12 +13,12 @@ from src.core.exceptions import ConfigError, MissingConfigError
 
 
 def get_default_modes() -> Dict[str, TranslationMode]:
-    """返回默认的翻译模式（精简为用户背景）"""
+    """返回默认的翻译模式（通用学术翻译）"""
     default_modes_data = {
         "999": {
-            "name": "Biomedical AI Researcher",
-            "role_desc": "你是一位具有生物技术和电子工程及端机背景的研究人员，专注于数据分析和人工智能应用。你对医疗AI、大模型应用、文本处理有深入理解。",
-            "style": "保持学术严谨性，用中文表达时追求精准和专业，避免翻译腔。特别关注医学术语、AI算法名称的准确性。",
+            "name": "Academic Researcher",
+            "role_desc": "你是一位具有计算机科学和人工智能背景的研究人员，专注于数据挖掘和大模型应用。你对AI技术、自然语言处理、文本分析有深入理解。",
+            "style": "保持学术严谨性，用中文表达时追求精准和专业，避免翻译腔。特别关注技术术语、学术概念的准确性。",
             "context_len": "high"
         }
     }

@@ -26,21 +26,31 @@ def main():
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog="""
                 示例用法:
-                python main.py                          # 使用.env配置的文档路径
-                python main.py path/to/document.pdf     # 翻译指定文档
-                python main.py document.epub            # 支持PDF和EPUB格式
+                python main.py                                      # 使用默认配置文件
+                python main.py path/to/document.pdf                 # 翻译指定文档
+                python main.py --config custom.env document.epub    # 使用自定义配置文件
             """
+        )
+        parser.add_argument(
+            '--config',
+            type=str,
+            default='config/config.env',
+            help='配置文件路径（默认: config/config.env）'
         )
         parser.add_argument(
             'file_path',
             nargs='?',
             type=str,
-            help='要翻译的文档路径（可选，未指定则使用.env中的配置）'
+            help='要翻译的文档路径（可选，未指定则使用配置文件中的设置）'
         )
         args = parser.parse_args()
         
-        # 初始化设置（从 env 读取）
-        base_settings = Settings.from_env_file()
+        # 初始化设置（从指定的配置文件读取）
+        config_path = Path(args.config)
+        if not config_path.exists():
+            logger.error(f"❌ 配置文件不存在: {config_path}")
+            sys.exit(1)
+        base_settings = Settings.from_env_file(config_path)
 
         # 使用 Builder 统一构建最终 Settings（避免在 main 中直接改 settings 字段）
         builder = SettingsBuilder(base_settings)

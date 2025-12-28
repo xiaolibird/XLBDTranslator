@@ -41,7 +41,7 @@
 
 - 克隆本仓库到本地:
   ```bash
-  git clone https://github.com/developer/XLBDTranslator-dev.git
+  git clone https://github.com/xiaolibird/XLBDTranslator-dev.git
   cd XLBDTranslator-dev
   ```
 - 推荐使用 `conda` 创建并激活一个 Python 虚拟环境:
@@ -82,7 +82,20 @@
 
 ### 3. 配置
 
-核心配置均在 `config/config.env` 文件中完成（注意：文件名为 `config.env`，不是 `.env`）。请根据以下说明修改该文件：
+#### 3.1 创建配置文件
+
+核心配置通过环境变量文件管理。项目提供了配置模板 `config/config.env.template`，首次使用前需要创建实际配置文件：
+
+```bash
+# 从模板创建配置文件
+cp config/config.env.template config/config.env
+```
+
+**注意**: `config/config.env` 文件包含敏感信息（如API密钥），已被 `.gitignore` 排除，不会提交到版本库。
+
+#### 3.2 编辑配置文件
+
+打开 `config/config.env` 文件，根据以下说明修改：
 
 1.  **API 密钥 (必需)**:
     ```dotenv
@@ -121,13 +134,27 @@
 
 ### 4. 运行翻译
 
+#### 4.1 基本用法
+
 一切就绪后，直接运行主程序：
 
 ```bash
-python main.py 
+python main.py
 ```
 
-程序启动后，会通过交互式命令行引导您完成配置（任何已在 `.env` 中设置的步骤将被自动跳过）：
+#### 4.2 指定自定义配置文件（可选）
+
+如果需要使用不同的配置文件（例如针对不同项目），可以通过命令行参数指定：
+
+```bash
+python main.py --config /path/to/your/custom.env
+```
+
+这对于管理多个翻译项目非常有用，每个项目可以有独立的配置文件。
+
+#### 4.3 交互式配置
+
+程序启动后，会通过交互式命令行引导您完成配置（任何已在配置文件中设置的步骤将被自动跳过）：
 
 1.  **选择翻译模式 (Persona)**: 根据您的文本类型选择一个最合适的专家身份。
 2.  **配置处理策略**:
