@@ -14,11 +14,21 @@
 - **断点续传**：支持意外中断后完美恢复，自动跳过已翻译片段，无需从头开始。
 - **原子化保存**：每批次翻译完成后，立即保存进度，最大程度减少数据丢失风险。
 - **健壮的错误处理**：内置 API 自动重试和 JSON 修复机制，智能处理网络波动和模型返回错误。
+- **异步并发优化**：多批次并发翻译，保证结果顺序与原文精确匹配，避免分配错误。
 
 ### 🤖 多模态翻译
 - **文本模式 (Native)**：针对文本清晰的 PDF/EPUB，直接提取并翻译，速度快。
 - **视觉模式 (Vision)**：针对扫描件或复杂排版的文档，自动渲染页面为图片并调用多模态模型进行翻译。
 - **智能策略**：支持在交互式会话中选择自动检测、强制开启或强制关闭视觉模式。
+
+### 🌐 多 API 支持
+- **Google Gemini**: 默认翻译引擎，支持多模态和长文本
+- **DeepSeek API**: 支持 128K 上下文，成本效益高，特别优化中文翻译
+  - 自动检测并启用长文本模式
+  - 完整的 system + instruction + mode + context 合并为单 user message
+  - 详见 [DeepSeek 使用指南](docs/DEEPSEEK_GUIDE.md)
+- **Ollama 本地**: 支持本地部署模型，适合离线或隐私要求高的场景
+- **OpenAI 兼容**: 支持任何 OpenAI 兼容的 API
 
 ### 🎭 专业翻译人格 (Persona)
 - **高度可定制**：通过编辑 `config/modes.json`，您可以轻松修改或创建新的专家角色。
@@ -97,13 +107,31 @@ cp config/config.env.template config/config.env
 
 打开 `config/config.env` 文件，根据以下说明修改：
 
-1.  **API 密钥 (必需)**:
+1.  **选择翻译引擎**:
+    ```dotenv
+    # 可选: gemini (默认), openai-compatible (支持 DeepSeek/OpenAI/Ollama)
+    API__TRANSLATOR_PROVIDER=gemini
+    ```
+
+2.  **API 密钥 (必需)**:
+    
+    **使用 Gemini**:
     ```dotenv
     # Google AI Studio 的 API Key
     API__GEMINI_API_KEY="YOUR_API_KEY_HERE"
     ```
+    
+    **使用 DeepSeek** (推荐用于中文翻译):
+    ```dotenv
+    # DeepSeek API (OpenAI 兼容)
+    API__TRANSLATOR_PROVIDER=openai-compatible
+    API__OPENAI_API_KEY="sk-your-deepseek-api-key"
+    API__OPENAI_BASE_URL="https://api.deepseek.com"
+    API__OPENAI_MODEL="deepseek-chat"
+    ```
+    > 📖 详细配置请参考 [DeepSeek 使用指南](docs/DEEPSEEK_GUIDE.md)
 
-2.  **文档路径 (必需)**:
+3.  **文档路径 (必需)**:
     ```dotenv
     # 待翻译的 EPUB 或 PDF 文件的完整路径
     FILES__DOCUMENT_PATH="/path/to/your/document.pdf"

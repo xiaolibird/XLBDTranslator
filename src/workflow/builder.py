@@ -234,6 +234,13 @@ class SettingsBuilder:
         self._modifications['use_vision_mode'] = enabled
         return self
     
+    # ========== API 设置 ==========
+    
+    def api_key(self, key: str) -> 'SettingsBuilder':
+        """设置 API 密钥"""
+        self._modifications['gemini_api_key'] = key
+        return self
+    
     # ========== 文件设置 ==========
     
     def document_path(self, file_path: str | Path) -> 'SettingsBuilder':
@@ -253,14 +260,34 @@ class SettingsBuilder:
     
     # ========== API 设置 ==========
     
+    def translation_provider(self, provider: str) -> 'SettingsBuilder':
+        """设置翻译供应商"""
+        self._modifications['translator_provider'] = provider
+        return self
+    
     def gemini_api_key(self, api_key: str) -> 'SettingsBuilder':
-        """设置 API Key"""
+        """设置Gemini API Key"""
         self._modifications['gemini_api_key'] = api_key
         return self
     
     def gemini_model(self, model: str) -> 'SettingsBuilder':
-        """设置模型名称"""
+        """设置Gemini模型名称"""
         self._modifications['model_name'] = model
+        return self
+    
+    def openai_api_key(self, api_key: str) -> 'SettingsBuilder':
+        """设置OpenAI兼容API Key"""
+        self._modifications['openai_api_key'] = api_key
+        return self
+    
+    def openai_base_url(self, base_url: str) -> 'SettingsBuilder':
+        """设置OpenAI兼容API基础URL"""
+        self._modifications['openai_base_url'] = base_url
+        return self
+    
+    def openai_model(self, model: str) -> 'SettingsBuilder':
+        """设置OpenAI兼容模型名称"""
+        self._modifications['openai_model'] = model
         return self
     
     def max_retries(self, retries: int) -> 'SettingsBuilder':
@@ -329,12 +356,19 @@ class SettingsBuilder:
             setattr(self._settings.files, key, value)
         
         # API 相关设置
-        elif key in ['gemini_api_key', 'model_name']:
-            # 注意：schema中是 gemini_model 而不是 model_name
-            if key == 'model_name':
+        elif key in ['translator_provider', 'gemini_api_key', 'model_name', 'openai_api_key', 'openai_base_url', 'openai_model']:
+            if key == 'translator_provider':
+                setattr(self._settings.api, 'translator_provider', value)
+            elif key == 'model_name':
                 setattr(self._settings.api, 'gemini_model', value)
             elif key == 'gemini_api_key':
                 setattr(self._settings.api, 'gemini_api_key', value)
+            elif key == 'openai_api_key':
+                setattr(self._settings.api, 'openai_api_key', value)
+            elif key == 'openai_base_url':
+                setattr(self._settings.api, 'openai_base_url', value)
+            elif key == 'openai_model':
+                setattr(self._settings.api, 'openai_model', value)
         
         # Logging 相关设置
         elif key in ['log_level']:

@@ -41,6 +41,10 @@ class CheckpointManager:
         self.project_dir = base_dir / doc_hash
         self.checkpoint_file = self.project_dir / "checkpoint.json"
         self.checkpoint_data: Dict = {}
+        
+        # 记录checkpoint文件路径，便于排查
+        logger.info(f"📍 Checkpoint文件路径: {self.checkpoint_file.absolute()}")
+        
         self._load_checkpoint()
     
     def _load_checkpoint(self):
@@ -108,7 +112,8 @@ class CheckpointManager:
         """获取所有未完成的段落"""
         completed_ids = self.get_completed_segment_ids()
         pending = [seg for seg in all_segments if seg.segment_id not in completed_ids]
-        
+        another_pending = [seg for seg in all_segments if seg.translated_text.endswith("Failed]") or seg.translated_text.startswith("[Failed")]
+        pending = pending + another_pending
         if pending:
             logger.info(f"🔄 检测到 {len(pending)} 个待翻译段落 (共 {len(all_segments)} 个)")
         else:
@@ -228,16 +233,18 @@ class CachePersistenceManager:
     def register_system_cache(
         self,
         cache_name: str,
-        mode_id: str,
         content_hash: str,
         ttl_hours: float = 1.0
     ) -> bool:
         """注册System Instruction缓存"""
         try:
-            cache_key = f"mode_{mode_id}_{content_hash[:8]}"
+            # 使用日期+doc_hash+内容hash生成缓存键
+            date_str = datetime.now().strftime("%Y%m%d")
+            doc_hash_short = self.doc_hash[:8] if self.doc_hash else "nodoc"
+            cache_key = f"sys_{date_str}_{doc_hash_short}_{content_hash[:8]}"
+            
             self.cache_metadata["system_instruction"][cache_key] = {
                 "cache_name": cache_name,
-                "mode_id": mode_id,
                 "content_hash": content_hash,
                 "created_at": time.time(),
                 "expiry_time": time.time() + (ttl_hours * 3600),
@@ -260,7 +267,11 @@ class CachePersistenceManager:
     ) -> bool:
         """注册术语表缓存"""
         try:
-            cache_key = f"glossary_{glossary_hash[:8]}"
+            # 使用日期+doc_hash+术语表hash生成缓存键
+            date_str = datetime.now().strftime("%Y%m%d")
+            doc_hash_short = self.doc_hash[:8] if self.doc_hash else "nodoc"
+            cache_key = f"glo_{date_str}_{doc_hash_short}_{glossary_hash[:8]}"
+            
             self.cache_metadata["glossary"][cache_key] = {
                 "cache_name": cache_name,
                 "glossary_hash": glossary_hash,
@@ -328,13 +339,15 @@ class CachePersistenceManager:
             logger.error(f"❌ 注册上传文件失败: {e}")
             return False
     
-    def get_system_cache(self, mode_id: str, content_hash: str) -> Optional[str]:
-        """获取System Instruction缓存名称"""
-        cache_key = f"mode_{mode_id}_{content_hash[:8]}"
-        cache_info = self.cache_metadata["system_instruction"].get(cache_key)
-        if cache_info and time.time() < cache_info.get('expiry_time', 0):
-            logger.debug(f"♻️  复用System缓存: {cache_key}")
-            return cache_info.get('cache_name')
+    def get_system_cache(self, content_hash: str) -> Optional[str]:
+        """获取System Instruction缓存名称（通过内容hash查找）"""
+        # 遍历所有system instruction缓存，根据content_hash查找
+        current_time = time.time()
+        for cache_key, cache_info in self.cache_metadata["system_instruction"].items():
+            if (cache_info.get('content_hash') == content_hash and 
+                current_time < cache_info.get('expiry_time', 0)):
+                logger.debug(f"♻️  复用System缓存: {cache_key}")
+                return cache_info.get('cache_name')
         return None
     
     def get_glossary_cache(self, glossary_hash: str) -> Optional[str]:
@@ -424,27 +437,26 @@ class CachePersistenceManager:
     
     def get_or_create_system_cache(
         self,
-        mode_entity: 'TranslationMode',
         system_instruction: str,
-        model_name: str
+        model_name: str,
+        display_name: Optional[str] = None
     ) -> Optional[str]:
         """
         统一的System Instruction缓存获取或创建方法
         
         Args:
-            mode_entity: 翻译模式实体对象
             system_instruction: 系统指令内容
             model_name: 模型名称
+            display_name: 缓存显示名称（可选）
             
         Returns:
             缓存名称（cache_name），如果创建失败则返回None
         """
         # 计算内容哈希
         content_hash = self.compute_content_hash(system_instruction)
-        mode_id = str(mode_entity)
         
-        # 检查是否已有可复用的缓存
-        existing_cache = self.get_system_cache(mode_id, content_hash)
+        # 检查是否已有可复用的缓存（基于内容hash）
+        existing_cache = self.get_system_cache(content_hash)
         if existing_cache:
             logger.info(f"♻️  复用已有System Instruction缓存: {existing_cache[:50]}...")
             return existing_cache
@@ -456,11 +468,16 @@ class CachePersistenceManager:
 
             client = genai.Client(api_key=self.settings.api.gemini_api_key)
             ttl_seconds = int(self.settings.processing.cache_ttl_hours * 3600)
+            
+            # 使用日期和hash生成显示名称
+            if display_name is None:
+                date_str = datetime.now().strftime("%Y%m%d")
+                display_name = f"sys_{date_str}_{content_hash[:8]}"
 
             cache = client.caches.create(
                 model=model_name,
                 config=types.CreateCachedContentConfig(
-                    display_name=f"system_instruction_{mode_entity.name}",
+                    display_name=display_name,
                     system_instruction=system_instruction,
                     ttl=f"{ttl_seconds}s",
                 ),
@@ -474,7 +491,6 @@ class CachePersistenceManager:
             # 注册到持久化管理器
             self.register_system_cache(
                 cache_name=cache_name,
-                mode_id=mode_id,
                 content_hash=content_hash,
                 ttl_hours=self.settings.processing.cache_ttl_hours
             )
@@ -588,9 +604,22 @@ class PromptManager:
         self.settings = settings
         self.mode_entity = settings.processing.translation_mode_entity
         
-        # 加载所有模板
-        self.system_instruction_base = self._load_prompt_template("system_instruction.md")
-        self.text_translation_prompt = self._load_prompt_template("text_translation_prompt.md")
+        # 根据translator provider选择prompt版本
+        provider = getattr(settings.api, 'translator_provider', 'gemini').lower()
+        is_cloud_provider = provider in {'deepseek', 'openai', 'openai-compatible', 'openai_compatible', 'gemini'}
+        
+        if is_cloud_provider:
+            # 云端API使用完整版本的prompt（更好的翻译质量）
+            self.system_instruction_base = self._load_prompt_template("system_instruction.md")
+            self.text_translation_prompt = self._load_prompt_template("text_translation_prompt.md")
+            logger.info("🌐 云端API模式：使用完整版prompt（高质量翻译）")
+        else:
+            # 本地模型使用简化版本（节省token）
+            self.system_instruction_base = self._load_prompt_template("system_instruction_simple.md")
+            self.text_translation_prompt = self._load_prompt_template("text_translation_prompt_simple.md")
+            logger.info("🏠 本地模式：使用简化版prompt（节省资源）")
+        
+        # 视觉和JSON修复prompt保持不变
         self.vision_translation_prompt = self._load_prompt_template("vision_translation_prompt.md")
         self.json_repair_prompt = self._load_prompt_template("json_repair_prompt.md")
     

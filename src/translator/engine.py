@@ -30,74 +30,6 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class _GenAIModelAdapter:
-    """Adapter to preserve the legacy `.generate_content(..., generation_config=...)` call shape.
-
-    The new `google.genai` SDK uses `client.models.generate_content(model=..., contents=..., config=...)`.
-    This adapter keeps existing translator code changes minimal.
-    """
-
-    def __init__(self, translator: "GeminiTranslator", *, use_system_cache: bool, purpose: str):
-        self._translator = translator
-        self._use_system_cache = use_system_cache
-        self._purpose = purpose
-
-    def generate_content(self, contents: Any, generation_config: Optional[Any] = None):
-        translator = self._translator
-
-        config_update: Dict[str, Any] = {}
-        if generation_config is None:
-            pass
-        elif isinstance(generation_config, types.GenerateContentConfig):
-            config_update = generation_config.model_dump(exclude_none=True)
-        elif isinstance(generation_config, dict):
-            config_update = dict(generation_config)
-        else:
-            # Best-effort conversion (e.g., pydantic types or other config objects).
-            if hasattr(generation_config, "model_dump"):
-                config_update = generation_config.model_dump(exclude_none=True)
-            elif hasattr(generation_config, "__dict__"):
-                config_update = dict(getattr(generation_config, "__dict__", {}) or {})
-
-        config = translator._base_generation_config.model_copy(update=config_update)
-
-        cache_name = translator.cache_refs.get("system") if self._use_system_cache else None
-        if cache_name:
-            # When using cached_content, we MUST NOT pass system_instruction/tools/tool_config
-            # because they are already in the cache. Remove them from config.
-            config = config.model_copy(update={
-                "cached_content": cache_name,
-                "system_instruction": None,
-                "tools": None,
-                "tool_config": None,
-            })
-
-        try:
-            response = translator._client.models.generate_content(
-                model=translator.settings.api.gemini_model,
-                contents=contents,
-                config=config,
-            )
-            if cache_name:
-                logger.debug(f"🔄 {self._purpose} 使用 Gemini Cache: {cache_name[:30]}...")
-            return response
-        except Exception as e:
-            # If cached content is stale/invalid, fall back once without cache.
-            if cache_name:
-                logger.warning(f"⚠️  {self._purpose} 缓存使用失败，降级为普通调用: {e}")
-                config_no_cache = config.model_copy(update={
-                    "cached_content": None,
-                    # Restore system_instruction from base config when not using cache
-                    "system_instruction": translator._base_generation_config.system_instruction,
-                })
-                return translator._client.models.generate_content(
-                    model=translator.settings.api.gemini_model,
-                    contents=contents,
-                    config=config_no_cache,
-                )
-            raise
-
-
 class GeminiTranslator(BaseTranslator):
     """Gemini 翻译客户端。
     
@@ -139,10 +71,12 @@ class GeminiTranslator(BaseTranslator):
         
         # 创建System Instruction缓存（委托给缓存管理器）
         if settings.processing.enable_gemini_caching and self.cache_persistence:
+            # 使用translation_mode_entity的name作为display_name（可选）
+            mode_name = getattr(settings.processing.translation_mode_entity, 'name', None)
             cache_name = self.cache_persistence.get_or_create_system_cache(
-                mode_entity=settings.processing.translation_mode_entity,
                 system_instruction=self.prompt_manager.get_system_instruction(use_vision=settings.processing.use_vision_mode),
-                model_name=settings.api.gemini_model
+                model_name=settings.api.gemini_model,
+                display_name=f"sys_{mode_name}" if mode_name else None
             )
             if cache_name:
                 self.cache_refs['system'] = cache_name
@@ -197,14 +131,55 @@ class GeminiTranslator(BaseTranslator):
             **self.generation_config,
         )
 
-        return _GenAIModelAdapter(self, use_system_cache=False, purpose="Gemini")
-
-    def _get_model_with_system_cache(self, purpose: str) -> Any:
-        """Return a model adapter that uses cached_content when available."""
-        cache_name = self.cache_refs.get("system")
-        if not cache_name:
-            return self.model
-        return _GenAIModelAdapter(self, use_system_cache=True, purpose=purpose)
+    def _generate_content(self, contents: Any, generation_config: Optional[Dict[str, Any]] = None, use_cache: bool = True, purpose: str = "API Call") -> Any:
+        """统一的内容生成方法，处理缓存逻辑
+        
+        Args:
+            contents: 要发送的内容
+            generation_config: 生成配置覆盖（字典格式）
+            use_cache: 是否尝试使用系统缓存
+            purpose: 调用目的（用于日志）
+            
+        Returns:
+            API响应对象
+        """
+        # 构建配置
+        config_update = generation_config or {}
+        config = self._base_generation_config.model_copy(update=config_update)
+        
+        # 处理缓存
+        cache_name = self.cache_refs.get("system") if use_cache else None
+        if cache_name:
+            config = config.model_copy(update={
+                "cached_content": cache_name,
+                "system_instruction": None,
+                "tools": None,
+                "tool_config": None,
+            })
+        
+        try:
+            response = self._client.models.generate_content(
+                model=self.settings.api.gemini_model,
+                contents=contents,
+                config=config,
+            )
+            if cache_name:
+                logger.debug(f"🔄 {purpose} 使用 Gemini Cache: {cache_name[:30]}...")
+            return response
+        except Exception as e:
+            # 缓存失败时降级
+            if cache_name:
+                logger.warning(f"⚠️  {purpose} 缓存使用失败，降级为普通调用: {e}")
+                config_no_cache = config.model_copy(update={
+                    "cached_content": None,
+                    "system_instruction": self._base_generation_config.system_instruction,
+                })
+                return self._client.models.generate_content(
+                    model=self.settings.api.gemini_model,
+                    contents=contents,
+                    config=config_no_cache,
+                )
+            raise
     
 
 
@@ -248,8 +223,8 @@ class GeminiTranslator(BaseTranslator):
                 content_parts,
                 generation_config=gen_cfg
             )
-            raw_text = response.text.strip()
-
+            # raw_text = response.text.strip()
+            raw_text = response.candidates[0].content.parts[0].text
             # 尝试解析修正后的 JSON
             parsed_data = json.loads(raw_text)
             logger.info("✅ JSON 自我修正成功。")
@@ -296,13 +271,13 @@ class GeminiTranslator(BaseTranslator):
         original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
 
         try:
-            model = self._get_model_with_system_cache("Title API")
-            response = model.generate_content(
-                original_prompt,
-                generation_config=self.generation_config
+            response = self._generate_content(
+                contents=original_prompt,
+                generation_config=self.generation_config,
+                use_cache=True,
+                purpose="Title Translation"
             )
-            raw_text = response.text.strip()
-
+            raw_text = response.candidates[0].content.parts[0].text
             # 解析响应，并处理自我修正
             parsed_data = self._handle_json_response_with_correction(
                 raw_text,
@@ -389,8 +364,8 @@ class GeminiTranslator(BaseTranslator):
                 contents=original_prompt,
                 config=extraction_config,
             )
-            raw_text = response.text.strip()
-            
+            # raw_text = response.text.strip()
+            raw_text = response.candidates[0].content.parts[0].text
             # 处理自我修正
             parsed_glossary = self._handle_json_response_with_correction(
                 raw_text, 
@@ -472,14 +447,14 @@ class GeminiTranslator(BaseTranslator):
             glossary=glossary_text
         )
 
-        model = self._get_model_with_system_cache("Text API")
-        response = model.generate_content(
-            original_prompt,
-            generation_config=self.generation_config
+        response = self._generate_content(
+            contents=original_prompt,
+            generation_config=self.generation_config,
+            use_cache=True,
+            purpose="Text Translation"
         )
-            
-        raw_text = response.text.strip()
         
+        raw_text = response.candidates[0].content.parts[0].text
         # 解析响应，并处理自我修正
         output_list = self._handle_json_response_with_correction(
             raw_text, 
@@ -559,10 +534,11 @@ class GeminiTranslator(BaseTranslator):
                 "response_mime_type": "application/json",
             }
 
-            model = self._get_model_with_system_cache("Vision API")
-            response = model.generate_content(
-                [original_prompt, image_part],
+            response = self._generate_content(
+                contents=[original_prompt, image_part],
                 generation_config=vision_config,
+                use_cache=True,
+                purpose="Vision Translation"
             )
 
             raw_text = (response.text or "").strip()
@@ -747,6 +723,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
     """异步 Gemini 翻译客户端，支持并发批量翻译。
     
     继承自 BaseAsyncTranslator，实现 Gemini 的异步翻译逻辑。
+    支持上下文管理器自动资源清理。
     """
 
     def __init__(self, base_translator: GeminiTranslator):
@@ -761,8 +738,42 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         self.cache_refs = base_translator.cache_refs
         self.prompt_manager = base_translator.prompt_manager  # 复用 prompt_manager
         
-        # 创建线程池用于 I/O 绑定的同步操作
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        # 从 settings 获取线程池大小，默认 10
+        max_workers = getattr(base_translator.settings.processing, 'async_max_workers', 10)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        
+        # 从 settings 获取视觉 API 信号量，默认 3
+        self.vision_semaphore_limit = getattr(base_translator.settings.processing, 'vision_max_concurrent', 3)
+        
+        # 从 settings 获取超时配置，默认 300 秒
+        self.async_timeout = getattr(base_translator.settings.processing, 'async_batch_timeout', 300)
+        
+        logger.debug(f"🔧 AsyncGeminiTranslator initialized: workers={max_workers}, vision_sem={self.vision_semaphore_limit}, timeout={self.async_timeout}s")
+    
+    async def __aenter__(self):
+        """异步上下文管理器入口"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """异步上下文管理器退出，自动清理资源"""
+        self.cleanup()
+        return False
+    
+    def __enter__(self):
+        """同步上下文管理器入口（兼容性）"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """同步上下文管理器退出"""
+        self.cleanup()
+        return False
+    
+    def __del__(self):
+        """析构函数，确保资源清理"""
+        try:
+            self.cleanup()
+        except Exception:
+            pass
         
     async def translate_text_batch_async(
         self,
@@ -774,45 +785,57 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         异步批量翻译文本segment
         
         将segments分成更小的chunk并发翻译，大幅提升速度
+        特性：超时控制、自动重试、异常隔离
         """
         if not segments:
             return []
         
-        logger.info(f"🚀 使用异步模式翻译 {len(segments)} 个文本段...")
+        logger.info(f"🚀 使用异步模式翻译 {len(segments)} 个文本段（超时: {self.async_timeout}s）...")
         
         # 将 segments 分成小批次 (避免单个请求过大)
         chunk_size = min(5, self.settings.processing.batch_size)
         chunks = [segments[i:i + chunk_size] for i in range(0, len(segments), chunk_size)]
         
-        # 并发翻译所有 chunk
+        # 并发翻译所有 chunk，带超时控制
         tasks = [
-            self._translate_single_chunk_async(chunk, context, glossary)
+            self._translate_single_chunk_async(chunk, context, glossary, retry_count=2)
             for chunk in chunks
         ]
         
-        # 等待所有翻译完成
-        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            # 添加总体超时控制
+            chunk_results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=self.async_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"❌ 异步翻译超时（{self.async_timeout}s），取消所有任务")
+            # 超时时返回失败标记
+            return [f"[Failed: Timeout after {self.async_timeout}s]"] * len(segments)
         
         # 合并结果
         results = []
-        for chunk_result in chunk_results:
+        for chunk, chunk_result in zip(chunks, chunk_results):
             if isinstance(chunk_result, Exception):
                 logger.error(f"❌ Chunk 翻译失败: {chunk_result}")
-                # 为失败的chunk填充失败标记
-                results.extend([f"[Failed: {str(chunk_result)}]"] * chunk_size)
+                # 为失败的chunk填充失败标记，使用实际的chunk大小
+                actual_chunk_size = len(chunk)
+                results.extend([f"[Failed: {str(chunk_result)}]"] * actual_chunk_size)
             else:
                 results.extend(chunk_result)
         
-        logger.info(f"✅ 异步翻译完成，成功 {len([r for r in results if not r.startswith('[Failed')])} / {len(segments)}")
+        success_count = len([r for r in results if not r.startswith('[Failed')])
+        logger.info(f"✅ 异步翻译完成，成功 {success_count} / {len(segments)}")
         return results[:len(segments)]  # 确保返回正确数量的结果
 
     async def _translate_single_chunk_async(
         self,
         segments: SegmentList,
         context: str,
-        glossary: Optional[Dict[str, str]] = None
+        glossary: Optional[Dict[str, str]] = None,
+        retry_count: int = 0
     ) -> List[str]:
-        """异步翻译单个 chunk"""
+        """异步翻译单个 chunk，支持重试"""
         
         # 准备输入数据
         input_data = [
@@ -840,38 +863,65 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
             glossary=glossary_text
         )
         
-        # 在线程池中执行同步的 API 调用（使用缓存如果可用）
-        loop = asyncio.get_event_loop()
+        # 获取当前事件循环（安全方式）
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 如果没有运行中的事件循环，回退到 get_event_loop
+            loop = asyncio.get_event_loop()
         
         def _call_with_cache():
-            model = self.base._get_model_with_system_cache("Async Text API")
-            return model.generate_content(
-                original_prompt,
-                generation_config=self.generation_config
+            return self.base._generate_content(
+                contents=original_prompt,
+                generation_config=self.generation_config,
+                use_cache=True,
+                purpose="Async Text Translation"
             )
         
-        response = await loop.run_in_executor(self.executor, _call_with_cache)
+        # 重试逻辑
+        last_error = None
+        for attempt in range(retry_count + 1):
+            try:
+                # 在线程池中执行同步的 API 调用（使用缓存如果可用）
+                response = await loop.run_in_executor(self.executor, _call_with_cache)
+                
+                # raw_text = response.text.strip()
+                raw_text = response.candidates[0].content.parts[0].text
+                # 解析响应（复用同步方法）
+                output_list = self.base._handle_json_response_with_correction(
+                    raw_text,
+                    original_prompt,
+                    is_text_translation=True
+                )
+                
+                # 映射结果
+                input_ids = [s.segment_id for s in segments]
+                output_map = {
+                    int(item['id']): str(item.get('translation', ''))
+                    for item in output_list
+                    if 'id' in item and str(item['id']).isdigit()
+                }
+                
+                # 生成最终结果
+                results = [output_map.get(uid, "[Translation Failed]") for uid in input_ids]
+                
+                if attempt > 0:
+                    logger.info(f"✅ Chunk 翻译重试成功（第 {attempt + 1} 次尝试）")
+                
+                return results
+            
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count:
+                    wait_time = 2 ** attempt  # 指数退避
+                    logger.warning(f"⚠️ Chunk 翻译失败（尝试 {attempt + 1}/{retry_count + 1}），{wait_time}s 后重试: {e}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Chunk 翻译失败，已用尽所有重试: {e}")
         
-        raw_text = response.text.strip()
-        
-        # 解析响应（复用同步方法）
-        output_list = self.base._handle_json_response_with_correction(
-            raw_text,
-            original_prompt,
-            is_text_translation=True
-        )
-        
-        # 映射结果
+        # 所有重试都失败，返回失败标记
         input_ids = [s.segment_id for s in segments]
-        output_map = {
-            int(item['id']): str(item.get('translation', ''))
-            for item in output_list
-            if 'id' in item and str(item['id']).isdigit()
-        }
-        
-        # 生成最终结果
-        results = [output_map.get(uid, "[Translation Failed]") for uid in input_ids]
-        return results
+        return [f"[Failed: {str(last_error)}]"] * len(input_ids)
 
     async def translate_vision_batch_async(
         self,
@@ -887,10 +937,10 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         if not segments:
             return []
         
-        logger.info(f"🖼️ 使用异步模式翻译 {len(segments)} 个视觉段...")
+        logger.info(f"🖼️ 使用异步模式翻译 {len(segments)} 个视觉段（并发限制: {self.vision_semaphore_limit}）...")
         
-        # 创建信号量，限制并发视觉 API 调用数
-        semaphore = asyncio.Semaphore(3)  # 最多同时3个视觉请求
+        # 创建信号量，限制并发视觉 API 调用数（从配置读取）
+        semaphore = asyncio.Semaphore(self.vision_semaphore_limit)
         
         # 创建翻译任务
         tasks = []
@@ -926,24 +976,47 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         self,
         img_path: str,
         context: str,
-        semaphore: asyncio.Semaphore
+        semaphore: asyncio.Semaphore,
+        retry_count: int = 2
     ) -> str:
-        """异步调用视觉 API，使用信号量限制并发"""
+        """异步调用视觉 API，使用信号量限制并发，支持重试"""
         
         async with semaphore:  # 限制并发数
-            loop = asyncio.get_event_loop()
+            # 获取当前事件循环（安全方式）
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
             
             # 在线程池中执行 I/O 绑定的图像处理
             def _process_vision():
                 # 直接调用基础翻译器的视觉API方法
                 return self.base._call_vision_api(img_path, context)
             
-            result = await loop.run_in_executor(self.executor, _process_vision)
+            # 重试逻辑
+            last_error = None
+            for attempt in range(retry_count + 1):
+                try:
+                    result = await loop.run_in_executor(self.executor, _process_vision)
+                    
+                    # 添加延迟避免速率限制
+                    await asyncio.sleep(self.settings.processing.vision_rate_limit_delay)
+                    
+                    if attempt > 0:
+                        logger.info(f"✅ 视觉 API 重试成功（第 {attempt + 1} 次尝试）: {img_path}")
+                    
+                    return result
+                
+                except Exception as e:
+                    last_error = e
+                    if attempt < retry_count:
+                        wait_time = 2 ** attempt
+                        logger.warning(f"⚠️ 视觉 API 失败（尝试 {attempt + 1}/{retry_count + 1}），{wait_time}s 后重试: {img_path}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"❌ 视觉 API 失败，已用尽所有重试: {img_path}")
             
-            # 添加延迟避免速率限制
-            await asyncio.sleep(self.settings.processing.vision_rate_limit_delay)
-            
-            return result
+            return f"[Failed: {str(last_error)}]"
 
     async def _translate_text_fallback_async(
         self,
@@ -952,7 +1025,11 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         glossary: Optional[Dict[str, str]]
     ) -> str:
         """异步文本降级处理"""
-        loop = asyncio.get_event_loop()
+        # 获取当前事件循环（安全方式）
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
         
         def _sync_fallback():
             results = self.base._translate_text_batch(
@@ -996,15 +1073,113 @@ class OpenAICompatibleTranslator(BaseTranslator):
         self.api_key: Optional[str] = settings.api.openai_api_key
         self.base_url: str = settings.api.openai_base_url
         self.model: str = settings.api.openai_model
+        
+        # 验证和修复 base_url 配置
+        self.base_url = self._validate_and_fix_base_url(self.base_url)
+        
+        # 自动检测是否为本地服务（Ollama）或 DeepSeek API
+        # 适配 M2 Pro 16GB 硬件环境，本地模式需要特殊处理
+        self.is_local: bool = self._detect_local_service(self.base_url)
+        self.is_deepseek: bool = self._detect_deepseek_api(self.base_url)
+        
+        # DeepSeek 长文本模式：自动切换为单 message 模式（system + instruction + mode + context + prompt）
+        # 原因：DeepSeek 对长上下文支持更好，且 system message 可能影响性能
+        self.use_long_text_mode: bool = self.is_deepseek
+        
+        if self.is_local:
+            logger.info("🏠 检测到本地模式（Ollama）")
+            logger.info(f"   - 服务地址: {self.base_url}")
+            logger.info(f"   - 模型: {self.model}")
+            logger.info("   - 已启用 M2 Pro 优化：num_ctx=8192, num_thread=10")
+        elif self.is_deepseek:
+            logger.info("🚀 检测到 DeepSeek API")
+            logger.info(f"   - API 地址: {self.base_url}")
+            logger.info(f"   - 模型: {self.model}")
+            logger.info("   - 已启用长文本模式（所有内容合并为单个 user message）")
+        else:
+            logger.info("☁️  检测到云端模式（OpenAI）")
+            logger.info(f"   - API 地址: {self.base_url}")
+            logger.info(f"   - 模型: {self.model}")
 
         if not self.api_key:
             raise APIAuthenticationError(
                 "OpenAI-compatible API key is missing. Set API_OPENAI_API_KEY (or OPENAI_API_KEY/DEEPSEEK_API_KEY).",
                 context={"setting": "API_OPENAI_API_KEY"},
             )
+    
+    def _validate_and_fix_base_url(self, base_url: str) -> str:
+        """验证并修复 base_url 配置
+        
+        Args:
+            base_url: 原始的 base_url 配置
+            
+        Returns:
+            修复后的 base_url
+        """
+        if not base_url:
+            raise ValueError("OPENAI_BASE_URL 不能为空")
+            
+        base = base_url.strip()
+        
+        # 如果已经是完整的 URL，直接返回
+        if base.startswith(('http://', 'https://')):
+            return base
+            
+        # 处理常见的错误配置
+        if 'deepseek' in base.lower():
+            # DeepSeek 常见错误配置
+            logger.warning(f"⚠️ 检测到不完整的 DeepSeek URL 配置: '{base}'")
+            logger.warning("   自动修复为: https://api.deepseek.com")
+            return 'https://api.deepseek.com'
+        elif 'localhost' in base or '127.0.0.1' in base:
+            # 本地服务
+            if not base.startswith('http://'):
+                fixed_url = f'http://{base}'
+                logger.warning(f"⚠️ 本地服务 URL 缺少协议: '{base}' -> '{fixed_url}'")
+                return fixed_url
+            return base
+        else:
+            # 其他云端服务，假设是域名，添加 https://
+            fixed_url = f'https://{base}'
+            logger.warning(f"⚠️ 检测到不完整的 URL 配置: '{base}' -> '{fixed_url}'")
+            logger.warning("   如果这是错误的，请在配置中提供完整的 URL（包含 http:// 或 https://）")
+            return fixed_url
+
+    def _detect_local_service(self, base_url: str) -> bool:
+        """检测是否为本地服务（Ollama）
+        
+        Args:
+            base_url: API 基础 URL
+            
+        Returns:
+            True 如果是本地服务（包含 localhost 或 127.0.0.1）
+        """
+        if not base_url:
+            return False
+        url_lower = base_url.lower()
+        return 'localhost' in url_lower or '127.0.0.1' in url_lower
+    
+    def _detect_deepseek_api(self, base_url: str) -> bool:
+        """检测是否为 DeepSeek API
+        
+        Args:
+            base_url: API 基础 URL
+            
+        Returns:
+            True 如果是 DeepSeek API（包含 api.deepseek.com）
+        """
+        if not base_url:
+            return False
+        url_lower = base_url.lower()
+        return 'deepseek.com' in url_lower or 'deepseek' in url_lower
 
     @property
-    def async_translator(self) -> 'AsyncOpenAICompatibleTranslator':
+    def async_translator(self) -> Optional['AsyncOpenAICompatibleTranslator']:
+        # 本地模式强制同步翻译，降低功耗和内存压力
+        if self.is_local:
+            logger.debug("🔒 本地模式禁用异步翻译（降低功耗）")
+            return None
+        
         if self._async_translator is None:
             self._async_translator = AsyncOpenAICompatibleTranslator(self)
         return self._async_translator
@@ -1130,20 +1305,37 @@ Return ONLY the JSON object.
                 [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
             )
 
-        original_prompt = self.prompt_manager.format_text_prompt(
-            context=safe_context,
-            input_json=input_json,
-            glossary=glossary_text,
-        )
+        # DeepSeek 长文本模式：将 system instruction 嵌入到 user content 中
+        if self.use_long_text_mode:
+            system_instruction = self.prompt_manager.get_system_instruction(use_vision=False)
+            user_prompt = self.prompt_manager.format_text_prompt(
+                context=safe_context,
+                input_json=input_json,
+                glossary=glossary_text,
+            )
+            # 将 system instruction 和 user prompt 合并为完整的长文本 prompt
+            combined_prompt = f"{system_instruction}\n\n{'='*80}\n\n{user_prompt}"
+            
+            raw_text = self._chat_completions(
+                system_instruction="",  # 长文本模式下 system_instruction 为空
+                user_content=combined_prompt,
+            )
+        else:
+            # 标准模式：system 和 user 分离
+            original_prompt = self.prompt_manager.format_text_prompt(
+                context=safe_context,
+                input_json=input_json,
+                glossary=glossary_text,
+            )
 
-        raw_text = self._chat_completions(
-            system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
-            user_content=original_prompt,
-        )
+            raw_text = self._chat_completions(
+                system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
+                user_content=original_prompt,
+            )
 
         output_list = self._handle_json_response_with_repair(
             raw_text=raw_text,
-            original_prompt=original_prompt,
+            original_prompt=combined_prompt if self.use_long_text_mode else original_prompt,
             is_text_translation=True,
         )
 
@@ -1201,22 +1393,98 @@ Return ONLY the JSON object.
             return f"[Failed: {str(e)}]"
 
     def _build_chat_completions_url(self) -> str:
+        """构建 Chat Completions API URL
+        
+        针对本地 Ollama 服务的路径修复逻辑：
+        - 本地模式：强制使用 http://127.0.0.1:11434/v1/chat/completions
+        - 云端模式（DeepSeek）：保持原逻辑
+        """
         base = (self.base_url or '').rstrip('/')
-        # DeepSeek supports both https://api.deepseek.com and https://api.deepseek.com/v1
+        
+        # 本地模式：强制使用 127.0.0.1:11434/v1/chat/completions（Ollama 标准接口）
+        if self.is_local:
+            # 统一使用 127.0.0.1 而非 localhost，避免 DNS 解析问题
+            return 'http://127.0.0.1:11434/v1/chat/completions'
+        
+        # 云端模式：确保 base_url 是完整的 URL
+        if not base.startswith(('http://', 'https://')):
+            # 如果不是完整的 URL，尝试修复常见的错误配置
+            if 'deepseek' in base.lower():
+                # DeepSeek 常见错误配置修复
+                logger.warning(f"⚠️ 检测到不完整的 DeepSeek URL 配置: '{base}'，自动修复为标准 URL")
+                return 'https://api.deepseek.com/v1/chat/completions'
+            else:
+                # 其他服务，尝试添加 https:// 前缀
+                logger.warning(f"⚠️ 检测到不完整的 URL 配置: '{base}'，尝试添加 https:// 前缀")
+                base = f'https://{base}'
+        
+        # 云端模式：DeepSeek 支持两种格式
+        # https://api.deepseek.com/chat/completions 或
+        # https://api.deepseek.com/v1/chat/completions
         if base.endswith('/v1'):
             return base + '/chat/completions'
         return base + '/chat/completions'
 
     def _chat_completions(self, system_instruction: str, user_content: Any) -> str:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.2,
-            "stream": False,
-        }
+        """调用 Chat Completions API
+        
+        本地模式优化（M2 Pro 16GB）：
+        - 强制 120s 超时（本地推理较慢）
+        - 注入 options 字段：num_ctx=8192（长文本记忆），num_thread=10（适配 M2 Pro 核心数）
+        
+        DeepSeek 长文本模式：
+        - 所有内容已预先合并到 user_content 中，system_instruction 为空
+        - 格式：完整的长文本 prompt 包含 system instruction + mode + context + input
+        - 原因：DeepSeek 对长上下文支持更好，且避免 system message 限制
+        """
+        # DeepSeek 长文本模式：所有内容已预先合并，无需额外处理
+        if self.use_long_text_mode:
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.2,
+                "stream": False,
+            }
+            logger.debug("📝 使用长文本模式（所有内容预先合并）")
+        else:
+            # 标准模式：system + user 分离
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.2,
+                "stream": False,
+            }
+        
+        # 记录发送给API的文本长度
+        total_text_length = 0
+        for message in payload["messages"]:
+            content = message["content"]
+            if isinstance(content, str):
+                total_text_length += len(content)
+            elif isinstance(content, list):
+                # 处理多模态内容
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        total_text_length += len(item["text"])
+        
+        logger.info(f"📤 发送API请求 - 文本总长度: {total_text_length} 字符")
+        if self.use_long_text_mode:
+            logger.debug("   📊 长文本模式: System Instruction + 分隔符 + Mode + Glossary + Context + Input JSON")
+        else:
+            logger.debug("   📊 标准模式: System Instruction + User Content")
+        
+        # 本地模式：注入 Ollama 专用参数，针对 M2 Pro 16GB 优化
+        if self.is_local:
+            payload["options"] = {
+                "num_ctx": 1024,      # 进一步降低：从 2048 到 1024（适应超长上下文）
+                "num_thread": 1,      # 进一步降低：从 2 到 1（单线程，极低内存压力）
+            }
+            logger.debug("🔧 本地模式 payload 已注入 options: num_ctx=1024, num_thread=1")
 
         url = self._build_chat_completions_url()
         data = json.dumps(payload).encode('utf-8')
@@ -1224,10 +1492,21 @@ Return ONLY the JSON object.
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {self.api_key}',
         }
+        
+        # 动态超时：本地模式强制 120s，云端模式根据服务调整
+        if self.is_deepseek:
+            timeout = 120  # DeepSeek响应较慢，增加到120秒
+            logger.debug(f"⏱️  DeepSeek模式超时设置: {timeout}s")
+        elif self.is_local:
+            timeout = 120 if self.is_local else self.settings.processing.request_timeout
+            if self.is_local:
+                logger.debug(f"⏱️  本地模式超时设置: {timeout}s")
+        else:
+            timeout = self.settings.processing.request_timeout
 
         req = request.Request(url, data=data, headers=headers, method='POST')
         try:
-            with request.urlopen(req, timeout=self.settings.processing.request_timeout) as resp:
+            with request.urlopen(req, timeout=timeout) as resp:
                 resp_text = resp.read().decode('utf-8')
         except error.HTTPError as e:
             body = e.read().decode('utf-8', errors='replace') if hasattr(e, 'read') else ''
@@ -1302,11 +1581,69 @@ Return ONLY the JSON object.
 
 
 class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
-    """异步 OpenAI-compatible 翻译器（线程池包装，同步HTTP请求并发执行）。"""
+    """异步 OpenAI-compatible 翻译器（线程池包装，同步HTTP请求并发执行）。
+    
+    并发控制策略（M2 Pro 16GB 优化）：
+    - 本地模式（Ollama）：max_workers=2，防止 16GB 统一内存溢出
+    - 云端模式（DeepSeek）：max_workers=10，充分利用网络并发
+    支持上下文管理器自动资源清理。
+    """
 
     def __init__(self, base_translator: OpenAICompatibleTranslator):
         super().__init__(base_translator)
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        
+        # 动态并发控制：根据服务类型调整并发数
+        if base_translator.is_local:
+            # 本地模式：2 并发（M2 Pro 16GB 限制，避免显存溢出）
+            max_workers = 2
+        elif base_translator.is_deepseek:
+            # DeepSeek：3 并发（避免触发速率限制，DeepSeek响应较慢）
+            max_workers = 3
+        else:
+            # 其他云端模式：10 并发（网络 I/O 密集，可以高并发）
+            max_workers = 10
+            
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._max_workers = max_workers  # 保存用于日志
+        
+        # 日志输出当前并发模式
+        if base_translator.is_local:
+            logger.info("🔒 异步翻译器已初始化（本地模式）")
+            logger.info("   - 并发数: 2（M2 Pro 16GB 内存保护）")
+            logger.info("   - 原因: 防止本地模型并发导致统一内存溢出")
+        elif base_translator.is_deepseek:
+            logger.info("🚀 异步翻译器已初始化（DeepSeek模式）")
+            logger.info("   - 并发数: 3（速率限制保护）")
+            logger.info("   - 原因: DeepSeek响应较慢，避免触发API限流")
+        else:
+            logger.info("🚀 异步翻译器已初始化（云端模式）")
+            logger.info("   - 并发数: 10（网络 I/O 优化）")
+            logger.info("   - 适用于: OpenAI 等云端服务")
+    
+    async def __aenter__(self):
+        """异步上下文管理器入口"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """异步上下文管理器退出，自动清理资源"""
+        self.cleanup()
+        return False
+    
+    def __enter__(self):
+        """同步上下文管理器入口（兼容性）"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """同步上下文管理器退出"""
+        self.cleanup()
+        return False
+    
+    def __del__(self):
+        """析构函数，确保资源清理"""
+        try:
+            self.cleanup()
+        except Exception:
+            pass
 
     async def translate_text_batch_async(
         self,
@@ -1317,7 +1654,11 @@ class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
         if not segments:
             return []
 
-        loop = asyncio.get_event_loop()
+        # 获取当前事件循环（安全方式）
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
 
         def _sync():
             return self.base._translate_text_batch(segments, context, glossary)
@@ -1333,7 +1674,11 @@ class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
         if not segments:
             return []
 
-        loop = asyncio.get_event_loop()
+        # 获取当前事件循环（安全方式）
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
 
         def _sync_one(seg: ContentSegment) -> str:
             if seg.content_type == 'image' and seg.image_path:

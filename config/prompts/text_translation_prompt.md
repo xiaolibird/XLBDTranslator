@@ -1,9 +1,3 @@
-# Mandatory Glossary (CRITICAL)
-The following is a list of key terms and their required translations. You MUST adhere to this list strictly to ensure consistency. If this section is empty, proceed as normal.
-<glossary>
-{glossary}
-</glossary>
-
 # Context (For Continuity)
 The following text is the translation of the segments immediately preceding this batch. Use it to ensure narrative consistency, character voice, and terminology alignment:
 <previous_context>

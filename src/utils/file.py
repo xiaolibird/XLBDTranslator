@@ -29,8 +29,8 @@ def get_file_hash(file_path: Path, algorithm: str = 'md5') -> str:
 
 
 def create_output_directory(
-    project_name: str, 
-    output_base_dir: str
+    output_base_dir: str,
+    project_name: str
 ) -> Path:
     """
     基于项目唯一标识 (如 MD5-hash) 创建并返回项目目录。

@@ -1,159 +1,115 @@
-/* pdf_style.css - 最终纯净版 */
+/* pdf_style.css - 护眼、极致呼吸感与建筑标识版 */
 
 /* =========================================
-   1. 页面布局与页眉页脚
+   1. 页面配置与右上角页眉
    ========================================= */
    @page {
     size: A4;
-    margin: 2.5cm;
+    margin: 3.2cm 2.8cm;
+    background-color: #fdfaf2; /* 护眼米色 */
 
-    /* --- 页眉 --- */
-    @top-center {
+    /* --- 页眉 (迁移至右上角) --- */
+    @top-right {
         content: string(current-chapter);
-        /* 字体设置：无衬线体 */
-        font-family: "Helvetica Neue", "Arial", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-        font-size: 9pt;
-        font-weight: 500;
-        color: #999;
-        
-        /* 布局：靠右，带下划线 */
-        text-align: right; 
+        font-family: "Palatino Linotype", "Book Antiqua", "Hiragino Sans GB", "Microsoft YaHei", serif;
+        font-size: 8.5pt;
+        color: #b0b0b0;
         vertical-align: bottom;
-        padding-bottom: 5px;
-        margin-bottom: 20px;
-        border-bottom: 1px solid #ddd;
-        width: 100%;
+        padding-bottom: 12px;
+        /* 右上角下划线：厚度降至极细，颜色维持淡灰 */
+        border-bottom: 0.25pt solid #e8e6df;
+        /* 增加宽度确保线条在右上角有足够的视觉延展 */
+        min-width: 150px; 
     }
 
-    /* --- 页脚 (修改点：变小、变淡) --- */
+    /* --- 页脚 (居中保持平衡) --- */
     @bottom-center {
         content: counter(page);
         font-family: "Arial", sans-serif;
-        
-        /* 【修改】字号更小，颜色更淡 */
-        font-size: 9pt; 
-        color: #ccc; 
-        
-        vertical-align: top;
-        padding-top: 10px;
+        font-size: 8.5pt;
+        color: #d1cfc8;
     }
 }
 
-/* 首页不显示页眉 */
-@page :first {
-    @top-center { content: none; border: none; }
-}
-
-/* =========================================
-   2. 全局排版
-   ========================================= */
-body {
+html, body {
+    background-color: #fdfaf2;
     font-family: "Palatino Linotype", "Book Antiqua", Georgia, "Hiragino Sans GB", "Microsoft YaHei", serif;
-    font-size: 11pt;
-    line-height: 1.7;
-    color: #333;
-    text-align: justify;
-    padding-top: 1em; 
 }
 
-/* 【关键修改】隐藏所有 Markdown 生成的水平分割线 (---) */
-hr {
-    display: none;
-    border: none;
-    height: 0;
-    margin: 0;
+body {
+    font-size: 10.5pt;
+    line-height: 2.1;
+    color: #3c3c3c;
+    text-align: justify;
 }
 
 /* =========================================
-   3. 引用块 (Markdown > 语法)
+   2. 分割元素：扁平灰色矩形
+   ========================================= */
+hr {
+    display: block;
+    border: none;
+    height: 4px;      /* 扁平 */
+    width: 30%;       /* 长矩形 */
+    border-radius: 2px;
+    background-color: #c2c0b8; /* 与锚点色一致 */
+    opacity: 0.8;
+    margin: 5em auto !important; 
+}
+
+/* =========================================
+   3. 引用块 (核心正文区)
    ========================================= */
 blockquote {
-    font-style: italic;
-    color: #555;
-    background-color: #fafafa;
-    border-left: 4px solid #bdc3c7;
-    
-    margin-top: 1.5em;    
-    margin-bottom: 1.5em;
-    padding: 1em 1.2em;
-    
-    /* 【修改】允许引用块跨页断开，避免页面大片留白 */
-    page-break-inside: auto; 
-    
-    font-family: "Hiragino Sans GB", "PingFang SC", "Microsoft YaHei", sans-serif;
+    position: relative;
+    display: block;
+    margin: 3.5em 0.5em !important; 
+    padding: 1.2em 2.5em 1.2em 3em !important; 
+    border: none;
+    border-left: 1px solid #e8e6df;
+    background: transparent;
+    font-family: inherit !important;
+    font-style: normal !important;
+}
+
+/* 顶部锚点小矩形 */
+blockquote::before {
+    content: "";
+    position: absolute;
+    left: -1px;
+    top: 0;
+    width: 6px;
+    height: 18px;
+    background-color: #c2c0b8;
+    border-radius: 0 1px 1px 0;
+    z-index: 5;
+}
+
+blockquote p {
+    font-family: inherit !important; 
+    font-size: 10.5pt !important;
+    margin-top: 0 !important;
+    margin-bottom: 1.35em !important; 
+    line-height: 2.1 !important;
+}
+
+blockquote p:last-child {
+    margin-bottom: 0 !important;
 }
 
 /* =========================================
    4. 标题样式
    ========================================= */
-h1, h2, h3, h4, h5 {
-    font-family: "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    color: #2c3e50;
-    line-height: 1.4;
-    page-break-after: avoid; /* 标题后不能立刻换页 */
-}
-
-h1 { 
-    font-size: 2.2em; 
-    margin-top: 1.5em; 
-    border-bottom: 2px solid #eee; 
-    padding-bottom: 0.3em; 
-}
-
 h2 { 
-    font-size: 1.8em; 
-    margin-top: 2.5em; 
-    border-bottom: 1px solid #eee; 
-    padding-bottom: 0.2em;
-    /* 抓取标题内容 */
+    font-size: 1.5em; 
+    margin-top: 5em !important; 
+    margin-bottom: 2em !important;
+    padding-bottom: 0.8em;
+    border-bottom: 0.25pt solid #e8e6df; 
     string-set: current-chapter content();
 }
 
-/* =========================================
-   5. 原文页码标记 (H6)
-   ========================================= */
+/* 确保小标题不进入章节信息 */
 h6 {
-    display: block;
-    
-    /* 弱化字体 */
-    font-family: "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    font-size: 8pt;
-    font-weight: normal;
-    color: #ddd; /* 极淡的灰色 */
-    
-    text-align: center;
-    margin-top: 2em;
-    margin-bottom: 1em;
-    
-    /* 【修改】移除了 border-top，不再显示分割线 */
-    border: none; 
-    padding-top: 0;
-    
-    /* 不进目录 */
-    bookmark-level: none;     
-}
-
-/* =========================================
-   6. 其他元素
-   ========================================= */
-img {
-    display: block;
-    max-width: 90%;
-    margin: 2em auto;
-    border: 1px solid #f0f0f0;
-    border-radius: 4px;
-    page-break-inside: avoid; /* 图片最好不要被切断 */
-}
-
-pre {
-    background-color: #f6f8fa;
-    border: 1px solid #e1e4e8;
-    border-radius: 6px;
-    padding: 1em;
-    margin: 1.5em 0;
-    font-family: 'Courier New', Courier, monospace;
-    font-size: 0.9em;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    page-break-inside: avoid; /* 代码块尽量不切断，如果太长会自动切 */
+    string-set: current-chapter none;
 }

@@ -1,12 +1,11 @@
-"""
-工作流模块
-"""
+"""Workflow management components."""
 from .workflow import TranslationWorkflow
-from .tester import TestWorkflow
+from .builder import SettingsBuilder
+from .tester import TestWorkflow, TranslationTester
 
 __all__ = [
-    'TranslationWorkflow',
-    'TestWorkflow'
+    "TranslationWorkflow",
+    "SettingsBuilder",
+    "TestWorkflow",
+    "TranslationTester",
 ]
-
-

@@ -91,3 +91,7 @@ class TestWorkflow:
             builder.set_output_dir(output_dir)
         test = cls(builder.build())
         test.run()
+
+
+# Compatibility alias expected by web.workflow
+TranslationTester = TestWorkflow

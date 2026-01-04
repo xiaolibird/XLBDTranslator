@@ -1,7 +1,16 @@
-"""
-翻译器模块
-"""
-from .client import GeminiTranslator
-from .prompts import format_text_prompt, format_vision_prompt, format_title_prompt
+"""Translator components including clients, engines, and support utilities."""
+from .base import BaseTranslator, BaseAsyncTranslator
+from .engine import GeminiTranslator, AsyncGeminiTranslator, OpenAICompatibleTranslator, AsyncOpenAICompatibleTranslator
+from .support import CheckpointManager, CachePersistenceManager, PromptManager
 
-__all__ = ['GeminiTranslator', 'format_text_prompt', 'format_vision_prompt', 'format_title_prompt']
+__all__ = [
+    "BaseTranslator",
+    "BaseAsyncTranslator",
+    "GeminiTranslator",
+    "AsyncGeminiTranslator",
+    "OpenAICompatibleTranslator",
+    "AsyncOpenAICompatibleTranslator",
+    "CheckpointManager",
+    "CachePersistenceManager",
+    "PromptManager",
+]

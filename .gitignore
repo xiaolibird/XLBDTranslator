@@ -44,8 +44,13 @@ config/config.env
 logs/
 output/
 test/
+.pytest_cache
 !test/test_toc.csv
 !test/test_pdf.pdf
+
+# Web UI Projects (separate development)
+web/
+web-next/
 
 # Development files
 digest_project.py

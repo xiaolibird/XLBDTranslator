@@ -147,12 +147,22 @@ class ContentSegment(BaseModel):
 
 class APISettings(BaseModel):
     """API 配置"""
-    gemini_api_key: str = Field(..., validation_alias="GEMINI_API_KEY", description="Gemini API密钥")
+    translator_provider: str = Field("gemini", validation_alias="TRANSLATOR_PROVIDER", description="翻译器提供商 (gemini, openai-compatible, ollama)")
+    gemini_api_key: Optional[str] = Field(None, validation_alias="GEMINI_API_KEY", description="Gemini API密钥")
     gemini_model: str = Field("gemini-2.5-flash", validation_alias="GEMINI_MODEL", description="Gemini模型名称")
+    
+    openai_base_url: str = Field("http://localhost:11434", validation_alias="OPENAI_BASE_URL", description="OpenAI兼容API基础URL")
+    openai_model: str = Field("gemma3", validation_alias="OPENAI_MODEL", description="OpenAI兼容模型名称")
+    openai_api_key: Optional[str] = Field(None, validation_alias="OPENAI_API_KEY", description="OpenAI兼容API密钥")
+    # Ollama配置
+    # ollama_base_url: str = Field("http://localhost:11434", validation_alias="OLLAMA_BASE_URL", description="Ollama服务器地址")
+    # ollama_model: str = Field("qwen2.5:14b", validation_alias="OLLAMA_MODEL", description="Ollama模型名称")
+
+
 
 class FileSettings(BaseModel):
     """文件与路径配置"""
-    document_path: Path = Field(..., validation_alias="DOCUMENT_PATH", description="待翻译的文档路径")
+    document_path: Optional[Path] = Field(None, validation_alias="DOCUMENT_PATH", description="待翻译的文档路径")
     output_base_dir: Path = Field("output", validation_alias="OUTPUT_DIR", description="缓存和中间文件的主输出目录")
     final_output_dir: Optional[Path] = Field(None, validation_alias="FINAL_OUTPUT_DIR", description="最终翻译文件的输出目录 (默认与源文件同目录)")
 
@@ -186,12 +196,29 @@ class ProcessingSettings(BaseModel):
     min_chunk_size: int = Field(200, validation_alias="MIN_CHUNK_SIZE", description="最小分块大小")
     max_chunk_size: int = Field(2000, validation_alias="MAX_CHUNK_SIZE", description="最大分块大小")
 
+    # 异步/并发与缓存相关（Builder 会设置这些）
+    enable_async: bool = Field(False, description="是否启用异步处理")
+    async_threshold: int = Field(10, description="触发异步的最小段落数阈值")
+    async_max_workers: int = Field(10, description="异步最大并发工作数")
+    enable_gemini_caching: bool = Field(True, description="是否启用 Gemini 缓存")
+    cache_ttl_hours: int = Field(1, description="缓存有效期（小时）")
+
+    # 翻译模式实体（UI/Builder 可设置完整的 TranslationMode 对象）
+    translation_mode_entity: Optional[TranslationMode] = Field(None, description="翻译模式实体（TranslationMode 对象）")
+
+    # 断点续传
+    enable_checkpoint: bool = Field(True, description="是否启用断点续传")
+    checkpoint_interval: int = Field(1, description="断点保存间隔（段数）")
+
     # 功能开关
     enable_cache: bool = Field(True, validation_alias="ENABLE_CACHE", description="是否启用缓存")
     use_breadcrumb: bool = Field(True, validation_alias="USE_BREADCRUMB", description="是否为章节标题生成面包屑导航")
     render_page_markers: bool = Field(True, validation_alias="RENDER_PAGE_MARKERS", description="是否在Markdown中显示页码标记")
     use_vision_mode: Optional[bool] = Field(None, validation_alias="USE_VISION_MODE", description="是否默认启用视觉模式")
     retain_original: Optional[bool] = Field(None, validation_alias="RETAIN_ORIGINAL", description="是否保留原文")
+    # 其他可选设置
+    json_repair_retries: int = Field(0, description="JSON 修复重试次数")
+    use_rich_progress: bool = Field(False, description="是否使用 rich 进度显示")
 
     @field_validator('batch_size')
     def validate_batch_size(cls, v):
@@ -233,12 +260,11 @@ class Settings(BaseSettings):
     @model_validator(mode='after')
     def validate_document_path_is_set(self) -> 'Settings':
         """验证文档路径已提供"""
-        if not self.files.document_path:
-            raise ValueError("'DOCUMENT_PATH' must be set in your config/.env file.")
-        if not self.files.document_path.exists():
-            raise FileNotFoundError(f"Document not found: {self.files.document_path}")
-        if self.files.document_path.suffix.lower() not in ['.pdf', '.epub']:
-            raise ValueError(f"Unsupported file format: {self.files.document_path.suffix}. Only PDF and EPUB are supported.")
+        if self.files.document_path:
+            if not self.files.document_path.exists():
+                raise FileNotFoundError(f"Document not found: {self.files.document_path}")
+            if self.files.document_path.suffix.lower() not in ['.pdf', '.epub']:
+                raise ValueError(f"Unsupported file format: {self.files.document_path.suffix}. Only PDF and EPUB are supported.")
         return self
 
     @classmethod

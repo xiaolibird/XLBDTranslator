@@ -100,13 +100,8 @@ class APIAuthenticationError(APIError):
         super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
 
 
-# 文档处理错误
-class DocumentError(TranslationError):
-    """文档处理错误"""
-    pass
-
-
-class DocumentParseError(DocumentError):
+# 文档处理错误（保留常用的）
+class DocumentParseError(TranslationError):
     """文档解析错误"""
     def __init__(self, message: Optional[str] = None, **kwargs):
         message = message if message is not None else "Failed to parse document"
@@ -114,7 +109,7 @@ class DocumentParseError(DocumentError):
         super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
 
 
-class DocumentFormatError(DocumentError):
+class DocumentFormatError(TranslationError):
     """文档格式错误"""
     def __init__(self, message: Optional[str] = None, **kwargs):
         message = message if message is not None else "Unsupported document format"
@@ -122,24 +117,11 @@ class DocumentFormatError(DocumentError):
         super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
 
 
-class DocumentNotFoundError(DocumentError):
-    """文档未找到错误"""
-    def __init__(self, message: Optional[str] = None, **kwargs):
-        message = message if message is not None else "Document not found"
-        suggestion = kwargs.pop("suggestion", "Check the file path and ensure the document exists.")
-        super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
-
-
-# 配置错误
+# 配置错误（保留常用的）
 class ConfigError(TranslationError):
     """配置错误"""
-    pass
-
-
-class InvalidConfigError(ConfigError):
-    """无效配置错误"""
     def __init__(self, message: Optional[str] = None, **kwargs):
-        message = message if message is not None else "Invalid configuration"
+        message = message if message is not None else "Configuration error"
         suggestion = kwargs.pop("suggestion", "Check your configuration file and environment variables.")
         super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
 
@@ -152,40 +134,9 @@ class MissingConfigError(ConfigError):
         super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
 
 
-# 翻译错误
-class TranslationQualityError(TranslationError):
-    """翻译质量错误"""
-    def __init__(self, message: Optional[str] = None, **kwargs):
-        message = message if message is not None else "Translation quality issue detected"
-        suggestion = kwargs.pop("suggestion", "Review the translation output and adjust translation parameters.")
-        super().__init__(message, ErrorSeverity.MEDIUM, suggestion=suggestion, **kwargs)
-
-
 class JSONParseError(TranslationError):
     """JSON解析错误"""
     def __init__(self, message: Optional[str] = None, **kwargs):
         message = message if message is not None else "Failed to parse JSON response"
         suggestion = kwargs.pop("suggestion", "Check the API response format or enable JSON repair mode.")
         super().__init__(message, ErrorSeverity.MEDIUM, suggestion=suggestion, **kwargs)
-
-
-# 文件系统错误
-class FileSystemError(TranslationError):
-    """文件系统错误"""
-    pass
-
-
-class DiskSpaceError(FileSystemError):
-    """磁盘空间不足错误"""
-    def __init__(self, **kwargs):
-        message = "Insufficient disk space"
-        suggestion = "Free up disk space or change output directory."
-        super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)
-
-
-class PermissionError(FileSystemError):
-    """权限错误"""
-    def __init__(self, **kwargs):
-        message = "Permission denied"
-        suggestion = "Check file permissions or run with appropriate privileges."
-        super().__init__(message, ErrorSeverity.HIGH, suggestion=suggestion, **kwargs)

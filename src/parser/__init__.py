@@ -4,11 +4,14 @@
 """
 from .formats import BaseDocPipeline, PDFParser, EPUBParser
 from .loader import DocumentLoader, load_document_structure
+from .helpers import process_unified_toc, extract_text_from_html
 
 __all__ = [
     'BaseDocPipeline',
-    'PDFParser', 
+    'PDFParser',
     'EPUBParser',
     'DocumentLoader',
     'load_document_structure',
+    'process_unified_toc',
+    'extract_text_from_html',
 ]
