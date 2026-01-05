@@ -5,6 +5,7 @@
 import json
 import time
 import hashlib
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Set, TYPE_CHECKING
 from datetime import datetime, timedelta
@@ -90,6 +91,12 @@ class CheckpointManager:
         if segment_id not in self.checkpoint_data['completed_segments']:
             self.checkpoint_data['completed_segments'].append(segment_id)
     
+    def remove_from_completed(self, segment_id: int):
+        """从已完成列表中移除一个段落（用于重新翻译）"""
+        if 'completed_segments' in self.checkpoint_data:
+            if segment_id in self.checkpoint_data['completed_segments']:
+                self.checkpoint_data['completed_segments'].remove(segment_id)
+
     def mark_segment_failed(self, segment_id: int, error_msg: str = ""):
         """标记一个段落为失败"""
         if 'failed_segments' not in self.checkpoint_data:
@@ -109,11 +116,41 @@ class CheckpointManager:
         return set(self.checkpoint_data.get('completed_segments', []))
     
     def get_pending_segments(self, all_segments: SegmentList) -> SegmentList:
-        """获取所有未完成的段落"""
+        """获取所有未完成的段落
+        
+        筛选条件（满足任一即为待翻译）：
+        1. segment_id 不在 completed_segments 中
+        2. translated_text 为空或包含失败标记
+        """
         completed_ids = self.get_completed_segment_ids()
-        pending = [seg for seg in all_segments if seg.segment_id not in completed_ids]
-        another_pending = [seg for seg in all_segments if seg.translated_text.endswith("Failed]") or seg.translated_text.startswith("[Failed")]
-        pending = pending + another_pending
+        
+        # 使用集合去重，避免重复添加
+        pending_ids = set()
+        pending = []
+        
+        for seg in all_segments:
+            # 已经添加过的跳过
+            if seg.segment_id in pending_ids:
+                continue
+            
+            # 条件1: 不在已完成列表中
+            not_completed = seg.segment_id not in completed_ids
+            
+            # 条件2: 翻译结果为空或包含失败标记
+            has_failed_content = (
+                not seg.translated_text or
+                seg.translated_text.startswith("[Failed") or
+                seg.translated_text.endswith("Failed]")
+            )
+            
+            # 满足任一条件即为待翻译
+            if not_completed or has_failed_content:
+                pending.append(seg)
+                pending_ids.add(seg.segment_id)
+                # 如果是失败的segment但在completed列表中，需要移除
+                if has_failed_content and seg.segment_id in completed_ids:
+                    self.remove_from_completed(seg.segment_id)
+        
         if pending:
             logger.info(f"🔄 检测到 {len(pending)} 个待翻译段落 (共 {len(all_segments)} 个)")
         else:
@@ -173,6 +210,9 @@ class CachePersistenceManager:
         from ..utils.file import get_file_hash
         doc_hash = get_file_hash(settings.files.document_path) if settings.files.document_path else "unknown"
         
+        # 存储为实例属性，供后续方法使用
+        self.doc_hash = doc_hash
+        
         # 从 settings 中获取项目目录
         base_dir = Path(settings.files.output_base_dir) if isinstance(settings.files.output_base_dir, str) else settings.files.output_base_dir
         # `output_base_dir` 在不同调用方中可能已经指向 {doc_hash} 目录。
@@ -186,6 +226,15 @@ class CachePersistenceManager:
             "context": {},
             "uploaded_files": {}
         }
+        
+        # ========== 线程安全机制 ==========
+        # 用于保护缓存创建操作的锁（防止异步模式下的竞态条件）
+        self._cache_creation_lock = threading.Lock()
+        # 记录正在创建的缓存（key=content_hash, value=True）
+        self._pending_cache_creation: Dict[str, bool] = {}
+        # 用于等待缓存创建完成的条件变量
+        self._cache_created_condition = threading.Condition(self._cache_creation_lock)
+        
         self._load_metadata()
     
     def _load_metadata(self):
@@ -442,7 +491,13 @@ class CachePersistenceManager:
         display_name: Optional[str] = None
     ) -> Optional[str]:
         """
-        统一的System Instruction缓存获取或创建方法
+        统一的System Instruction缓存获取或创建方法（线程安全版本）
+        
+        使用双重检查锁定模式防止异步模式下的竞态条件：
+        - 第一次检查：无锁快速路径，如果缓存已存在直接返回
+        - 加锁保护：确保同一时间只有一个线程创建缓存
+        - 第二次检查：防止在等待锁期间其他线程已创建缓存
+        - 等待机制：如果缓存正在创建中，等待完成而不是重复创建
         
         Args:
             system_instruction: 系统指令内容
@@ -455,13 +510,45 @@ class CachePersistenceManager:
         # 计算内容哈希
         content_hash = self.compute_content_hash(system_instruction)
         
-        # 检查是否已有可复用的缓存（基于内容hash）
+        # ========== 第一次检查（无锁快速路径）==========
         existing_cache = self.get_system_cache(content_hash)
         if existing_cache:
             logger.info(f"♻️  复用已有System Instruction缓存: {existing_cache[:50]}...")
             return existing_cache
         
-        # 创建新缓存
+        # ========== 加锁保护创建过程 ==========
+        with self._cache_creation_lock:
+            # ========== 第二次检查（防止重复创建）==========
+            existing_cache = self.get_system_cache(content_hash)
+            if existing_cache:
+                logger.debug(f"🔒 锁内检测到缓存已创建: {existing_cache[:30]}...")
+                return existing_cache
+            
+            # ========== 检查是否有其他线程正在创建 ==========
+            if content_hash in self._pending_cache_creation:
+                logger.info(f"⏳ 检测到其他 worker 正在创建缓存，等待完成...")
+                # 等待缓存创建完成（最多等待 30 秒）
+                wait_start = time.time()
+                while content_hash in self._pending_cache_creation:
+                    timeout_remaining = 30.0 - (time.time() - wait_start)
+                    if timeout_remaining <= 0:
+                        logger.warning("⚠️  等待缓存创建超时（30秒），继续尝试创建")
+                        break
+                    # 释放锁并等待通知
+                    self._cache_created_condition.wait(timeout=min(1.0, timeout_remaining))
+                
+                # 等待完成后再次检查缓存
+                existing_cache = self.get_system_cache(content_hash)
+                if existing_cache:
+                    logger.info(f"✅ 等待完成，缓存已就绪: {existing_cache[:30]}...")
+                    return existing_cache
+            
+            # ========== 标记正在创建 ==========
+            self._pending_cache_creation[content_hash] = True
+            logger.debug(f"🔨 开始创建缓存 (hash: {content_hash[:8]}...)")
+        
+        # ========== 创建缓存（释放锁，允许其他线程等待）==========
+        cache_name = None
         try:
             from google import genai
             from google.genai import types
@@ -488,12 +575,15 @@ class CachePersistenceManager:
             logger.debug(f"   缓存TTL: {self.settings.processing.cache_ttl_hours}小时")
             logger.debug(f"   缓存内容长度: {len(system_instruction):,} 字符")
             
-            # 注册到持久化管理器
-            self.register_system_cache(
-                cache_name=cache_name,
-                content_hash=content_hash,
-                ttl_hours=self.settings.processing.cache_ttl_hours
-            )
+            # ========== 立即保存元数据（加锁保护）==========
+            with self._cache_creation_lock:
+                self.register_system_cache(
+                    cache_name=cache_name,
+                    content_hash=content_hash,
+                    ttl_hours=self.settings.processing.cache_ttl_hours
+                )
+                # 强制立即写入磁盘
+                self._save_metadata()
             
             return cache_name
             
@@ -504,6 +594,13 @@ class CachePersistenceManager:
             logger.warning(f"⚠️  创建 System Instruction 缓存失败: {e}")
             logger.debug(f"   继续无缓存模式...")
             return None
+        finally:
+            # ========== 清除正在创建标记并通知等待线程 ==========
+            with self._cache_creation_lock:
+                self._pending_cache_creation.pop(content_hash, None)
+                # 通知所有等待的线程
+                self._cache_created_condition.notify_all()
+                logger.debug(f"🔓 缓存创建流程结束，已通知等待线程")
     
     def get_or_create_glossary_cache(
         self,
@@ -633,28 +730,78 @@ class PromptManager:
             logger.warning(f"⚠️ Prompt template not found: {path}, using fallback")
             return "Translate the following text: {input_json}"
     
-    def get_system_instruction(self, use_vision: bool = False) -> str:
+    def get_system_instruction(
+        self, 
+        use_vision: bool = False,
+        include_mode: bool = False,
+        include_glossary: bool = False,
+        glossary_text: str = ""
+    ) -> str:
         """
-        获取融合了prompt模板的基础system instruction
+        获取融合了prompt模板的system instruction
+        
+        缓存策略：
+        - 预翻译阶段：只包含 base + prompt_template（无 mode、无 glossary）
+        - 正式翻译阶段：包含 base + prompt_template + mode + glossary
         
         Args:
             use_vision: 是否使用视觉模式
+            include_mode: 是否包含翻译模式配置（正式翻译时为 True）
+            include_glossary: 是否包含术语表（正式翻译时为 True）
+            glossary_text: 格式化的术语表文本
         
         Returns:
             完整的 system instruction
         """
-        base = self.system_instruction_base
+        parts = [self.system_instruction_base]
         
+        # 添加 prompt 模板
         if use_vision:
-            prompt_template = f"\n\n---\n\n# TRANSLATION PROMPT TEMPLATE\n\n{self.vision_translation_prompt}\n"
+            parts.append(f"\n\n---\n\n# TRANSLATION PROMPT TEMPLATE\n\n{self.vision_translation_prompt}\n")
         else:
-            prompt_template = f"\n\n---\n\n# TRANSLATION PROMPT TEMPLATE\n\n{self.text_translation_prompt}\n"
+            parts.append(f"\n\n---\n\n# TRANSLATION PROMPT TEMPLATE\n\n{self.text_translation_prompt}\n")
         
-        return base + prompt_template
+        # 添加翻译模式（正式翻译时）
+        if include_mode and self.mode_entity:
+            mode_section = f"""
+---
+
+# ACTIVE TRANSLATION MODE
+
+**Mode Name**: {self.mode_entity.name}
+
+**Your Role**:
+{self.mode_entity.role_desc}
+
+**Your Style & Approach**:
+{self.mode_entity.style}
+
+**CRITICAL**: You MUST follow this mode's philosophy for ALL translations.
+"""
+            parts.append(mode_section)
+        
+        # 添加术语表（正式翻译时）
+        if include_glossary and glossary_text:
+            glossary_section = f"""
+---
+
+# MANDATORY GLOSSARY
+
+The following terms MUST be translated exactly as specified. These are non-negotiable:
+
+<glossary>
+{glossary_text}
+</glossary>
+
+**CRITICAL**: Always check the glossary before translating any term. If a term appears in the glossary, you MUST use the specified translation.
+"""
+            parts.append(glossary_section)
+        
+        return "".join(parts)
     
     def get_mode_prefix(self) -> str:
         """
-        获取Mode配置作为User message的前缀
+        获取Mode配置作为User message的前缀（已弃用，mode 现在包含在 system instruction 中）
         
         Returns:
             格式化的模式前缀字符串
@@ -686,33 +833,36 @@ Your Style & Approach:
         self,
         context: str,
         input_json: str,
-        glossary: str
+        glossary: str = ""
     ) -> str:
         """
-        格式化文本翻译的完整提示
+        格式化文本翻译的完整提示（用户消息部分）
+        
+        新设计：
+        - glossary 和 mode 已经在 system instruction 缓存中
+        - 这里只提供动态内容：context 和 input_json
+        - 预翻译阶段：glossary 为空
+        - 正式翻译阶段：glossary 已在 system instruction 中，这里可以不传
         
         Args:
-            context: 上下文文本
+            context: 上下文文本（前一个 batch 的翻译结果或原文）
             input_json: 输入的 JSON 数据
-            glossary: 术语表文本
+            glossary: 术语表文本（可选，用于非缓存模式）
         
         Returns:
             格式化的完整提示
         """
         parts = []
         
-        # 添加模式前缀
-        mode_prefix = self.get_mode_prefix()
-        if mode_prefix:
-            parts.append(mode_prefix)
-        
-        # 添加术语表
-        if glossary and glossary.strip():
-            parts.append(f"# Mandatory Glossary\n<glossary>\n{glossary}\n</glossary>\n")
-        
-        # 添加上下文
+        # 添加上下文（动态内容，每次请求都不同）
         if context and context.strip():
             parts.append(f"# Context from Previous Segments\n<previous_context>\n{context}\n</previous_context>\n")
+        else:
+            parts.append("# Context from Previous Segments\n<previous_context>\n(Beginning of document - no previous context)\n</previous_context>\n")
+        
+        # 如果术语表在消息中提供（非缓存模式或预翻译阶段）
+        if glossary and glossary.strip():
+            parts.append(f"# Glossary Reference\n<glossary>\n{glossary}\n</glossary>\n")
         
         # 添加输入数据
         parts.append(f"# Input Data\n{input_json}")

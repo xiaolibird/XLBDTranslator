@@ -29,6 +29,9 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ========================================================================
+# Gemini 翻译客户端
+# ========================================================================
 
 class GeminiTranslator(BaseTranslator):
     """Gemini 翻译客户端。
@@ -69,18 +72,100 @@ class GeminiTranslator(BaseTranslator):
         # 初始化模型（新 SDK：Client + GenerateContentConfig；通过适配器保留旧调用形态）
         self.model = self._create_model()
         
-        # 创建System Instruction缓存（委托给缓存管理器）
-        if settings.processing.enable_gemini_caching and self.cache_persistence:
-            # 使用translation_mode_entity的name作为display_name（可选）
-            mode_name = getattr(settings.processing.translation_mode_entity, 'name', None)
-            cache_name = self.cache_persistence.get_or_create_system_cache(
-                system_instruction=self.prompt_manager.get_system_instruction(use_vision=settings.processing.use_vision_mode),
-                model_name=settings.api.gemini_model,
-                display_name=f"sys_{mode_name}" if mode_name else None
-            )
-            if cache_name:
-                self.cache_refs['system'] = cache_name
-                logger.info(f"✅ System Instruction 缓存已就绪: {cache_name[:50]}...")
+        # 注意：初始化时不创建缓存
+        # 缓存创建分两阶段：
+        # 1. 预翻译阶段：调用 create_base_cache() 创建基础缓存（无 glossary、无 mode）
+        # 2. 正式翻译阶段：调用 create_full_cache() 创建完整缓存（含 glossary 和 mode）
+        logger.info("🔧 GeminiTranslator 初始化完成（延迟缓存创建）")
+    
+    def create_base_cache(self) -> Optional[str]:
+        """
+        创建基础缓存（用于预翻译阶段）
+        
+        只包含 system_instruction + text_translation_prompt
+        不包含 glossary 和 mode
+        
+        Returns:
+            缓存名称，如果失败返回 None
+        """
+        if not self.settings.processing.enable_gemini_caching or not self.cache_persistence:
+            logger.info("ℹ️ Gemini 缓存未启用，跳过基础缓存创建")
+            return None
+        
+        # 生成基础 system instruction（无 mode、无 glossary）
+        system_instruction = self.prompt_manager.get_system_instruction(
+            use_vision=self.settings.processing.use_vision_mode,
+            include_mode=False,
+            include_glossary=False
+        )
+        
+        cache_name = self.cache_persistence.get_or_create_system_cache(
+            system_instruction=system_instruction,
+            model_name=self.settings.api.gemini_model,
+            display_name="base_pretranslate"
+        )
+        
+        if cache_name:
+            self.cache_refs['base'] = cache_name
+            logger.info(f"✅ 基础缓存已就绪（预翻译用）: {cache_name[:50]}...")
+        
+        return cache_name
+    
+    def create_full_cache(self, glossary: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """
+        创建完整缓存（用于正式翻译阶段）
+        
+        包含 system_instruction + text_translation_prompt + mode + glossary
+        
+        Args:
+            glossary: 术语表字典
+            
+        Returns:
+            缓存名称，如果失败返回 None
+        """
+        if not self.settings.processing.enable_gemini_caching or not self.cache_persistence:
+            logger.info("ℹ️ Gemini 缓存未启用，跳过完整缓存创建")
+            return None
+        
+        # 格式化术语表
+        glossary_text = ""
+        if glossary:
+            glossary_text = "\n".join([
+                f"- **{k}**: {v}" 
+                for k, v in glossary.items()
+            ])
+        
+        # 生成完整 system instruction（含 mode 和 glossary）
+        system_instruction = self.prompt_manager.get_system_instruction(
+            use_vision=self.settings.processing.use_vision_mode,
+            include_mode=True,
+            include_glossary=bool(glossary),
+            glossary_text=glossary_text
+        )
+        
+        mode_name = getattr(self.settings.processing.translation_mode_entity, 'name', 'Default')
+        glossary_count = len(glossary) if glossary else 0
+        
+        cache_name = self.cache_persistence.get_or_create_system_cache(
+            system_instruction=system_instruction,
+            model_name=self.settings.api.gemini_model,
+            display_name=f"full_{mode_name}_g{glossary_count}"
+        )
+        
+        if cache_name:
+            self.cache_refs['system'] = cache_name  # 正式翻译使用 'system' key
+            logger.info(f"✅ 完整缓存已就绪（正式翻译用）: {cache_name[:50]}...")
+            logger.info(f"   - 翻译模式: {mode_name}")
+            logger.info(f"   - 术语表: {glossary_count} 条")
+        
+        return cache_name
+    
+    def use_base_cache(self) -> bool:
+        """切换到使用基础缓存（预翻译阶段）"""
+        if 'base' in self.cache_refs:
+            self.cache_refs['system'] = self.cache_refs['base']
+            return True
+        return False
     
     @property
     def async_translator(self):
@@ -114,12 +199,21 @@ class GeminiTranslator(BaseTranslator):
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
         ]
 
+        # 从 settings 读取生成参数（而不是硬编码）
         self.generation_config = {
-            "temperature": 0.2,  # 降低温度以获得更稳定的输出
-            "top_p": 0.95,
+            "temperature": self.settings.processing.temperature,
+            "top_p": self.settings.processing.top_p,
             "response_mime_type": "application/json",
-            "max_output_tokens": 8192,
+            "max_output_tokens": self.settings.processing.max_output_tokens,
         }
+        
+        # 可选参数：top_k（如果设置了才添加）
+        if self.settings.processing.top_k is not None:
+            self.generation_config["top_k"] = self.settings.processing.top_k
+        
+        logger.debug(f"🔧 API 生成参数: temperature={self.generation_config['temperature']}, "
+                    f"top_p={self.generation_config['top_p']}, "
+                    f"max_output_tokens={self.generation_config['max_output_tokens']}")
 
         # 根据processing模式选择对应的system instruction（包含prompt固定部分）
         use_vision = self.settings.processing.use_vision_mode
@@ -182,64 +276,6 @@ class GeminiTranslator(BaseTranslator):
             raise
     
 
-
-    def _attempt_json_self_correction(
-        self,
-        original_prompt: str,
-        failed_json: str,
-        error_message: str,
-        retries_left: int,
-        is_vision: bool = False,
-        image_part: Optional[Any] = None
-    ) -> Optional[Any]:
-        """
-        尝试引导模型自我修正 JSON 输出。
-        """
-        if retries_left <= 0:
-            logger.warning("❌ JSON 自我修正重试次数已用尽。")
-            return None
-
-        logger.info(f"🔄 尝试 JSON 自我修正 (剩余 {retries_left} 次)...")
-        repair_prompt_content = self.prompt_manager.format_json_repair_prompt(
-            original_prompt=original_prompt,
-            broken_json=failed_json,
-            error_details=error_message
-        )
-
-        try:
-            # 使用与原始请求相同的配置
-            gen_cfg = {
-                "temperature": self.generation_config["temperature"],
-                "top_p": self.generation_config["top_p"],
-                "max_output_tokens": self.generation_config["max_output_tokens"],
-                "response_mime_type": "application/json",
-            }
-
-            content_parts = [repair_prompt_content]
-            if is_vision and image_part is not None:
-                content_parts.append(image_part)
-
-            response = self.model.generate_content(
-                content_parts,
-                generation_config=gen_cfg
-            )
-            # raw_text = response.text.strip()
-            raw_text = response.candidates[0].content.parts[0].text
-            # 尝试解析修正后的 JSON
-            parsed_data = json.loads(raw_text)
-            logger.info("✅ JSON 自我修正成功。")
-            return parsed_data
-        except (json.JSONDecodeError, GoogleAPICallError, genai_errors.APIError, Exception) as e:
-            logger.warning(f"⚠️ JSON 自我修正失败 (第 {self.settings.processing.json_repair_retries - retries_left + 1} 次): {e}")
-            # 递归重试
-            return self._attempt_json_self_correction(
-                original_prompt=original_prompt,
-                failed_json=raw_text if 'raw_text' in locals() else failed_json, # 传入最新的失败JSON
-                error_message=str(e),
-                retries_left=retries_left - 1,
-                is_vision=is_vision,
-                image_part=image_part
-            )
 
     def translate_batch(
         self,
@@ -353,10 +389,11 @@ class GeminiTranslator(BaseTranslator):
             if self._client is None:
                 raise APIAuthenticationError("Gemini client is not configured")
 
+            # 使用 settings 中的参数，确保一致性
             extraction_config = types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.2,
-                max_output_tokens=8192,
+                temperature=self.settings.processing.temperature,
+                max_output_tokens=self.settings.processing.max_output_tokens,
             )
 
             response = self._client.models.generate_content(
@@ -432,13 +469,14 @@ class GeminiTranslator(BaseTranslator):
         input_json = json.dumps(input_data, ensure_ascii=False)
 
         # 截取上下文
-        safe_context = context[-self.settings.processing.max_context_length:] if context else "No Context"
+        safe_context = context[-self.settings.processing.max_context_length:] if context else ""
 
-        # 格式化术语表
-        if glossary:
+        # 格式化术语表（仅在非缓存模式下才在 user message 中包含）
+        # 正式翻译阶段 glossary 已在 system instruction 缓存中，这里不需要再传
+        glossary_text = ""
+        if glossary and not self.settings.processing.enable_gemini_caching:
+            # 非缓存模式：在 user message 中包含 glossary
             glossary_text = "\n".join([f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()])
-        else:
-            glossary_text = "N/A"
 
         # 格式化提示（固定部分已在system instruction，仅填充动态变量）
         original_prompt = self.prompt_manager.format_text_prompt(
@@ -455,15 +493,17 @@ class GeminiTranslator(BaseTranslator):
         )
         
         raw_text = response.candidates[0].content.parts[0].text
-        # 解析响应，并处理自我修正
+        
+        # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
+        input_ids = [s.segment_id for s in segments]
         output_list = self._handle_json_response_with_correction(
             raw_text, 
             original_prompt, 
-            is_text_translation=True
+            is_text_translation=True,
+            expected_ids=input_ids
         )
 
         # 映射结果
-        input_ids = [s.segment_id for s in segments]
         output_map = {
             int(item['id']): str(item.get('translation', ''))
             for item in output_list
@@ -572,83 +612,79 @@ class GeminiTranslator(BaseTranslator):
         is_glossary_extraction: bool = False,
         is_text_translation: bool = False,
         is_vision_translation: bool = False,
-        image_part: Optional[Any] = None
+        image_part: Optional[Any] = None,
+        expected_ids: Optional[List[int]] = None
     ) -> Any:
         """
-        处理 JSON 响应，优化解析顺序：
-        1. 先尝试标准JSON解析
-        2. 尝试去除代码块后解析
-        3. 尝试正则表达式兜底解析
-        4. 只有以上全部失败后，才请求模型自我修正
+        处理 JSON 响应（简化版，废除 LLM 自我修正，优先保存成功部分）
+        
+        纠错流程：
+        1. 标准 JSON 解析
+        2. 正则表达式兜底解析（尽可能提取成功的翻译）
+        3. 对于缺失的 segment，标记为失败（不再调用 LLM 修正）
+        
+        Args:
+            expected_ids: 期望的 segment ID 列表（用于检测缺失的翻译）
         """
-        final_parsed_data = None
-        current_raw_text = raw_text
-
-        for attempt in range(self.settings.processing.json_repair_retries + 1):
-            # ========== 阶段1：标准JSON解析 ==========
-            try:
-                final_parsed_data = self._repair_json_content(current_raw_text)
-                logger.debug("✅ 标准JSON解析成功")
-                return final_parsed_data
-            except JSONParseError as e:
-                logger.debug(f"⚠️ 标准JSON解析失败: {e}")
-            
-            # ========== 阶段2：正则表达式兜底解析 ==========
-            try:
-                if is_text_translation:
-                    fallback_result = self._regex_fallback(current_raw_text)
-                    if fallback_result and len(fallback_result) > 0:
-                        # 检查是否是真正的翻译失败标签
-                        if fallback_result[0].get("translation") != "[Translation Failed - JSON Parse Error]":
-                            logger.info(f"✅ 正则表达式解析成功，提取 {len(fallback_result)} 条翻译")
-                            return fallback_result
-                elif is_title_translation or is_glossary_extraction:
-                    fallback_result = self._regex_fallback_for_dict_like(current_raw_text)
-                    if fallback_result:
-                        logger.info(f"✅ 正则表达式解析成功（字典格式）")
+        # ========== 阶段1：标准JSON解析 ==========
+        try:
+            parsed_data = self._repair_json_content(raw_text)
+            logger.debug("✅ 标准JSON解析成功")
+            return parsed_data
+        except JSONParseError as e:
+            logger.debug(f"⚠️ 标准JSON解析失败: {e}")
+        
+        # ========== 阶段2：正则表达式兜底解析 ==========
+        try:
+            if is_text_translation:
+                fallback_result = self._regex_fallback(raw_text)
+                if fallback_result and len(fallback_result) > 0:
+                    # 检查是否是真正的翻译失败标签
+                    first_trans = fallback_result[0].get("translation", "")
+                    if not first_trans.startswith("[Failed") and not first_trans.startswith("[Translation Failed"):
+                        extracted_count = len(fallback_result)
+                        logger.info(f"✅ 正则表达式解析成功，提取 {extracted_count} 条翻译")
+                        
+                        # 如果提供了期望的 ID 列表，检查缺失的翻译
+                        if expected_ids:
+                            extracted_ids = {item.get("id") for item in fallback_result}
+                            missing_ids = [eid for eid in expected_ids if eid not in extracted_ids]
+                            
+                            if missing_ids:
+                                logger.warning(f"⚠️ {len(missing_ids)} 个 segment 翻译缺失: {missing_ids[:5]}{'...' if len(missing_ids) > 5 else ''}")
+                                # 为缺失的 ID 添加失败标记
+                                for mid in missing_ids:
+                                    fallback_result.append({
+                                        "id": mid,
+                                        "translation": "[Failed: Missing in response]"
+                                    })
+                        
                         return fallback_result
-            except Exception as e:
-                logger.debug(f"⚠️ 正则表达式解析失败: {e}")
-            
-            # ========== 阶段3：模型自我修正（仅当前两阶段都失败时） ==========
-            if attempt < self.settings.processing.json_repair_retries:
-                logger.warning(f"⚠️ JSON 解析失败 (尝试 {attempt+1}/{self.settings.processing.json_repair_retries + 1}): [MEDIUM] 标准解析和正则解析均失败")
-                logger.info(f"💡 建议: 尝试请求模型自我修正 (剩余 {self.settings.processing.json_repair_retries - attempt} 次)")
-                logger.info("🔄 尝试请求模型自我修正...")
-                
-                corrected_data = self._attempt_json_self_correction(
-                    original_prompt=original_prompt,
-                    failed_json=current_raw_text,
-                    error_message="JSON解析和正则解析均失败",
-                    retries_left=self.settings.processing.json_repair_retries - attempt,
-                    is_vision=is_vision_translation,
-                    image_part=image_part
-                )
-                
-                if corrected_data:
-                    logger.info("✅ 模型自我修正成功")
-                    final_parsed_data = corrected_data
-                    return final_parsed_data
-                else:
-                    logger.warning("❌ 模型自我修正失败")
-                    # 重置为原始文本，继续下一轮尝试
-                    current_raw_text = raw_text
-            else:
-                logger.warning("❌ 达到最大重试次数，所有解析方法均失败。")
-                break
-
+                        
+            elif is_title_translation or is_glossary_extraction:
+                fallback_result = self._regex_fallback_for_dict_like(raw_text)
+                if fallback_result:
+                    logger.info(f"✅ 正则表达式解析成功（字典格式），提取 {len(fallback_result)} 项")
+                    return fallback_result
+                    
+        except Exception as e:
+            logger.debug(f"⚠️ 正则表达式解析失败: {e}")
+        
         # ========== 最终兜底：返回错误标记 ==========
-        logger.error(f"❌ 所有解析方法失败（标准JSON + 正则 + 模型修正）")
+        logger.error(f"❌ JSON 解析失败（标准JSON + 正则均失败），原始响应长度: {len(raw_text)}")
+        logger.debug(f"   原始响应末尾: {raw_text[-200:] if len(raw_text) > 200 else raw_text}")
         
         if is_text_translation:
-            logger.warning("⚠️ 返回翻译失败标签以保证输出文件完整性")
-            return [{"id": 1, "translation": "[Translation Failed - All Parsing Methods Exhausted]"}]
+            # 如果提供了期望的 ID 列表，为所有 ID 返回失败标记
+            if expected_ids:
+                return [{"id": eid, "translation": "[Failed: JSON Parse Error]"} for eid in expected_ids]
+            return [{"id": 1, "translation": "[Failed: JSON Parse Error]"}]
         elif is_title_translation or is_glossary_extraction:
             return {}
         elif is_vision_translation:
             return {}
         
-        return final_parsed_data
+        return None
 
     def _parse_json_response(self, text: str) -> List[Dict[str, Any]]:
         """解析文本翻译的 JSON 响应，支持多种格式"""
@@ -683,40 +719,101 @@ class GeminiTranslator(BaseTranslator):
             raise JSONParseError(f"Initial JSON parse failed: {e}")
 
     def _regex_fallback(self, text: str) -> List[Dict[str, Any]]:
-        """正则表达式兜底解析"""
+        """正则表达式兜底解析（支持截断恢复）"""
         logger.info("🔄 Using regex fallback for JSON parsing...")
 
-        # 策略1: 标准JSON格式
-        pattern = r'"id":\s*(\d+),\s*"translation":\s*"(.*?)(?<!\\)"(?=\s*\}|\s*,)'
+        # 检测是否被截断（末尾没有 ] 或最后一个对象不完整）
+        is_truncated = not text.rstrip().endswith(']')
+        if is_truncated:
+            logger.warning("⚠️ Detected incomplete JSON (missing closing bracket or truncated content)")
+
+        # 策略1: 标准JSON格式（完整对象）
+        pattern = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*)"\s*\}'
         matches = re.findall(pattern, text, re.DOTALL)
 
         if not matches:
-            # 策略2: 单引号格式
-            pattern_sq = r"'id':\s*(\d+),\s*'translation':\s*'(.*?)'(?=\s*\}|\s*,)"
-            matches = re.findall(pattern_sq, text, re.DOTALL)
-
-        if not matches:
-            # 策略3: 更宽松的匹配（处理不完整的JSON）
-            pattern_loose = r'"id":\s*(\d+).*?"translation":\s*"(.*?)"'
+            # 策略2: 宽松匹配（允许缺少结束括号）
+            pattern_loose = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*?)"'
             matches = re.findall(pattern_loose, text, re.DOTALL)
 
         if not matches:
-            # 策略4: 极度宽松的匹配
-            pattern_ultra = r'id["\s:]+(\d+).*?translation["\s:]+["\']([^"\']*?)["\']'
-            matches = re.findall(pattern_ultra, text, re.DOTALL | re.IGNORECASE)
+            # 策略3: 单引号格式
+            pattern_sq = r"'id':\s*(\d+),\s*'translation':\s*'((?:[^'\\]|\\.)*)'"
+            matches = re.findall(pattern_sq, text, re.DOTALL)
 
         if not matches:
-            logger.error(f"❌ Regex fallback failed completely. Original text: {repr(text[:500])}")
-            # 返回翻译失败的标签，确保至少能生成完整的输出文件
+            # 策略4: 极度宽松（处理截断情况）- 查找所有可能的 id/translation 对
+            pattern_ultra = r'"id"\s*:\s*(\d+)[^}]*"translation"\s*:\s*"([^"]*?)(?:"|$)'
+            matches = re.findall(pattern_ultra, text, re.DOTALL)
+
+        if not matches:
+            logger.error(f"❌ Regex fallback failed completely. Text length: {len(text)}, Last 200 chars: {repr(text[-200:])}")
             logger.warning("⚠️ Returning translation failure tag to ensure output file integrity.")
             return [{"id": 1, "translation": "[Translation Failed - JSON Parse Error]"}]
 
-        logger.debug(f"✅ Regex found {len(matches)} matches.")
-        return [{"id": int(mid), "translation": mtext.replace('\\"', '"').replace("\\'", "'")} for mid, mtext in matches]
+        logger.info(f"✅ Regex extracted {len(matches)} segments" + (" (from truncated JSON)" if is_truncated else ""))
+        
+        result = []
+        for mid, mtext in matches:
+            # 清理转义字符
+            cleaned_text = mtext.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+            # 检测最后一个对象是否被截断
+            if is_truncated and (mid, mtext) == matches[-1]:
+                # 检查是否在句子中间截断（没有标点符号结尾）
+                if cleaned_text and not cleaned_text.rstrip().endswith(('。', '！', '？', '.', '!', '?', '」', '"', ')', '）')):
+                    logger.warning(f"⚠️ Segment {mid} appears truncated (no sentence-ending punctuation), marking as incomplete")
+                    cleaned_text += "[...翻译被截断]"
+            result.append({"id": int(mid), "translation": cleaned_text})
+        
+        return result
+
+    def _regex_fallback_for_dict_like(self, text: str) -> Optional[Dict[str, str]]:
+        """正则表达式兜底解析（字典格式，用于 title translation 和 glossary extraction）
+        
+        目标格式示例：
+        {"Chapter 1": "第一章", "Introduction": "简介"}
+        或
+        {"术语A": "翻译A", "术语B": "翻译B"}
+        """
+        logger.info("🔄 Using regex fallback for dict-like JSON parsing...")
+        
+        result = {}
+        
+        # 策略1: 标准 JSON 键值对格式
+        pattern = r'"([^"]+)"\s*:\s*"([^"]*)"'
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        if matches:
+            for key, value in matches:
+                # 跳过可能的元数据字段
+                if key.lower() in ('id', 'type', 'status', 'error'):
+                    continue
+                # 清理转义字符
+                cleaned_key = key.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+                cleaned_value = value.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+                result[cleaned_key] = cleaned_value
+        
+        if not result:
+            # 策略2: 单引号格式
+            pattern_sq = r"'([^']+)'\s*:\s*'([^']*)'"
+            matches = re.findall(pattern_sq, text, re.DOTALL)
+            for key, value in matches:
+                if key.lower() in ('id', 'type', 'status', 'error'):
+                    continue
+                cleaned_key = key.replace("\\'", "'").replace('\\n', '\n')
+                cleaned_value = value.replace("\\'", "'").replace('\\n', '\n')
+                result[cleaned_key] = cleaned_value
+        
+        if result:
+            logger.info(f"✅ Regex extracted {len(result)} key-value pairs (dict format)")
+            return result
+        else:
+            logger.error(f"❌ Regex fallback for dict-like failed. Text length: {len(text)}")
+            return None
 
 
 # ========================================================================
-# 异步翻译客户端
+# Gemini 异步翻译客户端
 # ========================================================================
 
 class AsyncGeminiTranslator(BaseAsyncTranslator):
@@ -771,10 +868,11 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
     def __del__(self):
         """析构函数，确保资源清理"""
         try:
-            self.cleanup()
+            if hasattr(self, 'executor') and self.executor is not None:
+                self.cleanup()
         except Exception:
             pass
-        
+    
     async def translate_text_batch_async(
         self,
         segments: SegmentList,
@@ -782,92 +880,67 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         glossary: Optional[Dict[str, str]] = None
     ) -> List[str]:
         """
-        异步批量翻译文本segment
+        异步批量翻译文本segment（简化版，与同步模式逻辑完全一致）
         
-        将segments分成更小的chunk并发翻译，大幅提升速度
-        特性：超时控制、自动重试、异常隔离
+        架构设计（V4：与同步模式统一，一个 batch = 一次 API 调用）：
+        
+        ┌─────────────────────────────────────────────────────────────────┐
+        │ 同步/异步模式统一流程:                                           │
+        │                                                                 │
+        │ 1. 整个 batch 的 segments 打包成 JSON 数组                       │
+        │    [{"id": 1, "original": "..."}, {"id": 2, "original": "..."}] │
+        │                                                                 │
+        │ 2. 一次 API 调用翻译整个 batch                                   │
+        │                                                                 │
+        │ 3. LLM 返回对应的翻译结果数组                                    │
+        │    [{"id": 1, "translation": "..."}, {"id": 2, ...}]            │
+        └─────────────────────────────────────────────────────────────────┘
+        
+        并发控制在 workflow 层通过 Semaphore 实现，engine 层只负责单次翻译。
+        
+        Args:
+            segments: 待翻译的 segment 列表（一个 batch）
+            context: 翻译上下文（batch 之前的原文，由 workflow 层提供）
+            glossary: 术语表（缓存模式下会被忽略）
+        
+        Returns:
+            翻译结果列表
         """
         if not segments:
             return []
         
-        logger.info(f"🚀 使用异步模式翻译 {len(segments)} 个文本段（超时: {self.async_timeout}s）...")
+        logger.info(f"🚀 异步翻译 {len(segments)} 个文本段...")
         
-        # 将 segments 分成小批次 (避免单个请求过大)
-        chunk_size = min(5, self.settings.processing.batch_size)
-        chunks = [segments[i:i + chunk_size] for i in range(0, len(segments), chunk_size)]
+        # ========== 与同步模式完全一致的数据准备 ==========
         
-        # 并发翻译所有 chunk，带超时控制
-        tasks = [
-            self._translate_single_chunk_async(chunk, context, glossary, retry_count=2)
-            for chunk in chunks
-        ]
+        # 截取上下文
+        safe_context = context[-self.settings.processing.max_context_length:] if context else ""
         
-        try:
-            # 添加总体超时控制
-            chunk_results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=self.async_timeout
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"❌ 异步翻译超时（{self.async_timeout}s），取消所有任务")
-            # 超时时返回失败标记
-            return [f"[Failed: Timeout after {self.async_timeout}s]"] * len(segments)
-        
-        # 合并结果
-        results = []
-        for chunk, chunk_result in zip(chunks, chunk_results):
-            if isinstance(chunk_result, Exception):
-                logger.error(f"❌ Chunk 翻译失败: {chunk_result}")
-                # 为失败的chunk填充失败标记，使用实际的chunk大小
-                actual_chunk_size = len(chunk)
-                results.extend([f"[Failed: {str(chunk_result)}]"] * actual_chunk_size)
-            else:
-                results.extend(chunk_result)
-        
-        success_count = len([r for r in results if not r.startswith('[Failed')])
-        logger.info(f"✅ 异步翻译完成，成功 {success_count} / {len(segments)}")
-        return results[:len(segments)]  # 确保返回正确数量的结果
-
-    async def _translate_single_chunk_async(
-        self,
-        segments: SegmentList,
-        context: str,
-        glossary: Optional[Dict[str, str]] = None,
-        retry_count: int = 0
-    ) -> List[str]:
-        """异步翻译单个 chunk，支持重试"""
-        
-        # 准备输入数据
+        # 准备输入数据（与同步模式完全一致）
         input_data = [
-            {
-                "id": seg.segment_id,
-                "original": seg.original_text,
-                "context": (context or "No Context")[-self.settings.processing.max_context_length:]
-            }
+            {"id": seg.segment_id, "original": seg.original_text}
             for seg in segments
         ]
         input_json = json.dumps(input_data, ensure_ascii=False)
         
-        # 格式化术语表
-        glossary_text = "N/A"
-        if glossary:
+        # 格式化术语表（仅在非缓存模式下使用）
+        glossary_text = ""
+        if glossary and not self.settings.processing.enable_gemini_caching:
             glossary_text = "\n".join([f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()])
         
-        # 截取上下文
-        safe_context = context[-self.settings.processing.max_context_length:] if context else "No Context"
-        
-        # 格式化 Prompt - 使用 prompt_manager
+        # 格式化 Prompt（与同步模式完全一致）
         original_prompt = self.prompt_manager.format_text_prompt(
             context=safe_context,
             input_json=input_json,
             glossary=glossary_text
         )
         
-        # 获取当前事件循环（安全方式）
+        # ========== 异步执行 API 调用 ==========
+        
+        # 获取当前事件循环
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # 如果没有运行中的事件循环，回退到 get_event_loop
             loop = asyncio.get_event_loop()
         
         def _call_with_cache():
@@ -878,24 +951,30 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 purpose="Async Text Translation"
             )
         
-        # 重试逻辑
+        # 重试逻辑（与同步模式的 @retry 装饰器效果一致）
+        retry_count = 2
         last_error = None
+        input_ids = [s.segment_id for s in segments]
+        
         for attempt in range(retry_count + 1):
             try:
-                # 在线程池中执行同步的 API 调用（使用缓存如果可用）
-                response = await loop.run_in_executor(self.executor, _call_with_cache)
+                # 在线程池中执行同步的 API 调用
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(self.executor, _call_with_cache),
+                    timeout=self.async_timeout
+                )
                 
-                # raw_text = response.text.strip()
                 raw_text = response.candidates[0].content.parts[0].text
-                # 解析响应（复用同步方法）
+                
+                # 解析响应（复用同步方法，传递期望的 ID 列表）
                 output_list = self.base._handle_json_response_with_correction(
                     raw_text,
                     original_prompt,
-                    is_text_translation=True
+                    is_text_translation=True,
+                    expected_ids=input_ids
                 )
                 
-                # 映射结果
-                input_ids = [s.segment_id for s in segments]
+                # 映射结果（与同步模式完全一致）
                 output_map = {
                     int(item['id']): str(item.get('translation', ''))
                     for item in output_list
@@ -903,25 +982,29 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 }
                 
                 # 生成最终结果
-                results = [output_map.get(uid, "[Translation Failed]") for uid in input_ids]
+                results = [output_map.get(uid, "[Failed: Missing translation]") for uid in input_ids]
                 
-                if attempt > 0:
-                    logger.info(f"✅ Chunk 翻译重试成功（第 {attempt + 1} 次尝试）")
+                success_count = len([r for r in results if not r.startswith('[Failed')])
+                logger.info(f"✅ 异步翻译完成，成功 {success_count}/{len(segments)}")
                 
                 return results
+            
+            except asyncio.TimeoutError:
+                last_error = f"Timeout after {self.async_timeout}s"
+                logger.error(f"❌ 异步翻译超时（{self.async_timeout}s）")
+                break  # 超时不重试
             
             except Exception as e:
                 last_error = e
                 if attempt < retry_count:
-                    wait_time = 2 ** attempt  # 指数退避
-                    logger.warning(f"⚠️ Chunk 翻译失败（尝试 {attempt + 1}/{retry_count + 1}），{wait_time}s 后重试: {e}")
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⚠️ 翻译失败（尝试 {attempt + 1}/{retry_count + 1}），{wait_time}s 后重试: {e}")
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"❌ Chunk 翻译失败，已用尽所有重试: {e}")
+                    logger.error(f"❌ 翻译失败，已用尽所有重试: {e}")
         
         # 所有重试都失败，返回失败标记
-        input_ids = [s.segment_id for s in segments]
-        return [f"[Failed: {str(last_error)}]"] * len(input_ids)
+        return [f"[Failed: {str(last_error)}]"] * len(segments)
 
     async def translate_vision_batch_async(
         self,
@@ -1043,12 +1126,17 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
 
     def cleanup(self):
         """清理资源"""
-        self.executor.shutdown(wait=True)
-        logger.info("🧹 异步翻译器已清理资源")
+        if hasattr(self, 'executor') and self.executor is not None:
+            try:
+                self.executor.shutdown(wait=True)
+                self.executor = None  # 标记为已清理
+                logger.info("🧹 异步翻译器已清理资源")
+            except Exception as e:
+                logger.debug(f"清理 executor 时出现警告: {e}")
 
 
 # ========================================================================
-# OpenAI-compatible (DeepSeek) translator
+# OpenAI-compatible (DeepSeek) 翻译客户端
 # ========================================================================
 
 
@@ -1333,13 +1421,15 @@ Return ONLY the JSON object.
                 user_content=original_prompt,
             )
 
+        # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
+        input_ids = [s.segment_id for s in segments]
         output_list = self._handle_json_response_with_repair(
             raw_text=raw_text,
             original_prompt=combined_prompt if self.use_long_text_mode else original_prompt,
             is_text_translation=True,
+            expected_ids=input_ids,
         )
 
-        input_ids = [s.segment_id for s in segments]
         output_map = {
             int(item['id']): str(item.get('translation', ''))
             for item in output_list
@@ -1537,49 +1627,100 @@ Return ONLY the JSON object.
         *,
         is_text_translation: bool = False,
         is_dict_like: bool = False,
+        expected_ids: Optional[List[int]] = None,
     ) -> Any:
-        current = raw_text
-
-        for _ in range(self.settings.processing.json_repair_retries + 1):
-            try:
-                current = self._strip_code_fences(current)
-                return json.loads(current)
-            except json.JSONDecodeError as e:
-                last_err = str(e)
-
-            if is_text_translation:
-                try:
-                    fallback = self._regex_fallback_for_list(current)
-                    if fallback:
-                        return fallback
-                except Exception:
-                    pass
-
-            repair_prompt = self.prompt_manager.format_json_repair_prompt(
-                original_prompt=original_prompt,
-                broken_json=current,
-                error_details=last_err,
-            )
-            current = self._chat_completions(
-                system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
-                user_content=repair_prompt,
-            )
-
+        """
+        处理 JSON 响应（简化版，与 Gemini translator 逻辑一致）
+        
+        纠错流程：
+        1. 标准 JSON 解析
+        2. 正则表达式兜底解析（尽可能提取成功的翻译）
+        3. 对于缺失的 segment，标记为失败（不再调用 LLM 修正）
+        
+        Args:
+            expected_ids: 期望的 segment ID 列表（用于检测缺失的翻译）
+        """
+        # ========== 阶段1：标准JSON解析 ==========
+        try:
+            cleaned = self._strip_code_fences(raw_text)
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.debug(f"⚠️ 标准JSON解析失败: {e}")
+        
+        # ========== 阶段2：正则表达式兜底解析 ==========
         if is_text_translation:
-            return [{"id": 1, "translation": "[Translation Failed - All Parsing Methods Exhausted]"}]
+            try:
+                fallback = self._regex_fallback_for_list(raw_text)
+                if fallback and len(fallback) > 0:
+                    extracted_count = len(fallback)
+                    logger.info(f"✅ 正则表达式解析成功，提取 {extracted_count} 条翻译")
+                    
+                    # 如果提供了期望的 ID 列表，检查缺失的翻译
+                    if expected_ids:
+                        extracted_ids = {item.get("id") for item in fallback}
+                        missing_ids = [eid for eid in expected_ids if eid not in extracted_ids]
+                        
+                        if missing_ids:
+                            logger.warning(f"⚠️ {len(missing_ids)} 个 segment 翻译缺失: {missing_ids[:5]}{'...' if len(missing_ids) > 5 else ''}")
+                            # 为缺失的 ID 添加失败标记
+                            for mid in missing_ids:
+                                fallback.append({
+                                    "id": mid,
+                                    "translation": "[Failed: Missing in response]"
+                                })
+                    
+                    return fallback
+            except Exception as e:
+                logger.debug(f"⚠️ 正则表达式解析失败: {e}")
+        
+        # ========== 最终兜底：返回错误标记 ==========
+        logger.error(f"❌ JSON 解析失败（标准JSON + 正则均失败），原始响应长度: {len(raw_text)}")
+        
+        if is_text_translation:
+            if expected_ids:
+                return [{"id": eid, "translation": "[Failed: JSON Parse Error]"} for eid in expected_ids]
+            return [{"id": 1, "translation": "[Failed: JSON Parse Error]"}]
         if is_dict_like:
             return {}
-        raise JSONParseError("Failed to parse JSON after repair attempts")
+        raise JSONParseError("Failed to parse JSON")
 
     def _regex_fallback_for_list(self, text: str) -> List[Dict[str, Any]]:
-        pattern = r'"id":\s*(\d+),\s*"translation":\s*"(.*?)(?<!\\)"(?=\s*\}|\s*,)'
+        """正则表达式兜底解析（与 Gemini translator 的 _regex_fallback 逻辑一致）"""
+        logger.info("🔄 Using regex fallback for JSON parsing...")
+        
+        # 检测是否被截断
+        is_truncated = not text.rstrip().endswith(']')
+        if is_truncated:
+            logger.warning("⚠️ Detected incomplete JSON (missing closing bracket)")
+        
+        # 策略1: 标准JSON格式
+        pattern = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*)"\s*\}'
         matches = re.findall(pattern, text, re.DOTALL)
-        return [
-            {"id": int(mid), "translation": mtext.replace('\\"', '"').replace("\\'", "'")}
-            for mid, mtext in matches
-        ]
+        
+        if not matches:
+            # 策略2: 宽松匹配
+            pattern_loose = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*?)"'
+            matches = re.findall(pattern_loose, text, re.DOTALL)
+        
+        if not matches:
+            return []
+        
+        logger.info(f"✅ Regex extracted {len(matches)} segments" + (" (from truncated JSON)" if is_truncated else ""))
+        
+        result = []
+        for mid, mtext in matches:
+            cleaned_text = mtext.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+            # 检测最后一个对象是否被截断
+            if is_truncated and (mid, mtext) == matches[-1]:
+                if cleaned_text and not cleaned_text.rstrip().endswith(('。', '！', '？', '.', '!', '?', '」', '"', ')', '）')):
+                    cleaned_text += "[...翻译被截断]"
+            result.append({"id": int(mid), "translation": cleaned_text})
+        
+        return result
 
-
+# ========================================================================
+# OpenAI-compatible (DeepSeek) 异步翻译客户端
+# ========================================================================
 class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
     """异步 OpenAI-compatible 翻译器（线程池包装，同步HTTP请求并发执行）。
     

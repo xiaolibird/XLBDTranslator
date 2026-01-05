@@ -73,6 +73,7 @@ def get_user_strategy(settings: Settings):
     交互式配置向导：根据文件类型和现有配置获取处理策略。
     
     现在会优先使用 settings 中的值，仅在缺失时才进行交互式询问。
+    注意：TOC 和页面范围已改为使用默认值，不再询问。
     """
     file_path = settings.files.document_path
     ext = os.path.splitext(file_path)[1].lower()
@@ -83,40 +84,24 @@ def get_user_strategy(settings: Settings):
     print("="*60)
     
     # ==========================================
-    # 1. 章节目录 (TOC) 配置
+    # 1. 章节目录 (TOC) 配置 - 跳过，使用默认值
     # ==========================================
-    print("\n[1/5] 📚 Table of Contents (章节目录)")
+    print("\n[1/4] 📚 Table of Contents (章节目录)")
     
     if ext == '.pdf':
-        # 优先使用 .env 中的配置
         if settings.document.custom_toc_path and settings.document.custom_toc_path.exists():
-            print(f"      ✅ Found in settings: {os.path.basename(str(settings.document.custom_toc_path))}")
-            print("      (Skipping interactive TOC setup)")
+            print(f"      ✅ Using custom TOC: {os.path.basename(str(settings.document.custom_toc_path))}")
         else:
-            # 如果配置中没有，再进行交互式询问
-            print("      PDFs often lack a readable TOC. Do you have a CSV mapping?")
-            print("      (Format: 'Page,Title,Level')")
-            
-            use_toc = input("      Load custom TOC CSV? (y/n) [n]: ").strip().lower()
-            if use_toc == 'y':
-                while True:
-                    path = input("      Enter CSV path: ").strip().strip("'").strip('"')
-                    if os.path.exists(path):
-                        settings.document.custom_toc_path = Path(path)
-                        print(f"      ✅ Loaded: {os.path.basename(path)}")
-                        break
-                    else:
-                        print("      ❌ File not found. Please try again.")
+            print("      ✅ Using PDF's built-in TOC (or per-page segmentation)")
     else:
         # EPUB 逻辑
         print(f"      ✅ Detected {ext.upper()} format. Using internal structure.")
-        print("      (Skipping custom TOC setup)")
 
     # ==========================================
     # 2. Vision 模式配置 (仅 PDF)
     # ==========================================
     # 对于非 PDF 文件，Vision 和 Cropping 步骤将被跳过，但 Retain Original Text 仍适用。
-    print("\n[2/5] 👁️  Vision Mode (视觉/图片模式)")
+    print("\n[2/4] 👁️  Vision Mode (视觉/图片模式)")
     if ext == '.pdf':    
         # 优先使用 .env 中的配置
         if settings.processing.use_vision_mode is not None:
@@ -143,43 +128,15 @@ def get_user_strategy(settings: Settings):
         print("      (Skipping Vision mode setup for non-PDF files)")
 
     # ==========================================
-    # 3. 页面范围配置 (仅 PDF)
+    # 3. 页面范围配置 (仅 PDF) - 跳过，使用默认值
     # ==========================================
-    print("\n[3/5] 📄 Page Range (页面范围)")
+    print("\n[3/4] 📄 Page Range (页面范围)")
 
     if ext == '.pdf':
-        # 优先使用 .env 中的配置
         if settings.document.page_range:
-            print(f"      ✅ Found in settings: Pages {settings.document.page_range[0]} to {settings.document.page_range[1]}")
-            print("      (Skipping interactive page range setup)")
+            print(f"      ✅ Using specified range: Pages {settings.document.page_range[0]} to {settings.document.page_range[1]}")
         else:
-            # 如果配置中没有，再进行交互式询问
-            print("      指定翻译页面范围 (例如, '10,50' 或 '10-50').")
-            print("      直接按 ENTER 键则翻译整个文档。")
-            
-            pr_input = input("      页面范围: ").strip()
-            
-            if pr_input:
-                try:
-                    # 支持逗号和短横线作为分隔符
-                    parts = [p.strip() for p in pr_input.replace('-', ',').split(',')]
-                    if len(parts) == 2:
-                        start, end = map(int, parts)
-                        if start > 0 and end >= start:
-                            # 假设用户输入的是 1-based，Pydantic 模型内部处理
-                            settings.document.page_range = (start, end)
-                            print(f"      🔵 范围设定: Pages {start} to {end}")
-                        else:
-                            print("      ⚠️ 无效范围。将翻译整个文档。")
-                            settings.document.page_range = None
-                    else:
-                        print("      ⚠️ 格式错误。将翻译整个文档。")
-                        settings.document.page_range = None
-                except ValueError:
-                    print("      ⚠️ 格式错误。将翻译整个文档。")
-                    settings.document.page_range = None
-            else:
-                print("      🔵 将翻译整个文档。")
+            print("      ✅ Translating all pages (no range specified)")
     else:
         print("      (Skipping page range setup for non-PDF files).")
 
@@ -187,7 +144,7 @@ def get_user_strategy(settings: Settings):
     # ==========================================
     # 4. 裁切/边距配置 (仅 PDF)
     # ==========================================
-    print("\n[4/5] ✂️  Image Cropping (Remove Headers/Footers)")
+    print("\n[4/4] ✂️  Image Cropping (Remove Headers/Footers)")
 
     if ext != '.pdf' or settings.processing.use_vision_mode is False:
         print("      Skipped (Vision mode disabled or non-PDF file).")

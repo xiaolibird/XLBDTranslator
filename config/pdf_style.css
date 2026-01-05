@@ -111,5 +111,6 @@ h2 {
 
 /* 确保小标题不进入章节信息 */
 h6 {
-    string-set: current-chapter none;
+    bookmark-level: none;
+    -weasy-bookmark-level: none; /* 针对 WeasyPrint 的兼容性 */
 }

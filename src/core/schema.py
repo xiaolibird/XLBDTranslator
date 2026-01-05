@@ -186,6 +186,23 @@ class ProcessingSettings(BaseModel):
     batch_size: int = Field(5, validation_alias="BATCH_SIZE", description="批量翻译大小")
     max_context_length: int = Field(4096, validation_alias="MAX_CONTEXT_LENGTH", description="最大上下文长度")
     
+    # ========== API 生成参数 ==========
+    # 控制模型输出的随机性和多样性
+    temperature: float = Field(0.2, validation_alias="TEMPERATURE", description="生成温度 (0.0-2.0)，越低越确定")
+    top_p: float = Field(0.95, validation_alias="TOP_P", description="核采样概率 (0.0-1.0)，控制多样性")
+    top_k: Optional[int] = Field(None, validation_alias="TOP_K", description="Top-K 采样 (1-100)，None 表示不限制")
+    max_output_tokens: int = Field(16384, validation_alias="MAX_OUTPUT_TOKENS", description="最大输出 token 数（不同模型限制: 8192-65535）")
+    
+    # ========== 术语表配置 ==========
+    glossary_preamble_ratio: float = Field(0.1, validation_alias="GLOSSARY_PREAMBLE_RATIO", description="预翻译比例 (0.05-0.3)，用于生成术语表")
+    glossary_min_terms: int = Field(10, validation_alias="GLOSSARY_MIN_TERMS", description="术语表最少条目数")
+    glossary_max_terms: int = Field(100, validation_alias="GLOSSARY_MAX_TERMS", description="术语表最多条目数")
+    enable_glossary_edit: bool = Field(False, validation_alias="ENABLE_GLOSSARY_EDIT", description="是否在生成后允许编辑术语表")
+    skip_pretranslate_if_glossary_exists: bool = Field(True, validation_alias="SKIP_PRETRANSLATE_IF_GLOSSARY_EXISTS", description="如果术语表已存在，跳过预翻译")
+    reprocess_pretranslated: bool = Field(True, validation_alias="REPROCESS_PRETRANSLATED", description="是否在正式翻译时重新处理预翻译部分")
+    enable_progressive_glossary: bool = Field(True, validation_alias="ENABLE_PROGRESSIVE_GLOSSARY", description="是否启用渐进式术语表提取（每个 batch 提取一次）")
+    glossary_stop_threshold: float = Field(0.8, validation_alias="GLOSSARY_STOP_THRESHOLD", description="术语表饱和度阈值 (0.5-1.0)，达到后停止预翻译")
+    
     # 性能与速率
     max_retries: int = Field(3, validation_alias="MAX_RETRIES", description="最大重试次数")
     request_timeout: int = Field(60, validation_alias="REQUEST_TIMEOUT", description="API请求超时时间")

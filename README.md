@@ -167,22 +167,107 @@ cp config/config.env.template config/config.env
 一切就绪后，直接运行主程序：
 
 ```bash
+# 使用默认配置文件 (config/config.env)
 python main.py
+
+# 指定要翻译的文档
+python main.py /path/to/document.pdf
+
+# 使用自定义配置文件
+python main.py --config /path/to/custom.env document.epub
 ```
 
-#### 4.2 指定自定义配置文件（可选）
+#### 4.2 命令行参数
 
-如果需要使用不同的配置文件（例如针对不同项目），可以通过命令行参数指定：
+程序支持通过命令行参数完全控制翻译流程，实现非交互式运行。参数优先级为：**命令行参数 > 配置文件 > 交互式询问**。
+
+##### 基础参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `file_path` | 要翻译的文档路径（位置参数）| `python main.py document.pdf` |
+| `--config` | 配置文件路径 | `--config config/custom.env` |
+
+##### 翻译模式参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `--mode` | 翻译模式 ID（对应 modes.json 中的 key）| `--mode 1` |
+
+##### PDF 专用参数
+
+| 参数 | 说明 | 可选值/格式 | 示例 |
+|------|------|-------------|------|
+| `--vision-mode` | Vision 模式控制 | `auto`（自动检测）<br>`force`（强制启用）<br>`off`（仅文本） | `--vision-mode force` |
+| `--page-range` | 页面范围 | `"起始,结束"` 或 `"起始-结束"` | `--page-range 10-50` |
+| `--toc` | 自定义 TOC CSV 文件路径 | CSV 文件路径 | `--toc test/my_toc.csv` |
+| `--margins` | 裁切边距（移除页眉页脚） | `"上,下,左,右"`（0.0-1.0 的比例） | `--margins 0.1,0.05,0.05,0.05` |
+
+##### 通用参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `--retain-original` | 在输出中保留原文（双语对照） | `--retain-original` |
+| `--no-retain-original` | 在输出中不保留原文 | `--no-retain-original` |
+
+#### 4.3 使用示例
+
+##### 完全非交互式运行
+
+所有参数通过命令行指定，适合脚本化和批处理：
 
 ```bash
-python main.py --config /path/to/your/custom.env
+# 翻译 PDF，指定所有参数
+python main.py document.pdf \
+  --mode 1 \
+  --vision-mode force \
+  --page-range 10-50 \
+  --margins 0.1,0.05,0.05,0.05 \
+  --retain-original
+
+# 翻译 EPUB，只指定模式和保留原文
+python main.py novel.epub \
+  --mode 5 \
+  --retain-original
+
+# 使用 DeepSeek API 翻译
+python main.py document.pdf \
+  --config examples/config_deepseek.env \
+  --mode 4 \
+  --page-range 1-100
 ```
 
-这对于管理多个翻译项目非常有用，每个项目可以有独立的配置文件。
+##### 混合模式
 
-#### 4.3 交互式配置
+部分参数通过命令行，其余从配置文件读取或交互式询问：
 
-程序启动后，会通过交互式命令行引导您完成配置（任何已在配置文件中设置的步骤将被自动跳过）：
+```bash
+# 仅指定模式和页面范围，其他参数从配置文件读取
+python main.py document.pdf --mode 2 --page-range 1-100
+
+# 仅指定文档和模式，其他参数通过交互式询问
+python main.py document.pdf --mode 1
+```
+
+##### Docker/CI 环境
+
+在容器或持续集成环境中，配合配置文件实现零交互：
+
+```bash
+# 所有配置都在 config.env 中预设
+python main.py
+
+# 或通过环境变量和命令行参数
+export API__GEMINI_API_KEY="your-api-key"
+python main.py /data/document.pdf \
+  --mode 1 \
+  --vision-mode off \
+  --no-retain-original
+```
+
+#### 4.4 交互式配置
+
+当参数既未通过命令行指定，也未在配置文件中设置时，程序会通过交互式命令行引导您完成配置：
 
 1.  **选择翻译模式 (Persona)**: 根据您的文本类型选择一个最合适的专家身份。
 2.  **配置处理策略**:
