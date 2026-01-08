@@ -12,76 +12,395 @@ from ..utils.logger import logger
 
 
 # ==================== 配置预设 ====================
+# 
+# 参数完整定义（基于 schema.py ProcessingSettings）
+# 
+# 【不在预设中配置的参数 - 需要用户/环境指定】:
+# - translator_provider: API 提供商
+# - gemini_api_key / openai_api_key: API 密钥
+# - gemini_model / openai_model: 模型名称
+# - openai_base_url: API 地址
+# - document_path: 文档路径
+# - output_base_dir / final_output_dir: 输出目录
+# - log_file / modes_config_path: 配置文件路径
+# - custom_toc_path: 自定义目录
+# - page_range: 页面范围
+# - margin_* : 边距裁切
+# - translation_mode: 翻译角色 ID
+# - translation_mode_entity: 翻译角色对象
 
 PRESETS: Dict[str, Dict[str, Any]] = {
+    # ============================================================
     # 快速模式：最快翻译速度，适合快速预览
+    # ============================================================
     "fast": {
         "description": "快速模式 - 最快翻译速度，适合快速预览",
-        "batch_size": 10,
-        "enable_async": True,
-        "async_threshold": 5,
-        "async_max_workers": 15,
-        "enable_gemini_caching": True,
-        "cache_ttl_hours": 1,
-        "enable_checkpoint": True,
-        "checkpoint_interval": 5,
-        "max_retries": 2
+        
+        # --- 核心处理参数 ---
+        "batch_size": 10,                    # 大批次，减少请求次数
+        "max_context_length": 4096,          # 标准上下文长度
+        
+        # --- 生成参数 ---
+        "temperature": 0.3,                  # 略高温度，允许一定灵活性
+        "top_p": 0.95,                       # 标准 top-p
+        "top_k": None,                       # 不限制 top-k
+        "max_output_tokens": 16384,          # 标准输出长度
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.08,     # 较小预翻译比例
+        "glossary_min_terms": 5,             # 最少术语数
+        "glossary_max_terms": 50,            # 较少最大术语数
+        "enable_glossary_edit": False,       # 不编辑术语表
+        "skip_pretranslate_if_glossary_exists": True,
+        "reprocess_pretranslated": False,    # 不重新处理预翻译
+        "enable_progressive_glossary": False, # 关闭渐进式术语提取
+        "glossary_stop_threshold": 0.6,      # 较低饱和度阈值
+        
+        # --- 性能与速率 ---
+        "max_retries": 2,                    # 较少重试
+        "request_timeout": 45,               # 较短超时
+        "rate_limit_delay": 0.5,             # 短请求间隔
+        "vision_rate_limit_delay": 1.0,      # 短 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 300,               # 较大最小块
+        "max_chunk_size": 2500,              # 较大最大块
+        
+        # --- 异步/并发 ---
+        "enable_async": True,                # 启用异步
+        "async_threshold": 5,                # 低阈值，更早触发异步
+        "async_max_workers": 15,             # 高并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": True,       # 启用缓存
+        "cache_ttl_hours": 1,                # 短缓存时间
+        "enable_cache": True,                # 启用通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 5,            # 较大保存间隔
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": False,             # 关闭面包屑（简化输出）
+        "render_page_markers": True,         # 显示页码
+        "use_vision_mode": None,             # 自动检测
+        "retain_original": False,            # 不保留原文
+        
+        # --- 其他 ---
+        "json_repair_retries": 1,            # 少量 JSON 修复
+        "use_rich_progress": True,           # 使用 rich 进度
+        "log_level": "INFO",                 # 标准日志级别
     },
     
+    # ============================================================
     # 高质量模式：追求翻译质量，速度较慢
+    # ============================================================
     "quality": {
         "description": "高质量模式 - 追求翻译质量，速度较慢",
-        "batch_size": 3,
-        "enable_async": False,  # 关闭异步，确保顺序翻译
-        "async_threshold": 20,
-        "async_max_workers": 5,
-        "enable_gemini_caching": True,
-        "cache_ttl_hours": 2,
-        "enable_checkpoint": True,
-        "checkpoint_interval": 1,
-        "max_retries": 5
+        
+        # --- 核心处理参数 ---
+        "batch_size": 3,                     # 小批次，精细处理
+        "max_context_length": 8192,          # 长上下文
+        
+        # --- 生成参数 ---
+        "temperature": 0.1,                  # 低温度，稳定输出
+        "top_p": 0.9,                        # 略低 top-p
+        "top_k": 40,                         # 限制 top-k
+        "max_output_tokens": 32768,          # 大输出长度
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.15,     # 较大预翻译比例
+        "glossary_min_terms": 15,            # 更多最少术语
+        "glossary_max_terms": 150,           # 更多最大术语
+        "enable_glossary_edit": True,        # 允许编辑术语表
+        "skip_pretranslate_if_glossary_exists": False,  # 每次都预翻译
+        "reprocess_pretranslated": True,     # 重新处理预翻译
+        "enable_progressive_glossary": True, # 启用渐进式术语
+        "glossary_stop_threshold": 0.9,      # 高饱和度阈值
+        
+        # --- 性能与速率 ---
+        "max_retries": 5,                    # 更多重试
+        "request_timeout": 120,              # 长超时
+        "rate_limit_delay": 2.0,             # 长请求间隔
+        "vision_rate_limit_delay": 3.0,      # 长 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 150,               # 较小最小块
+        "max_chunk_size": 1500,              # 较小最大块（精细）
+        
+        # --- 异步/并发 ---
+        "enable_async": False,               # 关闭异步，顺序处理
+        "async_threshold": 50,               # 高阈值
+        "async_max_workers": 5,              # 低并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": True,       # 启用缓存
+        "cache_ttl_hours": 3,                # 长缓存时间
+        "enable_cache": True,                # 启用通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 1,            # 每段保存
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": True,              # 启用面包屑
+        "render_page_markers": True,         # 显示页码
+        "use_vision_mode": None,             # 自动检测
+        "retain_original": False,            # 不保留原文
+        
+        # --- 其他 ---
+        "json_repair_retries": 3,            # 更多 JSON 修复
+        "use_rich_progress": True,           # 使用 rich 进度
+        "log_level": "INFO",                 # 标准日志级别
     },
     
+    # ============================================================
     # 平衡模式：速度和质量兼顾（默认推荐）
+    # ============================================================
     "balanced": {
         "description": "平衡模式 - 速度和质量兼顾（默认推荐）",
-        "batch_size": 5,
-        "enable_async": True,
-        "async_threshold": 10,
-        "async_max_workers": 10,
-        "enable_gemini_caching": True,
-        "cache_ttl_hours": 1,
-        "enable_checkpoint": True,
-        "checkpoint_interval": 1,
-        "max_retries": 3
+        
+        # --- 核心处理参数 ---
+        "batch_size": 5,                     # 中等批次
+        "max_context_length": 4096,          # 标准上下文
+        
+        # --- 生成参数 ---
+        "temperature": 0.2,                  # 较低温度
+        "top_p": 0.95,                       # 标准 top-p
+        "top_k": None,                       # 不限制
+        "max_output_tokens": 16384,          # 标准输出
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.1,      # 标准预翻译比例
+        "glossary_min_terms": 10,            # 标准最少术语
+        "glossary_max_terms": 100,           # 标准最大术语
+        "enable_glossary_edit": False,       # 不编辑
+        "skip_pretranslate_if_glossary_exists": True,
+        "reprocess_pretranslated": True,     # 重新处理
+        "enable_progressive_glossary": True, # 启用渐进式
+        "glossary_stop_threshold": 0.8,      # 标准饱和度
+        
+        # --- 性能与速率 ---
+        "max_retries": 3,                    # 标准重试
+        "request_timeout": 60,               # 标准超时
+        "rate_limit_delay": 1.0,             # 标准间隔
+        "vision_rate_limit_delay": 2.0,      # 标准 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 200,               # 标准最小块
+        "max_chunk_size": 2000,              # 标准最大块
+        
+        # --- 异步/并发 ---
+        "enable_async": True,                # 启用异步
+        "async_threshold": 10,               # 标准阈值
+        "async_max_workers": 10,             # 中等并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": True,       # 启用缓存
+        "cache_ttl_hours": 1,                # 标准缓存时间
+        "enable_cache": True,                # 启用通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 1,            # 每段保存
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": True,              # 启用面包屑
+        "render_page_markers": True,         # 显示页码
+        "use_vision_mode": None,             # 自动检测
+        "retain_original": False,            # 不保留原文
+        
+        # --- 其他 ---
+        "json_repair_retries": 2,            # 标准 JSON 修复
+        "use_rich_progress": True,           # 使用 rich 进度
+        "log_level": "INFO",                 # 标准日志级别
     },
     
+    # ============================================================
     # 调试模式：详细日志，小批次，便于问题定位
+    # ============================================================
     "debug": {
         "description": "调试模式 - 详细日志，小批次，便于问题定位",
-        "batch_size": 2,
-        "enable_async": False,  # 关闭异步，便于调试
-        "async_threshold": 50,
-        "async_max_workers": 3,
-        "enable_gemini_caching": False,  # 关闭缓存，确保每次都是新请求
-        "enable_checkpoint": True,
-        "checkpoint_interval": 1,
-        "max_retries": 2
+        
+        # --- 核心处理参数 ---
+        "batch_size": 2,                     # 极小批次
+        "max_context_length": 2048,          # 短上下文
+        
+        # --- 生成参数 ---
+        "temperature": 0.0,                  # 零温度，确定性输出
+        "top_p": 1.0,                        # 不过滤
+        "top_k": None,                       # 不限制
+        "max_output_tokens": 8192,           # 较小输出
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.05,     # 最小预翻译
+        "glossary_min_terms": 5,             # 最少术语
+        "glossary_max_terms": 30,            # 较少术语
+        "enable_glossary_edit": True,        # 允许编辑（调试）
+        "skip_pretranslate_if_glossary_exists": False,
+        "reprocess_pretranslated": True,     # 重新处理
+        "enable_progressive_glossary": False, # 关闭渐进式
+        "glossary_stop_threshold": 0.5,      # 低饱和度
+        
+        # --- 性能与速率 ---
+        "max_retries": 2,                    # 少量重试
+        "request_timeout": 30,               # 短超时（快速失败）
+        "rate_limit_delay": 0.5,             # 短间隔
+        "vision_rate_limit_delay": 1.0,      # 短 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 100,               # 极小最小块
+        "max_chunk_size": 1000,              # 极小最大块
+        
+        # --- 异步/并发 ---
+        "enable_async": False,               # 关闭异步
+        "async_threshold": 100,              # 极高阈值
+        "async_max_workers": 3,              # 极低并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": False,      # 关闭缓存（每次新请求）
+        "cache_ttl_hours": 0,                # 无缓存
+        "enable_cache": False,               # 关闭通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 1,            # 每段保存
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": True,              # 启用面包屑
+        "render_page_markers": True,         # 显示页码
+        "use_vision_mode": None,             # 自动检测
+        "retain_original": True,             # 保留原文（调试对照）
+        
+        # --- 其他 ---
+        "json_repair_retries": 5,            # 更多 JSON 修复
+        "use_rich_progress": False,          # 关闭 rich（避免干扰日志）
+        "log_level": "DEBUG",                # 详细日志
     },
     
+    # ============================================================
     # 经济模式：最小化 token 消耗，降低成本
+    # ============================================================
     "economy": {
         "description": "经济模式 - 最小化 token 消耗，降低成本",
-        "batch_size": 8,  # 较大批次减少请求次数
-        "enable_async": True,
-        "async_threshold": 10,
-        "async_max_workers": 12,
-        "enable_gemini_caching": True,  # 启用缓存减少重复请求
-        "cache_ttl_hours": 3,  # 更长的缓存时间
-        "enable_checkpoint": True,
-        "checkpoint_interval": 3,
-        "max_retries": 2
-    }
+        
+        # --- 核心处理参数 ---
+        "batch_size": 8,                     # 大批次减少请求
+        "max_context_length": 2048,          # 短上下文省 token
+        
+        # --- 生成参数 ---
+        "temperature": 0.3,                  # 略高温度
+        "top_p": 0.9,                        # 略低 top-p
+        "top_k": 30,                         # 限制 top-k
+        "max_output_tokens": 8192,           # 较小输出
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.05,     # 最小预翻译
+        "glossary_min_terms": 5,             # 最少术语
+        "glossary_max_terms": 30,            # 较少术语
+        "enable_glossary_edit": False,       # 不编辑
+        "skip_pretranslate_if_glossary_exists": True,
+        "reprocess_pretranslated": False,    # 不重新处理
+        "enable_progressive_glossary": False, # 关闭渐进式
+        "glossary_stop_threshold": 0.5,      # 低饱和度
+        
+        # --- 性能与速率 ---
+        "max_retries": 2,                    # 少量重试
+        "request_timeout": 60,               # 标准超时
+        "rate_limit_delay": 1.5,             # 略长间隔
+        "vision_rate_limit_delay": 2.5,      # 略长 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 300,               # 较大最小块
+        "max_chunk_size": 3000,              # 大最大块
+        
+        # --- 异步/并发 ---
+        "enable_async": True,                # 启用异步
+        "async_threshold": 10,               # 标准阈值
+        "async_max_workers": 12,             # 较高并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": True,       # 启用缓存减少重复
+        "cache_ttl_hours": 6,                # 长缓存时间
+        "enable_cache": True,                # 启用通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 3,            # 较大保存间隔
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": False,             # 关闭面包屑
+        "render_page_markers": False,        # 关闭页码（省空间）
+        "use_vision_mode": False,            # 关闭 Vision（省 token）
+        "retain_original": False,            # 不保留原文
+        
+        # --- 其他 ---
+        "json_repair_retries": 1,            # 少量 JSON 修复
+        "use_rich_progress": True,           # 使用 rich 进度
+        "log_level": "WARNING",              # 减少日志输出
+    },
+    
+    # ============================================================
+    # 双语模式：保留原文对照
+    # ============================================================
+    "bilingual": {
+        "description": "双语模式 - 保留原文，适合学习和对照阅读",
+        
+        # --- 核心处理参数 ---
+        "batch_size": 5,                     # 中等批次
+        "max_context_length": 4096,          # 标准上下文
+        
+        # --- 生成参数 ---
+        "temperature": 0.15,                 # 较低温度
+        "top_p": 0.95,                       # 标准 top-p
+        "top_k": None,                       # 不限制
+        "max_output_tokens": 16384,          # 标准输出
+        
+        # --- 术语表配置 ---
+        "glossary_preamble_ratio": 0.12,     # 略大预翻译
+        "glossary_min_terms": 15,            # 更多术语
+        "glossary_max_terms": 120,           # 更多术语
+        "enable_glossary_edit": True,        # 允许编辑
+        "skip_pretranslate_if_glossary_exists": True,
+        "reprocess_pretranslated": True,     # 重新处理
+        "enable_progressive_glossary": True, # 启用渐进式
+        "glossary_stop_threshold": 0.85,     # 较高饱和度
+        
+        # --- 性能与速率 ---
+        "max_retries": 3,                    # 标准重试
+        "request_timeout": 60,               # 标准超时
+        "rate_limit_delay": 1.0,             # 标准间隔
+        "vision_rate_limit_delay": 2.0,      # 标准 Vision 间隔
+        
+        # --- 分块 ---
+        "min_chunk_size": 200,               # 标准最小块
+        "max_chunk_size": 1800,              # 略小最大块
+        
+        # --- 异步/并发 ---
+        "enable_async": True,                # 启用异步
+        "async_threshold": 10,               # 标准阈值
+        "async_max_workers": 8,              # 中等并发
+        
+        # --- 缓存 ---
+        "enable_gemini_caching": True,       # 启用缓存
+        "cache_ttl_hours": 2,                # 中等缓存时间
+        "enable_cache": True,                # 启用通用缓存
+        
+        # --- 断点续传 ---
+        "enable_checkpoint": True,           # 启用断点
+        "checkpoint_interval": 1,            # 每段保存
+        
+        # --- 功能开关 ---
+        "use_breadcrumb": True,              # 启用面包屑
+        "render_page_markers": True,         # 显示页码
+        "use_vision_mode": None,             # 自动检测
+        "retain_original": True,             # ★ 保留原文（核心）
+        
+        # --- 其他 ---
+        "json_repair_retries": 2,            # 标准 JSON 修复
+        "use_rich_progress": True,           # 使用 rich 进度
+        "log_level": "INFO",                 # 标准日志级别
+    },
 }
 
 

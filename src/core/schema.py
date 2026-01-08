@@ -282,6 +282,10 @@ class Settings(BaseSettings):
                 raise FileNotFoundError(f"Document not found: {self.files.document_path}")
             if self.files.document_path.suffix.lower() not in ['.pdf', '.epub']:
                 raise ValueError(f"Unsupported file format: {self.files.document_path.suffix}. Only PDF and EPUB are supported.")
+            
+            # 对于 EPUB 文件，禁用页码标记（页码对EPUB无意义）
+            if self.files.document_path.suffix.lower() == '.epub':
+                self.processing.render_page_markers = False
         return self
 
     @classmethod

@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from bs4 import BeautifulSoup
-
+from urllib.parse import unquote
 
 def clean_html_text(text: str) -> str:
     """清理 HTML 文本"""
@@ -137,10 +137,13 @@ def parse_epub_toc(toc, level: int = 1) -> List[Dict[str, Any]]:
 
         # 检查是否有有效的 href
         if hasattr(entry, 'href') and entry.href:
+            # URL-decode href so keys are comparable to spine item names
+            
+            href_key = unquote(entry.href.split('#')[0])
             items.append({
                 'level': level,
                 'title': entry.title or "Untitled",
-                'key': entry.href.split('#')[0]  # key 是文件名
+                'key': href_key  # key 是文件名
             })
 
         if children:

@@ -9,6 +9,7 @@ from typing import Dict, Optional, List
 from ..core.schema import Settings, SegmentList, ContentSegment
 from ..core.exceptions import TranslationError
 from ..utils.logger import logger
+from datetime import datetime
 from ..utils.file import create_output_directory, get_file_hash
 from ..translator import GeminiTranslator, OpenAICompatibleTranslator, CheckpointManager
 from ..parser.loader import load_document_structure as parse_document
@@ -88,6 +89,10 @@ class TranslationWorkflow:
         self.cache_manager = None
         self.checkpoint: Optional[CheckpointManager] = None
         self.glossary: Optional[Dict[str, str]] = None
+        
+        # 文档标题（原文和译文）
+        self.doc_title: str = Path(self.file_path.name).stem  # 文件名（去后缀）
+        self.translated_doc_title: str = ""  # 翻译后的文档标题
         
         # 注册信号处理器（用于紧急保存）
         _current_workflow = self
@@ -343,17 +348,24 @@ class TranslationWorkflow:
     
     def _post_translate_titles(self) -> None:
         """
-        翻译完成后处理章节标题
+        翻译完成后处理章节标题和文档标题
         
         放在最后执行的优势：
         1. 可以利用已生成的术语表保持一致性
         2. 不需要复杂的 mode 配置（标题翻译本身是简单任务）
         3. 不影响主翻译流程
         """
-        logger.info("📝 开始翻译章节标题...")
+        logger.info("📝 开始翻译章节标题和文档标题...")
         
-        # 提取待翻译标题
+        # 提取待翻译标题（包括文档标题）
         raw_titles = []
+        
+        # 1. 首先添加文档标题（如果需要翻译）
+        if self.doc_title and not is_likely_chinese(self.doc_title):
+            raw_titles.append(self.doc_title)
+            logger.info(f"   - 文档标题: {self.doc_title}")
+        
+        # 2. 添加所有章节标题
         for seg in self.all_segments:
             if (seg.is_new_chapter and seg.chapter_title and
                 seg.chapter_title.strip() and not is_likely_chinese(seg.chapter_title)):
@@ -365,13 +377,22 @@ class TranslationWorkflow:
         
         # 去重
         unique_titles = list(dict.fromkeys(raw_titles))
-        logger.info(f"   - 发现 {len(unique_titles)} 个唯一标题")
+        logger.info(f"   - 发现 {len(unique_titles)} 个唯一标题（含文档标题）")
 
         # 批量翻译（不需要 mode 配置，translate_titles 方法本身已足够简单）
         translation_map = self.translator.translate_titles(unique_titles)
         
         # 回填结果
         update_count = 0
+        
+        # 1. 翻译文档标题
+        if self.doc_title in translation_map:
+            translated = translation_map[self.doc_title]
+            if translated:
+                self.translated_doc_title = translated
+                logger.info(f"   - 文档标题翻译: {self.doc_title} -> {self.translated_doc_title}")
+        
+        # 2. 翻译章节标题
         for seg in self.all_segments:
             if seg.is_new_chapter and seg.chapter_title in translation_map:
                 translated = translation_map[seg.chapter_title]
@@ -379,7 +400,7 @@ class TranslationWorkflow:
                     seg.chapter_title = translated
                     update_count += 1
         
-        logger.info(f"   - 更新了 {update_count} 个标题")
+        logger.info(f"   - 更新了 {update_count} 个章节标题")
         
         # 保存更新后的结构
         self._save_structure_map(self.all_segments)
@@ -535,6 +556,12 @@ class TranslationWorkflow:
                 # 预翻译阶段也标记完成状态（如果启用了 checkpoint）
                 if self.checkpoint and t and not t.startswith("[Failed") and not t.endswith("Failed]"):
                     self.checkpoint.mark_segment_completed(seg.segment_id)
+                # 记录被阻断的段落以便人工复核
+                if isinstance(t, str) and t.startswith("[Failed: Blocked"):
+                    try:
+                        self._record_blocked_segments([seg], reason=t)
+                    except Exception:
+                        logger.debug("Failed to record blocked segment")
             
             # 2. 从当前 batch 提取术语表
             if hasattr(self.translator, 'extract_glossary'):
@@ -631,6 +658,11 @@ class TranslationWorkflow:
                 # 传统预翻译阶段也标记完成状态（如果启用了 checkpoint）
                 if self.checkpoint and t and not t.startswith("[Failed") and not t.endswith("Failed]"):
                     self.checkpoint.mark_segment_completed(seg.segment_id)
+                if isinstance(t, str) and t.startswith("[Failed: Blocked"):
+                    try:
+                        self._record_blocked_segments([seg], reason=t)
+                    except Exception:
+                        logger.debug("Failed to record blocked segment")
             self._save_structure_map(self.all_segments)
             if self.checkpoint:
                 self.checkpoint.save_checkpoint()
@@ -765,6 +797,11 @@ class TranslationWorkflow:
                                 else:
                                     seg.translated_text = trans if trans else "[Failed: Empty response]"
                                     self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
+                                    if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
+                                        try:
+                                            self._record_blocked_segments([seg], reason=trans)
+                                        except Exception:
+                                            logger.debug("Failed to record blocked segment")
                                 
                                 progress.update(task, advance=1)
                             
@@ -805,6 +842,11 @@ class TranslationWorkflow:
                         else:
                             seg.translated_text = trans if trans else "[Failed: Empty response]"
                             self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
+                            if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
+                                try:
+                                    self._record_blocked_segments([seg], reason=trans)
+                                except Exception:
+                                    logger.debug("Failed to record blocked segment")
 
                     # 定期保存检查点
                     if (i // batch_size + 1) % self.settings.processing.checkpoint_interval == 0:
@@ -896,6 +938,11 @@ class TranslationWorkflow:
                             else:
                                 seg.translated_text = trans if trans else "[Failed: Empty response]"
                                 self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
+                                if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
+                                    try:
+                                        self._record_blocked_segments([seg], reason=trans)
+                                    except Exception:
+                                        logger.debug("Failed to record blocked segment")
                             stats["processed"] += 1
                         
                         stats["completed_batches"] += 1
@@ -1032,7 +1079,12 @@ class TranslationWorkflow:
         # 1. 生成 Markdown
         md_renderer = MarkdownRenderer(self.settings)
         md_output_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.md"
-        md_renderer.render_to_file(self.all_segments, md_output_path, f"原文: {self.file_path.name}")
+        md_renderer.render_to_file(
+            self.all_segments, 
+            md_output_path, 
+            title=self.doc_title,
+            translated_title=self.translated_doc_title or self.doc_title
+        )
         logger.info(f"✅ Markdown 已保存到: {md_output_path}")
         
         # 2. 生成 PDF（可选，如果依赖可用）
@@ -1041,7 +1093,12 @@ class TranslationWorkflow:
             pdf_renderer = PDFRenderer(self.settings)
             
             pdf_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.pdf"
-            pdf_renderer.render_to_file(self.all_segments, pdf_path, f"原文: {self.file_path.name}")
+            pdf_renderer.render_to_file(
+                self.all_segments, 
+                pdf_path,
+                title=self.doc_title,
+                translated_title=self.translated_doc_title or self.doc_title
+            )
             logger.info(f"✅ PDF 已保存到: {pdf_path}")
         except ImportError:
             logger.info("ℹ️  跳过 PDF 生成（未安装相关依赖）")
@@ -1078,6 +1135,42 @@ class TranslationWorkflow:
             import traceback
             logger.error(traceback.format_exc())
             raise
+
+    def _record_blocked_segments(self, segments: List[ContentSegment], reason: str | None = None) -> None:
+        """
+        Persist blocked segments to output/<project>/blocked_segments.json for manual review.
+        Each entry contains segment_id, page_index, chapter_title, original_text (truncated), and reason.
+        """
+        try:
+            out_path = self.project_dir / "blocked_segments.json"
+            existing = []
+            if out_path.exists():
+                try:
+                    with open(out_path, 'r', encoding='utf-8') as f:
+                        existing = json.load(f)
+                except Exception:
+                    existing = []
+
+            ts = datetime.utcnow().isoformat() + 'Z'
+            to_add = []
+            for seg in segments:
+                entry = {
+                    'segment_id': seg.segment_id,
+                    'page_index': seg.page_index,
+                    'chapter_title': seg.chapter_title,
+                    'original_text': (seg.original_text[:1000] + '...') if len(seg.original_text) > 1000 else seg.original_text,
+                    'reason': reason or seg.translated_text,
+                    'timestamp': ts
+                }
+                to_add.append(entry)
+
+            merged = existing + to_add
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"💾 已记录 {len(to_add)} 个被阻断段落到: {out_path}")
+        except Exception as e:
+            logger.error(f"⚠️ 保存被阻断段落失败: {e}")
     
     def _get_context_from_memory(self, current_segment: ContentSegment, max_length: int) -> str:
         """

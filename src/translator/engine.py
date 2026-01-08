@@ -259,6 +259,23 @@ class GeminiTranslator(BaseTranslator):
             )
             if cache_name:
                 logger.debug(f"🔄 {purpose} 使用 Gemini Cache: {cache_name[:30]}...")
+            # Validate response structure to avoid downstream NoneType subscripts
+            if not response:
+                logger.error(f"❌ {purpose} returned empty response object")
+                raise APIError(f"Empty response from model for {purpose}", context={"response": repr(response)})
+
+            candidates = getattr(response, 'candidates', None)
+            # Check for prompt_feedback block reasons (e.g., prohibited content)
+            prompt_fb = getattr(response, 'prompt_feedback', None)
+            if prompt_fb is not None and getattr(prompt_fb, 'block_reason', None):
+                block_reason = getattr(prompt_fb, 'block_reason')
+                logger.error(f"❌ {purpose} blocked by model: {block_reason}")
+                raise APIError(f"Model blocked content for {purpose}", context={"block_reason": str(block_reason), "response": repr(response)})
+
+            if not candidates or candidates[0] is None:
+                logger.error(f"❌ {purpose} response has no candidates: {repr(response)}")
+                raise APIError(f"Model response missing candidates for {purpose}", context={"response": repr(response)})
+
             return response
         except Exception as e:
             # 缓存失败时降级
@@ -268,11 +285,30 @@ class GeminiTranslator(BaseTranslator):
                     "cached_content": None,
                     "system_instruction": self._base_generation_config.system_instruction,
                 })
-                return self._client.models.generate_content(
+                response2 = self._client.models.generate_content(
                     model=self.settings.api.gemini_model,
                     contents=contents,
                     config=config_no_cache,
                 )
+
+                # 同样验证备用响应
+                if not response2:
+                    logger.error(f"❌ {purpose} fallback returned empty response object")
+                    raise APIError(f"Empty fallback response from model for {purpose}", context={"response": repr(response2)})
+
+                # Check fallback prompt feedback as well
+                prompt_fb2 = getattr(response2, 'prompt_feedback', None)
+                if prompt_fb2 is not None and getattr(prompt_fb2, 'block_reason', None):
+                    block_reason2 = getattr(prompt_fb2, 'block_reason')
+                    logger.error(f"❌ {purpose} fallback blocked by model: {block_reason2}")
+                    raise APIError(f"Fallback model blocked content for {purpose}", context={"block_reason": str(block_reason2), "response": repr(response2)})
+
+                candidates2 = getattr(response2, 'candidates', None)
+                if not candidates2 or candidates2[0] is None:
+                    logger.error(f"❌ {purpose} fallback response has no candidates: {repr(response2)}")
+                    raise APIError(f"Fallback model response missing candidates for {purpose}", context={"response": repr(response2)})
+
+                return response2
             raise
     
 
@@ -396,12 +432,19 @@ class GeminiTranslator(BaseTranslator):
                 max_output_tokens=self.settings.processing.max_output_tokens,
             )
 
-            response = self._client.models.generate_content(
-                model=self.settings.api.gemini_model,
+            # Use centralized _generate_content to benefit from response validation and cache fallback
+            response = self._generate_content(
                 contents=original_prompt,
-                config=extraction_config,
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": self.settings.processing.temperature,
+                    "max_output_tokens": self.settings.processing.max_output_tokens,
+                },
+                use_cache=True,
+                purpose="Glossary Extraction"
             )
-            # raw_text = response.text.strip()
+
+            # Extract text safely (validated by _generate_content)
             raw_text = response.candidates[0].content.parts[0].text
             # 处理自我修正
             parsed_glossary = self._handle_json_response_with_correction(
@@ -491,8 +534,12 @@ class GeminiTranslator(BaseTranslator):
             use_cache=True,
             purpose="Text Translation"
         )
-        
-        raw_text = response.candidates[0].content.parts[0].text
+        try:
+            raw_text = response.candidates[0].content.parts[0].text
+        except Exception:
+            # If the response was blocked/malformed, return failed markers for this batch
+            logger.error("❌ Text Translation response invalid or blocked; marking batch as failed")
+            return ["[Failed: Blocked or invalid response]" for _ in segments]
         
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]

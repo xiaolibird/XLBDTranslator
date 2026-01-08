@@ -4,14 +4,14 @@
    1. 页面配置与右上角页眉
    ========================================= */
    @page {
-    size: A4;
+    size: B5;
     margin: 3.2cm 2.8cm;
     background-color: #fdfaf2; /* 护眼米色 */
 
     /* --- 页眉 (迁移至右上角) --- */
     @top-right {
         content: string(current-chapter);
-        font-family: "Palatino Linotype", "Book Antiqua", "Hiragino Sans GB", "Microsoft YaHei", serif;
+        font-family: "Hiragino Sans GB", "Heiti SC", "STHeiti", Arial, sans-serif;
         font-size: 8.5pt;
         color: #b0b0b0;
         vertical-align: bottom;
@@ -25,7 +25,7 @@
     /* --- 页脚 (居中保持平衡) --- */
     @bottom-center {
         content: counter(page);
-        font-family: "Arial", sans-serif;
+        font-family: Arial, sans-serif;
         font-size: 8.5pt;
         color: #d1cfc8;
     }
@@ -33,14 +33,22 @@
 
 html, body {
     background-color: #fdfaf2;
-    font-family: "Palatino Linotype", "Book Antiqua", Georgia, "Hiragino Sans GB", "Microsoft YaHei", serif;
+    /* 使用系统字体栈，确保中文渲染稳定 */
+    font-family: -apple-system, "Hiragino Sans GB", "PingFang SC", "Heiti SC", "STHeiti", "Microsoft YaHei", "WenQuanYi Micro Hei", Arial, sans-serif;
 }
 
 body {
-    font-size: 10.5pt;
+    font-size: 11pt;
     line-height: 2.1;
     color: #3c3c3c;
     text-align: justify;
+    /* 确保 unicode 双向文本正确处理 */
+    unicode-bidi: embed;
+    direction: ltr;
+}
+
+p {
+    margin: 0.5em 0;
 }
 
 /* =========================================
@@ -54,63 +62,185 @@ hr {
     border-radius: 2px;
     background-color: #c2c0b8; /* 与锚点色一致 */
     opacity: 0.8;
-    margin: 5em auto !important; 
+    margin: 1.05em auto !important; 
 }
 
 /* =========================================
-   3. 引用块 (核心正文区)
+   3. 正文内容区 (不再使用 blockquote，避免渲染异常)
    ========================================= */
-blockquote {
+.content-block {
     position: relative;
     display: block;
-    margin: 3.5em 0.5em !important; 
-    padding: 1.2em 2.5em 1.2em 3em !important; 
+    margin: 1em 0.3em 1em 1em !important;  /* 减少左右边距，增大内容宽度 */
+    padding: 1em 1.2em 1em 1.2em !important;  /* 调整内边距 */
     border: none;
-    border-left: 1px solid #e8e6df;
+    border-left: 1.5px solid #c2c0b8;  /* 左侧细线 */
     background: transparent;
     font-family: inherit !important;
     font-style: normal !important;
 }
 
-/* 顶部锚点小矩形 */
-blockquote::before {
-    content: "";
+/* =========================================
+   伪元素已禁用 - 解决 WeasyPrint 中文乱码问题
+   页码标记改用 HTML <span class="page-marker"> 实现
+   ========================================= */
+
+/* 禁用 ::before 伪元素（会导致中文渲染异常）*/
+.content-block::before {
+    display: none !important;
+    content: none !important;
+}
+
+/* 页码标记改用 HTML 元素 */
+.page-marker {
+    display: inline-block;
+    float: right;
+    margin-right: -2em;
+    margin-top: -0.5em;
+    padding: 0.2em 0.4em;
+    background-color: #e8e6df;
+    border-radius: 3px;
+    font-size: 7pt;
+    color: #888;
+    font-family: Arial, Helvetica, sans-serif;
+    font-weight: 500;
+}
+
+/* 禁用 ::after 伪元素（会导致中文渲染异常）*/
+/* 左上角灰色矩形装饰改用 border-top 实现 */
+.content-block::after {
+    display: none !important;
+    content: none !important;
+}
+
+/* 左上角灰色矩形装饰 - 使用纯 CSS 实现（不用伪元素）*/
+.content-block {
+    /* 使用独立的装饰元素进行定位（不再使用 background gradient）
+       - 通过渲染器注入 <span class="decor"> 并使用绝对定位放置到左侧外边距
+       - 保留原有左侧细线和内边距设置
+    */
+    /* 保持 position: relative 以便装饰元素绝对定位 */
+    position: relative;
+}
+
+/* 装饰：放置在 content-block 的左侧外边距区域（负偏移） */
+.content-block .decor {
     position: absolute;
-    left: -1px;
-    top: 0;
-    width: 6px;
-    height: 18px;
+    left: -4px; /* 将短条移动到外侧，可根据需要调整为 -1em/-0.8em */
+    top: 0em;   /* 与段落顶部对齐的微调 */
+    width: 4px;
+    height: 6em;
     background-color: #c2c0b8;
-    border-radius: 0 1px 1px 0;
-    z-index: 5;
+    pointer-events: none;
 }
 
-blockquote p {
+.content-block p {
     font-family: inherit !important; 
-    font-size: 10.5pt !important;
+    font-size: 11.5pt !important;
     margin-top: 0 !important;
-    margin-bottom: 1.35em !important; 
+    margin-bottom: 0.8em !important; 
     line-height: 2.1 !important;
+    /* 确保中文段落渲染稳定 */
+    unicode-bidi: embed;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
 }
 
-blockquote p:last-child {
+.content-block p:last-child {
     margin-bottom: 0 !important;
 }
 
 /* =========================================
-   4. 标题样式
+   4. 标题层级样式与间距
+   基于 toc_level: h2 最远 (0.20em), h5 最近 (0.05em)
    ========================================= */
 h2 { 
     font-size: 1.5em; 
-    margin-top: 5em !important; 
-    margin-bottom: 2em !important;
+    margin-top: 0.20em !important;  /* toc_level 2 - 最远 */
+    margin-bottom: 1.5em !important;
     padding-bottom: 0.8em;
     border-bottom: 0.25pt solid #e8e6df; 
     string-set: current-chapter content();
 }
 
-/* 确保小标题不进入章节信息 */
+h3 {
+    font-size: 1.3em;
+    margin-top: 0.15em !important;  /* toc_level 3 */
+    margin-bottom: 1em !important;
+    string-set: current-chapter content();
+}
+
+h4 {
+    font-size: 1.15em;
+    margin-top: 0.10em !important;  /* toc_level 4 */
+    margin-bottom: 0.8em !important;
+    string-set: current-chapter content();
+}
+
+h5 {
+    font-size: 1.05em;
+    margin-top: 0.05em !important;  /* toc_level 5 - 最近 */
+    margin-bottom: 0.6em !important;
+    string-set: current-chapter content();
+}
+
+/* 完全隐藏 h6 标题（页码标记），不让它占据任何空间 */
+/* PDF 只渲染页码，不进入章节信息 */
 h6 {
+    display: none !important;
+    position: absolute !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 0 !important;
+    overflow: hidden !important;
     bookmark-level: none;
-    -weasy-bookmark-level: none; /* 针对 WeasyPrint 的兼容性 */
+    -weasy-bookmark-level: none;
+}
+
+/* =========================================
+   5. 层级 Emoji 标记样式
+   📚 (h2), 📖 (h3), 📄 (h4), 📝 (h5), 📌
+   ========================================= */
+h2, h3, h4, h5 {
+    /* Emoji 与文字间距 */
+    word-spacing: 0.1em;
+}
+
+/* =========================================
+   6. 面包屑/全页码模式样式 (🔖)
+   ========================================= */
+/* 面包屑标题统一使用 🔖 emoji */
+
+/* =========================================
+   7. 双语对照样式
+   ========================================= */
+.original {
+    font-family:  "Book Antiqua", serif;
+    /* font-style: italic; */
+    color: #666666;
+    font-size: 10pt;
+    line-height: 1.8;
+    margin-bottom: 0.10em;
+}
+
+.translated {
+    font-family: -apple-system, "Hiragino Sans GB", "PingFang SC", "Heiti SC", "STHeiti", "Microsoft YaHei", "WenQuanYi Micro Hei", Arial, sans-serif;
+    font-weight: normal;
+    color: #333333;
+    font-size: 11pt;
+    line-height: 2.1;
+    margin-top: 0.07em;
+    margin-bottom: 0.15em;
+}
+
+.bilingual-separator {
+    border: none;
+    border-top: 1px solid #efdada;
+    margin: 0 0;
+    height: 1px;
+    width: 38%;
+    margin-left: 0;
 }
