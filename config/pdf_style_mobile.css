@@ -1,0 +1,234 @@
+/* pdf_style_mobile.css - iPhone 13 mini 专用版本 */
+/* iPhone 13 mini 屏幕：5.4英寸，分辨率 2340x1080，物理尺寸约 131.5mm x 64.2mm */
+
+/* =========================================
+   1. 页面配置 - 适配手机屏幕尺寸
+   ========================================= */
+@page {
+    /* 使用接近 iPhone 13 mini 的尺寸（考虑边距后的可视区域）*/
+    size: 120mm 180mm;  /* 宽度比手机略窄以留出边距，高度适中便于滚动阅读 */
+    margin: 1.2cm 0.8cm;  /* 缩小边距以最大化内容区域 */
+    background-color: #fdfaf2; /* 护眼米色 */
+
+    /* --- 页眉 (简化为右上角) --- */
+    @top-right {
+        content: string(current-chapter);
+        font-family: "STHeiti", Arial, sans-serif;
+        font-size: 7pt;  /* 手机版减小 */
+        color: #b0b0b0;
+        vertical-align: bottom;
+        padding-bottom: 8px;
+        border-bottom: 0.25pt solid #e8e6df;
+        min-width: 100px;
+    }
+
+    /* --- 页脚 (居中) --- */
+    @bottom-center {
+        content: counter(page);
+        font-family: "Lucida Grande", Arial, sans-serif;
+        font-size: 7pt;
+        color: #d1cfc8;
+    }
+}
+
+@font-face {
+  font-family: 'Hiragino-Pure-CN';
+  src: local("Hiragino Sans GB W3"); 
+  unicode-range: U+3000-303F, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'LXGW-WenKai-Pure';
+  src: local("LXGWWenKai-Regular"); 
+  unicode-range: U+3000-303F, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+
+html, body {
+    background-color: #fdfaf2;
+    font-family: LXGW-WenKai-Pure, "YsabeauInfant-Medium", -apple-system, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+    font-size: 13pt;  /* 手机版增大字号：11pt -> 13pt */
+    line-height: 2.2;  /* 稍微增加行距 */
+    color: #2c2c2c;  /* 稍微加深文字颜色以提高对比度 */
+    text-align: left;
+    unicode-bidi: embed;
+    direction: ltr;
+}
+
+p {
+    margin: 0.6em 0;
+}
+
+/* =========================================
+   2. 分割元素：扁平灰色矩形
+   ========================================= */
+hr {
+    display: block;
+    border: none;
+    height: 3px;  /* 手机版稍微减小 */
+    width: 25%;  /* 缩短宽度 */
+    border-radius: 2px;
+    background-color: #c2c0b8;
+    opacity: 0.8;
+    margin: 0.9em auto !important; 
+}
+
+/* =========================================
+   3. 正文内容区
+   ========================================= */
+.content-block {
+    position: relative;
+    display: block;
+    margin: 0.8em 0.2em 0.8em 0.6em !important;  /* 减少边距 */
+    padding: 0.8em 0.8em 0.8em 0.6em !important;  /* 减少内边距 */
+    border: none;
+    border-left: 1.0px solid #c2c0b8;
+    background: transparent;
+    font-family: inherit !important;
+    font-style: normal !important;
+}
+
+/* 禁用 ::before 伪元素 */
+.content-block::before {
+    display: none !important;
+    content: none !important;
+}
+
+/* 页码标记 - 手机版调整 */
+.page-marker {
+    display: inline-block;
+    float: right;
+    margin-right: -1.5em;  /* 调整位置 */
+    margin-top: -0.3em;
+    padding: 0.15em 0.3em;  /* 缩小 */
+    background-color: #e8e6df;
+    border-radius: 2px;
+    font-size: 6pt;  /* 手机版减小 */
+    color: #888;
+    font-family: Helvetica, sans-serif;
+    font-weight: 500;
+}
+
+/* 禁用 ::after 伪元素 */
+.content-block::after {
+    display: none !important;
+    content: none !important;
+}
+
+/* 装饰条 - 保持比例 */
+.content-block .decor {
+    position: absolute;
+    left: -3px;
+    top: 0em;
+    width: 3px;  /* 稍微缩小 */
+    height: 5em;  /* 稍微缩短 */
+    background-color: #c2c0b8;
+    pointer-events: none;
+}
+
+.content-block p {
+    font-family: inherit !important; 
+    font-size: 12.5pt !important;  /* 手机版增大：10.5pt -> 12.5pt */
+    margin-top: 0 !important;
+    margin-bottom: 0.7em !important; 
+    line-height: 2.2 !important;
+    unicode-bidi: embed;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.content-block p:last-child {
+    margin-bottom: 0 !important;
+}
+
+/* =========================================
+   4. 标题层级样式 - 手机版增大字号
+   ========================================= */
+h2 { 
+    font-size: 1.7em;  /* 增大：1.5em -> 1.7em */
+    margin-top: 0.25em !important;
+    margin-bottom: 1.3em !important;
+    padding-bottom: 0.6em;
+    border-bottom: 0.25pt solid #e8e6df; 
+    string-set: current-chapter content();
+}
+
+h3 {
+    font-size: 1.5em;  /* 增大：1.3em -> 1.5em */
+    margin-top: 0.20em !important;
+    margin-bottom: 0.9em !important;
+    string-set: current-chapter content();
+}
+
+h4 {
+    font-size: 1.3em;  /* 增大：1.15em -> 1.3em */
+    margin-top: 0.15em !important;
+    margin-bottom: 0.7em !important;
+    string-set: current-chapter content();
+}
+
+h5 {
+    font-size: 1.15em;  /* 增大：1.05em -> 1.15em */
+    margin-top: 0.10em !important;
+    margin-bottom: 0.5em !important;
+    string-set: current-chapter content();
+}
+
+/* 完全隐藏 h6 标题（页码标记）*/
+h6 {
+    display: none !important;
+    position: absolute !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 0 !important;
+    overflow: hidden !important;
+    bookmark-level: none;
+    -weasy-bookmark-level: none;
+}
+
+/* =========================================
+   5. 层级 Emoji 标记样式
+   ========================================= */
+h2, h3, h4, h5 {
+    word-spacing: 0.1em;
+}
+
+/* =========================================
+   6. 双语对照样式 - 手机版调整
+   ========================================= */
+
+/* 3. 正文内容区 (不再使用 blockquote，避免渲染异常) */
+
+/* EPUB 专用的 span 样式 */
+.original {
+    font-family: "YsabeauInfant-Regular", -apple-system, Arial, serif;
+    color: #969696;  /* 浅淡灰色，比正文 #3c3c3c 更浅 */
+    font-size: 11.5pt;  /* 增大：10pt -> 11.5pt */
+    line-height: 1.9;
+    margin-bottom: 0.12em;
+}
+
+.translated {
+    font-family: LXGW-WenKai-Pure, "YsabeauInfant-Medium",-apple-system, Arial, sans-serif;
+    font-weight: normal;
+    color: #2c2c2c;
+    font-size: 12.5pt;  /* 增大：10.5pt -> 12.5pt */
+    line-height: 2.2;
+    margin-top: 0.08em;
+    margin-bottom: 0.15em;
+}
+
+.bilingual-separator {
+    border: none;
+    border-top: 1px solid #efdada;
+    margin: 0 0;
+    height: 1px;
+    width: 30%;  /* 缩短宽度 */
+    margin-left: 0;
+}

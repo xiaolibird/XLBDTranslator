@@ -244,31 +244,27 @@ class PDFParser(BaseDocPipeline):
         # =========================================================
         is_fallback_mode = False
         if not standardized_items:
-            logger.info("No TOC found. Falling back to Page-as-Chapter mode.")
+            logger.info("No TOC found. Using page-index-only mode (no chapter structure).")
             is_fallback_mode = True
-            # 每一页都作为一个 Level 1 的章节
-            for i in range(len(self.doc)):
-                standardized_items.append({
-                    'level': 1,
-                    'title': f"Page {i+1}",
-                    'key': i
-                })
+            # 纯页码回退模式：不创建任何章节结构
+            # chapter_map 保持为空，所有页面都是 is_new_chapter=False
+            # 页码将通过 page_index 渲染为 h6 标记（不进入章节信息）
 
         # =========================================================
         # 2. 统一调用核心策略
         # =========================================================
 
-        # 获取面包屑开关 (默认开启)
-        use_bc = self.settings.processing.use_breadcrumb
-
-        # 特殊处理：如果是纯页码回退模式，强制关闭面包屑
-        # 否则会变成 "Page 1 > Page 2 > Page 3..." 这种荒谬的层级
+        # 纯页码回退模式：不创建 chapter_map，所有页面保持 is_new_chapter=False
         if is_fallback_mode:
-            use_bc = False
+            self.chapter_map = {}
+            logger.info("📄 纯页码模式：所有页面将通过 page_index 渲染为 h6 标记（不作为章节）")
+        else:
+            # 获取面包屑开关 (默认开启)
+            use_bc = self.settings.processing.use_breadcrumb
 
-        # 调用 process_unified_toc 生成最终 Map
-        # 结果格式: { 0: {"title": "...", "level": 1}, 5: {"title": "...", "level": 2} }
-        self.chapter_map = process_unified_toc(standardized_items, use_breadcrumb=use_bc)
+            # 调用 process_unified_toc 生成最终 Map
+            # 结果格式: { 0: {"title": "...", "level": 1}, 5: {"title": "...", "level": 2} }
+            self.chapter_map = process_unified_toc(standardized_items, use_breadcrumb=use_bc)
 
         # (可选) 保存 raw items 供 process_flow 进行预翻译使用
         self.raw_toc_entries = standardized_items
