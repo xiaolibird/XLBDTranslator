@@ -38,13 +38,20 @@ class PDFRenderer:
         # CSS 文件路径（动态定位）
         self.css_path = self._locate_css_file()
 
-    def _locate_css_file(self) -> Optional[Path]:
-        """定位 CSS 文件"""
+    def _locate_css_file(self, version: str = "desktop") -> Optional[Path]:
+        """定位 CSS 文件
+        
+        Args:
+            version: 'desktop' 或 'mobile'，指定要使用的CSS版本
+        """
+        # 根据版本选择 CSS 文件名
+        css_filename = "pdf_style.css" if version == "desktop" else "pdf_style_mobile.css"
+        
         # 优先级：config/ -> assets/ -> 项目根目录
         candidates = [
-            Path(__file__).parent.parent.parent / "config" / "pdf_style.css",  # 配置目录（推荐）
-            Path(__file__).parent.parent.parent / "assets" / "pdf_style.css",
-            Path(__file__).parent.parent.parent / "pdf_style.css",  # 项目根目录（向后兼容）
+            Path(__file__).parent.parent.parent / "config" / css_filename,  # 配置目录（推荐）
+            Path(__file__).parent.parent.parent / "assets" / css_filename,
+            Path(__file__).parent.parent.parent / css_filename,  # 项目根目录（向后兼容）
         ]
 
         for css_path in candidates:
@@ -54,13 +61,44 @@ class PDFRenderer:
         return None
 
     def render_to_file(self, segments: SegmentList, output_path: Path, 
-                       title: str = "Document", translated_title: str = "") -> None:
+                       title: str = "Document", translated_title: str = "", 
+                       version: str = "desktop", generate_both: bool = False) -> None:
         """
         将片段列表渲染到 PDF 文件 (优化版，支持高阶 CSS 渲染)
         
         直接从 SegmentList 获取 page_index, toc_level 等信息，
         不再完全依赖 markdown 生成的内容
+        
+        Args:
+            segments: 片段列表
+            output_path: 输出路径（桌面版）
+            title: 文档标题
+            translated_title: 翻译后的标题
+            version: 'desktop' 或 'mobile'
+            generate_both: 是否同时生成桌面版和移动版
         """
+        if generate_both:
+            # 生成桌面版
+            self._render_single_version(segments, output_path, title, translated_title, "desktop")
+            # 生成移动版
+            mobile_path = output_path.parent / f"{output_path.stem}_mobile{output_path.suffix}"
+            self._render_single_version(segments, mobile_path, title, translated_title, "mobile")
+        else:
+            # 只生成指定版本
+            self._render_single_version(segments, output_path, title, translated_title, version)
+    
+    def _render_single_version(self, segments: SegmentList, output_path: Path, 
+                              title: str, translated_title: str, version: str) -> None:
+        """
+        渲染单个版本的 PDF
+        
+        Args:
+            version: 'desktop' 或 'mobile'
+        """
+        # 动态加载指定版本的 CSS
+        css_path = self._locate_css_file(version)
+        version_label = "桌面版" if version == "desktop" else "移动版(iPhone)"
+        
         try:
             # 1. 延迟导入依赖，确保环境缺失时不会直接崩溃
             import markdown2
@@ -93,15 +131,18 @@ class PDFRenderer:
                 ]
             )
 
+            # 5.4. 转换 blockquote 为 .original 样式
+            html_body = self._convert_blockquote_to_original(html_body)
+
             # 5.5. 后处理：为 blockquote 添加页码属性和层级间距
             html_body = self._enhance_blockquotes_with_metadata(html_body, segment_metadata)
             
             # 5.6. 处理层级标题间距（基于 toc_level）
             html_body = self._add_heading_spacing(html_body, segment_metadata)
 
-            # 6. 生成 HTML 模板
+            # 6. 生成 HTML 模板（使用动态CSS路径）
             display_title = translated_title if translated_title else title
-            html_content = self._create_html_template(html_body, display_title, title)
+            html_content = self._create_html_template(html_body, display_title, title, css_path)
 
             # 调试：保存 HTML 到临时文件
             # debug_html_path = output_path.parent / f"{output_path.stem}_debug.html"
@@ -119,10 +160,10 @@ class PDFRenderer:
             # 这是导致"拖动后才显示文字"问题的可能原因之一
             stylesheets = []
 
-            if self.css_path and self.css_path.exists():
-                self.logger.info(f"🎨 CSS 样式已内嵌到 HTML: {self.css_path.name}")
+            if css_path and css_path.exists():
+                self.logger.info(f"🎨 [{version_label}] CSS 样式已内嵌到 HTML: {css_path.name}")
             else:
-                self.logger.warning("⚠️ 未找到 CSS 样式表，PDF 将使用默认样式")
+                self.logger.warning(f"⚠️ [{version_label}] 未找到 CSS 样式表，PDF 将使用默认样式")
 
             # 8. 渲染 PDF
             # base_url 设为输出目录或项目根目录，确保图片相对路径解析正确
@@ -136,7 +177,7 @@ class PDFRenderer:
                 optimize_size=('images',)  # 仅优化图片，保留完整字体
             )
 
-            self.logger.info(f"✅ PDF 已成功生成: {output_path}")
+            self.logger.info(f"✅ [{version_label}] PDF 已成功生成: {output_path}")
 
         except ImportError as e:
             lib_name = str(e).split("'")[-2] if "'" in str(e) else "weasyprint/markdown2"
@@ -215,6 +256,40 @@ class PDFRenderer:
         clean_markdown = re.sub(r'\n{3,}', '\n\n', clean_markdown)
         
         return clean_markdown, page_map
+
+    def _convert_blockquote_to_original(self, html: str) -> str:
+        """将 markdown2 生成的 <blockquote> 转换为带分隔符的双语结构
+        
+        转换规则：
+        - 译文 (普通 <p>)
+        - <hr class="bilingual-separator"> (分隔符)
+        - <span class="original">原文</span> (原文)
+        
+        示例：
+        <p>译文</p>
+        <blockquote><p>原文</p></blockquote>
+        ↓
+        <p>译文</p>
+        <hr class="bilingual-separator"/>
+        <span class="original">原文</span>
+        """
+        def replace_blockquote(match):
+            blockquote_content = match.group(1)
+            # 提取所有 <p> 标签的内容
+            paragraphs = re.findall(r'<p>(.*?)</p>', blockquote_content, re.DOTALL)
+            if paragraphs:
+                # 用 <br/> 连接多个段落
+                original_text = '<br/>'.join(p.strip() for p in paragraphs if p.strip())
+            else:
+                # 如果没有 <p> 标签，直接使用内容
+                original_text = blockquote_content.strip()
+            
+            # 返回：分隔符 + 原文
+            return f'<hr class="bilingual-separator"/><span class="original">{original_text}</span>'
+        
+        # 匹配 <blockquote>...</blockquote>
+        html = re.sub(r'<blockquote>(.*?)</blockquote>', replace_blockquote, html, flags=re.DOTALL)
+        return html
 
     def _enhance_blockquotes_with_metadata(self, html_body: str, segment_metadata: Dict[int, Dict]) -> str:
         """
@@ -307,12 +382,14 @@ class PDFRenderer:
         
         return html_body
 
-    def _create_html_template(self, html_body: str, translated_title: str, original_title: str) -> str:
+    def _create_html_template(self, html_body: str, translated_title: str, original_title: str, 
+                             css_path: Optional[Path] = None) -> str:
         """强化版模板：嵌入完整CSS样式，确保与test_final.html一致"""
         # 读取CSS文件内容
         css_content = ""
-        if self.css_path and self.css_path.exists():
-            css_content = self.css_path.read_text(encoding='utf-8')
+        css_file = css_path if css_path else self.css_path
+        if css_file and css_file.exists():
+            css_content = css_file.read_text(encoding='utf-8')
         
         display_title = f"{translated_title} - {original_title}" if translated_title != original_title else translated_title
         

@@ -3,15 +3,15 @@
 /* =========================================
    1. 页面配置与右上角页眉
    ========================================= */
-   @page {
+@page {
     size: B5;
-    margin: 3.2cm 2.8cm;
+    margin: 3.0cm 2.6cm;
     background-color: #fdfaf2; /* 护眼米色 */
 
     /* --- 页眉 (迁移至右上角) --- */
     @top-right {
         content: string(current-chapter);
-        font-family: "Hiragino Sans GB", "Heiti SC", "STHeiti", Arial, sans-serif;
+        font-family: "STHeiti", Arial, sans-serif;
         font-size: 8.5pt;
         color: #b0b0b0;
         vertical-align: bottom;
@@ -25,23 +25,40 @@
     /* --- 页脚 (居中保持平衡) --- */
     @bottom-center {
         content: counter(page);
-        font-family: Arial, sans-serif;
+        font-family: "Lucida Grande", Arial, sans-serif;
         font-size: 8.5pt;
         color: #d1cfc8;
     }
 }
 
+@font-face {
+  font-family: 'Hiragino-Pure-CN'; /* 自定义名字 */
+  src: local("Hiragino Sans GB W3"); 
+  /* 关键点：限定 Unicode 范围 */
+  /* 包含：CJK统一表意文字, CJK标点符号, 全角字符 */
+  unicode-range: U+3000-303F, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'LXGW-WenKai-Pure'; /* 自定义名字 */
+  src: local("LXGWWenKai-Regular"); 
+  /* 关键点：限定 Unicode 范围 */
+  /* 包含：CJK统一表意文字, CJK标点符号, 全角字符 */
+  unicode-range: U+3000-303F, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+
 html, body {
     background-color: #fdfaf2;
     /* 使用系统字体栈，确保中文渲染稳定 */
-    font-family: -apple-system, "Hiragino Sans GB", "PingFang SC", "Heiti SC", "STHeiti", "Microsoft YaHei", "WenQuanYi Micro Hei", Arial, sans-serif;
+    font-family: LXGW-WenKai-Pure, "YsabeauInfant-Medium", -apple-system, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
 }
 
 body {
     font-size: 11pt;
     line-height: 2.1;
     color: #3c3c3c;
-    text-align: justify;
+    text-align: left;
     /* 确保 unicode 双向文本正确处理 */
     unicode-bidi: embed;
     direction: ltr;
@@ -72,9 +89,9 @@ hr {
     position: relative;
     display: block;
     margin: 1em 0.3em 1em 1em !important;  /* 减少左右边距，增大内容宽度 */
-    padding: 1em 1.2em 1em 1.2em !important;  /* 调整内边距 */
+    padding: 1em 1.2em 1em 1em !important;  /* 调整内边距 */
     border: none;
-    border-left: 1.5px solid #c2c0b8;  /* 左侧细线 */
+    border-left: 1.0px solid #c2c0b8;  /* 左侧细线 */
     background: transparent;
     font-family: inherit !important;
     font-style: normal !important;
@@ -102,7 +119,7 @@ hr {
     border-radius: 3px;
     font-size: 7pt;
     color: #888;
-    font-family: Arial, Helvetica, sans-serif;
+    font-family: Helvetica, sans-serif;
     font-weight: 500;
 }
 
@@ -136,7 +153,7 @@ hr {
 
 .content-block p {
     font-family: inherit !important; 
-    font-size: 11.5pt !important;
+    font-size: 10.5pt !important;
     margin-top: 0 !important;
     margin-bottom: 0.8em !important; 
     line-height: 2.1 !important;
@@ -217,20 +234,24 @@ h2, h3, h4, h5 {
 /* =========================================
    7. 双语对照样式
    ========================================= */
+
+/* 3. 正文内容区 (不再使用 blockquote，避免渲染异常) */
+
+/* EPUB 专用的 span 样式 */
 .original {
-    font-family:  "Book Antiqua", serif;
+    font-family: LXGW-WenKai-Pure, "YsabeauInfant-Regular", -apple-system, Arial, serif;
     /* font-style: italic; */
-    color: #666666;
+    color: #969696;  /* 浅淡灰色，比正文 #3c3c3c 更浅 */
     font-size: 10pt;
     line-height: 1.8;
     margin-bottom: 0.10em;
 }
 
 .translated {
-    font-family: -apple-system, "Hiragino Sans GB", "PingFang SC", "Heiti SC", "STHeiti", "Microsoft YaHei", "WenQuanYi Micro Hei", Arial, sans-serif;
+    font-family: LXGW-WenKai-Pure, "YsabeauInfant-Medium",-apple-system, Arial, sans-serif;
     font-weight: normal;
-    color: #333333;
-    font-size: 11pt;
+    color: #3c3c3c;
+    font-size: 10.5pt;
     line-height: 2.1;
     margin-top: 0.07em;
     margin-bottom: 0.15em;

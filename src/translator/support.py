@@ -7,7 +7,7 @@ import time
 import hashlib
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Set, TYPE_CHECKING
+from typing import Dict, Any, Optional, List, Set, Tuple, TYPE_CHECKING
 from datetime import datetime, timedelta
 
 from ..core.schema import ContentSegment, SegmentList
@@ -66,7 +66,10 @@ class CheckpointManager:
                 'completed_segments': [],
                 'failed_segments': [],
                 'total_segments': 0,
-                'last_update': None
+                'last_update': None,
+                'original_filename': None,
+                'translated_filename': None,
+                'title_translations': {}  # {原标题: 译标题}
             }
     
     def save_checkpoint(self):
@@ -114,6 +117,29 @@ class CheckpointManager:
     def get_completed_segment_ids(self) -> Set[int]:
         """获取所有已完成的段落ID"""
         return set(self.checkpoint_data.get('completed_segments', []))
+    
+    def get_title_translation(self, original_title: str) -> Optional[str]:
+        """获取已缓存的标题翻译"""
+        return self.checkpoint_data.get('title_translations', {}).get(original_title)
+    
+    def save_title_translation(self, original_title: str, translated_title: str):
+        """保存标题翻译到缓存"""
+        if 'title_translations' not in self.checkpoint_data:
+            self.checkpoint_data['title_translations'] = {}
+        self.checkpoint_data['title_translations'][original_title] = translated_title
+    
+    def get_filenames(self) -> Tuple[Optional[str], Optional[str]]:
+        """获取原文件名和翻译后文件名"""
+        return (
+            self.checkpoint_data.get('original_filename'),
+            self.checkpoint_data.get('translated_filename')
+        )
+    
+    def save_filenames(self, original_filename: str, translated_filename: str = None):
+        """保存文件名信息"""
+        self.checkpoint_data['original_filename'] = original_filename
+        if translated_filename:
+            self.checkpoint_data['translated_filename'] = translated_filename
     
     def get_pending_segments(self, all_segments: SegmentList) -> SegmentList:
         """获取所有未完成的段落
@@ -389,32 +415,82 @@ class CachePersistenceManager:
             return False
     
     def get_system_cache(self, content_hash: str) -> Optional[str]:
-        """获取System Instruction缓存名称（通过内容hash查找）"""
-        # 遍历所有system instruction缓存，根据content_hash查找
+        """获取System Instruction缓存名称（通过内容hash查找）
+        
+        增强版：提前10分钟视为过期，主动删除过期记录
+        """
         current_time = time.time()
+        buffer_seconds = 600  # 10分钟缓冲时间
+        
+        expired_keys = []
         for cache_key, cache_info in self.cache_metadata["system_instruction"].items():
-            if (cache_info.get('content_hash') == content_hash and 
-                current_time < cache_info.get('expiry_time', 0)):
+            expiry_time = cache_info.get('expiry_time', 0)
+            
+            if cache_info.get('content_hash') == content_hash:
+                # 检查是否已过期或即将过期（提前10分钟）
+                if current_time > (expiry_time - buffer_seconds):
+                    logger.warning(f"⏰ 缓存 {cache_key} 已过期或即将过期，删除本地记录")
+                    expired_keys.append(cache_key)
+                    continue
+                
                 logger.debug(f"♻️  复用System缓存: {cache_key}")
                 return cache_info.get('cache_name')
+        
+        # 清理过期记录
+        if expired_keys:
+            for key in expired_keys:
+                del self.cache_metadata["system_instruction"][key]
+            self._save_metadata()
+            logger.info(f"🗑️  已删除 {len(expired_keys)} 个过期缓存记录")
+        
         return None
     
     def get_glossary_cache(self, glossary_hash: str) -> Optional[str]:
-        """获取术语表缓存名称"""
+        """获取术语表缓存名称（增强版：提前过期检查）"""
         cache_key = f"glossary_{glossary_hash[:8]}"
         cache_info = self.cache_metadata["glossary"].get(cache_key)
-        if cache_info and time.time() < cache_info.get('expiry_time', 0):
+        
+        if cache_info:
+            current_time = time.time()
+            expiry_time = cache_info.get('expiry_time', 0)
+            buffer_seconds = 600  # 10分钟缓冲
+            
+            # 检查是否已过期或即将过期
+            if current_time > (expiry_time - buffer_seconds):
+                logger.warning(f"⏰ 术语表缓存 {cache_key} 已过期，删除记录")
+                del self.cache_metadata["glossary"][cache_key]
+                self._save_metadata()
+                return None
+            
             logger.debug(f"♻️  复用术语表缓存: {cache_key}")
             return cache_info.get('cache_name')
         return None
     
     def get_context_cache(self, context_hash: str) -> Optional[str]:
-        """获取上下文缓存名称"""
+        """获取上下文缓存名称（增强版：提前过期检查）"""
+        current_time = time.time()
+        buffer_seconds = 600  # 10分钟缓冲
+        expired_keys = []
+        
         for cache_key, cache_info in self.cache_metadata["context"].items():
-            if (cache_info.get('context_hash') == context_hash and
-                time.time() < cache_info.get('expiry_time', 0)):
+            expiry_time = cache_info.get('expiry_time', 0)
+            
+            if cache_info.get('context_hash') == context_hash:
+                # 检查是否已过期或即将过期
+                if current_time > (expiry_time - buffer_seconds):
+                    logger.warning(f"⏰ 上下文缓存 {cache_key} 已过期，删除记录")
+                    expired_keys.append(cache_key)
+                    continue
+                
                 logger.debug(f"♻️  复用上下文缓存: {cache_key}")
                 return cache_info.get('cache_name')
+        
+        # 清理过期记录
+        if expired_keys:
+            for key in expired_keys:
+                del self.cache_metadata["context"][key]
+            self._save_metadata()
+        
         return None
     
     def get_uploaded_file_uri(self, file_hash: str) -> Optional[str]:
@@ -472,6 +548,30 @@ class CachePersistenceManager:
             stats["active_caches"] += active
             stats["expired_caches"] += expired
         return stats
+    
+    def remove_invalid_cache(self, cache_name: str) -> bool:
+        """删除失效的缓存记录（用于降级处理）
+        
+        Args:
+            cache_name: 要删除的缓存名称
+            
+        Returns:
+            是否找到并删除了记录
+        """
+        removed = False
+        for cache_type in ["system_instruction", "glossary", "context"]:
+            keys_to_remove = [
+                k for k, v in self.cache_metadata[cache_type].items()
+                if v.get('cache_name') == cache_name
+            ]
+            for key in keys_to_remove:
+                del self.cache_metadata[cache_type][key]
+                removed = True
+                logger.info(f"🗑️  已删除失效缓存记录: {key} ({cache_type})")
+        
+        if removed:
+            self._save_metadata()
+        return removed
     
     def clear_all_caches(self):
         """清除所有缓存记录"""

@@ -16,7 +16,7 @@ from src.utils.ui import get_mode_selection, get_user_strategy, load_modes_confi
 from src.workflow import TranslationWorkflow
 from src.workflow.builder import SettingsBuilder
 
-
+ 
 def main():
     """主函数，协调整个翻译流程"""
     try:

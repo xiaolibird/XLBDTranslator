@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 
 from ..core.schema import ContentSegment, Settings
 from ..core.exceptions import DocumentParseError
-from .helpers import process_unified_toc, extract_text_from_html
+from .helpers import process_unified_toc, extract_text_from_html, parse_epub_toc
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,30 +60,7 @@ class BaseDocPipeline(ABC):
 
         # 遍历内容单元 (UnitKey 通常是 页码 或 文件名)
         for unit_key, content, content_type in self._iter_content_units():
-
-            # A. 视觉/图片模式处理
-            if content_type == "image":
-                self._flush_buffer()
-
-                seg = ContentSegment(
-                    segment_id=self.global_id_counter,
-                    original_text="",
-                    content_type="image",
-                    image_path=content,
-                    page_index=unit_key if isinstance(unit_key, int) else 0,
-                    chapter_title=self.current_chapter_title,
-                    toc_level=self.current_toc_level,
-                    is_new_chapter=False
-                )
-                self.all_segments.append(seg)
-                self.global_id_counter += 1
-                continue
-
-            # B. 纯文本模式处理
-            if not content or not content.strip():
-                continue
-
-            # 1. 检查章节变更
+            # 1. 检查章节变更 (必须在过滤逻辑和空文本检查之前)
             chap_info = self.chapter_map.get(unit_key)
 
             if chap_info:
@@ -97,15 +74,38 @@ class BaseDocPipeline(ABC):
                     logger.debug(f"New chapter detected: {new_title}")
                     self.pending_new_chapter = True
 
-            # 2. 更新当前页码 (针对 PDF)
+            # 2. 视觉/图片模式处理
+            if content_type == "image":
+                self._flush_buffer()
+
+                seg = ContentSegment(
+                    segment_id=self.global_id_counter,
+                    original_text="",
+                    content_type="image",
+                    image_path=content,
+                    page_index=unit_key if isinstance(unit_key, int) else 0,
+                    chapter_title=self.current_chapter_title,
+                    toc_level=self.current_toc_level,
+                    is_new_chapter=self.pending_new_chapter
+                )
+                self.all_segments.append(seg)
+                self.global_id_counter += 1
+                self.pending_new_chapter = False
+                continue
+
+            # 3. 纯文本模式处理
+            if not content or not content.strip():
+                continue
+
+            # 4. 更新当前页码 (针对 PDF)
             if isinstance(unit_key, int):
                 self.current_page_index = unit_key
 
-            # 3. 累积文本
+            # 5. 累积文本
             self.rolling_buffer.append(content)
             self.current_buffer_length += len(content)
 
-            # 4. 检查是否需要分块
+            # 6. 检查是否需要分块
             if self.current_buffer_length >= self.settings.processing.max_chunk_size:
                 self._flush_buffer()
 
@@ -407,8 +407,9 @@ class EPUBParser(BaseDocPipeline):
         # 1. 读取 EPUB
         self.book = epub.read_epub(str(self.file_path))
 
-        # 2. 尝试从 NCX/NAV 获取目录 (Flatten)
-        standardized_items = self._flatten_epub_to_standard(self.book.toc)
+        # 2. 尝试从 NCX/NAV 获取目录
+        # 使用 helpers 中的统一解析器 (带 unquote 和路径规整)
+        standardized_items = parse_epub_toc(self.book.toc)
 
         # 3. 兜底逻辑：如果目录为空，使用 Spine
         if not standardized_items:
@@ -431,7 +432,7 @@ class EPUBParser(BaseDocPipeline):
                         'key': file_name
                     })
 
-        # 4. 统一处理
+        # 4. 统一处理核心策略
         use_bc = self.settings.processing.use_breadcrumb
         self.chapter_map = process_unified_toc(standardized_items, use_breadcrumb=use_bc)
         logger.info(f"✅ Metadata loaded. Chapter Map size: {len(self.chapter_map)}")
@@ -457,37 +458,29 @@ class EPUBParser(BaseDocPipeline):
                 # 2. 找到 Body
                 root = soup.find('body') or soup
 
-                # 3. 遍历所有块级元素
-                for tag in root.find_all(BLOCK_TAGS):
-                    # 4. 提取纯文本
-                    text = tag.get_text(separator=' ', strip=True)
+                # 3. 遍历所有块级元素 (+ 处理图片占位以触发 TOC 更新)
+                tags = root.find_all(BLOCK_TAGS + ['img'])
+                
+                # 即使没有标签，也 yield 一个空行以维护 unit_key 的流转
+                if not tags:
+                    yield unit_key, "", "text"
+                    continue
 
-                    # 5. 过滤掉空标签
-                    if not text:
-                        continue
-
-                    # 6. Yield 单个段落
-                    yield unit_key, text, "text"
+                for tag in tags:
+                    if tag.name == 'img':
+                        # 尝试提取 alt 作为可翻译文本，否则 yield 空信号
+                        alt_text = tag.get('alt', '').strip()
+                        if alt_text:
+                            yield unit_key, f"[插图: {alt_text}]", "text"
+                        else:
+                            yield unit_key, "", "text"
+                    else:
+                        # 4. 提取纯文本
+                        text = tag.get_text(separator=' ', strip=True)
+                        # 注意：BaseDocPipeline 会过滤掉纯空格/空字符串
+                        # 但 yield 它们可以确保 chap_info 被 check 到
+                        yield unit_key, text, "text"
 
             except Exception as e:
                 logger.error(f"Failed to parse HTML structure for {item_id}: {e}")
                 continue
-
-    def _flatten_epub_to_standard(self, toc, level=1):
-        """解析 EPUB 目录结构"""
-        items = []
-        for node in toc:
-            # 兼容 ebooklib 的两种节点格式
-            entry = node[0] if isinstance(node, (list, tuple)) else node
-            children = node[1] if isinstance(node, (list, tuple)) and len(node) > 1 else []
-
-            if hasattr(entry, 'href') and entry.href:
-                items.append({
-                    'level': level,
-                    'title': entry.title or "Untitled",
-                    'key': entry.href.split('#')[0]
-                })
-
-            if children:
-                items.extend(self._flatten_epub_to_standard(children, level + 1))
-        return items

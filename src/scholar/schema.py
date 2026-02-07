@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Scholar Digest 数据结构定义
 使用 Pydantic 2.0 进行数据验证和序列化
@@ -67,11 +68,23 @@ class PaperMetadata(BaseModel):
     
     # 来源追踪
     source_email_id: Optional[str] = Field(None, description="来源邮件ID")
+    email_received_at: Optional[datetime] = Field(None, description="邮件接收时间")
     extracted_at: datetime = Field(default_factory=datetime.now, description="提取时间")
     
     # 被引用/相关信息
     citation_count: Optional[int] = Field(None, description="引用次数")
     related_papers: List[str] = Field(default_factory=list, description="相关论文ID列表")
+    
+    # 来源类型 (用于优先级排序)
+    source_type: str = Field(default="unknown", description="来源类型: journal/conference/arxiv/medrxiv/unknown")
+    paper_type: str = Field(default="research", description="论文类型: review/research/meta-analysis")
+    
+    # LLM处理结果（也可存储在Segment中）
+    translated_title: str = Field(default="", description="翻译后的标题")
+    keywords: List[str] = Field(default_factory=list, description="提取的关键词（LLM处理后更新）")
+    relevance_score: float = Field(default=0.0, description="与研究领域相关度 (0-1)")
+    priority_score: float = Field(default=0.0, description="综合优先级得分")
+    priority_reason: str = Field(default="", description="优先级评分理由")
 
     model_config = {'use_enum_values': True}
 
@@ -128,6 +141,13 @@ class PaperSegment(BaseModel):
     status: DigestStatus = Field(default=DigestStatus.PENDING, description="处理状态")
     error_message: Optional[str] = Field(None, description="错误信息")
     processed_at: Optional[datetime] = Field(None, description="处理完成时间")
+    
+    # LLM 处理结果
+    translated_title: str = Field(default="", description="翻译后的标题")
+    keywords: List[str] = Field(default_factory=list, description="提取的关键词")
+    relevance_score: float = Field(default=0.0, description="与研究领域相关度 (0-1)")
+    priority_score: float = Field(default=0.0, description="综合优先级得分")
+    priority_reason: str = Field(default="", description="优先级评分理由")
 
     model_config = {'use_enum_values': True}
 
@@ -290,33 +310,35 @@ class DigestOutput(BaseModel):
     def to_markdown(self) -> str:
         """转换为Markdown格式"""
         lines = [
-            f"# {self.title}",
+            "# {}".format(self.title),
             "",
-            f"**生成时间**: {self.created_at.strftime('%Y-%m-%d %H:%M')}",
-            f"**论文数量**: {self.total_papers}",
-            f"**邮件数量**: {self.total_emails}",
+            "**生成时间**: {}".format(self.created_at.strftime('%Y-%m-%d %H:%M')),
+            "**论文数量**: {}".format(self.total_papers),
+            "**邮件数量**: {}".format(self.total_emails),
             "",
             "## 领域分布",
             "",
         ]
         
         for field, count in sorted(self.fields_distribution.items(), key=lambda x: -x[1]):
-            lines.append(f"- {field}: {count}")
+            lines.append("- {}: {}".format(field, count))
         
         lines.extend(["", "---", "", "## 论文列表", ""])
         
         for i, seg in enumerate(self.segments, 1):
             meta = seg.metadata
             lines.extend([
-                f"### {i}. {meta.title}",
+                "### {}. {}".format(i, meta.title),
                 "",
-                f"**作者**: {', '.join(meta.authors[:5])}{'...' if len(meta.authors) > 5 else ''}",
-                f"**领域**: {meta.field}",
+                "**优先级**: `{:.2f}` ({})".format(seg.priority_score, meta.priority_reason or ""),
+                "**引用数**: {}".format(meta.citation_count if meta.citation_count is not None else "Unknown"),
+                "**作者**: {}{}".format(', '.join(meta.authors[:5]), '...' if len(meta.authors) > 5 else ''),
+                "**领域**: {}".format(meta.field),
             ])
             if meta.doi:
-                lines.append(f"**DOI**: [{meta.doi}](https://doi.org/{meta.doi})")
+                lines.append("**DOI**: [{0}](https://doi.org/{0})".format(meta.doi))
             if meta.journal:
-                lines.append(f"**期刊**: {meta.journal}")
+                lines.append("**期刊**: {}".format(meta.journal))
             
             lines.extend(["", "#### 摘要", ""])
             if seg.translated_abstract:
@@ -387,6 +409,16 @@ class ProcessingSettings(BaseModel):
         description="Google Scholar 发件人地址"
     )
     
+    # 关键词过滤
+    whitelist: List[str] = Field(
+        default_factory=lambda: ["EHR", "Clinical", "Prediction", "GNN", "LLM", "Graph", "Medicine"],
+        description="白名单关键词：包含任一则保留"
+    )
+    blacklist: List[str] = Field(
+        default_factory=lambda: ["Biology", "Gene", "Drug", "Vision"],
+        description="黑名单关键词：包含任一则剔除"
+    )
+    
     # 输出
     output_dir: Path = Field(
         Path("output/scholar_digest"),
@@ -396,7 +428,7 @@ class ProcessingSettings(BaseModel):
     
     # 功能开关
     auto_mark_read: bool = Field(True, description="自动标记邮件为已读")
-    translate_abstracts: bool = Field(True, description="是否翻译摘要")
+    translate_abstracts: bool = Field(False, description="是否翻译摘要")
     generate_summary: bool = Field(True, description="是否生成AI总结")
 
     @field_validator('output_dir', mode='before')

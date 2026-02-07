@@ -350,6 +350,8 @@ class TranslationWorkflow:
         """
         翻译完成后处理章节标题和文档标题
         
+        优化：使用 checkpoint 缓存标题翻译结果，避免重复翻译
+        
         放在最后执行的优势：
         1. 可以利用已生成的术语表保持一致性
         2. 不需要复杂的 mode 配置（标题翻译本身是简单任务）
@@ -379,8 +381,32 @@ class TranslationWorkflow:
         unique_titles = list(dict.fromkeys(raw_titles))
         logger.info(f"   - 发现 {len(unique_titles)} 个唯一标题（含文档标题）")
 
-        # 批量翻译（不需要 mode 配置，translate_titles 方法本身已足够简单）
-        translation_map = self.translator.translate_titles(unique_titles)
+        # 检查缓存，分离已缓存和需要翻译的标题
+        translation_map = {}
+        titles_to_translate = []
+        
+        for title in unique_titles:
+            cached = self.checkpoint.get_title_translation(title)
+            if cached:
+                translation_map[title] = cached
+                logger.debug(f"   ✓ 使用缓存: {title} -> {cached}")
+            else:
+                titles_to_translate.append(title)
+        
+        # 批量翻译未缓存的标题
+        if titles_to_translate:
+            logger.info(f"   - 需要翻译 {len(titles_to_translate)} 个新标题")
+            new_translations = self.translator.translate_titles(titles_to_translate)
+            
+            # 合并到translation_map并保存到缓存
+            for original, translated in new_translations.items():
+                translation_map[original] = translated
+                self.checkpoint.save_title_translation(original, translated)
+            
+            # 保存checkpoint（包含新的标题翻译）
+            self.checkpoint.save_checkpoint()
+        else:
+            logger.info("   - 所有标题均已缓存")
         
         # 回填结果
         update_count = 0
@@ -401,6 +427,12 @@ class TranslationWorkflow:
                     update_count += 1
         
         logger.info(f"   - 更新了 {update_count} 个章节标题")
+        
+        # 保存文件名信息到checkpoint
+        original_filename = Path(self.file_path).name
+        translated_filename = f"{self.translated_doc_title or self.doc_title}{Path(self.file_path).suffix}"
+        self.checkpoint.save_filenames(original_filename, translated_filename)
+        self.checkpoint.save_checkpoint()
         
         # 保存更新后的结构
         self._save_structure_map(self.all_segments)
@@ -1063,7 +1095,9 @@ class TranslationWorkflow:
             logger.debug(f"清理资源时出现警告: {e}")
     
     def _render_output(self) -> None:
-        """Render: 生成最终文档（Markdown + PDF）"""
+        """Render: 生成最终文档（Markdown + PDF + EPUB）"""
+        from ..renderer.markdown import MarkdownRenderer
+        
         logger.info("📄 开始渲染最终文档...")
         
         # 决定最终输出目录
@@ -1076,6 +1110,11 @@ class TranslationWorkflow:
             final_dir = self.settings.files.document_path.parent
             logger.info(f"   - 输出到源文件目录: {final_dir}")
         
+        # 检测源文件类型
+        source_suffix = self.file_path.suffix.lower()
+        is_epub_source = source_suffix == '.epub'
+        is_pdf_source = source_suffix == '.pdf'
+        
         # 1. 生成 Markdown
         md_renderer = MarkdownRenderer(self.settings)
         md_output_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.md"
@@ -1087,19 +1126,104 @@ class TranslationWorkflow:
         )
         logger.info(f"✅ Markdown 已保存到: {md_output_path}")
         
-        # 2. 生成 PDF（可选，如果依赖可用）
+        # 2. 生成 EPUB（默认）- 根据源文件类型选择不同策略
+        epub_output_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.epub"
+        
+        if is_epub_source:
+            # EPUB 源文件：使用 EPUBRenderer 回填原文件
+            try:
+                from ..renderer.epub import EPUBRenderer
+                epub_renderer = EPUBRenderer(self.settings)
+                epub_renderer.render_to_file(
+                    segments=self.all_segments,
+                    original_epub_path=self.file_path,
+                    output_path=epub_output_path,
+                    title=self.doc_title,
+                    translated_title=self.translated_doc_title or self.doc_title
+                )
+                logger.info(f"✅ EPUB 已保存到: {epub_output_path}")
+            except ImportError:
+                logger.info("ℹ️  跳过 EPUB 生成（未安装 ebooklib）")
+            except Exception as e:
+                logger.warning(f"⚠️  EPUB 生成失败: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        else:
+            # PDF/TXT 等其他源文件：使用 HTML → EPUB 转换
+            try:
+                from ..renderer.epub import render_html_to_epub
+                import markdown2
+                
+                # 生成 HTML 内容（复用 PDF 的渲染逻辑）
+                markdown_content = md_renderer.render_to_string(
+                    self.all_segments,
+                    title=self.doc_title,
+                    translated_title=self.translated_doc_title or self.doc_title
+                )
+                
+                # Markdown → HTML
+                html_body = markdown2.markdown(
+                    markdown_content,
+                    extras=[
+                        "fenced-code-blocks", 
+                        "tables", 
+                        "footnotes", 
+                        "break-on-newline", 
+                        "header-ids",
+                        "code-friendly",
+                        "cuddled-lists"
+                    ]
+                )
+                
+                # 构建完整 HTML
+                display_title = self.translated_doc_title if self.translated_doc_title else self.doc_title
+                html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>{display_title}</title>
+</head>
+<body>
+    {html_body}
+</body>
+</html>"""
+                
+                # HTML → EPUB
+                render_html_to_epub(
+                    html_content=html_content,
+                    output_path=epub_output_path,
+                    settings=self.settings,
+                    title=self.doc_title,
+                    translated_title=self.translated_doc_title or self.doc_title
+                )
+                logger.info(f"✅ EPUB 已保存到: {epub_output_path}")
+                
+            except ImportError as e:
+                logger.info(f"ℹ️  跳过 EPUB 生成（缺少依赖: {e}）")
+            except Exception as e:
+                logger.warning(f"⚠️  EPUB 生成失败: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        
+        # 3. 生成 PDF（可选，如果依赖可用）- 同时生成桌面版和移动版
         try:
             from ..renderer.pdf import PDFRenderer
             pdf_renderer = PDFRenderer(self.settings)
             
             pdf_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.pdf"
+            # 使用 generate_both=True 同时生成桌面版和移动版
+            # 桌面版：{filename}_Translated.pdf
+            # 移动版：{filename}_Translated_mobile.pdf
             pdf_renderer.render_to_file(
                 self.all_segments, 
                 pdf_path,
                 title=self.doc_title,
-                translated_title=self.translated_doc_title or self.doc_title
+                translated_title=self.translated_doc_title or self.doc_title,
+                generate_both=True  # 生成两个版本
             )
             logger.info(f"✅ PDF 已保存到: {pdf_path}")
+            mobile_pdf_path = final_dir / f"{Path(self.file_path.name).stem}_Translated_mobile.pdf"
+            logger.info(f"✅ 移动版 PDF 已保存到: {mobile_pdf_path}")
         except ImportError:
             logger.info("ℹ️  跳过 PDF 生成（未安装相关依赖）")
         except Exception as e:

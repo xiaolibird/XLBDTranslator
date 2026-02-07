@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Scholar Digest 工作流
 完整的论文摘要处理流程
@@ -65,9 +66,9 @@ class ScholarWorkflow:
         # 生成本次运行的唯一 ID
         self.run_id = self._generate_run_id()
         
-        logger.info(f"📊 ScholarWorkflow 初始化完成")
-        logger.info(f"   运行ID: {self.run_id}")
-        logger.info(f"   输出目录: {self.output_dir}")
+        logger.info("ScholarWorkflow 初始化完成")
+        logger.info("   运行ID: {}".format(self.run_id))
+        logger.info("   输出目录: {}".format(self.output_dir))
     
     def _generate_run_id(self) -> str:
         """生成运行ID"""
@@ -136,24 +137,24 @@ class ScholarWorkflow:
             
             logger.info("=" * 60)
             logger.info("🎉 Scholar Digest 工作流完成!")
-            logger.info(f"   处理邮件: {len(self.processed_emails)}")
-            logger.info(f"   提取论文: {len(self.segments)}")
+            logger.info("   处理邮件: {}".format(len(self.processed_emails)))
+            logger.info("   提取论文: {}".format(len(self.segments)))
             logger.info("=" * 60)
             
             return output
             
         except Exception as e:
-            logger.error(f"❌ 工作流执行失败: {e}")
+            logger.error("工作流执行失败: {}".format(e))
             raise
     
     def _step_fetch_emails(self):
         """Step 1: 获取 Google Scholar 邮件"""
-        logger.info("\n📥 Step 1: 获取 Google Scholar 邮件")
+        logger.info("\nStep 1: 获取 Google Scholar 邮件")
         logger.info("-" * 40)
         
         # 获取用户信息（同时触发认证）
         profile = self.gmail_client.get_user_profile()
-        logger.info(f"✅ 已登录: {profile.get('emailAddress')}")
+        logger.info("已登录: {}".format(profile.get('emailAddress')))
         
         # 获取邮件
         self.emails = self.gmail_client.fetch_scholar_emails(
@@ -162,42 +163,103 @@ class ScholarWorkflow:
             unread_only=False
         )
         
-        logger.info(f"📧 获取到 {len(self.emails)} 封 Scholar 邮件")
+        logger.info("获取到 {} 封 Scholar 邮件".format(len(self.emails)))
     
     def _step_parse_emails(self):
         """Step 2: 解析邮件提取论文"""
-        logger.info("\n📄 Step 2: 解析邮件提取论文")
+        logger.info("\nStep 2: 解析邮件提取论文")
         logger.info("-" * 40)
         
         self.parser.reset_counter()
         seen_paper_ids = set()
+        seen_dois = set()
+        
+        whitelist = self.settings.processing.whitelist
+        blacklist = self.settings.processing.blacklist
         
         for email_data in self.emails:
             metadata = email_data['metadata']
             body = email_data['body']
             
-            logger.info(f"  📧 处理: {metadata.subject[:50]}...")
+            logger.info("  处理邮件: {}".format(metadata.subject[:50]))
             
             # 解析邮件
             papers = self.parser.parse_email(body, metadata)
             
-            # 去重
+            extracted_count = 0
+            # 过滤与去重
             for paper in papers:
+                # 1. 检查黑白名单
+                if not self._filter_paper(paper, whitelist, blacklist):
+                    continue
+                
+                # 2. DOI 去重 (如果存在 DOI)
+                if paper.metadata.doi:
+                    norm_doi = paper.metadata.doi.lower().strip()
+                    if norm_doi in seen_dois:
+                        logger.debug("  跳过论文 (DOI 重复): {}".format(paper.metadata.title[:50]))
+                        continue
+                    seen_dois.add(norm_doi)
+                
+                # 3. Paper ID 去重 (兜底方案)
                 if paper.paper_id not in seen_paper_ids:
                     seen_paper_ids.add(paper.paper_id)
                     self.segments.append(paper)
+                    extracted_count += 1
             
             # 更新邮件元数据
-            metadata.papers_extracted = len(papers)
+            metadata.papers_extracted = extracted_count
             metadata.is_processed = True
             self.processed_emails.append(metadata)
         
-        logger.info(f"✅ 共提取 {len(self.segments)} 篇唯一论文（去重后）")
+        logger.info("共提取 {} 篇唯一论文（经过黑白名单筛选与 DOI/ID 去重）".format(len(self.segments)))
+
+    def _filter_paper(self, paper: PaperSegment, whitelist: List[str], blacklist: List[str]) -> bool:
+        """
+        根据黑白名单过滤论文
+        
+        Args:
+            paper: 论文对象
+            whitelist: 白名单关键词
+            blacklist: 黑名单关键词
+            
+        Returns:
+            bool: 是否保留
+        """
+        # 合并标题和摘要进行搜索
+        content = (paper.metadata.title + " " + (paper.original_abstract or "")).lower()
+        
+        # 1. 黑名单优先：只要命中任何一个黑名单关键词，直接剔除
+        for word in blacklist:
+            if word.lower() in content:
+                logger.debug("  跳过论文 (黑名单: {}): {}".format(word, paper.metadata.title[:50]))
+                return False
+        
+        # 2. 白名单检查：如果设置了白名单，则必须命中其中之一
+        if whitelist:
+            found_in_white = False
+            for word in whitelist:
+                if word.lower() in content:
+                    found_in_white = True
+                    break
+            
+            if not found_in_white:
+                logger.debug("  跳过论文 (未命中白名单): {}".format(paper.metadata.title[:50]))
+                return False
+        
+        return True
     
     def _step_process_papers(self):
-        """Step 3: 批量处理论文（翻译和摘要）"""
-        logger.info("\n🤖 Step 3: LLM 处理论文摘要")
+        """Step 3: 批量处理论文（翻译、关键词提取、优先级评分）"""
+        logger.info("\nStep 3: LLM 处理论文")
         logger.info("-" * 40)
+        
+        # 如果不需要翻译和总结，跳过 LLM 调用
+        if not self.settings.processing.translate_abstracts and not self.settings.processing.generate_summary:
+            logger.info("跳过 LLM 处理（翻译和总结均已禁用）")
+            # 仍然进行基于规则的优先级预排序
+            self._calculate_rule_based_priority()
+            return
         
         batch_size = self.settings.processing.batch_size
         total = len(self.segments)
@@ -208,18 +270,148 @@ class ScholarWorkflow:
             batch_num = i // batch_size + 1
             total_batches = (total + batch_size - 1) // batch_size
             
-            logger.info(f"  📦 处理批次 {batch_num}/{total_batches} ({len(batch_segments)} 篇)")
+            logger.info("  处理批次 {}/{} ({} 篇)".format(batch_num, total_batches, len(batch_segments)))
             
             try:
                 self._process_batch(batch_segments)
             except Exception as e:
-                logger.error(f"  ❌ 批次 {batch_num} 处理失败: {e}")
+                logger.error("  批次 {} 处理失败: {}".format(batch_num, e))
                 # 继续处理下一批
                 continue
         
+        # 按优先级排序
+        self._sort_by_priority()
+        
         # 统计
         processed = sum(1 for s in self.segments if s.is_processed)
-        logger.info(f"✅ 处理完成: {processed}/{total} 篇论文")
+        logger.info("处理完成: {}/{} 篇论文".format(processed, total))
+
+    def _calculate_rule_based_priority(self):
+        """基于规则计算论文优先级（不调用 LLM）"""
+        logger.info("计算基于规则的论文优先级...")
+        
+        for seg in self.segments:
+            meta = seg.metadata
+            
+            # 1. 来源类型评分
+            source_score = self._get_source_score(meta.source_type, meta.journal)
+            
+            # 2. 领域评分（基于字段）
+            field_score = self._get_field_score(meta.field)
+            
+            # 3. 时效性评分
+            recency_score = self._get_recency_score(meta.publication_date)
+            
+            # 4. 论文类型评分
+            type_score = self._get_type_score(meta.paper_type)
+            
+            # 5. 引用次数评分
+            citation_score = self._get_citation_score(meta.citation_count)
+            
+            # 综合评分 (调整权重，加入引用次数)
+            seg.priority_score = (
+                0.25 * source_score + 
+                0.25 * field_score + 
+                0.15 * recency_score + 
+                0.15 * type_score +
+                0.20 * citation_score
+            )
+            seg.priority_reason = "src:{:.1f} fld:{:.1f} rec:{:.1f} typ:{:.1f} cite:{:.1f}".format(
+                source_score, field_score, recency_score, type_score, citation_score
+            )
+        
+        self._sort_by_priority()
+    
+    def _get_citation_score(self, count: Optional[int]) -> float:
+        """计算引用次数评分 (对数增长模型)"""
+        if count is None or count <= 0:
+            return 0.0
+        
+        import math
+        # math.log10(10)=1.0, math.log10(100)=2.0, math.log10(1000)=3.0
+        # 我们希望 1000 次引用达到 0.9 以上
+        score = math.log10(count + 1) / 3.0
+        return min(1.0, score)
+    
+    def _get_source_score(self, source_type: str, journal: str) -> float:
+        """计算来源评分"""
+        # 顶级期刊
+        top_journals = ["lancet", "nejm", "nature", "science", "jama", "bmj"]
+        # 专业期刊
+        medical_ai_journals = ["jamia", "jbi", "npj digital medicine", "lancet digital health", 
+                               "bmc medical informatics", "artificial intelligence in medicine"]
+        
+        journal_lower = (journal or "").lower()
+        
+        if any(j in journal_lower for j in top_journals):
+            return 1.0
+        elif any(j in journal_lower for j in medical_ai_journals):
+            return 0.9
+        elif source_type == "journal":
+            return 0.7
+        elif source_type == "conference":
+            return 0.6
+        elif source_type in ["arxiv", "medrxiv", "biorxiv"]:
+            return 0.4
+        else:
+            return 0.3
+    
+    def _get_field_score(self, field: str) -> float:
+        """计算领域评分"""
+        field_lower = field.lower() if field else ""
+        
+        if any(kw in field_lower for kw in ["medicine", "medical", "clinical", "health"]):
+            return 1.0
+        elif any(kw in field_lower for kw in ["artificial intelligence", "machine learning", "deep learning"]):
+            return 0.8
+        elif any(kw in field_lower for kw in ["computer science", "engineering"]):
+            return 0.6
+        else:
+            return 0.4
+    
+    def _get_recency_score(self, pub_date) -> float:
+        """计算时效性评分"""
+        if not pub_date:
+            return 0.5
+        
+        from datetime import date
+        current_year = date.today().year
+        
+        if hasattr(pub_date, 'year'):
+            year = pub_date.year
+        else:
+            return 0.5
+        
+        if year >= current_year:
+            return 1.0
+        elif year == current_year - 1:
+            return 0.9
+        elif year == current_year - 2:
+            return 0.7
+        elif year == current_year - 3:
+            return 0.5
+        else:
+            return 0.3
+    
+    def _get_type_score(self, paper_type: str) -> float:
+        """计算论文类型评分"""
+        type_lower = (paper_type or "").lower()
+        
+        if any(kw in type_lower for kw in ["review", "meta-analysis", "systematic"]):
+            return 1.0
+        elif any(kw in type_lower for kw in ["method", "framework", "novel"]):
+            return 0.9
+        elif "research" in type_lower:
+            return 0.7
+        else:
+            return 0.5
+    
+    def _sort_by_priority(self):
+        """按优先级对论文排序"""
+        self.segments.sort(key=lambda x: x.priority_score, reverse=True)
+        logger.info("论文已按优先级排序（最高分: {:.2f}）".format(
+            self.segments[0].priority_score if self.segments else 0
+        ))
     
     def _process_batch(self, batch: List[PaperSegment]):
         """
@@ -241,47 +433,72 @@ class ScholarWorkflow:
         self._parse_llm_response(response, batch)
     
     def _build_batch_prompt(self, batch: List[PaperSegment]) -> str:
-        """构建批量处理的 prompt"""
+        """构建批量处理的 prompt（参考 scholar_digest_prompt.md）"""
         papers_data = []
         for seg in batch:
+            # 获取邮件接收时间
+            email_received = None
+            if seg.metadata.email_received_at:
+                email_received = seg.metadata.email_received_at.isoformat()
+            
             papers_data.append({
                 "id": seg.segment_id,
                 "title": seg.metadata.title,
-                "authors": ", ".join(seg.metadata.authors[:3]) if seg.metadata.authors else "Unknown",
-                "abstract": seg.original_abstract[:1000] if seg.original_abstract else "No abstract available",
-                "field": seg.metadata.field,
+                "authors": ", ".join(seg.metadata.authors[:5]) if seg.metadata.authors else "Unknown",
+                "abstract": seg.original_abstract[:1500] if seg.original_abstract else "No abstract available",
+                "journal": seg.metadata.journal,
+                "doi": seg.metadata.doi,
+                "url": seg.metadata.url,
+                "citation_count": seg.metadata.citation_count,
+                "publication_date": str(seg.metadata.publication_date) if seg.metadata.publication_date else None,
+                "email_received_at": email_received
             })
         
-        prompt = f"""你是一个学术论文摘要助手。请对以下论文进行处理：
+        prompt = """你是一位医学人工智能领域的博士生导师，正在帮助学生筛选和分析论文。
 
-1. 将每篇论文的标题和摘要翻译成中文
-2. 为每篇论文生成一个简洁的总结（100-200字）
+## 研究背景
+学生研究方向：电子健康记录(EHR)数据挖掘、临床预测模型、图神经网络(GNN)、半监督学习、大语言模型(LLM)在医学中的应用
 
-输入论文列表（JSON格式）：
+## 任务
+对以下论文进行：
+1. 标题和摘要翻译（首次出现的术语需标注英文原文）
+2. 提取5个关键词
+3. 评估与研究方向的相关度(0-1)
+4. 计算综合优先级(0-1)
+
+## 评分规则
+- source_score: 顶级期刊(Lancet/NEJM/Nature)=1.0, 专业期刊(JAMIA/JBI)=0.9, 一般期刊=0.7, 会议=0.6, 预印本=0.4
+- field_score: 医学信息学/EHR/临床预测=1.0, 医学AI=0.9, 通用ML=0.6, 其他=0.3
+- recency_score: 2026年=1.0, 2025年=0.9, 2024年=0.7, 2023年=0.5
+- type_score: 综述/Meta分析=1.0, 方法论=0.9, 原创研究=0.7, 应用研究=0.5
+- citation_score: 引用量 > 1000 = 1.0, > 100 = 0.7, > 10 = 0.4, 0 = 0.0
+- priority_score = 0.25*source + 0.25*field + 0.15*recency + 0.15*type + 0.2*citation
+
+## 输出格式（严格JSON数组）
 ```json
-{json.dumps(papers_data, ensure_ascii=False, indent=2)}
+[
+  {
+    "id": 1,
+    "translated_title": "中文标题",
+    "translated_abstract": "中文摘要（术语标注英文）",
+    "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
+    "relevance_score": 0.85,
+    "relevance_reason": "相关度评估理由",
+    "source_type": "journal/conference/arxiv",
+    "paper_type": "review/research/method",
+    "priority_score": 0.82,
+    "priority_breakdown": {"source_score": 0.9, "field_score": 0.8, "recency_score": 0.7, "type_score": 0.6}
+  }
+]
 ```
 
-请按以下 JSON 格式输出结果（必须是有效的 JSON）：
+## 输入论文
 ```json
-{{
-  "papers": [
-    {{
-      "id": <segment_id>,
-      "translated_title": "<中文标题>",
-      "translated_abstract": "<中文摘要>",
-      "summary": "<简洁总结，突出研究的主要贡献和发现>"
-    }}
-  ]
-}}
+{}
 ```
 
-注意：
-- 翻译要准确、学术化
-- 总结要简洁，突出核心贡献
-- 保持 JSON 格式正确
-- 如果没有摘要，请根据标题推测可能的研究方向
-"""
+请严格按照JSON格式输出，ID必须与输入一一对应。""".format(json.dumps(papers_data, ensure_ascii=False, indent=2))
+        
         return prompt
     
     def _call_llm(self, prompt: str) -> str:
@@ -310,7 +527,7 @@ class ScholarWorkflow:
             raise NotImplementedError("OpenAI compatible API not implemented yet")
     
     def _parse_llm_response(self, response: str, batch: List[PaperSegment]):
-        """解析 LLM 响应并更新段落"""
+        """解析 LLM 响应并更新段落（新JSON格式）"""
         try:
             # 尝试提取 JSON
             json_match = response
@@ -319,8 +536,11 @@ class ScholarWorkflow:
             elif '```' in response:
                 json_match = response.split('```')[1].split('```')[0]
             
-            data = json.loads(json_match.strip())
-            papers = data.get('papers', [])
+            papers = json.loads(json_match.strip())
+            
+            # 支持两种格式：直接数组或 {papers: [...]}
+            if isinstance(papers, dict) and 'papers' in papers:
+                papers = papers['papers']
             
             # 创建 ID 到结果的映射
             results_map = {p['id']: p for p in papers}
@@ -329,27 +549,54 @@ class ScholarWorkflow:
             for seg in batch:
                 if seg.segment_id in results_map:
                     result = results_map[seg.segment_id]
+                    
+                    # 更新翻译内容
                     seg.translated_abstract = result.get('translated_abstract', '')
-                    seg.summary = result.get('summary', '')
+                    seg.summary = result.get('summary', seg.translated_abstract[:200])
+                    
+                    # 更新元数据
+                    if 'translated_title' in result:
+                        seg.metadata.translated_title = result['translated_title']
+                    if 'keywords' in result:
+                        seg.metadata.keywords = result['keywords']
+                    if 'relevance_score' in result:
+                        seg.metadata.relevance_score = float(result['relevance_score'])
+                    if 'source_type' in result:
+                        seg.metadata.source_type = result['source_type']
+                    if 'paper_type' in result:
+                        seg.metadata.paper_type = result['paper_type']
+                    if 'priority_score' in result:
+                        # 使用 LLM 返回的优先级覆盖规则计算的值
+                        seg.priority_score = float(result['priority_score'])
+                    if 'priority_breakdown' in result:
+                        breakdown = result['priority_breakdown']
+                        seg.metadata.priority_reason = "source={:.1f}, field={:.1f}, recency={:.1f}, type={:.1f}".format(
+                            breakdown.get('source_score', 0),
+                            breakdown.get('field_score', 0),
+                            breakdown.get('recency_score', 0),
+                            breakdown.get('type_score', 0)
+                        )
+                    if 'relevance_reason' in result:
+                        seg.metadata.priority_reason = (seg.metadata.priority_reason or "") + " | " + result['relevance_reason']
+                    
                     seg.status = DigestStatus.COMPLETED
                     seg.processed_at = datetime.now()
-                    
-                    # 更新元数据中的标题
-                    if 'translated_title' in result:
-                        # 可以添加一个 translated_title 字段
-                        pass
+                    logger.info("    [OK] {} (priority={:.2f}, relevance={:.2f})".format(
+                        seg.metadata.title[:40], seg.priority_score, seg.metadata.relevance_score or 0
+                    ))
                 else:
                     seg.status = DigestStatus.FAILED
                     seg.error_message = "Not found in LLM response"
+                    logger.warning("    [MISS] ID {} not in response".format(seg.segment_id))
                     
         except json.JSONDecodeError as e:
-            logger.error(f"  ❌ JSON 解析失败: {e}")
+            logger.error("  [ERROR] JSON parse failed: {}".format(str(e)))
             # 标记批次中所有论文为失败
             for seg in batch:
                 seg.status = DigestStatus.FAILED
-                seg.error_message = f"JSON parse error: {str(e)}"
+                seg.error_message = "JSON parse error: {}".format(str(e))
         except Exception as e:
-            logger.error(f"  ❌ 响应处理失败: {e}")
+            logger.error("  [ERROR] Response processing failed: {}".format(str(e)))
             for seg in batch:
                 seg.status = DigestStatus.FAILED
                 seg.error_message = str(e)
@@ -403,20 +650,26 @@ class ScholarWorkflow:
         logger.info("\n✅ Step 5: 标记邮件为已读")
         logger.info("-" * 40)
         
-        unread_ids = [
-            email['metadata'].email_id 
-            for email in self.emails 
-            if not email['metadata'].is_read
-        ]
-        
-        if unread_ids:
-            success = self.gmail_client.mark_as_read(unread_ids)
-            if success:
-                logger.info(f"  ✅ 已标记 {len(unread_ids)} 封邮件为已读")
-            else:
-                logger.warning(f"  ⚠️ 标记已读失败")
+        # 如果设置了获取历史所有邮件，或者显式开启了全量清理
+        if self.settings.processing.days_to_fetch == 0:
+            count = self.gmail_client.mark_all_scholar_read()
+            if count > 0:
+                logger.info(f"  ✅ 已将所有 {count} 封历史 Scholar 邮件标记为已读")
         else:
-            logger.info("  ℹ️ 没有需要标记的未读邮件")
+            # 仅标记本次处理过的邮件 ID
+            all_ids = [
+                email['metadata'].email_id 
+                for email in self.emails
+            ]
+            
+            if all_ids:
+                success = self.gmail_client.mark_as_read(all_ids)
+                if success:
+                    logger.info(f"  ✅ 已将 {len(all_ids)} 封处理过的邮件标记为已读")
+                else:
+                    logger.warning(f"  ⚠️ 标记已读失败")
+            else:
+                logger.info("  ℹ️ 没有需要标记的邮件")
     
     # ==================== 辅助方法 ====================
     

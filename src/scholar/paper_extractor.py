@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Google Scholar 邮件解析器
 从邮件内容中提取论文信息
@@ -174,33 +175,39 @@ class ScholarEmailParser:
         查找论文信息块
         
         Google Scholar Alert 邮件结构可能因版本不同而变化，
-        这里尝试多种选择器
+        这里尝试多种选择器，包括对引用（Citations）邮件的支持
         """
-        # 常见的 Scholar Alert 邮件结构
+        # 常见论文容器选择器
         selectors = [
-            # 新版邮件格式
+            # 新版及引用邮件格式
+            'div[style*="margin-bottom"]',
             'div[class*="paper"]',
             'table[class*="paper"]',
             'tr[class*="paper"]',
-            # 基于表格的旧版格式
+            # 搜索结果/引用列表项
+            'div[style*="padding"]',
+            # 基于表格的结构
             'table table tr',
-            # 通用 div 容器
-            'div[style*="margin"]',
         ]
         
+        blocks = []
         for selector in selectors:
-            blocks = soup.select(selector)
-            if blocks and len(blocks) > 0:
-                # 过滤掉太短的块（可能是装饰性元素）
-                valid_blocks = [
-                    b for b in blocks 
-                    if len(b.get_text(strip=True)) > 50
-                ]
-                if valid_blocks:
-                    return valid_blocks
+            found = soup.select(selector)
+            for b in found:
+                text = b.get_text(strip=True)
+                # 论文块通常包含标题且长度适中，且包含学术特征（如链接或 [PDF] 标记）
+                if 40 < len(text) < 2000:
+                    # 检查是否有链接，论文块至少应该有一个标题链接
+                    if b.find('a', href=True) and b not in blocks:
+                        # 进一步检查父子关系，避免嵌套重复添加
+                        if not any(b in existing or existing in b for existing in blocks):
+                            blocks.append(b)
+        
+        if blocks:
+            return blocks
         
         # 如果没找到明确的块，尝试基于 <h3> 或 <font size> 分割
-        headers = soup.find_all(['h3', 'font'])
+        headers = soup.find_all(['h3', 'font', 'b'])
         if headers:
             return self._split_by_headers(soup, headers)
         
@@ -261,6 +268,9 @@ class ScholarEmailParser:
             # 尝试提取 arXiv ID
             arxiv_id = self._extract_arxiv_id(block, url)
             
+            # 提取引用次数
+            citation_count = self._extract_citation_count(block)
+            
             # 推断领域
             field = self._infer_field(title, abstract, email_metadata.alert_query)
             
@@ -278,6 +288,7 @@ class ScholarEmailParser:
                 arxiv_id=arxiv_id,
                 url=url,
                 field=field,
+                citation_count=citation_count,
                 source_email_id=email_metadata.email_id,
                 extracted_at=datetime.now()
             )
@@ -373,14 +384,20 @@ class ScholarEmailParser:
                     authors = potential_authors
                     break
         
-        # 如果没找到，尝试其他模式
+        # 如果没找到，尝试从 "Author - Journal, Year" 这种常见格式中提取
         if not authors:
             text = block.get_text()
-            # 查找 "by Author1, Author2" 模式
-            by_match = re.search(r'by\s+([^-\n]+)', text, re.IGNORECASE)
-            if by_match:
-                author_text = by_match.group(1)
+            # 模式：Author, Author - Journal, Year
+            meta_match = re.search(r'([^-\n]+)\s+-\s+[^-\n]+,\s+\d{4}', text)
+            if meta_match:
+                author_text = meta_match.group(1).strip()
                 authors = [a.strip() for a in author_text.split(',') if a.strip()]
+            else:
+                # 查找 "by Author1, Author2" 模式
+                by_match = re.search(r'by\s+([^-\n]+)', text, re.IGNORECASE)
+                if by_match:
+                    author_text = by_match.group(1)
+                    authors = [a.strip() for a in author_text.split(',') if a.strip()]
         
         return authors[:10]  # 限制最多10个作者
     
@@ -475,6 +492,18 @@ class ScholarEmailParser:
             if match:
                 return match.group(1)
         
+        return None
+    
+    def _extract_citation_count(self, block: Any) -> Optional[int]:
+        """提取引用次数"""
+        text = block.get_text()
+        # 匹配 "Cited by 123" 或 "被引用次数：123" 或 "引用次数：123"
+        match = re.search(r'(?:Cited by|被引用次数|引用次数|被引用)[:：\s]+(\d+)', text, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except:
+                pass
         return None
     
     def _infer_field(

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Gmail API 客户端
 实现 OAuth 2.0 认证、邮件获取、筛选和标记已读功能
@@ -35,10 +36,11 @@ class GmailClient:
     - 标记邮件为已读
     """
     
-    # Google Scholar 邮件发件人
+    # Google Scholar 邮件发件人或关键词
     SCHOLAR_SENDERS = [
         "scholaralerts-noreply@google.com",
         "scholar-alerts-noreply@google.com",
+        "scholar-noreply@google.com",
     ]
     
     def __init__(self, settings: ScholarSettings):
@@ -81,25 +83,25 @@ class GmailClient:
                     str(self.token_path), 
                     self.scopes
                 )
-                logger.info(f"📂 从 {self.token_path} 加载已有凭据")
+                logger.info("从 {} 加载已有凭据".format(self.token_path))
             except Exception as e:
-                logger.warning(f"⚠️ 加载凭据失败: {e}")
+                logger.warning("加载凭据失败: {}".format(e))
                 creds = None
         
         # 检查凭据是否有效或需要刷新
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                logger.info("🔄 凭据已刷新")
+                logger.info("凭据已刷新")
             except Exception as e:
-                logger.warning(f"⚠️ 刷新凭据失败: {e}")
+                logger.warning("刷新凭据失败: {}".format(e))
                 creds = None
         
         # 如果没有有效凭据，执行授权流程
         if not creds or not creds.valid:
             if not self.credentials_path.exists():
                 raise FileNotFoundError(
-                    f"❌ OAuth 凭据文件不存在: {self.credentials_path}\n"
+                    "OAuth 凭据文件不存在: {}\n".format(self.credentials_path) +
                     "请从 Google Cloud Console 下载 OAuth 2.0 客户端凭据文件"
                 )
             
@@ -132,17 +134,17 @@ class GmailClient:
     def list_messages(
         self,
         query: Optional[str] = None,
-        max_results: int = 100,
+        max_results: int = 100,  # 0 表示不限制
         label_ids: Optional[List[str]] = None,
         include_spam_trash: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        获取邮件列表
+        获取邮件列表，支持无限分页
         
         Args:
-            query: Gmail 搜索查询（如 "from:scholaralerts-noreply@google.com"）
-            max_results: 最大返回数量
-            label_ids: 标签过滤（如 ['INBOX', 'UNREAD']）
+            query: Gmail 搜索查询
+            max_results: 最大返回数量 (0 表示不限制)
+            label_ids: 标签过滤
             include_spam_trash: 是否包含垃圾邮件
             
         Returns:
@@ -151,11 +153,15 @@ class GmailClient:
         messages = []
         page_token = None
         
+        # 如果 max_results 为 0，设置为一个极大的值
+        limit = max_results if max_results > 0 else 1000000 
+        
         try:
-            while len(messages) < max_results:
+            while len(messages) < limit:
+                current_batch_size = min(limit - len(messages), 500)
                 request_params = {
                     'userId': 'me',
-                    'maxResults': min(max_results - len(messages), 500),
+                    'maxResults': current_batch_size,
                     'includeSpamTrash': include_spam_trash
                 }
                 
@@ -170,14 +176,14 @@ class GmailClient:
                 
                 if 'messages' in response:
                     messages.extend(response['messages'])
-                    logger.debug(f"📬 获取到 {len(response['messages'])} 封邮件")
+                    logger.debug(f"📬 获取到 {len(response['messages'])} 封邮件 (累计: {len(messages)})")
                 
                 page_token = response.get('nextPageToken')
                 if not page_token:
                     break
             
             logger.info(f"📬 共获取 {len(messages)} 封邮件")
-            return messages[:max_results]
+            return messages[:limit]
             
         except HttpError as e:
             logger.error(f"❌ 获取邮件列表失败: {e}")
@@ -318,17 +324,19 @@ class GmailClient:
     
     def fetch_scholar_emails(
         self,
-        days: int = 7,
-        max_results: int = 100,
-        unread_only: bool = False
+        days: Optional[int] = 7,
+        max_results: int = 100,  # 0 为不限制
+        unread_only: bool = False,
+        include_archived: bool = True
     ) -> List[Dict[str, Any]]:
         """
         获取 Google Scholar 邮件
         
         Args:
-            days: 获取最近 N 天的邮件
-            max_results: 最大返回数量
+            days: 获取最近 N 天的邮件，如果是 None 或 0 则获取所有历史邮件
+            max_results: 最大返回数量 (0 为不限制)
             unread_only: 是否只获取未读邮件
+            include_archived: 是否包含已存档邮件（不在收件箱中的）
             
         Returns:
             包含邮件内容和元数据的列表
@@ -340,48 +348,108 @@ class GmailClient:
         sender_query = ' OR '.join([
             f'from:{sender}' for sender in self.SCHOLAR_SENDERS
         ])
-        query_parts.append(f'({sender_query})')
+        
+        # 扩展主题关键词，涵盖引用提醒和相关研究
+        subject_keywords = [
+            "Scholar Alert", 
+            "Google Scholar Alert",
+            "new citations",
+            "related research",
+            "new results for",
+            "Follow articles by"
+        ]
+        subject_query = ' OR '.join(['subject:"{}"'.format(kw) for kw in subject_keywords])
+        
+        query_parts.append('({} OR {})'.format(sender_query, subject_query))
         
         # 时间过滤
-        after_date = (datetime.now() - timedelta(days=days)).strftime('%Y/%m/%d')
-        query_parts.append(f'after:{after_date}')
+        if days and days > 0:
+            after_date = (datetime.now() - timedelta(days=days)).strftime('%Y/%m/%d')
+            query_parts.append('after:{}'.format(after_date))
+            logger.info("过滤最近 {} 天的邮件".format(days))
+        else:
+            logger.info("获取所有历史邮件（无时间限制）")
         
         query = ' '.join(query_parts)
-        logger.info(f"🔍 搜索查询: {query}")
+        logger.info("搜索查询: {}".format(query))
         
         # 获取邮件列表
-        label_ids = ['INBOX']
+        # 显式移除 INBOX 限制以允许遍历所有标签/分类中的邮件
+        label_ids = []
+        if not include_archived:
+            label_ids.append('INBOX')
+            
         if unread_only:
             label_ids.append('UNREAD')
         
         messages = self.list_messages(
             query=query,
             max_results=max_results,
-            label_ids=label_ids
+            label_ids=label_ids if label_ids else None
         )
         
         # 获取完整邮件内容
         scholar_emails = []
         for msg_info in messages:
             try:
-                message = self.get_message(msg_info['id'])
+                # 即使在 fetch 过程中，我们也进行基本的解析以确保它是真正的 Scholar 邮件
+                message = self.get_message(msg_info['id'], format='metadata') # 先拿元数据
                 metadata = self.parse_email_metadata(message)
                 
-                if metadata.is_google_scholar:
-                    body = self.get_message_body(message)
-                    scholar_emails.append({
-                        'message': message,
-                        'metadata': metadata,
-                        'body': body
-                    })
-                    logger.debug(f"  📧 {metadata.subject[:50]}...")
+                # 获取正文（仅针对真正符合条件的，减少 API 调用）
+                details = self.get_message(msg_info['id'], format='full')
+                body = self.get_message_body(details)
+                
+                scholar_emails.append({
+                    'message': details,
+                    'metadata': metadata,
+                    'body': body
+                })
+                logger.debug("  📧 {}".format(metadata.subject[:50]))
                     
             except Exception as e:
-                logger.warning(f"⚠️ 处理邮件 {msg_info['id']} 时出错: {e}")
+                logger.warning("处理邮件 {} 时出错: {}".format(msg_info['id'], e))
                 continue
         
-        logger.info(f"✅ 找到 {len(scholar_emails)} 封 Google Scholar 邮件")
+        logger.info("找到 {} 封 Google Scholar 邮件".format(len(scholar_emails)))
         return scholar_emails
+
+    def mark_all_scholar_read(self) -> int:
+        """
+        一次性将所有历史 Scholar 邮件标记为已读（忽略收件箱/分页限制）
+        
+        Returns:
+            标记已读的数量
+        """
+        logger.info("开始全量清理 unread Scholar 邮件...")
+        
+        # 激进查询，涵盖官方发件人和所有相关关键词
+        sender_query = ' OR '.join(['from:{}'.format(sender) for sender in self.SCHOLAR_SENDERS])
+        subject_keywords = [
+            "Scholar Alert", 
+            "Google Scholar Alert",
+            "new citations", 
+            "related research",
+            "new results for",
+            "Follow articles by"
+        ]
+        subject_query = ' OR '.join(['subject:"{}"'.format(kw) for kw in subject_keywords])
+        
+        query = '({} OR {}) label:UNREAD'.format(sender_query, subject_query)
+        
+        # 获取所有符合条件的 ID
+        messages = self.list_messages(query=query, max_results=0) # 0 为全部
+        ids = [m['id'] for m in messages]
+        
+        if not ids:
+            logger.info("没有发现未读的 Scholar 邮件")
+            return 0
+            
+        success = self.mark_as_read(ids)
+        if success:
+            logger.info("成功将 {} 封历史 Scholar 邮件标记为已读".format(len(ids)))
+            return len(ids)
+        return 0
     
     def mark_as_read(self, message_ids: List[str]) -> bool:
         """
@@ -397,17 +465,20 @@ class GmailClient:
             return True
             
         try:
-            # 使用批量修改API
-            body = {
-                'ids': message_ids,
-                'removeLabelIds': ['UNREAD']
-            }
-            
-            self.service.users().messages().batchModify(
-                userId='me',
-                body=body
-            ).execute()
-            
+            # Gmail batchModify 限制每次最多 1000 个 ID
+            batch_size = 1000
+            for i in range(0, len(message_ids), batch_size):
+                chunk = message_ids[i:i + batch_size]
+                body = {
+                    'ids': chunk,
+                    'removeLabelIds': ['UNREAD']
+                }
+                
+                self.service.users().messages().batchModify(
+                    userId='me',
+                    body=body
+                ).execute()
+                
             logger.info(f"✅ 已将 {len(message_ids)} 封邮件标记为已读")
             return True
             

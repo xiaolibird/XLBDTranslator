@@ -55,6 +55,8 @@ web-next/
 # Development files
 digest_project.py
 migrating_instructions.md
+config/credentials.json
+config/token.json
 
 # Generated content
 **/page_images/

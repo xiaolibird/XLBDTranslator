@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Scholar Digest 模块
 用于处理 Google Scholar 邮件提醒，提取论文信息并生成摘要
@@ -14,6 +15,7 @@ from .schema import (
 from .gmail_client import GmailClient
 from .paper_extractor import ScholarEmailParser
 from .workflow import ScholarWorkflow
+from .deep_research import DeepResearchClient
 
 __all__ = [
     # Schema
@@ -27,4 +29,5 @@ __all__ = [
     "GmailClient",
     "ScholarEmailParser",
     "ScholarWorkflow",
+    "DeepResearchClient",
 ]

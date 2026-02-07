@@ -51,10 +51,8 @@ class MarkdownRenderer:
             'image_caption': "\n> 💡 **图注/内容译文**\n> {caption}",
             'image_footer': "\n",
             'section_separator': "\n\n---",
-            'original_text': '<span class="original">{text}</span>',
-            'translated_text_first': '<span class="translated">{text}</span>',
-            'translated_text_continue': "      {text}",
-            'bilingual_separator': '<hr class="bilingual-separator">',
+            'original_text': '> {text}',
+            'translated_text': '{text}',
             'translated_only': "{text}",
             'markdown_header': "\n{header}\n",
         }
@@ -238,6 +236,8 @@ class MarkdownRenderer:
     def _render_structure_elements(self, segment: ContentSegment, title_mode: str = 'normal') -> str:
         """
         渲染结构元素（章节标题、页码标记）
+        
+        注意：章节标题和页码标记后都需要添加分割线，保持格式一致性
         """
         parts = []
 
@@ -251,6 +251,8 @@ class MarkdownRenderer:
                 emoji=emoji,
                 title=self._clean_text(segment.chapter_title)
             ))
+            # 章节标题后添加分割线
+            parts.append(self.templates['section_separator'])
 
         # 页码标记（仅在非章节开头且配置允许时显示，永远使用 h6）
         elif (segment.page_index is not None and
@@ -259,6 +261,8 @@ class MarkdownRenderer:
             parts.append(self.templates['page_marker'].format(
                 page=segment.page_index + 1
             ))
+            # 页码标记后也添加分割线
+            parts.append(self.templates['section_separator'])
 
         return "".join(parts)
 
@@ -266,22 +270,33 @@ class MarkdownRenderer:
         """
         渲染文本内容（不再包含 Segment 标记）
         PDF 渲染器将直接从 SegmentList 获取页码信息
+        
+        注意：双语模式下，分割线已经在每对译文-原文后添加，这里不再重复添加
         """
-        parts = []
-
+        # 检查是否有实际的文本内容
+        has_content = (segment.original_text and segment.original_text.strip()) or \
+                      (segment.translated_text and segment.translated_text.strip())
+        
+        if not has_content:
+            return ""
+        
         # 根据配置选择渲染模式
         if self.retain_original:
-            content = self._render_bilingual_content(segment)
+            # 双语模式：分割线已经在 _render_bilingual_content 中添加
+            return self._render_bilingual_content(segment)
         else:
+            # 纯译文模式：在最后添加分割线
             content = self._render_translation_only_content(segment)
-
-        parts.append(content)
-        parts.append(self.templates['section_separator'])
-
-        return "".join(parts)
+            return content + self.templates['section_separator']
 
     def _render_bilingual_content(self, segment: ContentSegment) -> str:
-        """渲染双语对照内容"""
+        """渲染双语对照内容（纯 Markdown 语法）
+        
+        格式：每对译文-原文后都有分割线
+        - 译文：正文（普通段落）
+        - 原文：引用块（> 开头）
+        - 分割线
+        """
         parts = []
 
         original_text = self._clean_text(segment.original_text or "")
@@ -291,30 +306,26 @@ class MarkdownRenderer:
         trans_paras = self._split_into_paragraphs(translated_text)
 
         for i in range(max(len(orig_paras), len(trans_paras))):
-            block_parts = []
-
+            # 1. 先输出译文（正文）
             if i < len(trans_paras) and trans_paras[i].strip():
-                trans_lines = trans_paras[i].split('\n')
-                for j, line in enumerate(trans_lines):
-                    if line.strip():
-                        if self._is_markdown_header(line):
-                            block_parts.append(self.templates['markdown_header'].format(header=line))
-                        elif j == 0:
-                            block_parts.append(self.templates['translated_text_first'].format(text=line))
-                        else:
-                            block_parts.append(self.templates['translated_text_continue'].format(text=line))
+                trans_text = trans_paras[i].strip()
+                if self._is_markdown_header(trans_text):
+                    parts.append(self.templates['markdown_header'].format(header=trans_text))
+                else:
+                    parts.append(self.templates['translated_text'].format(text=trans_text))
+                parts.append("\n")
 
+            # 2. 再输出原文（Quote 引用块，后续会被转换为 .original 样式）
             if i < len(orig_paras) and orig_paras[i].strip():
-                block_parts.append(self.templates['original_text'].format(
-                    text=orig_paras[i].strip()
-                ))
-
-            # 在原文和译文之后加分隔线，如果两者都有
-            if (i < len(trans_paras) and trans_paras[i].strip()) and (i < len(orig_paras) and orig_paras[i].strip()):
-                block_parts.append(self.templates['bilingual_separator'])
-
-            if block_parts:
-                parts.append("\n".join(block_parts) + "\n")
+                # 将原文的每一行都加上 > 前缀
+                orig_lines = orig_paras[i].strip().split('\n')
+                quoted_lines = ['> ' + line if line.strip() else '>' for line in orig_lines]
+                parts.append('\n'.join(quoted_lines))
+                parts.append("\n")
+            
+            # 3. 每对译文-原文后添加分割线
+            parts.append(self.templates['section_separator'])
+            parts.append("\n")
 
         return "".join(parts)
 

@@ -138,8 +138,9 @@ def parse_epub_toc(toc, level: int = 1) -> List[Dict[str, Any]]:
         # 检查是否有有效的 href
         if hasattr(entry, 'href') and entry.href:
             # URL-decode href so keys are comparable to spine item names
+            # Also normalize path by stripping leading slashes
+            href_key = unquote(entry.href.split('#')[0]).lstrip('/')
             
-            href_key = unquote(entry.href.split('#')[0])
             items.append({
                 'level': level,
                 'title': entry.title or "Untitled",

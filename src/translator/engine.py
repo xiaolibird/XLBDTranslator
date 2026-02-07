@@ -281,6 +281,16 @@ class GeminiTranslator(BaseTranslator):
             # 缓存失败时降级
             if cache_name:
                 logger.warning(f"⚠️  {purpose} 缓存使用失败，降级为普通调用: {e}")
+                
+                # P1修复：清理失效的缓存引用
+                if 'system' in self.cache_refs and self.cache_refs['system'] == cache_name:
+                    del self.cache_refs['system']
+                    logger.info("🗑️  已清理内存中的失效缓存引用")
+                
+                # P1修复：从元数据中删除失效缓存
+                if self.cache_persistence:
+                    self.cache_persistence.remove_invalid_cache(cache_name)
+                
                 config_no_cache = config.model_copy(update={
                     "cached_content": None,
                     "system_instruction": self._base_generation_config.system_instruction,
@@ -433,16 +443,24 @@ class GeminiTranslator(BaseTranslator):
             )
 
             # Use centralized _generate_content to benefit from response validation and cache fallback
-            response = self._generate_content(
-                contents=original_prompt,
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "temperature": self.settings.processing.temperature,
-                    "max_output_tokens": self.settings.processing.max_output_tokens,
-                },
-                use_cache=True,
-                purpose="Glossary Extraction"
-            )
+            try:
+                response = self._generate_content(
+                    contents=original_prompt,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                        "temperature": self.settings.processing.temperature,
+                        "max_output_tokens": self.settings.processing.max_output_tokens,
+                    },
+                    use_cache=True,
+                    purpose="Glossary Extraction"
+                )
+            except APIError as e:
+                # If blocked by safety or other non-critical issues, we can skip glossary extraction
+                # to allow the translation to proceed.
+                if "blocked" in str(e).lower() or "PROHIBITED_CONTENT" in str(e):
+                    logger.warning(f"⚠️  Glossary Extraction was blocked by safety filters. Skipping glossary. Error: {e}")
+                    return {}
+                raise # Re-raise other API errors
 
             # Extract text safely (validated by _generate_content)
             raw_text = response.candidates[0].content.parts[0].text
