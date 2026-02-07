@@ -12,8 +12,7 @@ from dotenv import load_dotenv
 # --- 配置 --- 
 # 尝试从 .env 文件加载 API Key
 load_dotenv()
-API_KEY = "YOUR_API_KEY_HERE"
-
+API_KEY = os.getenv("GEMINI_API_KEY")
 # 如果 API Key 不存在，则打印错误并退出
 if not API_KEY:
     print("❌ 错误: 未找到 API 密钥。")
