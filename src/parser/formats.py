@@ -2,22 +2,21 @@
 文档解析器集合
 包含所有文档格式的解析器实现：BaseDocPipeline, PDFParser, EPUBParser
 """
-import os
+
 import csv
 import json
-import fitz  # PyMuPDF
-import ebooklib
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict, Any, Iterator, Tuple
+from typing import Any, Dict, Iterator, List, Tuple
 
-from ebooklib import epub
+import ebooklib
+import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
+from ebooklib import epub
 
 from ..core.schema import ContentSegment, Settings
-from ..core.exceptions import DocumentParseError
-from .helpers import process_unified_toc, extract_text_from_html
 from ..utils.logger import get_logger
+from .helpers import process_unified_toc
 
 logger = get_logger(__name__)
 
@@ -26,11 +25,13 @@ logger = get_logger(__name__)
 # 基础抽象类
 # ============================================================================
 
+
 class BaseDocPipeline(ABC):
     """
     文档处理流水线的抽象基类。
     负责将文档流转换为 List[ContentSegment] 对象流。
     """
+
     def __init__(self, file_path: Path, cache_path: Path, settings: Settings):
         self.file_path = file_path
         self.cache_path = cache_path
@@ -54,7 +55,9 @@ class BaseDocPipeline(ABC):
 
     def run(self) -> List[ContentSegment]:
         """主流程：迭代单元 -> 维护状态 -> 生成对象"""
-        logger.info(f"Starting pipeline '{self.__class__.__name__}' for {self.file_path.name}")
+        logger.info(
+            f"Starting pipeline '{self.__class__.__name__}' for {self.file_path.name}"
+        )
 
         self._load_metadata()
 
@@ -73,7 +76,7 @@ class BaseDocPipeline(ABC):
                     page_index=unit_key if isinstance(unit_key, int) else 0,
                     chapter_title=self.current_chapter_title,
                     toc_level=self.current_toc_level,
-                    is_new_chapter=False
+                    is_new_chapter=False,
                 )
                 self.all_segments.append(seg)
                 self.global_id_counter += 1
@@ -130,7 +133,7 @@ class BaseDocPipeline(ABC):
             chapter_title=self.current_chapter_title,
             toc_level=self.current_toc_level,
             is_new_chapter=self.pending_new_chapter,
-            page_index=self.current_page_index
+            page_index=self.current_page_index,
         )
 
         self.all_segments.append(seg)
@@ -167,6 +170,7 @@ class BaseDocPipeline(ABC):
 # PDF 解析器
 # ============================================================================
 
+
 class PDFParser(BaseDocPipeline):
     """PDF 文档解析器"""
 
@@ -189,34 +193,52 @@ class PDFParser(BaseDocPipeline):
         # 分支 A: 尝试加载 CSV 自定义目录 (优先级最高)
         # =========================================================
         # 修正: 从 settings.document 读取最终生效的 TOC 路径
-        if self.settings.document.custom_toc_path and self.settings.document.custom_toc_path.exists():
-            logger.info(f"Loading custom TOC from CSV: {self.settings.document.custom_toc_path}")
+        if (
+            self.settings.document.custom_toc_path
+            and self.settings.document.custom_toc_path.exists()
+        ):
+            logger.info(
+                f"Loading custom TOC from CSV: {self.settings.document.custom_toc_path}"
+            )
             try:
                 # utf-8-sig 兼容 Excel 保存的 CSV
-                with open(self.settings.document.custom_toc_path, 'r', encoding='utf-8-sig') as f:
+                with open(
+                    self.settings.document.custom_toc_path, "r", encoding="utf-8-sig"
+                ) as f:
                     reader = csv.DictReader(f)
                     for row in reader:
                         # 健壮性读取：处理 CSV 列名大小写或空格
                         # 假设标准列名: Page, Title, Level (可选)
                         row_lower = {k.lower().strip(): v for k, v in row.items()}
 
-                        page_str = row_lower.get('page') or row_lower.get('页码')
-                        if not page_str: continue
+                        page_str = row_lower.get("page") or row_lower.get("页码")
+                        if not page_str:
+                            continue
 
-                        p_idx = int(page_str) - 1 # 用户习惯 1-based, 内部逻辑 0-based
+                        p_idx = int(page_str) - 1  # 用户习惯 1-based, 内部逻辑 0-based
 
-                        title = row_lower.get('title') or row_lower.get('标题') or f"Page {p_idx+1}"
-                        level_str = row_lower.get('level') or row_lower.get('层级') or "1"
+                        title = (
+                            row_lower.get("title")
+                            or row_lower.get("标题")
+                            or f"Page {p_idx+1}"
+                        )
+                        level_str = (
+                            row_lower.get("level") or row_lower.get("层级") or "1"
+                        )
 
                         if p_idx >= 0:
-                            standardized_items.append({
-                                'level': int(level_str),
-                                'title': title.strip(),
-                                'key': p_idx
-                            })
+                            standardized_items.append(
+                                {
+                                    "level": int(level_str),
+                                    "title": title.strip(),
+                                    "key": p_idx,
+                                }
+                            )
             except Exception as e:
-                logger.error(f"Failed to parse CSV TOC: {e}. Falling back to native TOC.")
-                standardized_items = [] # 解析失败，清空以触发回退
+                logger.error(
+                    f"Failed to parse CSV TOC: {e}. Falling back to native TOC."
+                )
+                standardized_items = []  # 解析失败，清空以触发回退
 
         # =========================================================
         # 分支 B: 尝试加载 PDF 原生 TOC (如果 CSV 为空)
@@ -233,18 +255,18 @@ class PDFParser(BaseDocPipeline):
 
                     p_idx = page_num - 1
                     if p_idx >= 0:
-                        standardized_items.append({
-                            'level': lvl,
-                            'title': title,
-                            'key': p_idx
-                        })
+                        standardized_items.append(
+                            {"level": lvl, "title": title, "key": p_idx}
+                        )
 
         # =========================================================
         # 分支 C: 纯页码回退模式 (如果以上都为空)
         # =========================================================
         is_fallback_mode = False
         if not standardized_items:
-            logger.info("No TOC found. Using page-index-only mode (no chapter structure).")
+            logger.info(
+                "No TOC found. Using page-index-only mode (no chapter structure)."
+            )
             is_fallback_mode = True
             # 纯页码回退模式：不创建任何章节结构
             # chapter_map 保持为空，所有页面都是 is_new_chapter=False
@@ -257,19 +279,25 @@ class PDFParser(BaseDocPipeline):
         # 纯页码回退模式：不创建 chapter_map，所有页面保持 is_new_chapter=False
         if is_fallback_mode:
             self.chapter_map = {}
-            logger.info("📄 纯页码模式：所有页面将通过 page_index 渲染为 h6 标记（不作为章节）")
+            logger.info(
+                "📄 纯页码模式：所有页面将通过 page_index 渲染为 h6 标记（不作为章节）"
+            )
         else:
             # 获取面包屑开关 (默认开启)
             use_bc = self.settings.processing.use_breadcrumb
 
             # 调用 process_unified_toc 生成最终 Map
             # 结果格式: { 0: {"title": "...", "level": 1}, 5: {"title": "...", "level": 2} }
-            self.chapter_map = process_unified_toc(standardized_items, use_breadcrumb=use_bc)
+            self.chapter_map = process_unified_toc(
+                standardized_items, use_breadcrumb=use_bc
+            )
 
         # (可选) 保存 raw items 供 process_flow 进行预翻译使用
         self.raw_toc_entries = standardized_items
 
-        logger.info(f"Metadata loaded. Chapter Map contains {len(self.chapter_map)} entries.")
+        logger.info(
+            f"Metadata loaded. Chapter Map contains {len(self.chapter_map)} entries."
+        )
 
     def _iter_content_units(self) -> Iterator[Tuple[int, str, str]]:
         """
@@ -281,23 +309,27 @@ class PDFParser(BaseDocPipeline):
         # --- Text 模式 ---
         # 根据 settings.document.page_range 进行页面切割
         actual_start_page = 0
-        actual_end_page = len(self.doc) # 总页数
+        actual_end_page = len(self.doc)  # 总页数
 
         if self.settings.document.page_range:
             user_start, user_end = self.settings.document.page_range
-            
+
             # 将用户输入的 1-based 转换为 0-based 索引
             potential_start_idx = user_start - 1
-            potential_end_idx = user_end # range 是 exclusive 的，所以直接用 user_end
-            
+            potential_end_idx = user_end  # range 是 exclusive 的，所以直接用 user_end
+
             # 确保范围不超出文档实际页数
             actual_start_page = max(0, potential_start_idx)
             actual_end_page = min(len(self.doc), potential_end_idx)
 
-            logger.info(f"📄 页面范围切割: 用户请求 {user_start}-{user_end}，实际处理 {actual_start_page + 1}-{actual_end_page}")
+            logger.info(
+                f"📄 页面范围切割: 用户请求 {user_start}-{user_end}，实际处理 {actual_start_page + 1}-{actual_end_page}"
+            )
             if actual_start_page >= actual_end_page:
-                logger.warning(f"⚠️ 设定的页面范围 {user_start}-{user_end} 无效或超出文档范围，将跳过页面解析。")
-                return # 范围无效，不生成任何内容
+                logger.warning(
+                    f"⚠️ 设定的页面范围 {user_start}-{user_end} 无效或超出文档范围，将跳过页面解析。"
+                )
+                return  # 范围无效，不生成任何内容
 
         for i in range(actual_start_page, actual_end_page):
             page = self.doc[i]
@@ -394,6 +426,7 @@ class PDFParser(BaseDocPipeline):
 # EPUB 解析器
 # ============================================================================
 
+
 class EPUBParser(BaseDocPipeline):
     """EPUB 文档解析器"""
 
@@ -412,7 +445,9 @@ class EPUBParser(BaseDocPipeline):
 
         # 3. 兜底逻辑：如果目录为空，使用 Spine
         if not standardized_items:
-            logger.warning("⚠️ EPUB TOC is empty. Falling back to Spine (linear reading order).")
+            logger.warning(
+                "⚠️ EPUB TOC is empty. Falling back to Spine (linear reading order)."
+            )
 
             for item_id, linear in self.book.spine:
                 item = self.book.get_item_with_id(item_id)
@@ -421,46 +456,59 @@ class EPUBParser(BaseDocPipeline):
                     if item.get_type() != ebooklib.ITEM_DOCUMENT:
                         continue
 
-                    if 'nav' in (item.get_name() or "").lower():
+                    if "nav" in (item.get_name() or "").lower():
                         continue
 
                     file_name = item.get_name()
-                    standardized_items.append({
-                        'level': 1,
-                        'title': f"Section: {file_name}",
-                        'key': file_name
-                    })
+                    standardized_items.append(
+                        {"level": 1, "title": f"Section: {file_name}", "key": file_name}
+                    )
 
         # 4. 统一处理
         use_bc = self.settings.processing.use_breadcrumb
-        self.chapter_map = process_unified_toc(standardized_items, use_breadcrumb=use_bc)
+        self.chapter_map = process_unified_toc(
+            standardized_items, use_breadcrumb=use_bc
+        )
         logger.info(f"✅ Metadata loaded. Chapter Map size: {len(self.chapter_map)}")
 
     def _iter_content_units(self):
         """按照 EPUB Spine 遍历，并解析 HTML 块级元素"""
-        BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre']
+        BLOCK_TAGS = [
+            "p",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "blockquote",
+            "pre",
+        ]
 
         for item_id, linear in self.book.spine:
             item = self.book.get_item_with_id(item_id)
 
-            if not item: continue
-            if item.get_type() != ebooklib.ITEM_DOCUMENT: continue
+            if not item:
+                continue
+            if item.get_type() != ebooklib.ITEM_DOCUMENT:
+                continue
 
             try:
                 # 1. 解析 HTML
                 raw_content = item.get_content()
-                soup = BeautifulSoup(raw_content, 'html.parser')
+                soup = BeautifulSoup(raw_content, "html.parser")
 
                 # 获取文件名作为 Key
                 unit_key = item.get_name()
 
                 # 2. 找到 Body
-                root = soup.find('body') or soup
+                root = soup.find("body") or soup
 
                 # 3. 遍历所有块级元素
                 for tag in root.find_all(BLOCK_TAGS):
                     # 4. 提取纯文本
-                    text = tag.get_text(separator=' ', strip=True)
+                    text = tag.get_text(separator=" ", strip=True)
 
                     # 5. 过滤掉空标签
                     if not text:
@@ -479,14 +527,18 @@ class EPUBParser(BaseDocPipeline):
         for node in toc:
             # 兼容 ebooklib 的两种节点格式
             entry = node[0] if isinstance(node, (list, tuple)) else node
-            children = node[1] if isinstance(node, (list, tuple)) and len(node) > 1 else []
+            children = (
+                node[1] if isinstance(node, (list, tuple)) and len(node) > 1 else []
+            )
 
-            if hasattr(entry, 'href') and entry.href:
-                items.append({
-                    'level': level,
-                    'title': entry.title or "Untitled",
-                    'key': entry.href.split('#')[0]
-                })
+            if hasattr(entry, "href") and entry.href:
+                items.append(
+                    {
+                        "level": level,
+                        "title": entry.title or "Untitled",
+                        "key": entry.href.split("#")[0],
+                    }
+                )
 
             if children:
                 items.extend(self._flatten_epub_to_standard(children, level + 1))

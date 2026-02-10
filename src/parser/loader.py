@@ -2,14 +2,14 @@
 文档加载器 (DocumentLoader)
 统一入口，负责根据文件类型选择合适的解析器并管理缓存
 """
+
 import json
 from pathlib import Path
-from typing import List, Dict, Any
 
-from ..core.schema import ContentSegment, Settings, SegmentList
 from ..core.exceptions import DocumentFormatError
-from .formats import PDFParser, EPUBParser
+from ..core.schema import ContentSegment, SegmentList, Settings
 from ..utils.logger import get_logger
+from .formats import EPUBParser, PDFParser
 
 logger = get_logger(__name__)
 
@@ -36,7 +36,7 @@ class DocumentLoader:
         # 检查缓存
         if self.settings.processing.enable_cache and cache_path.exists():
             try:
-                with open(cache_path, 'r', encoding='utf-8') as f:
+                with open(cache_path, "r", encoding="utf-8") as f:
                     raw_data = json.load(f)
                     segments = [ContentSegment(**item) for item in raw_data]
                 logger.info(f"✅ Loaded {len(segments)} segments from cache.")
@@ -45,9 +45,9 @@ class DocumentLoader:
                 logger.warning(f"⚠️ Cache file corrupted: {e}. Will re-parse document.")
 
         # 根据文件类型选择解析器
-        if ext == '.pdf':
+        if ext == ".pdf":
             parser = PDFParser(file_path, cache_path, self.settings)
-        elif ext == '.epub':
+        elif ext == ".epub":
             parser = EPUBParser(file_path, cache_path, self.settings)
         else:
             raise DocumentFormatError(f"Unsupported file format: {ext}")
@@ -65,7 +65,7 @@ class DocumentLoader:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             data = [seg.model_dump() for seg in segments]
-            with open(cache_path, 'w', encoding='utf-8') as f:
+            with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             logger.info(f"💾 Cache saved: {len(segments)} segments.")
         except Exception as e:
@@ -74,9 +74,7 @@ class DocumentLoader:
 
 # 便捷函数
 def load_document_structure(
-    file_path: Path,
-    cache_path: Path,
-    settings: Settings
+    file_path: Path, cache_path: Path, settings: Settings
 ) -> SegmentList:
     """
     加载文档结构的便捷函数

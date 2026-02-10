@@ -2,8 +2,7 @@
 日志配置工具
 使用 loguru 进行现代化日志管理
 """
-from pathlib import Path
-from typing import Optional
+
 
 from loguru import logger
 
@@ -20,7 +19,7 @@ def setup_logging(settings: Settings) -> None:
         lambda msg: print(msg, end=""),
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> <level>{level}</level> <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
         level=settings.logging.log_level.upper(),
-        colorize=True
+        colorize=True,
     )
 
     # 文件处理器
@@ -32,12 +31,12 @@ def setup_logging(settings: Settings) -> None:
             level="DEBUG",
             rotation="10 MB",
             retention="1 week",
-            encoding="utf-8"
+            encoding="utf-8",
         )
 
     # 避免日志传播
     logger.disable("google")  # 禁用 Google 库的日志
-    logger.disable("PIL")     # 禁用 PIL 库的日志
+    logger.disable("PIL")  # 禁用 PIL 库的日志
 
 
 def get_logger(name: str) -> logger:
