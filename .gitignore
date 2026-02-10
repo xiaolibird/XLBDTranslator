@@ -39,6 +39,8 @@ env002_reader/
 .env.local
 .env.*.local
 config/config.env
+config/credentials.json
+config/token.json
 
 # Project Specific
 logs/
@@ -89,9 +91,16 @@ Thumbs.db
 # Logs
 *.log
 
+# Docs
+docs/
+
 # Temporary files
 *.tmp
 *.temp
 *.sh
 bfg-report/
 ..bfg-report/
+
+.ruff_cache/
+src/scholar/
+.conda_env
