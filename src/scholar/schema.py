@@ -7,7 +7,7 @@ Scholar Digest 数据结构定义
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from datetime import datetime, date
 import json
@@ -362,12 +362,12 @@ class GmailAPISettings(BaseModel):
     """Gmail API 配置"""
     credentials_path: Path = Field(
         Path("config/credentials.json"),
-        validation_alias="GMAIL_CREDENTIALS_PATH",
+        validation_alias=AliasChoices("credentials_path", "GMAIL_CREDENTIALS_PATH"),
         description="OAuth 2.0 客户端凭据文件路径"
     )
     token_path: Path = Field(
         Path("config/token.json"),
-        validation_alias="GMAIL_TOKEN_PATH",
+        validation_alias=AliasChoices("token_path", "GMAIL_TOKEN_PATH"),
         description="OAuth 2.0 令牌存储路径"
     )
     scopes: List[str] = Field(
@@ -388,10 +388,15 @@ class GmailAPISettings(BaseModel):
 
 class LLMSettings(BaseModel):
     """LLM 配置（用于论文摘要）"""
-    provider: str = Field("gemini", validation_alias="LLM_PROVIDER", description="LLM提供商")
-    api_key: Optional[str] = Field(None, validation_alias="GEMINI_API_KEY", description="API密钥")
-    model: str = Field("gemini-2.0-flash", validation_alias="LLM_MODEL", description="模型名称")
-    
+    provider: str = Field("gemini", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, openai-compatible)")
+    api_key: Optional[str] = Field(None, validation_alias=AliasChoices("api_key", "GEMINI_API_KEY"), description="Gemini API密钥")
+    model: str = Field("gemini-2.0-flash", validation_alias=AliasChoices("model", "LLM_MODEL"), description="模型名称")
+
+    # OpenAI 兼容提供商（DeepSeek 等）。未设置时回退复用主配置
+    # config/config.env 中的 API__OPENAI_API_KEY / API__OPENAI_BASE_URL
+    openai_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("openai_api_key", "OPENAI_API_KEY"), description="OpenAI兼容API密钥（DeepSeek等）")
+    base_url: Optional[str] = Field(None, validation_alias=AliasChoices("base_url", "LLM_BASE_URL"), description="OpenAI兼容API地址")
+
     # 生成参数
     temperature: float = Field(0.3, description="生成温度")
     max_output_tokens: int = Field(8192, description="最大输出token数")
@@ -399,9 +404,9 @@ class LLMSettings(BaseModel):
 
 class ProcessingSettings(BaseModel):
     """处理配置"""
-    batch_size: int = Field(5, validation_alias="BATCH_SIZE", description="批量处理大小")
-    max_emails: int = Field(100, validation_alias="MAX_EMAILS", description="最大处理邮件数")
-    days_to_fetch: int = Field(7, validation_alias="DAYS_TO_FETCH", description="获取最近N天的邮件")
+    batch_size: int = Field(5, validation_alias=AliasChoices("batch_size", "BATCH_SIZE"), description="批量处理大小")
+    max_emails: int = Field(100, validation_alias=AliasChoices("max_emails", "MAX_EMAILS"), description="最大处理邮件数")
+    days_to_fetch: int = Field(7, validation_alias=AliasChoices("days_to_fetch", "DAYS_TO_FETCH"), description="获取最近N天的邮件")
     
     # 过滤
     scholar_sender: str = Field(
@@ -422,7 +427,7 @@ class ProcessingSettings(BaseModel):
     # 输出
     output_dir: Path = Field(
         Path("output/scholar_digest"),
-        validation_alias="OUTPUT_DIR",
+        validation_alias=AliasChoices("output_dir", "OUTPUT_DIR"),
         description="输出目录"
     )
     

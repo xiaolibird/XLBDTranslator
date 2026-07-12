@@ -2,16 +2,17 @@
 """
 测试脚本：验证 Markdown 正文和 > 引用格式的渲染
 """
-from pathlib import Path
 import sys
+from pathlib import Path
 
 # 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.schema import ContentSegment, SegmentList, Settings
+from src.renderer.epub import EPUBRenderer
 from src.renderer.markdown import MarkdownRenderer
 from src.renderer.pdf import PDFRenderer
-from src.renderer.epub import EPUBRenderer
+
 
 def test_markdown_rendering():
     """测试 Markdown 渲染器"""
@@ -29,8 +30,16 @@ def test_markdown_rendering():
     
     segments = SegmentList([segment])
     
-    # 创建设置（双语模式）
-    settings = Settings()
+    # 创建设置（双语模式）。Settings 的子配置为必填，测试用 model_construct 组装
+    from src.core.schema import (APISettings, FileSettings, LoggingSettings,
+                                 ProcessingSettings)
+    from pathlib import Path as _Path
+    settings = Settings.model_construct(
+        api=APISettings.model_construct(gemini_api_key="fake-key", gemini_model="fake-model"),
+        files=FileSettings.model_construct(document_path=None, output_base_dir=_Path("output"), modes_config_path=_Path("config/modes.json")),
+        processing=ProcessingSettings.model_construct(),
+        logging=LoggingSettings.model_construct(),
+    )
     settings.processing.retain_original = True
     
     # 渲染
@@ -124,7 +133,7 @@ def test_epub_bilingual_rendering():
     print("=" * 60)
     
     from bs4 import BeautifulSoup
-    
+
     # 模拟 EPUB 中的原始内容
     original_html = """<html>
 <body>

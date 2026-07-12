@@ -33,18 +33,24 @@ env.bak/
 venv.bak/
 .venv/
 env002_reader/
+.conda_env
 
 # Environment Variables
 .env
 .env.local
 .env.*.local
 config/config.env
+config/scholar.env
 
 # Project Specific
 logs/
 output/
-test/
+test_output/
 .pytest_cache
+# test/ 用白名单结构：目录排除（test/）会阻止 git 进入目录，
+# 负向规则必须配合 test/* 才生效
+test/*
+!test/*.py
 !test/test_toc.csv
 !test/test_pdf.pdf
 
@@ -97,3 +103,6 @@ Thumbs.db
 *.sh
 bfg-report/
 ..bfg-report/
+docs/
+.ruff_cache/
+.claude/

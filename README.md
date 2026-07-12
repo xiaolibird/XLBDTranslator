@@ -26,7 +26,7 @@
 - **DeepSeek API**: 支持 128K 上下文，成本效益高，特别优化中文翻译
   - 自动检测并启用长文本模式
   - 完整的 system + instruction + mode + context 合并为单 user message
-  - 详见 [DeepSeek 使用指南](docs/DEEPSEEK_GUIDE.md)
+  - 详见下文「3.2 编辑配置文件」中的 DeepSeek 配置示例
 - **Ollama 本地**: 支持本地部署模型，适合离线或隐私要求高的场景
 - **OpenAI 兼容**: 支持任何 OpenAI 兼容的 API
 
@@ -39,9 +39,11 @@
     - **人工智能专家**： 精通 AI 和科技前沿领域。
     - **小说翻译家**：世情耽美言情小说翻译专家。
     - **尼采阐释者**：哲学隐喻的诗意翻译。
+    - **摘要模式**：快速提炼与归纳文档要点。
+    - **逻辑分析师**：论证结构与逻辑链条的精确翻译。
 
 ### ⚙️ 高度可配置
-- **`.env` 驱动**：所有核心配置均通过 `config/.env` 文件管理，支持非交互式运行。
+- **`.env` 驱动**：所有核心配置均通过 `config/config.env` 文件管理，支持非交互式运行。
 - **自定义目录 (TOC)**: 支持通过外部 CSV 文件为 PDF 注入章节结构，实现更精准的语义切分。
 - **自定义 PDF 样式**: 通过修改 `config/pdf_style.css` 文件，您可以完全控制最终输出 PDF 的字体、边距、颜色等外观。
 
@@ -129,7 +131,6 @@ cp config/config.env.template config/config.env
     API__OPENAI_BASE_URL="https://api.deepseek.com"
     API__OPENAI_MODEL="deepseek-chat"
     ```
-    > 📖 详细配置请参考 [DeepSeek 使用指南](docs/DEEPSEEK_GUIDE.md)
 
 3.  **文档路径 (必需)**:
     ```dotenv
@@ -200,7 +201,6 @@ python main.py --config /path/to/custom.env document.epub
 |------|------|-------------|------|
 | `--vision-mode` | Vision 模式控制 | `auto`（自动检测）<br>`force`（强制启用）<br>`off`（仅文本） | `--vision-mode force` |
 | `--page-range` | 页面范围 | `"起始,结束"` 或 `"起始-结束"` | `--page-range 10-50` |
-| `--toc` | 自定义 TOC CSV 文件路径 | CSV 文件路径 | `--toc test/my_toc.csv` |
 | `--margins` | 裁切边距（移除页眉页脚） | `"上,下,左,右"`（0.0-1.0 的比例） | `--margins 0.1,0.05,0.05,0.05` |
 
 ##### 通用参数
@@ -230,9 +230,9 @@ python main.py novel.epub \
   --mode 5 \
   --retain-original
 
-# 使用 DeepSeek API 翻译
+# 使用 DeepSeek API 翻译（config.env 中配置 API__TRANSLATOR_PROVIDER 等 DeepSeek 参数，见 3.2 节）
 python main.py document.pdf \
-  --config examples/config_deepseek.env \
+  --config config/config.env \
   --mode 4 \
   --page-range 1-100
 ```
@@ -280,25 +280,71 @@ python main.py /data/document.pdf \
 
 配置完成后，翻译流程将自动开始。您可以在终端看到实时的进度日志。
 
+## 🎓 Scholar Digest（Google Scholar 邮件摘要）
+
+除文档翻译外，项目内置一个独立的 Scholar Digest 模块：读取 Gmail 中的 Google Scholar 论文提醒邮件，按关键词过滤后调用 LLM 生成中文论文摘要汇总。
+
+### 配置
+
+```bash
+# 1. 从模板创建配置文件（包含密钥，已被 .gitignore 排除，不会入库）
+cp config/scholar.env.template config/scholar.env
+
+# 2. 编辑 config/scholar.env，填入 Gemini API Key 和 Gmail OAuth 凭据路径
+#    注意：嵌套配置使用双下划线命名，如 LLM__GEMINI_API_KEY、GMAIL__CREDENTIALS_PATH
+
+# 3. 安装 Scholar 专用依赖
+pip install -r requirements_scholar.txt
+```
+
+Gmail OAuth 凭据（`config/credentials.json`）从 [Google Cloud Console](https://console.cloud.google.com/) 下载，首次运行时会引导完成授权并生成 `config/token.json`（两者均已被 .gitignore 排除）。
+
+### 运行
+
+```bash
+# 生成论文摘要汇总（读取最近邮件 -> 过滤 -> LLM 摘要 -> 输出到 output/scholar_digest/）
+python scholar_main.py digest
+
+# 使用 DeepSeek v4 生成摘要（复用 config/config.env 的 DeepSeek 密钥）
+python scholar_main.py digest --provider deepseek
+
+# 补跑历史邮件（例如最近 151 天），跨月时自动按月份拆分 Markdown 输出
+python scholar_main.py digest --days 151 --max-emails 0 --provider deepseek
+
+# 深度研究模式
+python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
+
+# 批量翻译论文（需要环境变量 GEMINI_API_KEY 或 --key 参数）
+python batch_translate_scholar.py --json <papers.json>
+```
+
 ## 📁 项目结构
 
 ```
 XLBDTranslator/
 ├── main.py                 # 主入口文件
+├── scholar_main.py         # Scholar Digest 入口（Google Scholar 邮件摘要）
+├── batch_translate_scholar.py # Scholar 论文批量翻译
 ├── check_models.py         # 检查可用的 Gemini 模型
 ├── requirements.txt        # Python 依赖包
+├── requirements_scholar.txt # Scholar Digest 依赖包
 ├── LICENSE                 # MIT 开源协议
 ├── README.md              # 中文说明文档
 ├── README.md.en           # 英文说明文档
 ├── config/                # 配置文件目录
 │   ├── config.env.template # 环境变量模板
+│   ├── scholar.env.template # Scholar Digest 配置模板
 │   ├── modes.json         # 翻译人格定义
 │   ├── pdf_style.css      # PDF 输出样式
 │   └── prompts/           # 提示词模板
 │       ├── system_instruction.md
+│       ├── system_instruction_simple.md
 │       ├── text_translation_prompt.md
+│       ├── text_translation_prompt_simple.md
 │       ├── vision_translation_prompt.md
-│       └── json_repair_prompt.md
+│       ├── json_repair_prompt.md
+│       ├── scholar_digest_prompt.md
+│       └── thesis_introduction_prompt.md
 ├── src/                   # 源代码目录
 │   ├── core/             # 核心模块（数据结构、异常）
 │   │   ├── schema.py     # Pydantic 数据模型
@@ -311,13 +357,15 @@ XLBDTranslator/
 │   │   ├── base.py       # 基础翻译器
 │   │   ├── engine.py     # 翻译引擎
 │   │   └── support.py    # 支持模块
-│   ├── renderer/         # 渲染器（Markdown、PDF）
+│   ├── renderer/         # 渲染器（Markdown、PDF、EPUB）
 │   │   ├── markdown.py   # Markdown 渲染
-│   │   └── pdf.py        # PDF 渲染
+│   │   ├── pdf.py        # PDF 渲染
+│   │   └── epub.py       # EPUB 渲染
 │   ├── workflow/         # 工作流
 │   │   ├── workflow.py   # 主工作流
 │   │   ├── builder.py    # 配置构建器
 │   │   └── tester.py     # 测试工具
+│   ├── scholar/          # Scholar Digest（Gmail 论文邮件摘要）
 │   └── utils/            # 工具函数
 │       ├── file.py       # 文件操作
 │       ├── logger.py     # 日志系统

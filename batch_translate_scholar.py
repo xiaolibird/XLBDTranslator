@@ -171,8 +171,9 @@ if __name__ == "__main__":
         if scholar_env.exists():
             with open(scholar_env, 'r', encoding='utf-8') as f:
                 for line in f:
-                    if line.startswith("GEMINI_API_KEY="):
-                        api_key = line.split("=")[1].strip()
+                    # 兼容嵌套命名（LLM__GEMINI_API_KEY，模板现行写法）与旧平铺命名
+                    if line.startswith(("LLM__GEMINI_API_KEY=", "GEMINI_API_KEY=")):
+                        api_key = line.split("=", 1)[1].strip()
                         break
     
     if not api_key:

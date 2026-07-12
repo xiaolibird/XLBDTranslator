@@ -3,6 +3,7 @@
 Google Scholar 邮件解析器
 从邮件内容中提取论文信息
 """
+import copy
 import re
 import hashlib
 from typing import List, Dict, Any, Optional, Tuple
@@ -177,6 +178,13 @@ class ScholarEmailParser:
         Google Scholar Alert 邮件结构可能因版本不同而变化，
         这里尝试多种选择器，包括对引用（Citations）邮件的支持
         """
+        # 策略0（优先）：Scholar Alert 的标准结构是每篇论文一个 <h3><a>标题</a></h3>，
+        # 其后的兄弟节点为作者行与摘要。按 h3 锚点切分能拿到全部论文；
+        # 泛型 div 选择器常常只命中一个无关容器，导致整封邮件只提取出 1 篇。
+        h3_blocks = self._split_by_h3_anchors(soup)
+        if len(h3_blocks) >= 2:
+            return h3_blocks
+
         # 常见论文容器选择器
         selectors = [
             # 新版及引用邮件格式
@@ -213,6 +221,38 @@ class ScholarEmailParser:
         
         return []
     
+    def _split_by_h3_anchors(self, soup: BeautifulSoup) -> List[Any]:
+        """按 <h3><a>（Scholar 论文标题的标准标记）切分邮件为独立论文片段。
+
+        每个片段包含 h3 本身及其后直到下一个 h3 之前的所有兄弟节点
+        （作者行、期刊行、摘要片段），供 _parse_paper_block 解析。
+        """
+        anchors = [h for h in soup.find_all('h3') if h.find('a', href=True)]
+        if len(anchors) < 2:
+            return []
+
+        blocks = []
+        rich_count = 0
+        for anchor in anchors:
+            frag = BeautifulSoup('<div></div>', 'html.parser')
+            container = frag.div
+            container.append(copy.copy(anchor))
+            sibling = anchor.next_sibling
+            while sibling is not None:
+                if getattr(sibling, 'name', None) == 'h3':
+                    break
+                container.append(copy.copy(sibling))
+                sibling = sibling.next_sibling
+            if len(container.get_text(strip=True)) > len(anchor.get_text(strip=True)) + 20:
+                rich_count += 1
+            blocks.append(container)
+
+        # 嵌套表格布局（h3 与摘要不在同一层级）下兄弟遍历只能拿到标题：
+        # 若多数片段没带出正文，放弃本策略，回退到容器选择器路径
+        if rich_count * 2 < len(blocks):
+            return []
+        return blocks
+
     def _split_by_headers(
         self, 
         soup: BeautifulSoup, 
@@ -290,6 +330,7 @@ class ScholarEmailParser:
                 field=field,
                 citation_count=citation_count,
                 source_email_id=email_metadata.email_id,
+                email_received_at=email_metadata.received_at,
                 extracted_at=datetime.now()
             )
             
@@ -582,6 +623,7 @@ class ScholarEmailParser:
                 doi=doi,
                 field=self._infer_field(text, abstract, email_metadata.alert_query),
                 source_email_id=email_metadata.email_id,
+                email_received_at=email_metadata.received_at,
                 extracted_at=datetime.now()
             )
             

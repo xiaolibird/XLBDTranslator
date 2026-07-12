@@ -27,9 +27,11 @@ An intelligent document translation tool powered by Google Gemini and state-driv
   - **AI Expert**: Technology and AI domain expertise
   - **Fiction Translator**: Literary fiction and novels
   - **Philosophy Interpreter**: Poetic translation of philosophical metaphors
+  - **Digest Mode**: Rapid extraction and summarization of key points
+  - **Logic Analyst**: Precise translation of argument structures and logical chains
 
 ### ⚙️ Highly Configurable
-- **`.env` Driven**: All core settings managed via `config/.env` for non-interactive runs
+- **`.env` Driven**: All core settings managed via `config/config.env` for non-interactive runs
 - **Custom TOC**: Inject chapter structure via external CSV files for better semantic segmentation
 - **Custom PDF Styling**: Full control over fonts, margins, colors via `config/pdf_style.css`
 
@@ -199,9 +201,9 @@ FILES__DOCUMENT_PATH=path/to/your/document.pdf
 PROCESSING__TRANSLATION_MODE=1
 
 # Processing Strategy
-PROCESSING__USE_ASYNC=true
+PROCESSING__ENABLE_ASYNC=true
 PROCESSING__RETAIN_ORIGINAL=true
-PROCESSING__USE_VISION_MODE=auto
+PROCESSING__USE_VISION_MODE=true  # true/false; omit for auto-detect
 
 # Custom TOC (optional - for PDF)
 DOCUMENT__CUSTOM_TOC_PATH=./test/my_toc.csv
@@ -214,8 +216,8 @@ DOCUMENT__MARGIN_LEFT=0.05
 DOCUMENT__MARGIN_RIGHT=0.05
 
 # Advanced Settings
-TRANSLATION__MAX_RETRIES=3
-TRANSLATION__BATCH_SIZE=10
+PROCESSING__MAX_RETRIES=3
+PROCESSING__BATCH_SIZE=10
 ```
 
 ### Custom Table of Contents Format
@@ -232,14 +234,57 @@ Page,Title,Level
 
 **Format Requirements**: CSV file must contain `Page`, `Title`, `Level` columns.
 
+## 🎓 Scholar Digest (Google Scholar Email Summaries)
+
+Besides document translation, the project ships a standalone Scholar Digest module: it reads Google Scholar alert emails from Gmail, filters papers by keyword, and calls an LLM to produce a Chinese digest of the papers.
+
+### Setup
+
+```bash
+# 1. Create the config file from the template (holds secrets; excluded by .gitignore)
+cp config/scholar.env.template config/scholar.env
+
+# 2. Edit config/scholar.env with your Gemini API Key and Gmail OAuth credential paths
+#    Note: nested settings use double underscores, e.g. LLM__GEMINI_API_KEY, GMAIL__CREDENTIALS_PATH
+
+# 3. Install Scholar-specific dependencies
+pip install -r requirements_scholar.txt
+```
+
+Download the Gmail OAuth credentials (`config/credentials.json`) from the [Google Cloud Console](https://console.cloud.google.com/). The first run walks you through authorization and creates `config/token.json` (both files are excluded by .gitignore).
+
+### Usage
+
+```bash
+# Generate a paper digest (fetch recent emails -> filter -> LLM summary -> output/scholar_digest/)
+python scholar_main.py digest
+
+# Use DeepSeek v4 for summaries (reuses the DeepSeek key from config/config.env)
+python scholar_main.py digest --provider deepseek
+
+# Backfill older emails (e.g. last 151 days); output is split into monthly Markdown files
+python scholar_main.py digest --days 151 --max-emails 0 --provider deepseek
+
+# Deep research mode
+python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
+
+# Batch-translate papers (needs GEMINI_API_KEY env var or --key)
+python batch_translate_scholar.py --json <papers.json>
+```
+
 ## 📁 Project Structure
 
 ```
 XLBDTranslator/
 ├── main.py                 # Main entry point
+├── scholar_main.py         # Scholar Digest entry (Google Scholar email digest)
+├── batch_translate_scholar.py # Batch translation for Scholar papers
+├── check_models.py         # List available Gemini models
 ├── requirements.txt        # Python dependencies
+├── requirements_scholar.txt # Scholar Digest dependencies
 ├── config/                 # Configuration files
 │   ├── config.env.template # Environment template
+│   ├── scholar.env.template # Scholar Digest config template
 │   ├── modes.json         # Translation persona definitions
 │   ├── pdf_style.css      # PDF output styling
 │   └── prompts/           # Prompt templates
@@ -247,7 +292,9 @@ XLBDTranslator/
 │   ├── core/             # Core modules (Schema, Exceptions)
 │   ├── parser/           # Document parsers (PDF, EPUB)
 │   ├── translator/       # Translation engine (sync/async)
-│   ├── renderer/         # Renderers (Markdown, PDF)
+│   ├── renderer/         # Renderers (Markdown, PDF, EPUB)
+│   ├── workflow/         # Translation workflow (builder, tester)
+│   ├── scholar/          # Scholar Digest (Gmail paper alert digest)
 │   └── utils/            # Utility functions
 ├── output/               # Translation outputs (auto-generated)
 │   └── <file_md5>/      # Per-document cache and results

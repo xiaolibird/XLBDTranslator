@@ -29,6 +29,14 @@ def run_digest(args, settings):
         settings.processing.max_emails = args.max_emails
     if args.batch_size is not None:
         settings.processing.batch_size = args.batch_size
+    if getattr(args, 'provider', None):
+        settings.llm.provider = args.provider
+        # 切换到 DeepSeek 时若模型仍是 gemini 默认值，则换用 DeepSeek 默认模型
+        if args.provider != 'gemini' and settings.llm.model.startswith('gemini'):
+            settings.llm.model = 'deepseek-v4-flash'
+            logger.info("提供商切换为 {}，默认模型: deepseek-v4-flash".format(args.provider))
+    if getattr(args, 'model', None):
+        settings.llm.model = args.model
     if args.no_translate:
         settings.processing.translate_abstracts = False
     if args.no_summary:
@@ -71,12 +79,14 @@ def run_digest(args, settings):
     logger.info("  自动已读: {}".format('是' if settings.processing.auto_mark_read else '否'))
     logger.info("  输出目录: {}".format(settings.processing.output_dir))
     
-    # 检查 API 密钥
+    # 检查 API 密钥（按提供商区分；llm.api_key 是 Gemini 专用字段）
     if settings.processing.translate_abstracts or settings.processing.generate_summary:
-        if not settings.llm.api_key:
+        if settings.llm.provider.lower() == 'gemini' and not settings.llm.api_key:
             logger.error("需要 LLM API 密钥进行翻译和摘要")
-            logger.error("   请在配置文件中设置 GEMINI_API_KEY 或使用 --no-translate --no-summary")
+            logger.error("   请在配置文件中设置 LLM__GEMINI_API_KEY 或使用 --no-translate --no-summary")
             sys.exit(1)
+        # deepseek / openai-compatible 的密钥校验交给 workflow._create_llm_client
+        #（支持回退复用 config/config.env 的 API__OPENAI_API_KEY）
     
     # Dry run 模式
     if args.dry_run:
@@ -224,6 +234,12 @@ def main():
         digest_parser.add_argument('--max-emails', type=int, default=None, help='最大处理邮件数量')
         digest_parser.add_argument('--all', action='store_true', help='获取所有历史邮件')
         
+        # LLM 参数
+        digest_parser.add_argument('--provider', type=str, default=None,
+                                   choices=['gemini', 'deepseek', 'openai-compatible'],
+                                   help='LLM 提供商（覆盖配置文件）')
+        digest_parser.add_argument('--model', type=str, default=None, help='LLM 模型名称（覆盖配置文件）')
+
         # 处理参数
         digest_parser.add_argument('--batch-size', type=int, default=None, help='LLM 批量处理大小')
         digest_parser.add_argument('--no-translate', action='store_true', help='不翻译摘要')

@@ -5,6 +5,7 @@ Scholar Digest 工作流
 """
 import json
 import hashlib
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -85,11 +86,11 @@ class ScholarWorkflow:
     def _create_llm_client(self):
         """创建 LLM 客户端"""
         provider = self.settings.llm.provider.lower()
-        
+
         if provider == 'gemini':
             from google import genai
             from google.genai import types
-            
+
             client = genai.Client(api_key=self.settings.llm.api_key)
             return {
                 'client': client,
@@ -97,11 +98,38 @@ class ScholarWorkflow:
                 'provider': 'gemini'
             }
         else:
-            # OpenAI 兼容接口
+            # OpenAI 兼容接口（deepseek / openai-compatible）
             import httpx
+
+            api_key = self.settings.llm.openai_api_key
+            base_url = self.settings.llm.base_url
+
+            # 未在 scholar.env 中配置时，回退复用主配置的 OpenAI 兼容凭据
+            if not api_key or not base_url:
+                try:
+                    from ..core.schema import Settings as CoreSettings
+                    core = CoreSettings.from_env_file(Path('config/config.env'))
+                    api_key = api_key or core.api.openai_api_key
+                    base_url = base_url or core.api.openai_base_url
+                    logger.info("复用主配置 config/config.env 的 OpenAI 兼容凭据")
+                except Exception as e:
+                    logger.debug("读取主配置失败: {}".format(e))
+
+            if provider == 'deepseek' and not base_url:
+                base_url = 'https://api.deepseek.com/v1'
+
+            if not api_key:
+                raise ValueError(
+                    "未找到 OpenAI 兼容 API 密钥：请在 config/scholar.env 设置 "
+                    "LLM__OPENAI_API_KEY，或在 config/config.env 设置 API__OPENAI_API_KEY"
+                )
+            if not base_url:
+                raise ValueError("未找到 API 地址：请设置 LLM__BASE_URL 或 API__OPENAI_BASE_URL")
+
             return {
-                'client': httpx.Client(timeout=60.0),
-                'base_url': self.settings.llm.api_key,  # 假设存储了 base_url
+                'client': httpx.Client(timeout=120.0),
+                'base_url': base_url.rstrip('/'),
+                'api_key': api_key,
                 'model': self.settings.llm.model,
                 'provider': 'openai-compatible'
             }
@@ -228,25 +256,30 @@ class ScholarWorkflow:
         """
         # 合并标题和摘要进行搜索
         content = (paper.metadata.title + " " + (paper.original_abstract or "")).lower()
-        
+
+        def keyword_hit(word: str) -> bool:
+            """ASCII 关键词按整词匹配（避免 'Gene' 命中 'general'、
+            'Vision' 命中 'supervision'），并容忍复数形式（LLM->LLMs、
+            Network->Networks）；中文关键词按包含匹配。空关键词不命中。"""
+            w = word.lower().strip()
+            if not w:
+                return False
+            if re.fullmatch(r'[a-z0-9 \-]+', w):
+                return re.search(r'\b{}(?:e?s)?\b'.format(re.escape(w)), content) is not None
+            return w in content
+
         # 1. 黑名单优先：只要命中任何一个黑名单关键词，直接剔除
         for word in blacklist:
-            if word.lower() in content:
+            if keyword_hit(word):
                 logger.debug("  跳过论文 (黑名单: {}): {}".format(word, paper.metadata.title[:50]))
                 return False
-        
+
         # 2. 白名单检查：如果设置了白名单，则必须命中其中之一
         if whitelist:
-            found_in_white = False
-            for word in whitelist:
-                if word.lower() in content:
-                    found_in_white = True
-                    break
-            
-            if not found_in_white:
+            if not any(keyword_hit(word) for word in whitelist):
                 logger.debug("  跳过论文 (未命中白名单): {}".format(paper.metadata.title[:50]))
                 return False
-        
+
         return True
     
     def _step_process_papers(self):
@@ -494,10 +527,12 @@ class ScholarWorkflow:
 
 ## 输入论文
 ```json
-{}
+__PAPERS_JSON__
 ```
 
-请严格按照JSON格式输出，ID必须与输入一一对应。""".format(json.dumps(papers_data, ensure_ascii=False, indent=2))
+请严格按照JSON格式输出，ID必须与输入一一对应。"""
+        # 不能用 str.format()：模板中的 JSON 示例花括号会被当成格式占位符（KeyError）
+        prompt = prompt.replace("__PAPERS_JSON__", json.dumps(papers_data, ensure_ascii=False, indent=2))
         
         return prompt
     
@@ -522,9 +557,24 @@ class ScholarWorkflow:
             
             return response.text
         else:
-            # OpenAI 兼容接口
-            # TODO: 实现 OpenAI 兼容调用
-            raise NotImplementedError("OpenAI compatible API not implemented yet")
+            # OpenAI 兼容接口（DeepSeek 等）
+            client = self.llm_client['client']
+            resp = client.post(
+                "{}/chat/completions".format(self.llm_client['base_url']),
+                headers={
+                    "Authorization": "Bearer {}".format(self.llm_client['api_key']),
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.llm_client['model'],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": self.settings.llm.temperature,
+                    "max_tokens": self.settings.llm.max_output_tokens,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data['choices'][0]['message']['content']
     
     def _parse_llm_response(self, response: str, batch: List[PaperSegment]):
         """解析 LLM 响应并更新段落（新JSON格式）"""
@@ -591,15 +641,17 @@ class ScholarWorkflow:
                     
         except json.JSONDecodeError as e:
             logger.error("  [ERROR] JSON parse failed: {}".format(str(e)))
-            # 标记批次中所有论文为失败
+            # 只把尚未成功的论文标记失败，不回写已 COMPLETED 的
             for seg in batch:
-                seg.status = DigestStatus.FAILED
-                seg.error_message = "JSON parse error: {}".format(str(e))
+                if seg.status != DigestStatus.COMPLETED:
+                    seg.status = DigestStatus.FAILED
+                    seg.error_message = "JSON parse error: {}".format(str(e))
         except Exception as e:
             logger.error("  [ERROR] Response processing failed: {}".format(str(e)))
             for seg in batch:
-                seg.status = DigestStatus.FAILED
-                seg.error_message = str(e)
+                if seg.status != DigestStatus.COMPLETED:
+                    seg.status = DigestStatus.FAILED
+                    seg.error_message = str(e)
     
     def _step_generate_output(self) -> DigestOutput:
         """Step 4: 生成输出文件"""
@@ -627,6 +679,9 @@ class ScholarWorkflow:
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(output.to_markdown())
         logger.info(f"  📝 Markdown: {md_path}")
+
+        # 按月切分 Markdown（跨月时额外输出每月一份，便于渲染）
+        self._write_monthly_markdown()
         
         # 生成统计信息
         stats_path = self.output_dir / f"{self.run_id}_stats.json"
@@ -644,7 +699,43 @@ class ScholarWorkflow:
         logger.info(f"  📊 统计: {stats_path}")
         
         return output
-    
+
+    def _month_key(self, segment: PaperSegment) -> str:
+        """取论文的归属月份（优先邮件接收时间，回退发布日期）"""
+        dt = segment.metadata.email_received_at or segment.metadata.publication_date
+        return dt.strftime('%Y-%m') if dt else 'unknown'
+
+    def _write_monthly_markdown(self) -> List[Path]:
+        """跨月时按月份拆分输出 Markdown，返回生成的文件路径列表"""
+        monthly: Dict[str, List[PaperSegment]] = {}
+        for seg in self.segments:
+            monthly.setdefault(self._month_key(seg), []).append(seg)
+
+        if len(monthly) <= 1:
+            return []
+
+        written = []
+        for key in sorted(monthly):
+            segs = monthly[key]
+            emails_month = [
+                e for e in self.processed_emails
+                if e.received_at and e.received_at.strftime('%Y-%m') == key
+            ]
+            month_output = DigestOutput(
+                digest_id=f"{self.run_id}_{key}",
+                title=f"Scholar Digest {key}",
+                description=f"{key}: {len(segs)} 篇论文（来自 {len(emails_month)} 封邮件）",
+                segments=segs,
+                emails_processed=emails_month,
+                status=DigestStatus.COMPLETED,
+                created_at=datetime.now(),
+            )
+            month_md = self.output_dir / f"{self.run_id}_{key}.md"
+            month_md.write_text(month_output.to_markdown(), encoding='utf-8')
+            logger.info(f"  📆 月度 Markdown: {month_md} ({len(segs)} 篇)")
+            written.append(month_md)
+        return written
+
     def _step_mark_emails_read(self):
         """Step 5: 标记邮件为已读"""
         logger.info("\n✅ Step 5: 标记邮件为已读")

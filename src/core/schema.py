@@ -5,7 +5,7 @@
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 
@@ -163,7 +163,7 @@ class APISettings(BaseModel):
 class FileSettings(BaseModel):
     """文件与路径配置"""
     document_path: Optional[Path] = Field(None, validation_alias="DOCUMENT_PATH", description="待翻译的文档路径")
-    output_base_dir: Path = Field("output", validation_alias="OUTPUT_DIR", description="缓存和中间文件的主输出目录")
+    output_base_dir: Path = Field("output", validation_alias=AliasChoices("OUTPUT_DIR", "OUTPUT_BASE_DIR"), description="缓存和中间文件的主输出目录")
     final_output_dir: Optional[Path] = Field(None, validation_alias="FINAL_OUTPUT_DIR", description="最终翻译文件的输出目录 (默认与源文件同目录)")
 
     log_file: Optional[Path] = Field("logs/default.log", validation_alias="LOG_FILE", description="日志文件路径 (默认不输出到文件)")
@@ -268,7 +268,7 @@ class Settings(BaseSettings):
     document: DocumentConfig = Field(default_factory=DocumentConfig)
 
     model_config = SettingsConfigDict(
-        env_file=Path('config/.env'),
+        env_file=Path('config/config.env'),
         env_file_encoding='utf-8',
         env_nested_delimiter='__',
         case_sensitive=False
@@ -276,7 +276,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def validate_document_path_is_set(self) -> 'Settings':
-        """验证文档路径已提供"""
+        """校验已提供的文档路径（存在性与格式）。
+
+        document_path 允许为 None：main.py 先从 env 构造 Settings，
+        再由 SettingsBuilder 注入 CLI 传入的文档路径。
+        """
         if self.files.document_path:
             if not self.files.document_path.exists():
                 raise FileNotFoundError(f"Document not found: {self.files.document_path}")
@@ -289,7 +293,7 @@ class Settings(BaseSettings):
         return self
 
     @classmethod
-    def from_env_file(cls, env_file_path: Path = Path('config/.env')) -> 'Settings':
+    def from_env_file(cls, env_file_path: Path = Path('config/config.env')) -> 'Settings':
         """
         从指定的 .env 文件路径加载设置。
         """

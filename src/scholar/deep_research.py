@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from .schema import PaperSegment, PaperMetadata, ScholarSettings
+from .schema import PaperSegment, ScholarSettings
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -417,56 +417,3 @@ Generate a comprehensive literature review in academic style.
             area=focus_area,
             papers=papers_text
         )
-
-
-def run_deep_research_cli(settings: ScholarSettings, papers_file: str):
-    """
-    CLI 入口点
-    
-    Args:
-        settings: 配置
-        papers_file: 论文 JSON 文件路径
-    """
-    import json
-    from pathlib import Path
-    
-    # 加载论文
-    papers_path = Path(papers_file)
-    if not papers_path.exists():
-        logger.error("Papers file not found: {}".format(papers_file))
-        return
-    
-    with open(papers_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    # 转换为 PaperSegment 对象
-    segments = []
-    for seg_data in data.get('segments', []):
-        # 简化处理，实际使用时需要完整转换
-        meta = PaperMetadata(**seg_data.get('metadata', {}))
-        seg = PaperSegment(
-            segment_id=seg_data.get('segment_id', 0),
-            paper_id=seg_data.get('paper_id', ''),
-            metadata=meta,
-            original_abstract=seg_data.get('original_abstract', ''),
-            translated_abstract=seg_data.get('translated_abstract', ''),
-            priority_score=seg_data.get('priority_score', 0.0)
-        )
-        segments.append(seg)
-    
-    logger.info("Loaded {} papers from {}".format(len(segments), papers_file))
-    
-    # 运行 Deep Research
-    client = DeepResearchClient(settings)
-    result = client.generate_thesis_introduction(
-        papers=segments,
-        research_topic="EHR Data Mining and Clinical Prediction using Graph Neural Networks and Large Language Models"
-    )
-    
-    if result.get('success'):
-        logger.info("\n" + "=" * 60)
-        logger.info("SUCCESS! Thesis introduction generated.")
-        logger.info("Output file: {}".format(result.get('output_file')))
-        logger.info("=" * 60)
-    else:
-        logger.error("Failed: {}".format(result.get('error')))
