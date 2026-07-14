@@ -275,6 +275,10 @@ class ZoteroConnectorClient:
         return pick_citekey(results, norm_doi, title)
 
 
+def _norm_alnum(t: str) -> str:
+    return "".join(ch.lower() for ch in (t or "") if ch.isalnum())
+
+
 def pick_citekey(results: List[Dict[str, Any]], norm_doi: str, title: Optional[str]) -> Optional[str]:
     """从 BBT 搜索结果里挑与 DOI/标题最匹配项的 citation-key（纯函数，便于单测）。"""
     if not results:
@@ -287,16 +291,25 @@ def pick_citekey(results: List[Dict[str, Any]], norm_doi: str, title: Optional[s
                 ck = it.get("citation-key") or it.get("citationKey")
                 if ck:
                     return ck
-    # 2) 标题精确匹配
+    # 2) 标题匹配（先严格，再忽略大小写/标点/空白的规范化比对）
     if title_norm:
+        tqn = _norm_alnum(title_norm)
         for it in results:
-            if (it.get("title") or "").strip().lower() == title_norm:
+            rt = (it.get("title") or "").strip().lower()
+            if rt == title_norm or (tqn and _norm_alnum(rt) == tqn):
                 ck = it.get("citation-key") or it.get("citationKey")
                 if ck:
                     return ck
-    # 3) 唯一结果兜底
+    # 3) 唯一结果兜底——必须标题近似（一方规范化包含另一方）才采纳。
+    #    片段检索（标题前 6/4/3 词）常唯一命中库里*另一篇*同前缀文献，
+    #    盲取会把别人的 citekey 安给新论文（曾致两篇不同论文共用 dayan…2021 键）。
     if len(results) == 1:
-        return results[0].get("citation-key") or results[0].get("citationKey")
+        it = results[0]
+        tqn = _norm_alnum(title or "")
+        rtn = _norm_alnum(it.get("title") or "")
+        if tqn and rtn and (tqn in rtn or rtn in tqn):
+            return it.get("citation-key") or it.get("citationKey")
+        return None
     return None
 
 

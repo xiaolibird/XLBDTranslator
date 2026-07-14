@@ -60,7 +60,7 @@ ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_inde
 ## ⚠️ citekey 注意事项(重要)
 
 - 多数 citekey 是 **headless 兜底键**(`作者姓+年+标题词`,`citekey_source: "fallback"`),**不是** Zotero/Better BibTeX 权威键。跨系统对账(Zotero、他人书目)一律以 **DOI / dedup_key** 为论文身份,citekey 只在「本索引 + 对应月 references.json」闭包内有效。
-- `citekey_collisions` 非空 = 不同论文共用同一键,`jq unique_by(.id)` 合并会**静默吞掉一篇**;先给其中一篇改键(改该月 md 里的 `[@key]` 和 references.json 里的 `id`,或直接问用户)再合并。
+- `citekey_collisions` 非空 = 不同论文共用同一键,`jq unique_by(.id)` 合并会**静默吞掉一篇**;在 XLBDTranslator-dev 仓库跑 `python scripts/notes_index.py --fix-collisions` 自动改键(保最早月不动,后出现者加 b/c 后缀,md+references.json 同步改)后再合并。
 - **升级为权威键的路径**(人在时做):按索引 DOI 批量导入 Zotero → BBT 生成正式 citekey → 论文 md 里 `sed` 替换旧键 → bibliography 换 BBT 自动导出。
 
 ## 可拷贝到论文项目 CLAUDE.md 的片段

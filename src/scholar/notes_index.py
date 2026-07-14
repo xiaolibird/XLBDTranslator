@@ -214,13 +214,28 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
     return entries
 
 
-def load_csl_items(ref_path: Path) -> Dict[str, Dict[str, Any]]:
-    """references.json（CSL-JSON 数组）→ citekey -> item。缺文件/坏文件返回空。"""
+def load_csl_items(ref_path: Path) -> List[Dict[str, Any]]:
+    """references.json（CSL-JSON 数组）→ item 列表。缺文件/坏文件返回空。"""
     try:
         items = json.loads(Path(ref_path).read_text(encoding="utf-8"))
-        return {it["id"]: it for it in items if isinstance(it, dict) and it.get("id")}
+        return [it for it in items if isinstance(it, dict)]
     except Exception:
-        return {}
+        return []
+
+
+def _match_csl(entry: Dict[str, Any], items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """给 md 条目挑对应 CSL item：先按 DOI 精确，citekey 仅在文件内唯一时才用。
+
+    同月多篇论文可能共用同一 citekey（BBT 误配所致）——若盲按 citekey 匹配，
+    第二篇会被灌入第一篇的 DOI/作者（曾致索引里两篇不同论文同 DOI 的假重复）。
+    """
+    doi = (entry.get("doi") or "").strip().lower()
+    if doi:
+        for it in items:
+            if (it.get("DOI") or "").strip().lower() == doi:
+                return it
+    cand = [it for it in items if it.get("id") == entry.get("citekey")]
+    return cand[0] if len(cand) == 1 else None
 
 
 def _merge_csl(entry: Dict[str, Any], item: Dict[str, Any]) -> None:
@@ -278,9 +293,9 @@ def build_month_entries(month: str, md_path: Path,
             logger.warning("  ⚠️ sidecar 损坏，退回 md 解析（{}）: {}".format(sidecar_path, e))
     if not entries:
         entries = parse_note_md(md_path)
-        csl = load_csl_items(ref_path) if ref_path and Path(ref_path).exists() else {}
+        csl = load_csl_items(ref_path) if ref_path and Path(ref_path).exists() else []
         for e in entries:
-            item = csl.get(e["citekey"])
+            item = _match_csl(e, csl)
             if item:
                 _merge_csl(e, item)
         source = "md-parse"
@@ -313,6 +328,22 @@ def _note_files(notes_dir: Path) -> Dict[str, Path]:
     return out
 
 
+def _entry_keys(e: Dict[str, Any]) -> List[str]:
+    """条目的身份键集合：dedup_key + 规范化标题键（二级）。
+
+    二级标题键捕获「同一论文、不同 dedup_key」的漏网重复——典型场景是
+    某月该篇缺 DOI（title 键）、另一月经 Crossref 补出 DOI（doi 键），
+    一级键不同但实为同文（如预印本/正刊双收）。
+    """
+    keys = [e["dedup_key"]]
+    t = norm_title(e.get("title"))
+    if t:
+        tk = "title:" + t
+        if tk != e["dedup_key"]:
+            keys.append(tk)
+    return keys
+
+
 def _global_pass(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """全局排序 + 跨月去重标记（最早月优先）+ 撞键检测的前置排序。"""
     papers.sort(key=lambda e: (e["month"], e.get("priority_rank") or 9999))
@@ -321,14 +352,15 @@ def _global_pass(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         e["duplicate_months"] = []
         e["duplicate_of"] = None
     for e in papers:
-        k = e["dedup_key"]
-        if k in first:
-            keeper = first[k]
+        keys = _entry_keys(e)
+        keeper = next((first[k] for k in keys if k in first), None)
+        if keeper is not None and keeper is not e:
             if e["month"] not in keeper["duplicate_months"]:
                 keeper["duplicate_months"].append(e["month"])
-            e["duplicate_of"] = "{}@{}".format(k, keeper["month"])
+            e["duplicate_of"] = "{}@{}".format(keeper["dedup_key"], keeper["month"])
         else:
-            first[k] = e
+            for k in keys:
+                first.setdefault(k, e)
     return papers
 
 
@@ -499,6 +531,83 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
         wrote["agents_md"] = _write_if_changed(notes_dir / AGENTS_MD,
                                                src.read_text(encoding="utf-8"))
     return wrote
+
+
+# ---------------- citekey 撞键修复 ----------------
+
+def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
+                            old: str, new: str) -> bool:
+    """把 entry 所在札记里的 [@old] 改为 [@new]，并同步 references.json 的 id。
+
+    优先按 entry.note_line 定点替换（防同名键误伤），找不到再全文首个命中。
+    """
+    md = Path(notes_dir) / entry["note_file"]
+    try:
+        lines = md.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        logger.warning("  ⚠️ 读札记失败，跳过改键 {}: {}".format(md, e))
+        return False
+    tag_old, tag_new = "[@{}]".format(old), "[@{}]".format(new)
+    ln = entry.get("note_line")
+    hit_line = None
+    if ln and 1 <= ln <= len(lines) and tag_old in lines[ln - 1]:
+        hit_line = ln - 1
+    else:
+        hit_line = next((i for i, l in enumerate(lines) if tag_old in l), None)
+    if hit_line is None:
+        logger.warning("  ⚠️ 未在 {} 找到 {}，跳过".format(md.name, tag_old))
+        return False
+    lines[hit_line] = lines[hit_line].replace(tag_old, tag_new)
+    md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    ref_name = entry.get("references_json")
+    if ref_name:
+        rp = Path(notes_dir) / ref_name
+        try:
+            items = json.loads(rp.read_text(encoding="utf-8"))
+            cand = [it for it in items if isinstance(it, dict) and it.get("id") == old]
+            # 按 DOI 精确挑（同文件同 id 极罕见，防御一下）
+            doi = (entry.get("doi") or "").lower()
+            tgt = next((it for it in cand if doi and (it.get("DOI") or "").lower() == doi),
+                       cand[0] if cand else None)
+            if tgt is not None:
+                tgt["id"] = new
+                rp.write_text(json.dumps(items, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+        except Exception as e:
+            logger.warning("  ⚠️ 同步 references.json 失败（{}）: {}".format(ref_name, e))
+    return True
+
+
+def fix_citekey_collisions(notes_dir: Path) -> int:
+    """自动修复撞键：同 citekey 指向不同论文时，保最早月不动，
+    后出现者加 b/c… 后缀（仿 BBT 消歧），就地改 md + references.json。
+
+    返回重命名条数；调用方随后应重建索引（md 已变更）。docx 为人读版不回写。
+    """
+    notes_dir = Path(notes_dir)
+    index = update_index(notes_dir)
+    live = [e for e in index["papers"] if not e.get("duplicate_of")]
+    all_keys = {e.get("citekey") for e in index["papers"]}
+    by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for e in live:
+        by_key.setdefault(e.get("citekey") or "", []).append(e)
+    renamed = 0
+    for key, group in sorted(by_key.items()):
+        if not key or len(group) <= 1 or len({e["dedup_key"] for e in group}) <= 1:
+            continue
+        group.sort(key=lambda e: (e["month"], e.get("priority_rank") or 9999))
+        for e in group[1:]:                      # 最早月保留原键
+            suf = ord("b")
+            new = "{}{}".format(key, chr(suf))
+            while new in all_keys:
+                suf += 1
+                new = "{}{}".format(key, chr(suf))
+            if _rename_citekey_in_note(notes_dir, e, key, new):
+                all_keys.add(new)
+                renamed += 1
+                logger.info("  🔧 改键 {} → {}（{}）".format(key, new, e["month"]))
+    return renamed
 
 
 # ---------------- backfill 去重集 ----------------

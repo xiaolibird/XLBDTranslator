@@ -11,21 +11,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.scholar.notes_index import update_index, write_outputs  # noqa: E402
+from src.scholar.notes_index import (  # noqa: E402
+    update_index, write_outputs, fix_citekey_collisions,
+)
 
 
 def main():
     ap = argparse.ArgumentParser(description="构建/更新科研札记文献索引")
     ap.add_argument("--notes-dir", default="output/scholar_notes")
     ap.add_argument("--full", action="store_true", help="全量重建（忽略增量缓存）")
-    ap.add_argument("--since", default=None, help="只重解析 >= 此月份（YYYY-MM）")
-    ap.add_argument("--until", default=None, help="只重解析 <= 此月份（YYYY-MM）")
+    ap.add_argument("--since", default=None, help="强制重扫 >= 此月份（YYYY-MM）")
+    ap.add_argument("--until", default=None, help="强制重扫 <= 此月份（YYYY-MM）")
+    ap.add_argument("--fix-collisions", action="store_true",
+                    help="自动修复 citekey 撞键（后出现月加 b/c 后缀，改 md+references.json）")
     args = ap.parse_args()
 
     notes_dir = Path(args.notes_dir)
     if not notes_dir.is_dir():
         print("❌ 札记目录不存在: {}".format(notes_dir))
         return 1
+    if args.fix_collisions:
+        n = fix_citekey_collisions(notes_dir)
+        print("🔧 撞键改键 {} 篇".format(n))
     index = update_index(notes_dir, full=args.full, since=args.since, until=args.until)
     wrote = write_outputs(index, notes_dir)
     uniq = [e for e in index["papers"] if not e.get("duplicate_of")]

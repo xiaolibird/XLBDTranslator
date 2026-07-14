@@ -94,8 +94,19 @@ def test_pick_citekey_title_fallback():
     assert zotero_sync.pick_citekey(results, "", "A Study of MNAR in EHR") == "public2025mnar"
 
 
-def test_pick_citekey_unique_fallback_and_none():
-    assert zotero_sync.pick_citekey([{"citation-key": "solo2024"}], "", None) == "solo2024"
+def test_pick_citekey_unique_fallback_requires_title_similarity():
+    """唯一结果不再盲取：片段检索常唯一命中库里另一篇同前缀文献，
+    盲取会把别人的 citekey 安给新论文（回归：dayan…2021 键被两篇不同论文共用）。"""
+    solo = [{"title": "Federated Learning for Predicting Dementia Conversion",
+             "citation-key": "dayan2021Fed"}]
+    # 标题不近似（另一篇同前缀论文）→ 拒绝
+    assert zotero_sync.pick_citekey(
+        solo, "", "Federated Learning for Predicting Major Postoperative Complications") is None
+    # 无标题可校验 → 拒绝
+    assert zotero_sync.pick_citekey([{"citation-key": "solo2024"}], "", None) is None
+    # 标题近似（规范化后互相包含，如仅标点/大小写差异）→ 采纳
+    assert zotero_sync.pick_citekey(
+        solo, "", "federated learning for predicting dementia conversion.") == "dayan2021Fed"
     assert zotero_sync.pick_citekey([], "10.1/x", "t") is None
     # 多结果无匹配 → None（不乱猜）
     two = [{"DOI": "10.a/1", "citation-key": "a"}, {"DOI": "10.b/2", "citation-key": "b"}]

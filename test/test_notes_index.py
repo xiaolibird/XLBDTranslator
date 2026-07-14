@@ -132,6 +132,75 @@ def test_dedup_earliest_month_wins():
     assert next(e for e in out if e["month"] == "2023-03")["duplicate_of"] is None
 
 
+def test_same_month_same_citekey_keeps_own_doi(tmp_path):
+    """同月两篇不同论文共用 citekey(BBT 误配)时,CSL 匹配须按 DOI 优先,
+    不得把第一篇的 DOI 灌给第二篇(假重复+元数据污染)。"""
+    _write_month(tmp_path, citekeys={"pa": "shared2025Key", "pb": "shared2025Key", "pc": None},
+                 sidecar=False)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=None)
+    by_title = {e["title"]: e for e in entries}
+    assert by_title["Deep | EHR [Models] under MNAR"]["doi"] == "10.1/aaa"
+    b = by_title["Graph Transformers for Missingness"]
+    assert b["doi"] is None and b["arxiv_id"] == "2501.01234"   # 没被灌入 10.1/aaa
+    assert b["dedup_key"] == "arxiv:2501.01234"
+
+
+def test_title_secondary_dedup_catches_missed_duplicate():
+    """同一论文一月缺 DOI(title 键)、另一月补出 DOI(doi 键):一级键不同,
+    须由规范化标题二级键判为重复,而非留成 citekey 撞键。"""
+    papers = [
+        {"month": "2025-03", "priority_rank": 1, "citekey": "dayan2021Fed",
+         "title": "Federated Learning for Predicting Outcomes",
+         "dedup_key": "title:federatedlearningforpredictingoutcomes"},
+        {"month": "2025-05", "priority_rank": 2, "citekey": "dayan2021Fed",
+         "title": "Federated Learning for Predicting Outcomes",
+         "dedup_key": "doi:10.1038/xyz"},
+    ]
+    out = ni._global_pass(papers)
+    dup = next(e for e in out if e["month"] == "2025-05")
+    assert dup["duplicate_of"] == "title:federatedlearningforpredictingoutcomes@2025-03"
+    assert ni._citekey_collisions(out) == []          # 不再报撞键
+
+
+def test_fix_citekey_collisions_renames_later_month(tmp_path):
+    """真撞键(不同论文同键):最早月保留,后月加 b 后缀,md 与 references.json 同步改。"""
+    _write_month(tmp_path, month="2024-01",
+                 citekeys={"pa": "wang2024Same", "pb": "lee2025Graph", "pc": None})
+    _write_month(tmp_path, month="2024-05",
+                 citekeys={"pa": "x2024A", "pb": "x2024B", "pc": None})
+    # 手工制造撞键:把 2024-05 的 pa(不同 DOI 论文)改成同键 wang2024Same
+    stem5 = "科研札记_2024-05_全文精读"
+    md5 = tmp_path / (stem5 + ".md")
+    md5.write_text(md5.read_text(encoding="utf-8").replace("[@x2024A]", "[@wang2024Same]"),
+                   encoding="utf-8")
+    rp5 = tmp_path / (stem5 + ".references.json")
+    items = json.loads(rp5.read_text(encoding="utf-8"))
+    for it in items:
+        if it["id"] == "x2024A":
+            it["id"] = "wang2024Same"
+            it["DOI"] = "10.9/other"           # 不同论文(不同 DOI、不同标题则太重,改 DOI 即可)
+            it["title"] = "Another Different Paper"
+    rp5.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    # 标题也要不同,否则会被二级标题键判成重复而非撞键
+    md5.write_text(md5.read_text(encoding="utf-8").replace(
+        "Deep | EHR [Models] under MNAR", "Another Different Paper"), encoding="utf-8")
+
+    renamed = ni.fix_citekey_collisions(tmp_path)
+    assert renamed == 1
+    idx = ni.update_index(tmp_path, full=True)
+    assert idx["citekey_collisions"] == []
+    md_txt = md5.read_text(encoding="utf-8")
+    assert "[@wang2024Sameb]" in md_txt and md_txt.count("[@wang2024Same]") == 0
+    items = json.loads(rp5.read_text(encoding="utf-8"))
+    assert any(it["id"] == "wang2024Sameb" for it in items)
+    # 最早月原键不动
+    md1 = (tmp_path / "科研札记_2024-01_全文精读.md").read_text(encoding="utf-8")
+    assert "[@wang2024Same]" in md1
+
+
 def test_citekey_collision_detected():
     papers = [
         {"month": "2024-01", "citekey": "wang2024Missing", "dedup_key": "doi:10.1/a",
