@@ -1,0 +1,96 @@
+# -*- coding: utf-8 -*-
+"""Crossref 元数据增强回归测试：解析 / 标题相似度门槛 / 增强覆盖。全程 mock，不发网络。"""
+import httpx
+
+from src.scholar.schema import PaperMetadata
+from src.scholar import crossref
+
+
+_WORK = {
+    "DOI": "10.1016/j.landig.2026.101043",
+    "title": ["Deception in clinical large language models: an under-recognised safety risk"],
+    "author": [
+        {"given": "Aakash", "family": "Reddy"},
+        {"given": "David T", "family": "Zhu"},
+    ],
+    "container-title": ["The Lancet Digital Health"],
+    "volume": "8", "issue": "2", "page": "e101043",
+    "issued": {"date-parts": [[2026, 2, 1]]},
+    "URL": "https://doi.org/10.1016/j.landig.2026.101043",
+}
+
+
+def test_title_similarity():
+    assert crossref.title_similarity("A B C", "A B C") == 1.0
+    assert crossref.title_similarity("A B C D", "X Y Z") == 0.0
+    assert 0 < crossref.title_similarity("causal EHR missingness", "EHR missingness graph") < 1
+
+
+def test_parse_crossref_work():
+    p = crossref.parse_crossref_work(_WORK)
+    assert p["doi"] == "10.1016/j.landig.2026.101043"
+    assert p["authors"] == ["Aakash Reddy", "David T Zhu"]
+    assert p["journal"] == "The Lancet Digital Health"
+    assert p["publication_date"].year == 2026 and p["publication_date"].month == 2
+
+
+def test_best_match_accepts_exact_rejects_low():
+    title = "Deception in clinical large language models: an under-recognised safety risk"
+    # 完全匹配 → 命中
+    assert crossref.best_match([_WORK], title) is not None
+    # 无关论文（低相似度）→ 拒绝，返回 None（不污染）
+    wrong = dict(_WORK, title=["Game Theory Approach to Identifying Deception"],
+                 author=[{"given": "Tyler", "family": "Di Maggio"}])
+    assert crossref.best_match([wrong], title) is None
+
+
+def test_crossref_lookup_via_mock():
+    def handler(request):
+        assert "api.crossref.org" in str(request.url)
+        assert "mailto=" in str(request.url)
+        return httpx.Response(200, json={"message": {"items": [_WORK]}})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    hit = crossref.crossref_lookup(
+        "Deception in clinical large language models: an under-recognised safety risk",
+        email="x@y.com", client=client)
+    assert hit and hit["doi"] == "10.1016/j.landig.2026.101043"
+
+
+def test_enrich_metadata_cleans_dirty_authors():
+    # 模拟 Scholar 邮件解析出的脏作者 + 缺 DOI
+    meta = PaperMetadata(
+        paper_id="p1",
+        title="Deception in clinical large language models: an under-recognised safety risk",
+        authors=["recognised safety riskA Reddy", "DT Zhu"], doi=None)
+
+    def handler(request):
+        return httpx.Response(200, json={"message": {"items": [_WORK]}})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    ok = crossref.enrich_metadata(meta, email="x@y.com", client=client)
+    assert ok is True
+    assert meta.authors == ["Aakash Reddy", "David T Zhu"]  # 脏作者被规范覆盖
+    assert meta.doi == "10.1016/j.landig.2026.101043"       # 补上 DOI
+    assert meta.journal == "The Lancet Digital Health"
+
+
+def test_enrich_metadata_no_match_keeps_original():
+    """标题对不上时保留原始元数据（宁可漏增强也不误配）。"""
+    meta = PaperMetadata(paper_id="p2", title="Totally Unrelated Preprint About Nothing",
+                         authors=["Correct Author"], doi=None)
+
+    def handler(request):
+        return httpx.Response(200, json={"message": {"items": [_WORK]}})  # 返回无关论文
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    ok = crossref.enrich_metadata(meta, email="x@y.com", client=client)
+    assert ok is False
+    assert meta.authors == ["Correct Author"]  # 未被覆盖
+    assert meta.doi is None
+
+
+def test_crossref_lookup_network_error_returns_none():
+    def handler(request):
+        raise httpx.ConnectError("boom")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert crossref.crossref_lookup("whatever title here", email="x@y.com", client=client) is None

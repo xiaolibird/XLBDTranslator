@@ -6,7 +6,7 @@ import json, os, traceback, signal, threading
 from pathlib import Path
 from typing import Dict, Optional, List
 
-from ..core.schema import Settings, SegmentList, ContentSegment
+from ..core.schema import Settings, SegmentList, ContentSegment, contains_failed_marker
 from ..core.exceptions import TranslationError
 from ..utils.logger import logger
 from datetime import datetime
@@ -260,6 +260,9 @@ class TranslationWorkflow:
 
             # 6. 执行翻译循环
             self._run_translation_loop()
+
+            # 6.5 质检回路：扫描失败/术语违例段落，定向重译（上限 1 轮），生成 quality_report.json
+            self._quality_check()
 
             # 7. 翻译完成后处理标题（利用术语表保持一致性）
             self._post_translate_titles()
@@ -784,7 +787,128 @@ class TranslationWorkflow:
         self._save_structure_map(self.all_segments)
         self.checkpoint.save_checkpoint()
         logger.info("✅ 强制保存完成")
-    
+
+    def _glossary_violations(self, seg: ContentSegment) -> List[tuple]:
+        """检查单个已译段落是否违反术语表：原文（整词）出现某术语英文 key，
+        但译文中缺失其规定的中文译名。返回 [(en, zh), ...]。
+
+        整词匹配英文 key（ASCII 词边界）以降低误报；只考虑长度≥3 的 key。
+        """
+        if not self.glossary:
+            return []
+        import re as _re
+        orig = seg.original_text or ""
+        trans = seg.translated_text or ""
+        violations = []
+        for en, zh in self.glossary.items():
+            if not en or not zh or len(en) < 3:
+                continue
+            if _re.search(r'(?<![A-Za-z0-9])' + _re.escape(en) + r'(?![A-Za-z0-9])', orig) and zh not in trans:
+                violations.append((en, zh))
+        return violations
+
+    def _quality_check(self) -> None:
+        """译后质检回路：定向重译硬失败段落（上限 1 轮），术语违例仅报告，生成 quality_report.json。
+
+        复用 checkpoint 重入队与同步翻译路径，不重造翻译逻辑。属确定性扫描（零 LLM 成本）。
+
+        重要：只重译「硬失败/空译文」段落——它们本就没有可用译文，重译只赚不赔。
+        术语违例段落**只报告不重译**：它们本有合格可读译文，字面包含判定有误报，
+        清空重译一旦失败反而毁掉好译文、且成本可能翻倍（见评审 MEDIUM-4/5）。"""
+        if not getattr(self.settings.processing, 'enable_quality_check', True):
+            logger.info("⏭️ 质检回路已禁用 (enable_quality_check=False)")
+            return
+        if not self.all_segments:
+            return
+
+        logger.info("🔍 质检：扫描失败标记与术语违例段落...")
+        failed: SegmentList = []
+        term_violations: List[tuple] = []  # (seg, [(en,zh),...])
+        for seg in self.all_segments:
+            if seg.content_type != "text":
+                continue
+            tt = seg.translated_text or ""
+            if not tt.strip() or contains_failed_marker(tt):
+                failed.append(seg)
+                continue
+            v = self._glossary_violations(seg)
+            if v:
+                term_violations.append((seg, v))
+
+        if failed:
+            logger.info(
+                "🔁 质检触发定向重译：{} 段硬失败/空译文（上限 1 轮）；另有 {} 段术语违例仅报告不重译".format(
+                    len(failed), len(term_violations)
+                )
+            )
+            # 仅对硬失败段清空译文并移出 completed，使其重新入队（无好译文可毁）
+            for seg in failed:
+                seg.translated_text = ""
+                try:
+                    self.checkpoint.remove_from_completed(seg.segment_id)
+                except Exception:
+                    pass
+            try:
+                self._run_sync_translation(list(failed))
+            except Exception as e:
+                logger.error(f"❌ 质检定向重译失败（保留失败标记）: {e}")
+            self._save_structure_map(self.all_segments)
+            self.checkpoint.save_checkpoint()
+        elif term_violations:
+            logger.info("ℹ️ 质检：{} 段术语违例（仅报告，见 quality_report.json）".format(len(term_violations)))
+        else:
+            logger.info("✅ 质检未发现失败或术语违例段落")
+
+        # 重译后仍失败的段落
+        still_failed = [
+            seg for seg in self.all_segments
+            if seg.content_type == "text" and contains_failed_marker(seg.translated_text or "")
+        ]
+        self._write_quality_report(failed, term_violations, still_failed)
+
+        if still_failed:
+            logger.warning(
+                "⚠️ 质检结束：仍有 {} 个段落翻译失败（详见 quality_report.json），已如实标记在输出中".format(
+                    len(still_failed)
+                )
+            )
+        else:
+            logger.info("✅ 质检结束：无残留失败段落")
+
+    def _write_quality_report(self, failed_before, term_violations_before, still_failed) -> None:
+        """写出质检报告，替代‘标 [Failed] 就完事’的静默降级。"""
+        try:
+            report = {
+                "generated_at": datetime.now().isoformat(),
+                "document": self.file_path.name,
+                "total_segments": len(self.all_segments) if self.all_segments else 0,
+                "failed_before_retry": [seg.segment_id for seg in failed_before],
+                "term_violations_before_retry": [
+                    {
+                        "segment_id": seg.segment_id,
+                        "missing_terms": [{"term": en, "expected": zh} for en, zh in vs],
+                    }
+                    for seg, vs in term_violations_before
+                ],
+                "still_failed_after_retry": [
+                    {
+                        "segment_id": seg.segment_id,
+                        "page_index": getattr(seg, "page_index", None),
+                        "original_excerpt": (seg.original_text or "")[:200],
+                        "translated_excerpt": (seg.translated_text or "")[:200],
+                    }
+                    for seg in still_failed
+                ],
+            }
+            out_path = self.project_dir / "quality_report.json"
+            with open(out_path, 'w', encoding='utf-8') as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            logger.info(f"🗂️ 质检报告已写入: {out_path}")
+        except Exception as e:
+            logger.error(f"❌ 写质检报告失败: {e}")
+
     def _run_sync_translation(self, pending_segments: SegmentList) -> None:
         """同步翻译模式（带进度条）"""
         logger.info("🔄 使用同步模式翻译")
@@ -822,7 +946,7 @@ class TranslationWorkflow:
                             results = self.translator.translate_batch(batch, context=context)
                             
                             for seg, trans in zip(batch, results):
-                                if trans and not trans.startswith("[Failed") and not trans.endswith("Failed]"):
+                                if trans and not contains_failed_marker(trans):
                                     seg.translated_text = trans
                                     self.checkpoint.mark_segment_completed(seg.segment_id)
                                     success_count += 1
@@ -867,7 +991,7 @@ class TranslationWorkflow:
                     results = self.translator.translate_batch(batch, context=context)
 
                     for seg, trans in zip(batch, results):
-                        if trans and not trans.startswith("[Failed") and not trans.endswith("Failed]"):
+                        if trans and not contains_failed_marker(trans):
                             seg.translated_text = trans
                             self.checkpoint.mark_segment_completed(seg.segment_id)
                             success_count += 1

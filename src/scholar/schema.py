@@ -149,6 +149,12 @@ class PaperSegment(BaseModel):
     priority_score: float = Field(default=0.0, description="综合优先级得分")
     priority_reason: str = Field(default="", description="优先级评分理由")
 
+    # 过滤裁决（三态 decision/bucket/flags/role/confidence 随论文进入输出，用于分节与排序）
+    filter_decision: Optional["FilterDecision"] = Field(None, description="该论文的过滤裁决记录")
+
+    # 全文精读（从正文归纳，句级三色联想标记；仅对高优先级 top-N 生成）
+    close_reading: Optional["CloseReading"] = Field(None, description="全文精读结果（结构化+句级标记）")
+
     model_config = {'use_enum_values': True}
 
     @property
@@ -199,6 +205,64 @@ class EmailMetadata(BaseModel):
     papers_extracted: int = Field(default=0, description="提取的论文数量")
 
     model_config = {'use_enum_values': True}
+
+
+class FilterDecision(BaseModel):
+    """单篇论文的过滤裁决记录（写入 excluded sidecar，保证可审计性）
+
+    方法学审稿三态：decision(INCLUDE/MAYBE/EXCLUDE) + bucket/flags/role/one_line/confidence。
+    verdict 保留为二值（included/excluded）以兼容旧 sidecar 消费方：INCLUDE/MAYBE→included，EXCLUDE→excluded。
+    """
+    paper_id: str = Field(description="论文唯一标识")
+    title: str = Field(description="论文标题")
+    verdict: Literal["included", "excluded"] = Field(description="二值裁决（向后兼容）")
+    decision: Optional[Literal["INCLUDE", "MAYBE", "EXCLUDE"]] = Field(
+        None, description="三态裁决（LLM 方法学审稿；关键词阶段为 None）"
+    )
+    stage: Literal["blacklist_keyword", "llm_judge", "whitelist_keyword", "keyword_fallback"] = Field(
+        description="裁决阶段：黑名单确定性匹配 / LLM 相关性裁决 / 关键词白名单 / LLM 失败后的关键词回退"
+    )
+    reason: str = Field(default="", description="裁决理由（LLM 的 one_line 或命中的关键词）")
+    bucket: List[str] = Field(default_factory=list, description="命中的纳入维度（A..G）")
+    exclude_reason: Optional[str] = Field(None, description="排除维度代码（X1..X7），仅 EXCLUDE 时有值")
+    flags: List[str] = Field(default_factory=list, description="危险信号标记（THREAT/BENCHMARK/OVERCLAIM_PRECEDENT）")
+    role: Optional[str] = Field(None, description="对本文的角色：CITE_SUPPORT/CITE_CONTRAST/MUST_ENGAGE/BACKGROUND/NONE")
+    one_line: str = Field(default="", description="一句话用处说明（≤30字）")
+    confidence: Optional[float] = Field(None, description="裁决置信度 0.0-1.0")
+    model: Optional[str] = Field(None, description="做出裁决的 LLM 模型（确定性阶段为 None）")
+    prompt_version: Optional[str] = Field(None, description="裁决 prompt 版本标签+模板哈希（如 filter-v2@a1b2c3d4）")
+    decided_at: datetime = Field(default_factory=datetime.now, description="裁决时间")
+
+
+# ==================== 全文精读结果 ====================
+
+# 句级联想标记：关联研究主线的三类角色（可空=普通句子）
+CloseReadTag = Literal["方法学创新", "重要发现", "研究背景"]
+
+
+class CloseReadSentence(BaseModel):
+    """精读正文的一个句子/片段，可带一个三色联想标记。"""
+    text: str = Field(description="句子文本（中文）")
+    tag: Optional[CloseReadTag] = Field(None, description="句级联想标记：方法学创新/重要发现/研究背景，或无")
+
+
+class CloseReadSection(BaseModel):
+    """精读的一个分节（研究问题/方法与数据/关键结论/可质疑点/对我研究的联想）。"""
+    heading: str = Field(description="分节标题")
+    sentences: List[CloseReadSentence] = Field(default_factory=list, description="句级片段列表")
+
+
+class CloseReading(BaseModel):
+    """单篇论文的全文精读结果（结构化 + 句级三色标记）。"""
+    from_full_text: bool = Field(True, description="是否基于全文（False=付费墙无全文，摘要级降级）")
+    sections: List[CloseReadSection] = Field(default_factory=list, description="分节精读内容")
+    model: Optional[str] = Field(None, description="精读使用的 LLM 模型")
+    source: Optional[str] = Field(None, description="全文来源：arxiv/unpaywall/abstract")
+    read_at: datetime = Field(default_factory=datetime.now, description="精读时间")
+
+
+# 解析 PaperSegment 的前向引用（FilterDecision / CloseReading 定义在其后）
+PaperSegment.model_rebuild()
 
 
 class DigestBatch(BaseModel):
@@ -327,9 +391,33 @@ class DigestOutput(BaseModel):
         
         for i, seg in enumerate(self.segments, 1):
             meta = seg.metadata
+            # 裁决徽章：三态 decision + 危险信号 flags + 角色 role（方法学审稿输出）
+            badge = ""
+            fd = seg.filter_decision
+            if fd:
+                parts = []
+                if fd.decision:
+                    parts.append("`{}`".format(fd.decision))
+                if fd.bucket:
+                    parts.append("维度 {}".format("/".join(fd.bucket)))
+                if fd.flags:
+                    parts.append("⚑ " + "/".join(fd.flags))
+                if fd.role and fd.role != "NONE":
+                    parts.append("角色 {}".format(fd.role))
+                if fd.confidence is not None:
+                    parts.append("conf {:.2f}".format(fd.confidence))
+                if parts:
+                    badge = " ".join(parts)
+            title_line = "### {}. {}".format(i, meta.title)
+            lines.append(title_line)
+            lines.append("")
+            if badge:
+                lines.append("**裁决**: {}".format(badge))
+            if fd and fd.one_line:
+                lines.append("**用处**: {}".format(fd.one_line))
+            if meta.source_type and meta.source_type != "unknown":
+                lines.append("**来源**: {}".format(meta.source_type))
             lines.extend([
-                "### {}. {}".format(i, meta.title),
-                "",
                 "**优先级**: `{:.2f}` ({})".format(seg.priority_score, meta.priority_reason or ""),
                 "**引用数**: {}".format(meta.citation_count if meta.citation_count is not None else "Unknown"),
                 "**作者**: {}{}".format(', '.join(meta.authors[:5]), '...' if len(meta.authors) > 5 else ''),
@@ -388,14 +476,19 @@ class GmailAPISettings(BaseModel):
 
 class LLMSettings(BaseModel):
     """LLM 配置（用于论文摘要）"""
-    provider: str = Field("gemini", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, openai-compatible)")
+    provider: str = Field("deepseek", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, openai-compatible)")
     api_key: Optional[str] = Field(None, validation_alias=AliasChoices("api_key", "GEMINI_API_KEY"), description="Gemini API密钥")
-    model: str = Field("gemini-2.0-flash", validation_alias=AliasChoices("model", "LLM_MODEL"), description="模型名称")
+    model: str = Field("deepseek-v4-flash", validation_alias=AliasChoices("model", "LLM_MODEL"), description="模型名称")
 
     # OpenAI 兼容提供商（DeepSeek 等）。未设置时回退复用主配置
     # config/config.env 中的 API__OPENAI_API_KEY / API__OPENAI_BASE_URL
     openai_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("openai_api_key", "OPENAI_API_KEY"), description="OpenAI兼容API密钥（DeepSeek等）")
     base_url: Optional[str] = Field(None, validation_alias=AliasChoices("base_url", "LLM_BASE_URL"), description="OpenAI兼容API地址")
+
+    # 白名单裁决专用模型（None 时复用主模型 model）
+    filter_model: Optional[str] = Field(None, validation_alias=AliasChoices("filter_model", "FILTER_MODEL"), description="过滤裁决使用的模型，未设置时复用 model")
+    # 全文精读专用模型（强模型；None 时复用主模型 model）
+    closeread_model: Optional[str] = Field(None, validation_alias=AliasChoices("closeread_model", "CLOSEREAD_MODEL"), description="全文精读使用的强模型，未设置时复用 model")
 
     # 生成参数
     temperature: float = Field(0.3, description="生成温度")
@@ -414,16 +507,164 @@ class ProcessingSettings(BaseModel):
         description="Google Scholar 发件人地址"
     )
     
-    # 关键词过滤
+    # 过滤模式：llm = 黑名单确定性预过滤 + LLM 相关性裁决（宽松语义匹配）
+    #           keyword = 传统黑白名单关键词匹配
+    filter_mode: Literal["llm", "keyword"] = Field(
+        "llm",
+        validation_alias=AliasChoices("filter_mode", "FILTER_MODE"),
+        description="白名单过滤模式：llm（LLM 相关性裁决）或 keyword（关键词匹配）"
+    )
+
+    # 研究方向描述 / 论文主题与定位（注入 LLM 裁决 prompt 的 {{RESEARCH_INTERESTS}}）
+    research_interests: str = Field(
+        "论文主题：EHR 缺失机制（MNAR）与「缺失条件依赖结构」的跨中心可迁移性；"
+        "定位为 causal hypothesis generation，不做 causal identification。"
+        "基础工作：MA-GCT（特征专属可学习掩码嵌入 + Guide/Prior 注意力约束）。",
+        validation_alias=AliasChoices("research_interests", "RESEARCH_INTERESTS"),
+        description="论文主题与定位，用于 LLM 方法学审稿裁决"
+    )
+
+    # 关键词过滤（keyword 模式的白名单；两种模式共用黑名单做确定性预过滤）
     whitelist: List[str] = Field(
-        default_factory=lambda: ["EHR", "Clinical", "Prediction", "GNN", "LLM", "Graph", "Medicine"],
-        description="白名单关键词：包含任一则保留"
+        default_factory=lambda: [
+            # EHR / 临床预测
+            "EHR", "Electronic Health Record", "EMR", "Electronic Medical Record",
+            "Clinical Prediction", "Predictive Model", "Risk Prediction", "Clinical Decision Support",
+            # 缺失机制方法学
+            "MNAR", "MAR", "missing not at random", "missingness", "informative missingness",
+            "missing data", "imputation", "mask embedding", "missingness-aware", "missingness indicator",
+            # 缺失 × 因果
+            "missingness graph", "m-graph", "causal discovery", "causal structure", "identifiability",
+            # 跨域 / 迁移
+            "transportability", "domain shift", "dataset shift", "distribution shift",
+            "external validation", "LODO", "site heterogeneity", "generalization",
+            # 建模
+            "GNN", "Graph Neural Network", "Graph Convolutional", "attention", "feature propagation",
+            "LLM", "Large Language Model", "foundation model", "Transformer",
+            "Semi-supervised", "Active Learning",
+            # venue 基准 / 临床场景
+            "MIMIC", "eICU", "AmsterdamUMCdb", "HiRID", "ICU",
+            "sepsis", "AKI", "acute kidney injury", "CKD", "mortality prediction",
+        ],
+        description="白名单关键词：keyword 模式下必须命中其一；llm 模式下仅作 LLM 失败时的回退"
     )
     blacklist: List[str] = Field(
-        default_factory=lambda: ["Biology", "Gene", "Drug", "Vision"],
-        description="黑名单关键词：包含任一则剔除"
+        default_factory=lambda: [
+            # 只保留与 EHR/临床机器学习方法学“明确无关”的领域，避免抢在 LLM 之前误杀
+            # 影像/基因组/信号等由 LLM 依 X1..X7 判定（否则会误杀 MNAR×影像 等对抗性证据）。
+            "天文", "Astronomy", "Astrophysics", "天体",
+            "材料科学", "Materials Science", "地质", "Geology",
+            "农业", "Agriculture", "考古", "Archaeology",
+            "particle physics", "量子化学", "Quantum Chemistry", "催化", "Catalysis",
+            "植物学", "Botany", "昆虫", "Entomology",
+        ],
+        description="黑名单关键词：仅无歧义的完全离题领域（确定性预过滤）；X1-X7 交给 LLM 判定"
     )
     
+    # 外部检索来源（PubMed / arXiv，并入每周 digest）
+    external_sources_enabled: bool = Field(
+        True,
+        validation_alias=AliasChoices("external_sources_enabled", "EXTERNAL_SOURCES_ENABLED"),
+        description="是否在 digest 中并入 PubMed/arXiv 检索式抓取的论文"
+    )
+    external_max_results: int = Field(
+        25,
+        validation_alias=AliasChoices("external_max_results", "EXTERNAL_MAX_RESULTS"),
+        description="每个外部来源最多抓取的论文数"
+    )
+    external_email: str = Field(
+        "",
+        validation_alias=AliasChoices("external_email", "EXTERNAL_EMAIL"),
+        description="NCBI E-utilities 礼貌参数用的联系邮箱（可选，无需密钥）"
+    )
+    arxiv_query: str = Field(
+        "(all:MNAR OR all:\"missing not at random\" OR all:\"informative missingness\" "
+        "OR all:\"missingness mechanism\") AND (all:EHR OR all:\"electronic health record\" "
+        "OR all:ICU OR all:\"clinical prediction\") AND (all:\"causal discovery\" "
+        "OR all:transportability OR all:\"distribution shift\" OR all:\"external validation\" "
+        "OR all:attention OR all:\"graph neural network\")",
+        validation_alias=AliasChoices("arxiv_query", "ARXIV_QUERY"),
+        description="arXiv 检索式（Atom API 语法，字段前缀 all:/abs:）"
+    )
+    pubmed_query: str = Field(
+        "(missing not at random OR MNAR OR informative missingness OR missingness mechanism) "
+        "AND (electronic health record OR EHR OR ICU OR clinical prediction) "
+        "AND (causal discovery OR causal structure OR transportability OR distribution shift "
+        "OR external validation OR attention OR graph neural network)",
+        validation_alias=AliasChoices("pubmed_query", "PUBMED_QUERY"),
+        description="PubMed 检索式（E-utilities term 语法）"
+    )
+
+    # Zotero 联动（B1 全自动写库 + citekey + pandoc 札记）
+    # 默认关闭：写库需 Zotero 桌面端在线，无人值守 cron 下可能没开，建议交互式运行。
+    zotero_enabled: bool = Field(
+        False,
+        validation_alias=AliasChoices("zotero_enabled", "ZOTERO_ENABLED"),
+        description="digest 后是否把入选论文写入 Zotero 并生成 pandoc 札记"
+    )
+    zotero_base_url: str = Field(
+        "http://localhost:23119",
+        validation_alias=AliasChoices("zotero_base_url", "ZOTERO_BASE_URL"),
+        description="Zotero 连接器服务地址（本地）"
+    )
+    zotero_collection: str = Field(
+        "",
+        validation_alias=AliasChoices("zotero_collection", "ZOTERO_COLLECTION"),
+        description="要求写入的分类名（防呆）：设了就必须在 Zotero 里选中同名分类，否则拒绝写入；空=写入当前选中"
+    )
+    zotero_attach_pdf: bool = Field(
+        True,
+        validation_alias=AliasChoices("zotero_attach_pdf", "ZOTERO_ATTACH_PDF"),
+        description="是否解析 OA PDF（arXiv/Unpaywall）作为附件让 Zotero 自抓"
+    )
+    zotero_enrich_crossref: bool = Field(
+        True,
+        validation_alias=AliasChoices("zotero_enrich_crossref", "ZOTERO_ENRICH_CROSSREF"),
+        description="写库前用 Crossref 标题检索规范作者+补 DOI（修正 Scholar 邮件解析的脏作者）"
+    )
+    zotero_translation_server_url: str = Field(
+        "",
+        validation_alias=AliasChoices("zotero_translation_server_url", "ZOTERO_TRANSLATION_SERVER_URL"),
+        description="Zotero translation-server 地址（如 http://localhost:1969）。设了则把标识符交给它做权威解析；空=用自建 item"
+    )
+    zotero_email: str = Field(
+        "",
+        validation_alias=AliasChoices("zotero_email", "ZOTERO_EMAIL"),
+        description="Unpaywall 礼貌参数邮箱（联系句柄，非密钥）；为空时复用 external_email"
+    )
+    notes_dir: Path = Field(
+        Path("output/scholar_notes"),
+        validation_alias=AliasChoices("notes_dir", "NOTES_DIR"),
+        description="pandoc 科研札记输出目录"
+    )
+    notes_instruction: str = Field(
+        "",
+        validation_alias=AliasChoices("notes_instruction", "NOTES_INSTRUCTION"),
+        description="自定义归纳指令（写入札记手记区注释，指导你后续整理）"
+    )
+    # 全文精读（从正文归纳 + 句级三色联想）
+    closeread_enabled: bool = Field(
+        False,
+        validation_alias=AliasChoices("closeread_enabled", "CLOSEREAD_ENABLED"),
+        description="是否对高优先级 top-N 做全文精读（下 PDF 抽全文 → 强模型精读）"
+    )
+    closeread_top_n: int = Field(
+        5,
+        validation_alias=AliasChoices("closeread_top_n", "CLOSEREAD_TOP_N"),
+        description="每次精读覆盖的高优先级论文数（控成本）"
+    )
+    # 样式化 docx 输出
+    notes_emit_docx: bool = Field(
+        True,
+        validation_alias=AliasChoices("notes_emit_docx", "NOTES_EMIT_DOCX"),
+        description="生成札记时是否同时产出样式化 docx（单元格着色/句级三色/字体区分）"
+    )
+    notes_docx_cjk_font: str = Field(
+        "",
+        validation_alias=AliasChoices("notes_docx_cjk_font", "NOTES_DOCX_CJK_FONT"),
+        description="docx 中文字体名（如 思源宋体/宋体）；空=不显式设置"
+    )
+
     # 输出
     output_dir: Path = Field(
         Path("output/scholar_digest"),

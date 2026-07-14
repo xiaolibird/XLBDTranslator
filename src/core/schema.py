@@ -9,6 +9,25 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
 
+# 统一的翻译失败/不完整标记词表。
+# 此前 is_translated（本文件）只认 "[Translation Failed"，而 checkpoint 的 get_pending_segments
+# 认 "[Failed"/"Failed]"，engine 两种都会产出——导致 "[Failed: ...]" 段被 is_translated 误判为已译、
+# 逃过质检与续译。以下常量是全链路（is_translated、get_pending_segments、质检 step）的唯一真源。
+FAILED_MARKERS = (
+    "[Translation Failed",
+    "[Failed",
+    "[Fallback Failed",
+    "[...翻译被截断]",
+)
+
+
+def contains_failed_marker(text: Optional[str]) -> bool:
+    """文本是否含任一失败/不完整标记（大小写敏感，标记本身固定为英文/中文字面量）。"""
+    if not text:
+        return False
+    return any(marker in text for marker in FAILED_MARKERS)
+
+
 class ContextLength(str, Enum):
     """上下文长度枚举"""
     LOW = "low"
@@ -110,21 +129,10 @@ class ContentSegment(BaseModel):
 
     @property
     def is_translated(self) -> bool:
-        """检查是否已翻译"""
+        """检查是否已翻译（含失败/不完整标记的视为未完成，交给质检与续译）"""
         if not self.translated_text or not self.translated_text.strip():
             return False
-
-        # 检查是否是失败标签
-        failed_markers = [
-            "[Translation Failed",
-            "[Translation Failed - JSON Parse Error]",
-            "[Translation Failed]"
-        ]
-        for marker in failed_markers:
-            if marker in self.translated_text:
-                return False
-
-        return True
+        return not contains_failed_marker(self.translated_text)
 
     def get_context_window(self, all_segments: list['ContentSegment'], window_size: int = 3) -> str:
         """获取上下文窗口"""
@@ -236,6 +244,10 @@ class ProcessingSettings(BaseModel):
     # 其他可选设置
     json_repair_retries: int = Field(0, description="JSON 修复重试次数")
     use_rich_progress: bool = Field(False, description="是否使用 rich 进度显示")
+
+    # 质检回路：翻译完成后扫描失败/术语违例段落并定向重译（上限 1 轮），生成 quality_report.json
+    enable_quality_check: bool = Field(True, validation_alias="ENABLE_QUALITY_CHECK", description="是否启用译后质检与定向重译")
+    qc_semantic: bool = Field(False, validation_alias="QC_SEMANTIC", description="是否启用廉价模型语义漏译抽检（默认关，控成本，预留）")
 
     @field_validator('batch_size')
     def validate_batch_size(cls, v):

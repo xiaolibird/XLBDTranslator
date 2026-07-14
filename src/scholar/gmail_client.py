@@ -327,17 +327,21 @@ class GmailClient:
         days: Optional[int] = 7,
         max_results: int = 100,  # 0 为不限制
         unread_only: bool = False,
-        include_archived: bool = True
+        include_archived: bool = True,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取 Google Scholar 邮件
-        
+
         Args:
             days: 获取最近 N 天的邮件，如果是 None 或 0 则获取所有历史邮件
             max_results: 最大返回数量 (0 为不限制)
             unread_only: 是否只获取未读邮件
             include_archived: 是否包含已存档邮件（不在收件箱中的）
-            
+            after: 起始日期 YYYY/MM/DD（历史区间回填；优先于 days）
+            before: 结束日期 YYYY/MM/DD（不含当天，Gmail 语义）
+
         Returns:
             包含邮件内容和元数据的列表
         """
@@ -362,8 +366,14 @@ class GmailClient:
         
         query_parts.append('({} OR {})'.format(sender_query, subject_query))
         
-        # 时间过滤
-        if days and days > 0:
+        # 时间过滤：显式区间(after/before) 优先于相对 days（回填历史月份）
+        if after or before:
+            if after:
+                query_parts.append('after:{}'.format(after))
+            if before:
+                query_parts.append('before:{}'.format(before))
+            logger.info("过滤邮件区间: after={} before={}".format(after or '-', before or '-'))
+        elif days and days > 0:
             after_date = (datetime.now() - timedelta(days=days)).strftime('%Y/%m/%d')
             query_parts.append('after:{}'.format(after_date))
             logger.info("过滤最近 {} 天的邮件".format(days))

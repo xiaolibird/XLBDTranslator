@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Set, Tuple, TYPE_CHECKING
 from datetime import datetime, timedelta
 
-from ..core.schema import ContentSegment, SegmentList
+from ..core.schema import ContentSegment, SegmentList, contains_failed_marker
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -162,11 +162,10 @@ class CheckpointManager:
             # 条件1: 不在已完成列表中
             not_completed = seg.segment_id not in completed_ids
             
-            # 条件2: 翻译结果为空或包含失败标记
+            # 条件2: 翻译结果为空或包含失败/不完整标记（统一词表，见 core.schema.FAILED_MARKERS）
             has_failed_content = (
                 not seg.translated_text or
-                seg.translated_text.startswith("[Failed") or
-                seg.translated_text.endswith("Failed]")
+                contains_failed_marker(seg.translated_text)
             )
             
             # 满足任一条件即为待翻译
@@ -816,9 +815,8 @@ class PromptManager:
             self.text_translation_prompt = self._load_prompt_template("text_translation_prompt_simple.md")
             logger.info("🏠 本地模式：使用简化版prompt（节省资源）")
         
-        # 视觉和JSON修复prompt保持不变
+        # 视觉 prompt 保持不变（JSON 修复已由结构化输出取代，不再加载 json_repair_prompt）
         self.vision_translation_prompt = self._load_prompt_template("vision_translation_prompt.md")
-        self.json_repair_prompt = self._load_prompt_template("json_repair_prompt.md")
     
     def _load_prompt_template(self, template_name: str) -> str:
         """从文件加载 Prompt 模板"""
@@ -898,22 +896,17 @@ The following terms MUST be translated exactly as specified. These are non-negot
             parts.append(glossary_section)
         
         return "".join(parts)
-    
+
     def get_mode_prefix(self) -> str:
-        """
-        获取Mode配置作为User message的前缀（已弃用，mode 现在包含在 system instruction 中）
-        
-        Returns:
-            格式化的模式前缀字符串
-        """
+        """获取 Mode 配置作为 User message 的前缀（文本路径已并入 system instruction，
+        视觉路径仍在 user message 中拼接此前缀）。"""
         if not self.mode_entity:
             return ""
-        
-        # 使用属性访问
+
         role_desc = self.mode_entity.role_desc
         style = self.mode_entity.style
         mode_name = self.mode_entity.name
-        
+
         return f"""{'='*80}
 ⚠️ ACTIVE TRANSLATION MODE: {mode_name}
 {'='*80}
@@ -928,7 +921,7 @@ Your Style & Approach:
 {'='*80}
 
 """
-    
+
     def format_text_prompt(
         self,
         context: str,
@@ -969,29 +962,40 @@ Your Style & Approach:
         
         return "\n".join(parts)
     
-    def format_vision_prompt(self, context: str) -> str:
+    def format_vision_prompt(self, context: str, glossary: str = "") -> str:
         """
         格式化视觉翻译的完整提示
-        
+
         Args:
             context: 上下文文本
-        
+            glossary: 术语表文本（已格式化为「- **原文**: Must be translated as **译文**」行），
+                      为空时不注入。修复此前视觉路径不带术语表、与文本路径术语不一致的问题。
+
         Returns:
             格式化的完整提示
         """
         parts = []
-        
+
         # 添加模式前缀
         mode_prefix = self.get_mode_prefix()
         if mode_prefix:
             parts.append(mode_prefix)
-        
+
+        # 添加术语表（与文本路径一致，强制术语统一）
+        if glossary and glossary.strip() and glossary.strip() != "N/A":
+            parts.append(
+                "# MANDATORY GLOSSARY\n<glossary>\n"
+                f"{glossary}\n</glossary>\n"
+                "**CRITICAL**: If any term in the image matches the glossary, "
+                "you MUST use the specified translation."
+            )
+
         # 添加上下文
         if context and context.strip():
             parts.append(f"# Context from Previous Page\n<previous_context>\n{context}\n</previous_context>")
         else:
             parts.append("# Context from Previous Page\nNo previous context.")
-        
+
         return "\n".join(parts)
     
     def format_title_prompt(self, text_list: str) -> str:
@@ -1017,27 +1021,4 @@ Output JSON format: A flat JSON Dictionary where keys are the source text and va
 Example: {{"Chapter 1": "第一章", "Index": "索引"}}
 
 Return ONLY the JSON object."""
-    
-    def format_json_repair_prompt(
-        self,
-        original_prompt: str,
-        broken_json: str,
-        error_details: str
-    ) -> str:
-        """
-        格式化 JSON 修复提示
-        
-        Args:
-            original_prompt: 原始提示
-            broken_json: 损坏的 JSON 字符串
-            error_details: 错误详情
-        
-        Returns:
-            格式化的 JSON 修复提示
-        """
-        return self.json_repair_prompt.format(
-            original_prompt=original_prompt,
-            broken_json=broken_json,
-            error_details=error_details
-        )
 

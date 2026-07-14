@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Scholar Digest 每周自动运行（launchd 用户代理）
+  由 scripts/install_weekly_digest.sh 安装：占位符 __REPO_ROOT__ / __PYTHON_BIN__ /
+  __LOG_DIR__ 会被替换为实际路径后拷入 ~/Library/LaunchAgents/。
+
+  直接执行 python 而非 bash 包装脚本：仓库在 ~/Documents 下受 macOS TCC 保护，
+  launchd 任务访问它需要在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中授权，
+  直接执行 python 可把需授权的二进制收窄到一个（见 install 脚本输出的提示）。
+  日志写到 ~/Library/Logs/（无 TCC 限制），避免 launchd 写日志本身被拒。
+
+  相比 crontab 的优势：错过触发时点（睡眠/关机）唤醒后自动补跑。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scholar_main.py</string>
+        <string>digest</string>
+        <string>--days</string>
+        <string>8</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- 每周一 09:00 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_digest.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_digest.err.log</string>
+</dict>
+</plist>

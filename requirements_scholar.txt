@@ -18,5 +18,11 @@ pydantic-settings>=2.0.0
 # HTTP 客户端
 httpx>=0.25.0
 
+# 样式化 docx 札记（单元格着色/句级三色/字体区分）
+python-docx>=1.1.0
+
+# 全文精读抽取（PDF → 文本）
+PyMuPDF>=1.23.0
+
 # 其他工具
 python-dateutil>=2.8.2

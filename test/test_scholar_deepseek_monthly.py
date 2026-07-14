@@ -44,9 +44,9 @@ def make_segment(seg_id: int, title: str, received: datetime) -> PaperSegment:
 
 
 def test_deepseek_client_uses_scholar_env_credentials(tmp_path):
-    """provider=deepseek 时客户端使用 scholar.env 的 key/base_url，不再是 NotImplementedError 桩"""
+    """provider=deepseek 时客户端使用 scholar.env 的 key/base_url（LLMClient.conn 暴露连接字典）"""
     wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
-    client = wf.llm_client
+    client = wf.llm_client.conn  # 委托 LLMClient；.conn 是连接字典
     assert client["provider"] == "openai-compatible"
     assert client["api_key"] == "FAKE_DEEPSEEK_KEY"
     assert client["base_url"] == "https://fake.example.com/v1"
@@ -74,13 +74,16 @@ def test_call_llm_openai_compatible_posts_chat_completions(tmp_path, monkeypatch
             captured["json"] = json
             return FakeResponse()
 
-    wf._llm_client = {
+    from src.scholar.llm_client import LLMClient
+    lc = LLMClient(wf.settings.llm)
+    lc._conn = {
         "client": FakeClient(),
         "base_url": "https://fake.example.com/v1",
         "api_key": "FAKE_DEEPSEEK_KEY",
         "model": "deepseek-v4-flash",
         "provider": "openai-compatible",
     }
+    wf._llm_client = lc
 
     result = wf._call_llm("测试 prompt")
     assert result == "摘要结果"
@@ -148,22 +151,22 @@ def test_blacklist_matches_whole_words_only(tmp_path):
     whitelist = []
 
     ok = make_segment(1, "A general framework with supervision for EHR prediction", datetime(2026, 3, 1))
-    assert wf._filter_paper(ok, whitelist, blacklist) is True
+    assert wf._match_keyword(ok, blacklist) is None
 
     bad_gene = make_segment(2, "Gene expression analysis in cancer", datetime(2026, 3, 1))
-    assert wf._filter_paper(bad_gene, whitelist, blacklist) is False
+    assert wf._match_keyword(bad_gene, blacklist) == "Gene"
 
     bad_vision = make_segment(3, "Computer Vision for radiology", datetime(2026, 3, 1))
-    assert wf._filter_paper(bad_vision, whitelist, blacklist) is False
+    assert wf._match_keyword(bad_vision, blacklist) == "Vision"
 
 
 def test_whitelist_whole_word(tmp_path):
     """白名单同样整词匹配：'LLM' 不应被 'allmark' 之类误命中，但正常命中保留"""
     wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
     hit = make_segment(1, "An LLM approach to clinical notes", datetime(2026, 3, 1))
-    assert wf._filter_paper(hit, ["LLM"], []) is True
+    assert wf._match_keyword(hit, ["LLM"]) == "LLM"
     miss = make_segment(2, "The hallmark of allmark systems", datetime(2026, 3, 1))
-    assert wf._filter_paper(miss, ["LLM"], []) is False
+    assert wf._match_keyword(miss, ["LLM"]) is None
 
 
 def test_build_batch_prompt_handles_json_braces(tmp_path):
@@ -201,17 +204,17 @@ def test_whitelist_matches_plural_forms(tmp_path):
         "Predictive Models for ICU Mortality",
     ):
         seg = make_segment(1, title, datetime(2026, 3, 1))
-        assert wf._filter_paper(seg, whitelist, []) is True, title
+        assert wf._match_keyword(seg, whitelist) is not None, title
     # 整词边界仍然生效
     miss = make_segment(2, "The hallmark of allmark systems", datetime(2026, 3, 1))
-    assert wf._filter_paper(miss, ["LLM"], []) is False
+    assert wf._match_keyword(miss, ["LLM"]) is None
 
 
 def test_empty_keyword_never_matches(tmp_path):
     """空关键词不得命中一切（黑名单混入空项时不能全灭）"""
     wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
     seg = make_segment(1, "Any EHR paper", datetime(2026, 3, 1))
-    assert wf._filter_paper(seg, [], ["", "  "]) is True
+    assert wf._match_keyword(seg, ["", "  "]) is None
 
 
 def test_batch_failure_does_not_overwrite_completed(tmp_path):

@@ -293,8 +293,8 @@ class ScholarEmailParser:
             if not title:
                 return None
             
-            # 提取作者
-            authors = self._extract_authors(block)
+            # 提取作者（传入干净标题，剥除粘连的标题尾巴）
+            authors = self._extract_authors(block, title)
             
             # 提取摘要/描述
             abstract = self._extract_abstract(block)
@@ -402,45 +402,89 @@ class ScholarEmailParser:
         
         return url
     
-    def _extract_authors(self, block: Any) -> List[str]:
-        """提取作者列表"""
-        authors = []
-        
-        # Google Scholar 邮件中作者通常是灰色文本
-        # 或在特定的 class 中
-        gray_texts = block.find_all(['font', 'span'], 
+    # 作者 token 的排除关键词（标题尾巴/邮件样板文字混入的信号）
+    _AUTHOR_JUNK_KEYWORDS = (
+        "google scholar", "following", "new articles", "related to research",
+        "http", "arxiv", "preprint", "[pdf]", "[html]", "et al", "journal",
+    )
+
+    @staticmethod
+    def _strip_title_bleed(author_text: str, title: str) -> str:
+        """剥掉粘在作者串开头的标题尾巴。
+
+        Scholar 邮件里 get_text 常把标题末段与作者行粘在一起（如
+        "…Multi-Agent LLM Systems?J Bai, L Shi" 或无分隔的 "…RecordsD Pant"）。
+        标题是单独干净提取的，故找“title 的最长后缀恰是 author_text 的前缀”并截掉。
+        """
+        if not author_text or not title:
+            return author_text
+        a = re.sub(r"\s+", " ", author_text).strip()
+        t = re.sub(r"\s+", " ", title).strip()
+        al, tl = a.lower(), t.lower()
+        best = 0
+        # 找 title 的最长后缀，使其为 author_text 的前缀（字符级，忽略大小写）
+        for i in range(len(tl)):
+            suffix = tl[i:]
+            if len(suffix) <= best:
+                break  # 后面更短，无需再试
+            if al.startswith(suffix):
+                best = len(suffix)
+                break  # 从最左 i 起即最长后缀
+        if best >= 6:  # 至少 6 字符才认定是标题尾巴，避免误伤短姓名
+            return a[best:].lstrip(" ,:?[]-–—")
+        return author_text
+
+    @classmethod
+    def _clean_author_list(cls, raw_text: str, title: str = "") -> List[str]:
+        """把原始作者串清洗为作者列表（纯函数，可离线单测）。
+
+        步骤：剥标题尾巴 → 截到 " - "（作者 - 期刊, 年）前 → 逗号分隔 → 过滤噪声 token。
+        """
+        text = cls._strip_title_bleed(raw_text or "", title)
+        # 截断到 " - "（Scholar 引用行的作者/期刊分隔），去掉期刊年份尾巴
+        text = re.split(r"\s[-–—]\s", text)[0]
+        out: List[str] = []
+        for tok in text.split(","):
+            t = tok.strip()
+            if not t:
+                continue
+            if any(ch.isdigit() for ch in t):      # 排除年份/卷期等
+                continue
+            if len(t) > 40:                          # 过长 → 标题残留
+                continue
+            if any(ch in t for ch in "?:[]{}"):     # 标题标点混入
+                continue
+            low = t.lower()
+            if any(k in low for k in cls._AUTHOR_JUNK_KEYWORDS):
+                continue
+            out.append(t)
+        return out[:10]
+
+    def _extract_authors(self, block: Any, title: str = "") -> List[str]:
+        """提取作者列表（传入干净标题以剥除粘连的标题尾巴）"""
+        raw = ""
+
+        # Google Scholar 邮件中作者通常是灰色/绿色着色文本
+        gray_texts = block.find_all(['font', 'span'],
             attrs={'color': re.compile(r'#[0-9a-fA-F]{6}|gray', re.I)})
-        
         for elem in gray_texts:
             text = elem.get_text(strip=True)
-            # 作者列表通常包含多个名字，用逗号分隔
             if ',' in text and len(text) < 500:
-                # 可能是作者列表
-                potential_authors = [
-                    a.strip() 
-                    for a in text.split(',')
-                    if a.strip() and not any(c.isdigit() for c in a)  # 排除年份等数字
-                ]
-                if len(potential_authors) >= 1:
-                    authors = potential_authors
-                    break
-        
-        # 如果没找到，尝试从 "Author - Journal, Year" 这种常见格式中提取
-        if not authors:
+                raw = text
+                break
+
+        # 回退：从 "Author - Journal, Year" 或 "by Author1, Author2" 中取
+        if not raw:
             text = block.get_text()
-            # 模式：Author, Author - Journal, Year
             meta_match = re.search(r'([^-\n]+)\s+-\s+[^-\n]+,\s+\d{4}', text)
             if meta_match:
-                author_text = meta_match.group(1).strip()
-                authors = [a.strip() for a in author_text.split(',') if a.strip()]
+                raw = meta_match.group(1).strip()
             else:
-                # 查找 "by Author1, Author2" 模式
                 by_match = re.search(r'by\s+([^-\n]+)', text, re.IGNORECASE)
                 if by_match:
-                    author_text = by_match.group(1)
-                    authors = [a.strip() for a in author_text.split(',') if a.strip()]
-        
-        return authors[:10]  # 限制最多10个作者
+                    raw = by_match.group(1)
+
+        return self._clean_author_list(raw, title)
     
     def _extract_abstract(self, block: Any) -> str:
         """提取摘要/描述"""

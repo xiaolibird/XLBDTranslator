@@ -29,6 +29,65 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# 文本翻译的结构化输出 schema：强制模型返回 [{"id": int, "translation": str}] 数组。
+# 仅用于文本批量翻译（字段固定）；术语表/标题翻译是动态键字典，无法用固定 schema 约束，故不设。
+_TRANSLATION_LIST_SCHEMA = types.Schema(
+    type=types.Type.ARRAY,
+    items=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "id": types.Schema(type=types.Type.INTEGER),
+            "translation": types.Schema(type=types.Type.STRING),
+        },
+        required=["id", "translation"],
+    ),
+)
+
+# 术语抽取的分窗大小（字符）。此前对全文只取前 8000 字符导致大文档后半段术语系统性缺失；
+# 现改为按此预算切窗、逐窗抽取后合并，覆盖全文。
+GLOSSARY_WINDOW_SIZE = 8000
+
+
+def _normalize_translation_list(parsed: Any) -> List[Dict[str, Any]]:
+    """把翻译解析结果规整成 [{"id":..,"translation":..}] 列表。
+
+    DeepSeek 的 response_format=json_object 语义是「顶层为对象」，模型可能把数组包成
+    {"translations":[...]}/{"data":[...]} 或退化成 {id: 译文} 映射；直接遍历 dict 会拿到键、
+    导致整批被误判缺失。这里统一解包，避免结构化输出反而打断解析。
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("translations", "data", "results", "papers", "items"):
+            val = parsed.get(key)
+            if isinstance(val, list):
+                return val
+        # 退化的 {id: 译文} 映射（值为字符串）
+        if parsed and all(isinstance(v, str) for v in parsed.values()):
+            out = []
+            for k, v in parsed.items():
+                out.append({"id": k, "translation": v})
+            return out
+    return []
+
+
+def _iter_glossary_windows(pair_texts: List[str], window_size: int = GLOSSARY_WINDOW_SIZE):
+    """把「原文/译文」配对字符串按字符预算切成多个窗口，保证覆盖全文。
+
+    单条配对若本身超过窗口大小，则单独成窗（不再截断，交给模型自行处理）。
+    """
+    window: List[str] = []
+    length = 0
+    for pair in pair_texts:
+        if window and length + len(pair) > window_size:
+            yield "\n".join(window)
+            window, length = [], 0
+        window.append(pair)
+        length += len(pair) + 1
+    if window:
+        yield "\n".join(window)
+
+
 # ========================================================================
 # Gemini 翻译客户端
 # ========================================================================
@@ -402,9 +461,29 @@ class GeminiTranslator(BaseTranslator):
             logger.warning("   - 提供的片段均未翻译，无法提取术语。")
             return {}
 
-        content_sample = "\n".join(text_to_analyze)
-        
-        # 构建 Prompt
+        # 按窗口覆盖全文（不再只取前 8000 字符），逐窗抽取后合并
+        final_glossary: Dict[str, str] = {}
+        windows = list(_iter_glossary_windows(text_to_analyze))
+        for idx, content_sample in enumerate(windows, 1):
+            if len(windows) > 1:
+                logger.info(f"   - 术语抽取窗口 {idx}/{len(windows)}")
+            try:
+                final_glossary.update(self._extract_glossary_window(content_sample))
+            except Exception as e:
+                logger.error(f"   - ❌ 术语抽取窗口 {idx} 失败（跳过）: {e}")
+
+        if final_glossary:
+            logger.info(f"   - ✅ 成功提取 {len(final_glossary)} 个术语。")
+            for k, v in list(final_glossary.items())[:5]:
+                logger.info(f"     - '{k}' -> '{v}'")
+            if len(final_glossary) > 5:
+                logger.info("     - ... (更多术语)")
+        else:
+            logger.warning("   - ⚠️ 术语提取未能产生有效字典。")
+        return final_glossary
+
+    def _extract_glossary_window(self, content_sample: str) -> Dict[str, str]:
+        """对单个内容窗口做一次术语抽取，返回归一化后的 {原文: 译文} 字典。"""
         original_prompt = f"""
         You are an expert linguist and terminologist.
         Analyze the following pairs of original and translated text. Identify all key, recurring, or specialized terms (like names, places, philosophical concepts, technical jargon) and create a definitive glossary.
@@ -425,89 +504,61 @@ class GeminiTranslator(BaseTranslator):
 
         Text to Analyze:
         <text>
-        {content_sample[:8000]}
+        {content_sample}
         </text>
 
         Return ONLY the JSON object.
         """
 
+        if self._client is None:
+            raise APIAuthenticationError("Gemini client is not configured")
+
+        # Use centralized _generate_content to benefit from response validation and cache fallback
         try:
-            if self._client is None:
-                raise APIAuthenticationError("Gemini client is not configured")
-
-            # 使用 settings 中的参数，确保一致性
-            extraction_config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=self.settings.processing.temperature,
-                max_output_tokens=self.settings.processing.max_output_tokens,
+            response = self._generate_content(
+                contents=original_prompt,
+                generation_config={
+                    "response_mime_type": "application/json",
+                    "temperature": self.settings.processing.temperature,
+                    "max_output_tokens": self.settings.processing.max_output_tokens,
+                },
+                use_cache=True,
+                purpose="Glossary Extraction"
             )
+        except APIError as e:
+            # 被安全过滤器拦截时跳过该窗口，允许翻译继续
+            if "blocked" in str(e).lower() or "PROHIBITED_CONTENT" in str(e):
+                logger.warning(f"⚠️  Glossary Extraction was blocked by safety filters. Skipping window. Error: {e}")
+                return {}
+            raise
 
-            # Use centralized _generate_content to benefit from response validation and cache fallback
-            try:
-                response = self._generate_content(
-                    contents=original_prompt,
-                    generation_config={
-                        "response_mime_type": "application/json",
-                        "temperature": self.settings.processing.temperature,
-                        "max_output_tokens": self.settings.processing.max_output_tokens,
-                    },
-                    use_cache=True,
-                    purpose="Glossary Extraction"
-                )
-            except APIError as e:
-                # If blocked by safety or other non-critical issues, we can skip glossary extraction
-                # to allow the translation to proceed.
-                if "blocked" in str(e).lower() or "PROHIBITED_CONTENT" in str(e):
-                    logger.warning(f"⚠️  Glossary Extraction was blocked by safety filters. Skipping glossary. Error: {e}")
-                    return {}
-                raise # Re-raise other API errors
+        raw_text = response.candidates[0].content.parts[0].text
+        parsed_glossary = self._handle_json_response_with_correction(
+            raw_text,
+            original_prompt,
+            is_glossary_extraction=True
+        )
 
-            # Extract text safely (validated by _generate_content)
-            raw_text = response.candidates[0].content.parts[0].text
-            # 处理自我修正
-            parsed_glossary = self._handle_json_response_with_correction(
-                raw_text, 
-                original_prompt, 
-                is_glossary_extraction=True
-            )
-            
-            # 归一化不同可能的模型输出格式为平坦的 {str: str} 形式
-            final_glossary: Dict[str, str] = {}
-
-            if isinstance(parsed_glossary, dict):
-                for k, v in parsed_glossary.items():
-                    try:
+        # 归一化不同可能的模型输出格式为平坦的 {str: str} 形式
+        window_glossary: Dict[str, str] = {}
+        if isinstance(parsed_glossary, dict):
+            for k, v in parsed_glossary.items():
+                try:
+                    if k and v:
+                        window_glossary[str(k).strip()] = str(v).strip()
+                except TypeError:
+                    continue
+        elif isinstance(parsed_glossary, list):
+            for item in parsed_glossary:
+                if isinstance(item, dict):
+                    for k, v in item.items():
                         if k and v:
-                            final_glossary[str(k).strip()] = str(v).strip()
-                    except TypeError:
-                        # 跳过不可哈希或非标量的键
-                        continue
-
-            elif isinstance(parsed_glossary, list):
-                for item in parsed_glossary:
-                    if isinstance(item, dict):
-                        for k, v in item.items():
-                            if k and v:
-                                final_glossary[str(k).strip()] = str(v).strip()
-                    elif isinstance(item, (list, tuple)) and len(item) == 2:
-                        k, v = item
-                        if k and v:
-                            final_glossary[str(k).strip()] = str(v).strip()
-
-            # 日志和返回
-            if final_glossary:
-                logger.info(f"   - ✅ 成功提取 {len(final_glossary)} 个术语。")
-                for k, v in list(final_glossary.items())[:5]:
-                    logger.info(f"     - '{k}' -> '{v}'")
-                if len(final_glossary) > 5:
-                    logger.info("     - ... (更多术语)")
-                return final_glossary
-
-            logger.warning(f"   - ⚠️ 术语提取未能产生有效字典。原始响应类型: {type(parsed_glossary)}. 原始响应片段: {raw_text[:200]}")
-            return {}
-        except Exception as e:
-            logger.error(f"   - ❌ 提取术语表时发生错误: {e}")
-            return {}
+                            window_glossary[str(k).strip()] = str(v).strip()
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    k, v = item
+                    if k and v:
+                        window_glossary[str(k).strip()] = str(v).strip()
+        return window_glossary
 
     @retry(
         stop=stop_after_attempt(3),
@@ -546,9 +597,12 @@ class GeminiTranslator(BaseTranslator):
             glossary=glossary_text
         )
 
+        # 结构化输出：强制模型返回符合 schema 的 JSON 数组，几乎消除畸形输出。
+        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_LIST_SCHEMA}
+
         response = self._generate_content(
             contents=original_prompt,
-            generation_config=self.generation_config,
+            generation_config=text_generation_config,
             use_cache=True,
             purpose="Text Translation"
         )
@@ -562,17 +616,18 @@ class GeminiTranslator(BaseTranslator):
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]
         output_list = self._handle_json_response_with_correction(
-            raw_text, 
-            original_prompt, 
+            raw_text,
+            original_prompt,
             is_text_translation=True,
             expected_ids=input_ids
         )
+        output_list = _normalize_translation_list(output_list)
 
         # 映射结果
         output_map = {
             int(item['id']): str(item.get('translation', ''))
             for item in output_list
-            if 'id' in item and str(item['id']).isdigit()
+            if isinstance(item, dict) and 'id' in item and str(item['id']).isdigit()
         }
 
         # 生成最终结果
@@ -597,7 +652,8 @@ class GeminiTranslator(BaseTranslator):
                 if seg.content_type == "image" and seg.image_path:
                     translation = self._call_vision_api(
                         seg.image_path,
-                        current_context
+                        current_context,
+                        glossary
                     )
                     time.sleep(self.settings.processing.vision_rate_limit_delay)
                 else:
@@ -619,11 +675,18 @@ class GeminiTranslator(BaseTranslator):
 
         return results
 
-    def _call_vision_api(self, img_path: str, context: str) -> str:
+    def _call_vision_api(self, img_path: str, context: str, glossary: Optional[Dict[str, str]] = None) -> str:
         """调用视觉 API（支持 Gemini Caching）"""
         try:
+            # 格式化术语表（非缓存模式下在 prompt 中注入；缓存模式下已在 system instruction）
+            glossary_text = ""
+            if glossary and not self.settings.processing.enable_gemini_caching:
+                glossary_text = "\n".join(
+                    [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
+                )
+
             # 使用 prompt_manager 格式化提示
-            original_prompt = self.prompt_manager.format_vision_prompt(context)
+            original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
 
             mime_type, _ = mimetypes.guess_type(img_path)
             mime_type = mime_type or "image/png"
@@ -751,24 +814,6 @@ class GeminiTranslator(BaseTranslator):
         
         return None
 
-    def _parse_json_response(self, text: str) -> List[Dict[str, Any]]:
-        """解析文本翻译的 JSON 响应，支持多种格式"""
-        try:
-            # 调用新的处理函数，并明确这是文本翻译场景
-            # 注意: 这里 original_prompt 传递空字符串，因为 _parse_json_response 之前没有直接的 prompt 信息。
-            # 只有当原始 API 调用失败时，_handle_json_response_with_correction 才会使用到 original_prompt 进行自我修正。
-            # 如果是 _parse_json_response 独立调用（例如从缓存读取），那么 original_prompt 确实是未知的。
-            result = self._handle_json_response_with_correction(text, "", is_text_translation=True)
-            if isinstance(result, list):
-                return result
-            elif isinstance(result, dict) and 'translations' in result:
-                return result['translations']
-            else:
-                return []
-        except Exception as e:
-            logger.error(f"❌ 最终JSON解析失败，包括修正和正则回退: {e}")
-            return []
-
     def _repair_json_content(self, text: str) -> Any:
         """修复 JSON 字符串 (只进行代码块去除，不进行高级字符串修复)"""
         # 去除 Markdown 代码块
@@ -792,24 +837,10 @@ class GeminiTranslator(BaseTranslator):
         if is_truncated:
             logger.warning("⚠️ Detected incomplete JSON (missing closing bracket or truncated content)")
 
-        # 策略1: 标准JSON格式（完整对象）
-        pattern = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*)"\s*\}'
+        # 单档宽松匹配：结构化输出已从根上保证合法 JSON，这里只作最小安全网
+        # （主要覆盖不支持 response_schema 的本地 Ollama 及截断场景）。
+        pattern = r'"id"\s*:\s*(\d+)[^}]*?"translation"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)'
         matches = re.findall(pattern, text, re.DOTALL)
-
-        if not matches:
-            # 策略2: 宽松匹配（允许缺少结束括号）
-            pattern_loose = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*?)"'
-            matches = re.findall(pattern_loose, text, re.DOTALL)
-
-        if not matches:
-            # 策略3: 单引号格式
-            pattern_sq = r"'id':\s*(\d+),\s*'translation':\s*'((?:[^'\\]|\\.)*)'"
-            matches = re.findall(pattern_sq, text, re.DOTALL)
-
-        if not matches:
-            # 策略4: 极度宽松（处理截断情况）- 查找所有可能的 id/translation 对
-            pattern_ultra = r'"id"\s*:\s*(\d+)[^}]*"translation"\s*:\s*"([^"]*?)(?:"|$)'
-            matches = re.findall(pattern_ultra, text, re.DOTALL)
 
         if not matches:
             logger.error(f"❌ Regex fallback failed completely. Text length: {len(text)}, Last 200 chars: {repr(text[-200:])}")
@@ -841,34 +872,22 @@ class GeminiTranslator(BaseTranslator):
         {"术语A": "翻译A", "术语B": "翻译B"}
         """
         logger.info("🔄 Using regex fallback for dict-like JSON parsing...")
-        
+
         result = {}
-        
-        # 策略1: 标准 JSON 键值对格式
+
+        # 单档键值对提取（结构化输出已保证合法 JSON，此处仅为最小安全网）
         pattern = r'"([^"]+)"\s*:\s*"([^"]*)"'
         matches = re.findall(pattern, text, re.DOTALL)
-        
-        if matches:
-            for key, value in matches:
-                # 跳过可能的元数据字段
-                if key.lower() in ('id', 'type', 'status', 'error'):
-                    continue
-                # 清理转义字符
-                cleaned_key = key.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
-                cleaned_value = value.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
-                result[cleaned_key] = cleaned_value
-        
-        if not result:
-            # 策略2: 单引号格式
-            pattern_sq = r"'([^']+)'\s*:\s*'([^']*)'"
-            matches = re.findall(pattern_sq, text, re.DOTALL)
-            for key, value in matches:
-                if key.lower() in ('id', 'type', 'status', 'error'):
-                    continue
-                cleaned_key = key.replace("\\'", "'").replace('\\n', '\n')
-                cleaned_value = value.replace("\\'", "'").replace('\\n', '\n')
-                result[cleaned_key] = cleaned_value
-        
+
+        for key, value in matches:
+            # 跳过可能的元数据字段
+            if key.lower() in ('id', 'type', 'status', 'error'):
+                continue
+            # 清理转义字符
+            cleaned_key = key.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+            cleaned_value = value.replace('\\"', '"').replace("\\'", "'").replace('\\n', '\n')
+            result[cleaned_key] = cleaned_value
+
         if result:
             logger.info(f"✅ Regex extracted {len(result)} key-value pairs (dict format)")
             return result
@@ -1008,10 +1027,13 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         except RuntimeError:
             loop = asyncio.get_event_loop()
         
+        # 结构化输出：与同步文本翻译一致，强制返回符合 schema 的 JSON 数组
+        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_LIST_SCHEMA}
+
         def _call_with_cache():
             return self.base._generate_content(
                 contents=original_prompt,
-                generation_config=self.generation_config,
+                generation_config=text_generation_config,
                 use_cache=True,
                 purpose="Async Text Translation"
             )
@@ -1038,12 +1060,13 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                     is_text_translation=True,
                     expected_ids=input_ids
                 )
-                
+                output_list = _normalize_translation_list(output_list)
+
                 # 映射结果（与同步模式完全一致）
                 output_map = {
                     int(item['id']): str(item.get('translation', ''))
                     for item in output_list
-                    if 'id' in item and str(item['id']).isdigit()
+                    if isinstance(item, dict) and 'id' in item and str(item['id']).isdigit()
                 }
                 
                 # 生成最终结果
@@ -1097,7 +1120,8 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 task = self._call_vision_api_async(
                     seg.image_path,
                     context,
-                    semaphore
+                    semaphore,
+                    glossary=glossary
                 )
             else:
                 # 文本降级处理
@@ -1125,21 +1149,22 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         img_path: str,
         context: str,
         semaphore: asyncio.Semaphore,
-        retry_count: int = 2
+        retry_count: int = 2,
+        glossary: Optional[Dict[str, str]] = None
     ) -> str:
         """异步调用视觉 API，使用信号量限制并发，支持重试"""
-        
+
         async with semaphore:  # 限制并发数
             # 获取当前事件循环（安全方式）
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 loop = asyncio.get_event_loop()
-            
+
             # 在线程池中执行 I/O 绑定的图像处理
             def _process_vision():
                 # 直接调用基础翻译器的视觉API方法
-                return self.base._call_vision_api(img_path, context)
+                return self.base._call_vision_api(img_path, context, glossary)
             
             # 重试逻辑
             last_error = None
@@ -1348,7 +1373,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
         has_image = any(seg.content_type == "image" for seg in segments)
         if has_image:
-            return self._translate_vision_batch(segments, context)
+            return self._translate_vision_batch(segments, context, glossary)
         return self._translate_text_batch(segments, context, glossary)
 
     def translate_titles(self, titles: List[str]) -> TranslationMap:
@@ -1397,7 +1422,17 @@ class OpenAICompatibleTranslator(BaseTranslator):
         if not text_to_analyze:
             return {}
 
-        content_sample = "\n".join(text_to_analyze)
+        # 按窗口覆盖全文（不再只取前 8000 字符），逐窗抽取后合并
+        final_glossary: Dict[str, str] = {}
+        for content_sample in _iter_glossary_windows(text_to_analyze):
+            try:
+                final_glossary.update(self._extract_glossary_window(content_sample))
+            except Exception as e:
+                logger.error(f"术语抽取窗口失败（跳过）: {e}")
+        return final_glossary
+
+    def _extract_glossary_window(self, content_sample: str) -> Dict[str, str]:
+        """对单个内容窗口做一次术语抽取，返回归一化后的 {原文: 译文} 字典。"""
         original_prompt = f"""
 You are an expert linguist and terminologist.
 Analyze the following pairs of original and translated text. Identify all key, recurring, or specialized terms (like names, places, philosophical concepts, technical jargon) and create a definitive glossary.
@@ -1411,7 +1446,7 @@ RULES:
 
 Text to Analyze:
 <text>
-{content_sample[:8000]}
+{content_sample}
 </text>
 
 Return ONLY the JSON object.
@@ -1428,12 +1463,12 @@ Return ONLY the JSON object.
             is_dict_like=True,
         )
 
-        final_glossary: Dict[str, str] = {}
+        window_glossary: Dict[str, str] = {}
         if isinstance(parsed, dict):
             for k, v in parsed.items():
                 if k and v:
-                    final_glossary[str(k).strip()] = str(v).strip()
-        return final_glossary
+                    window_glossary[str(k).strip()] = str(v).strip()
+        return window_glossary
 
     @retry(
         stop=stop_after_attempt(3),
@@ -1494,6 +1529,7 @@ Return ONLY the JSON object.
             is_text_translation=True,
             expected_ids=input_ids,
         )
+        output_list = _normalize_translation_list(output_list)
 
         output_map = {
             int(item['id']): str(item.get('translation', ''))
@@ -1502,15 +1538,16 @@ Return ONLY the JSON object.
         }
         return [output_map.get(uid, "[Failed: Missing translation]") for uid in input_ids]
 
-    def _translate_vision_batch(self, segments: SegmentList, context: str) -> List[str]:
+    def _translate_vision_batch(self, segments: SegmentList, context: str,
+                                glossary: Optional[Dict[str, str]] = None) -> List[str]:
         results: List[str] = []
         current_context = context[-self.settings.processing.max_context_length:] if context else ""
 
         for seg in segments:
             if seg.content_type == "image" and seg.image_path:
-                results.append(self._call_vision_api(seg.image_path, current_context))
+                results.append(self._call_vision_api(seg.image_path, current_context, glossary))
             else:
-                fallback = self._translate_text_batch([seg], current_context, glossary=None)
+                fallback = self._translate_text_batch([seg], current_context, glossary=glossary)
                 results.append(fallback[0] if fallback else "[Fallback Failed]")
 
             current_context += f"\n{results[-1]}"
@@ -1519,8 +1556,14 @@ Return ONLY the JSON object.
 
         return results
 
-    def _call_vision_api(self, img_path: str, context: str) -> str:
-        original_prompt = self.prompt_manager.format_vision_prompt(context)
+    def _call_vision_api(self, img_path: str, context: str,
+                         glossary: Optional[Dict[str, str]] = None) -> str:
+        glossary_text = ""
+        if glossary:
+            glossary_text = "\n".join(
+                [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
+            )
+        original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
 
         try:
             with open(img_path, 'rb') as f:
@@ -1599,7 +1642,7 @@ Return ONLY the JSON object.
                 "messages": [
                     {"role": "user", "content": user_content},
                 ],
-                "temperature": 0.2,
+                "temperature": self.settings.processing.temperature,
                 "stream": False,
             }
             logger.debug("📝 使用长文本模式（所有内容预先合并）")
@@ -1611,9 +1654,16 @@ Return ONLY the JSON object.
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_content},
                 ],
-                "temperature": 0.2,
+                "temperature": self.settings.processing.temperature,
                 "stream": False,
             }
+
+        # 结构化输出：云端（DeepSeek/OpenAI 兼容）原生支持 JSON mode，从根上保证返回是合法 JSON；
+        # 本地 Ollama 不保证，跳过以免报错（由正则安全网兜底）。
+        # 不设 max_tokens：不同模型输出上限不一（deepseek-chat 仅 8192），显式设过高会 400；
+        # 交给服务端默认，避免为一个非必要参数引入整批失败风险。
+        if not self.is_local:
+            payload["response_format"] = {"type": "json_object"}
         
         # 记录发送给API的文本长度
         total_text_length = 0
@@ -1758,15 +1808,10 @@ Return ONLY the JSON object.
         if is_truncated:
             logger.warning("⚠️ Detected incomplete JSON (missing closing bracket)")
         
-        # 策略1: 标准JSON格式
-        pattern = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*)"\s*\}'
+        # 单档宽松匹配（response_format=json_object 已保证云端返回合法 JSON，此处仅安全网）
+        pattern = r'"id"\s*:\s*(\d+)[^}]*?"translation"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)'
         matches = re.findall(pattern, text, re.DOTALL)
-        
-        if not matches:
-            # 策略2: 宽松匹配
-            pattern_loose = r'"id":\s*(\d+),\s*"translation":\s*"((?:[^"\\]|\\.)*?)"'
-            matches = re.findall(pattern_loose, text, re.DOTALL)
-        
+
         if not matches:
             return []
         
@@ -1888,7 +1933,7 @@ class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
 
         def _sync_one(seg: ContentSegment) -> str:
             if seg.content_type == 'image' and seg.image_path:
-                return self.base._call_vision_api(seg.image_path, context)
+                return self.base._call_vision_api(seg.image_path, context, glossary)
             fallback = self.base._translate_text_batch([seg], context, glossary)
             return fallback[0] if fallback else "[Fallback Failed]"
 
