@@ -13,7 +13,8 @@
 - **状态驱动架构**：整个翻译流程由内存中的数据结构驱动，并通过文件持久化。
 - **断点续传**：支持意外中断后完美恢复，自动跳过已翻译片段，无需从头开始。
 - **原子化保存**：每批次翻译完成后，立即保存进度，最大程度减少数据丢失风险。
-- **健壮的错误处理**：内置 API 自动重试和 JSON 修复机制，智能处理网络波动和模型返回错误。
+- **结构化输出**：Gemini 用 `response_schema`、DeepSeek/OpenAI 兼容用 `response_format=json_object` 从根上保证返回合法 JSON；本地 Ollama 仍保留轻量正则安全网。
+- **译后质检回路**：翻译完成后自动扫描失败标记与术语违例段落并定向重译（上限 1 轮），残留失败写入 `quality_report.json` 显式报告，不再把 `[Failed]` 悄悄渲染进成品（可用 `ENABLE_QUALITY_CHECK=false` 关闭）。
 - **异步并发优化**：多批次并发翻译，保证结果顺序与原文精确匹配，避免分配错误。
 
 ### 🤖 多模态翻译
@@ -282,7 +283,13 @@ python main.py /data/document.pdf \
 
 ## 🎓 Scholar Digest（Google Scholar 邮件摘要）
 
-除文档翻译外，项目内置一个独立的 Scholar Digest 模块：读取 Gmail 中的 Google Scholar 论文提醒邮件，按关键词过滤后调用 LLM 生成中文论文摘要汇总。
+除文档翻译外，项目内置一个独立的 Scholar Digest 模块：读取 Gmail 中的 Google Scholar 论文提醒邮件（可选并入 PubMed/arXiv 检索），经两级过滤后调用 LLM 生成中文论文摘要汇总。
+
+**方法学审稿三态裁决**：黑名单保持零成本的确定性关键词匹配，只剔除无歧义的完全离题领域（保守，避免误杀对抗性证据）；相关性判断默认交给 LLM 做方法学审稿裁决（`PROCESSING__FILTER_MODE=llm`，可切回 `keyword`），输出三态 `INCLUDE / MAYBE / EXCLUDE` 加纳入维度（bucket）、危险信号（`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`）、角色（`MUST_ENGAGE` 等）与一句话用处。`MAYBE` 与 `INCLUDE` 一并进入翻译摘要，输出里用裁决徽章区分；标 `THREAT`/`MUST_ENGAGE` 的论文在优先级排序中置顶。每次裁决的判定、理由、模型与 prompt 版本连同被排除论文的完整元数据固化到 `{run_id}_excluded.json`，可审计、可回溯；LLM 调用失败时自动回退关键词匹配，不中断流程。审稿维度可在 `config/prompts/whitelist_filter_prompt.md` 定制，论文主题经 `PROCESSING__RESEARCH_INTERESTS` 注入。
+
+**PubMed / arXiv 检索来源**：除 Gmail 外，可按检索式抓取 PubMed（E-utilities）与 arXiv（Atom API），与邮件结果去重后并入同一条筛选→翻译→摘要流水线，默认随每周 digest 自动运行（`PROCESSING__EXTERNAL_SOURCES_ENABLED=true`，`--external`/`--no-external` 覆盖）。全部公开接口、无需密钥；`--dry-run` 下自动跳过网络请求。检索式见 `PROCESSING__ARXIV_QUERY` / `PROCESSING__PUBMED_QUERY`。
+
+**Zotero 联动 + pandoc 科研札记**：入选论文可一键写入 Zotero（本地连接器 `saveItems`），由 [Better BibTeX](https://retorque.re/zotero-better-bibtex/) 自动分配 citekey，随后生成 pandoc-ready 札记——每篇一份含 YAML front matter、正文 `[@citekey]` 引用、三态裁决徽章、摘要与 AI 归纳的 markdown，外加一份自包含 `references.json`（CSL-JSON）。配 Zotero 自动导出的 `references.bib/json`，可直接 `pandoc --citeproc` 转 LaTeX/docx。OA 全文（arXiv 直链 / Unpaywall，合法免费）作为附件交给 Zotero 自抓，非 OA 则退化为 abstract-only。默认关闭（写库需 Zotero 桌面端在线）；推荐「cron 出 digest → 人在时 `python scholar_main.py zotero --input <run_id>.json` 推送」的分离流程，或 digest 时加 `--zotero`。配置见 `PROCESSING__ZOTERO_*` / `PROCESSING__NOTES_*`。
 
 ### 配置
 
@@ -311,12 +318,63 @@ python scholar_main.py digest --provider deepseek
 # 补跑历史邮件（例如最近 151 天），跨月时自动按月份拆分 Markdown 输出
 python scholar_main.py digest --days 151 --max-emails 0 --provider deepseek
 
+# 使用传统关键词白名单（跳过 LLM 裁决）
+python scholar_main.py digest --filter-mode keyword
+
+# 并入 PubMed/arXiv 检索来源（默认已开启，可显式覆盖）
+python scholar_main.py digest --external
+python scholar_main.py digest --no-external   # 只用 Gmail
+
+# Zotero 联动：把已有 digest 写入 Zotero + 生成 pandoc 札记（需 Zotero 开着）
+python scholar_main.py zotero --input output/scholar_digest/digest_xxx.json
+# 或 digest 时一并推送（人在时）
+python scholar_main.py digest --provider deepseek --zotero
+
 # 深度研究模式
 python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
 
 # 批量翻译论文（需要环境变量 GEMINI_API_KEY 或 --key 参数）
 python batch_translate_scholar.py --json <papers.json>
 ```
+
+### 全文精读（句级三色联想）
+
+对每月优先级 top-N（默认 5）论文做**全文级**精读：解析 OA 全文（arXiv 直链 / Unpaywall，合法免费）→ 下载 PDF → PyMuPDF 抽文本 → 强模型（`LLM__CLOSEREAD_MODEL`）输出结构化中文精读（研究问题 / 方法与数据 / 关键结论 / 可质疑点 / **对我研究的联想**），并对与研究主线相关的句子打三色联想标记：`〔方法学创新〕`墨绿 / `〔重要发现〕`紫 / `〔研究背景〕`蓝（docx 版真三色着色）。候选层做 **OA 择优**：在高优先级候选里优先挑能拿到全文的，避免 top-N 恰好全是付费墙；无全文则降级为摘要级精读并明确标注。开关 `PROCESSING__CLOSEREAD_ENABLED` 或 CLI `--close-read`。
+
+### 按月科研札记回填（headless）
+
+```bash
+# 单月 / 区间回填：Gmail+PubMed+arXiv → 三态筛选 → 权威元数据矫正 → top-5 全文精读
+#   → output/scholar_notes/科研札记_YYYY-MM_全文精读.{md,docx,references.json,index.json}
+python scripts/backfill_notes.py --since 2025-06 --until 2025-06
+python scripts/backfill_notes.py --prev-month          # 上一自然月（月度 launchd 用）
+```
+
+headless 设计：不写 Zotero 库（元数据由 translation-server + Crossref 矫正；citekey 用「作者姓+年+标题词」人读兜底键，需要权威键时人在再 `zotero --input` 推库）。已存在的月份自动跳过（`--force` 覆盖）；**跨运行去重**——`seen` 集从文献索引恢复，新月份不会与历史月重复收录同一篇。并行分片跑历史时给每个进程独立 `--token-path`，避免并发刷新 Gmail token 写坏。
+
+### 文献索引（论文写作 agent 的检索入口）
+
+札记目录会维护一份机器可读总索引 `output/scholar_notes/literature_index.json`（+人读 `INDEX.md`、agent 使用说明 `AGENTS.md`），每篇一条：citekey/DOI/arXiv id、标题、裁决、一句话用处、优先级、是否全文精读、三色标记计数、所在札记文件+行号、跨月重复标记（`duplicate_of`）与 **citekey 撞键警告**（`citekey_collisions`，合并 bibliography 前必查）。
+
+```bash
+python scripts/notes_index.py                       # 增量（写札记时也会自动刷新）
+python scripts/notes_index.py --full                # 全量重建
+python scripts/notes_index.py --since 2025-01 --until 2025-12   # 强制重扫区间
+```
+
+数据源：新札记由 `write_notes` 自动写出无损 sidecar `{札记名}.index.json`；存量札记按 md 格式契约解析（`test/test_notes_index.py::test_roundtrip_md_parse` 锁格式）。**Agent 消费**：全局技能 `~/.claude/skills/scholar-notes/`（源码在 `docs/skills/scholar-notes/`，任何项目说"找文献/查札记"即可触发）；或直接读札记目录里的 `AGENTS.md`（源码 `docs/scholar_notes_AGENTS.md`，索引脚本自动部署）。检索四步法：查索引（过滤 `duplicate_of == null`）→ `grep '[@citekey]'` 定位精读节 → 正文 `[@citekey]` 引用 → 合并对应月 `references.json` 出 bibliography。
+
+### 自动运行（launchd，两个互补 job）
+
+```bash
+bash scripts/install_weekly_digest.sh       # 每周一 09:00：digest 速览（不出札记）
+bash scripts/install_monthly_backfill.sh    # 每月 1 日 21:30：出上月精读札记 + 刷新文献索引
+# 卸载：各自加 --uninstall；手动触发：launchctl kickstart gui/$(id -u)/<label>
+```
+
+两个 job 时间错开且 Gmail token 物理隔离（monthly 用 `config/token.monthly.json` 副本），互不冲突；复用同一 python 实体二进制，TCC 完全磁盘访问只需授权一次。日志在 `~/Library/Logs/xlbd-scholar-digest/cron_digest.log` 与 `cron_monthly.log`；错过触发时点（睡眠/关机）唤醒后自动补跑。
+
+> ⚠️ 仓库位于 `~/Documents` 等受 macOS 隐私保护的目录时，需一次性授权：系统设置 > 隐私与安全性 > **完全磁盘访问权限**，添加安装脚本打印的 python 二进制路径；否则后台任务会报 `Operation not permitted`。
 
 ## 📁 项目结构
 
@@ -342,9 +400,13 @@ XLBDTranslator/
 │       ├── text_translation_prompt.md
 │       ├── text_translation_prompt_simple.md
 │       ├── vision_translation_prompt.md
-│       ├── json_repair_prompt.md
 │       ├── scholar_digest_prompt.md
+│       ├── whitelist_filter_prompt.md  # 方法学审稿三态筛选 prompt
 │       └── thesis_introduction_prompt.md
+├── scripts/               # 部署运维脚本
+│   ├── run_weekly_digest.sh          # 每周 digest 运行脚本
+│   ├── install_weekly_digest.sh      # launchd 定时任务安装/卸载
+│   └── com.xlbd.scholar-digest.plist # launchd 配置模板
 ├── src/                   # 源代码目录
 │   ├── core/             # 核心模块（数据结构、异常）
 │   │   ├── schema.py     # Pydantic 数据模型
@@ -365,7 +427,11 @@ XLBDTranslator/
 │   │   ├── workflow.py   # 主工作流
 │   │   ├── builder.py    # 配置构建器
 │   │   └── tester.py     # 测试工具
-│   ├── scholar/          # Scholar Digest（Gmail 论文邮件摘要）
+│   ├── scholar/          # Scholar Digest（Gmail 邮件 + PubMed/arXiv 检索）
+│   │   ├── academic_search.py # PubMed/arXiv 检索客户端
+│   │   ├── fulltext.py   # OA 全文解析（arXiv 直链 / Unpaywall）
+│   │   ├── zotero_sync.py # Zotero 连接器写库 + Better BibTeX citekey 解析
+│   │   └── notes.py      # pandoc-ready 科研札记 + CSL-JSON 生成
 │   └── utils/            # 工具函数
 │       ├── file.py       # 文件操作
 │       ├── logger.py     # 日志系统

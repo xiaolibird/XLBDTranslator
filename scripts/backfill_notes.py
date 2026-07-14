@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+"""按月历史回填科研札记（headless、稳健、可续跑）。
+
+每月：Gmail + PubMed + arXiv → 跨源去重 → LLM 三态筛选 → 元数据增强
+      （Crossref/arXiv/translation-server，均不依赖 Zotero 桌面端）
+      → 尽力回查 BBT citekey（拿不到用「作者+年份」兜底）→ top-N 强模型全文精读
+      → 科研札记_YYYY-MM_全文精读.md/.docx
+
+设计取舍（供无人值守过夜跑）：
+- 不写 Zotero 库：避免桌面端需常驻+选中、避免数百条目污染与跨月重复入库。
+  权威元数据由 translation-server（Zotero 翻译引擎，Docker）+ Crossref 提供，
+  即"依赖 Zotero 数据矫正"。需要入库时，人在时对每月 digest JSON 跑 `zotero --input` 即可。
+- 全局去重：同一篇（DOI / arXiv id / 规范标题）只落在最早出现的月份，跨月不重复。
+- 每月独立 try/except；已存在同名 .md 的月份默认跳过（可 --force 覆盖）。进度写 backfill_progress.json。
+
+用法：
+  PYTHONPATH=. python scripts/backfill_notes.py --since 2023-01 --until 2026-05
+  PYTHONPATH=. python scripts/backfill_notes.py --since 2025-06 --until 2025-06   # 单月验证
+  PYTHONPATH=. python scripts/backfill_notes.py --prev-month                      # 上一自然月（launchd 月度 job）
+  可选 --no-close-read（跳过精读，快速） / --force（覆盖已存在月份） / --top-n N / --no-index
+
+跨运行去重：seen 集从 output/scholar_notes/literature_index.json 恢复（收尾自动刷新该索引），
+新月份不会与历史月重复；--force 重跑时自动剔除待跑月份自己的键。
+"""
+import argparse
+import json
+import sys
+import time
+import traceback
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.scholar.schema import ScholarSettings, DigestOutput, DigestStatus  # noqa: E402
+from src.scholar.workflow import ScholarWorkflow  # noqa: E402
+from src.utils.logger import get_logger  # noqa: E402
+
+logger = get_logger("backfill")
+
+
+def month_list(since: str, until: str):
+    sy, sm = map(int, since.split("-"))
+    uy, um = map(int, until.split("-"))
+    out = []
+    y, m = sy, sm
+    while (y, m) <= (uy, um):
+        out.append((y, m))
+        m += 1
+        if m > 12:
+            y += 1
+            m = 1
+    return out
+
+
+def month_range(y, m):
+    start = date(y, m, 1)
+    end = date(y + (m == 12), (m % 12) + 1, 1)
+    from datetime import timedelta
+    return start, (end - timedelta(days=1))
+
+
+def dedup_key(meta):
+    """全局去重键（权威实现在 notes_index，与索引同源同规则）。"""
+    from src.scholar.notes_index import dedup_key_fields
+    return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
+
+
+def enrich_segments(segs, email, ts_url):
+    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + translation-server 权威解析。"""
+    from src.scholar.crossref import enrich_metadata
+    from src.scholar.academic_search import enrich_from_arxiv
+    from src.scholar.fulltext import ipv4_client
+    from src.scholar.translation_server import resolve_and_apply
+    cr = ax = ts = 0
+    with ipv4_client(timeout=30) as xc:
+        for seg in segs:
+            hit = False
+            try:
+                hit = enrich_metadata(seg.metadata, email=email, client=xc)
+                if hit:
+                    cr += 1
+            except Exception:
+                pass
+            if not hit and seg.metadata.arxiv_id:
+                try:
+                    if enrich_from_arxiv(seg.metadata, client=xc):
+                        ax += 1
+                except Exception:
+                    pass
+    if ts_url:
+        for seg in segs:
+            try:
+                if resolve_and_apply(seg.metadata, base_url=ts_url):
+                    ts += 1
+            except Exception:
+                pass
+    return cr, ax, ts
+
+
+def resolve_citekeys(segs, base_url):
+    """尽力回查 BBT citekey；Zotero 未开/拿不到则返回 None（札记用兜底键，自包含可渲染）。"""
+    citekeys = {seg.paper_id: None for seg in segs}
+    try:
+        from src.scholar.zotero_sync import ZoteroConnectorClient
+        cli = ZoteroConnectorClient(base_url=base_url)
+        if not cli.ping():
+            logger.info("  Zotero 未开，citekey 全用兜底键")
+            cli.close()
+            return citekeys
+        for seg in segs:
+            m = seg.metadata
+            try:
+                citekeys[seg.paper_id] = cli.resolve_citekey(doi=m.doi, title=m.title, retries=2, delay=0.5)
+            except Exception:
+                pass
+        cli.close()
+    except Exception as e:
+        logger.warning("  citekey 回查异常（全用兜底）: {}".format(e))
+    return citekeys
+
+
+def run_month(y, m, settings, seen: set, args) -> dict:
+    proc = settings.processing
+    label = "{:04d}-{:02d}".format(y, m)
+    note_md = Path(proc.notes_dir) / "科研札记_{}_全文精读.md".format(label)
+    if note_md.exists() and not args.force:
+        logger.info("⏭️  {} 已有札记，跳过（--force 可覆盖）".format(label))
+        return {"month": label, "status": "skipped"}
+
+    dr = month_range(y, m)
+    proc.auto_mark_read = False
+    proc.zotero_enabled = False          # 不写库
+    proc.closeread_enabled = False       # 精读在本驱动里单独跑
+    proc.external_sources_enabled = True # PubMed + arXiv
+    proc.filter_mode = "llm"
+    # 过夜吞吐优化：整月 Gmail 常有数百篇，逐篇 AI 归纳太慢；
+    # 交付重点是 top-N 全文精读，非 top-N 只保留摘要即可 → 默认关摘要级归纳、加大筛选批量。
+    proc.translate_abstracts = False
+    proc.generate_summary = bool(args.summary)
+    proc.batch_size = max(proc.batch_size, args.batch_size)
+
+    wf = ScholarWorkflow(settings)
+    wf.date_range = dr
+    out = wf.execute()                   # fetch + 跨源去重 + filter + translate/summary + 出 JSON
+    segs = out.segments
+
+    # 全局跨月去重：同一篇只留最早月份
+    fresh = []
+    for seg in segs:
+        k = dedup_key(seg.metadata)
+        if k in seen:
+            continue
+        seen.add(k)
+        fresh.append(seg)
+    dropped = len(segs) - len(fresh)
+    logger.info("  {} 入选 {} 篇，跨月去重后 {} 篇（去掉 {} 篇早前月已收录）".format(
+        label, len(segs), len(fresh), dropped))
+
+    if not fresh:
+        logger.info("  {} 去重后无新论文，不出札记".format(label))
+        return {"month": label, "status": "empty", "included": len(segs), "fresh": 0}
+
+    email = proc.zotero_email or proc.external_email or ""
+    cr, ax, ts = enrich_segments(fresh, email, proc.zotero_translation_server_url)
+    citekeys = resolve_citekeys(fresh, proc.zotero_base_url)
+
+    full_text = 0
+    if not args.no_close_read:
+        from src.scholar.closereading import close_read_segments
+        from src.scholar.llm_client import LLMClient
+        close_read_segments(
+            fresh, proc.research_interests, LLMClient(settings.llm),
+            top_n=args.top_n, email=email,
+            model=(settings.llm.closeread_model or settings.llm.model),
+            scratch_dir=Path("output/scholar_pdfs"))
+        full_text = sum(1 for s in fresh if s.close_reading and s.close_reading.from_full_text)
+
+    from src.scholar.notes import write_notes
+    res = write_notes(
+        fresh, citekeys, out_dir=Path(proc.notes_dir),
+        instruction=proc.notes_instruction,
+        digest_title="科研札记 · {}（全文精读）".format(label),
+        filename="科研札记_{}_全文精读".format(label),
+        emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
+        fallback_citekeys=True)  # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
+
+    hit_ck = sum(1 for v in citekeys.values() if v)
+    logger.info("  ✅ {} → {} 篇 | citekey {}/{} | 全文精读 {} | 增强 CR{}/AX{}/TS{}".format(
+        label, len(fresh), hit_ck, len(fresh), full_text, cr, ax, ts))
+    return {"month": label, "status": "ok", "included": len(segs), "fresh": len(fresh),
+            "citekey": hit_ck, "full_text": full_text,
+            "md": res["note_path"], "docx": res.get("docx_path")}
+
+
+def prev_month_label(today=None):
+    d = today or date.today()
+    y, m = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+    return "{:04d}-{:02d}".format(y, m)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since", default="2023-01")
+    ap.add_argument("--until", default="2026-05")
+    ap.add_argument("--prev-month", action="store_true",
+                    help="只跑上一个自然月（覆盖 --since/--until，供 launchd 月度 job 静态调用）")
+    ap.add_argument("--no-index", action="store_true", help="收尾不刷新文献索引")
+    ap.add_argument("--config", default="config/scholar.env")
+    ap.add_argument("--top-n", type=int, default=5)
+    ap.add_argument("--batch-size", type=int, default=15, help="LLM 筛选批量（过夜吞吐）")
+    ap.add_argument("--summary", action="store_true", help="为非 top-N 也生成 AI 归纳（更慢）")
+    ap.add_argument("--no-close-read", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--token-path", default="", help="独立 Gmail token 副本路径（并行分片防写冲突）")
+    args = ap.parse_args()
+    if args.prev_month:
+        args.since = args.until = prev_month_label()
+
+    settings = ScholarSettings.from_env_file(Path(args.config))
+    # 并行分片：每个进程用独立 token 副本，避免多进程刷新时并发写 config/token.json 损坏
+    if args.token_path:
+        import shutil
+        tp = Path(args.token_path)
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        src = settings.gmail.token_path
+        if src.exists() and not tp.exists():
+            shutil.copy2(str(src), str(tp))
+        settings.gmail.token_path = tp
+    if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
+        settings.llm.provider = "deepseek"  # 与既有 pipeline 一致，走 deepseek
+    months = month_list(args.since, args.until)
+    logger.info("=" * 60)
+    logger.info("按月回填：{} → {}，共 {} 个月".format(args.since, args.until, len(months)))
+    logger.info("精读: {} (top-{}, 模型 {})".format(
+        not args.no_close_read, args.top_n, settings.llm.closeread_model or settings.llm.model))
+    logger.info("=" * 60)
+
+    # 进度文件按分片区分，避免多进程并行时互相覆盖
+    prog_path = Path("output/scholar_notes/backfill_progress_{}_{}.json".format(args.since, args.until))
+    prog_path.parent.mkdir(parents=True, exist_ok=True)
+    results = []
+    if prog_path.exists():
+        try:
+            results = json.loads(prog_path.read_text(encoding="utf-8")).get("results", [])
+        except Exception:
+            results = []
+    # 全局去重集：从文献索引恢复（跨运行持久化——跑新月份不与历史月重复）。
+    # --force 重跑历史月时剔除待跑月份自己的键，否则本月论文全在 seen 里会被 dedup 成空札记。
+    from src.scholar.notes_index import load_seen_keys
+    run_months = {"{:04d}-{:02d}".format(y, m) for y, m in months}
+    seen: set = load_seen_keys(
+        Path(settings.processing.notes_dir) / "literature_index.json",
+        exclude_months=run_months if args.force else None)
+    logger.info("跨运行去重集：从索引恢复 {} 个键".format(len(seen)))
+
+    for i, (y, m) in enumerate(months, 1):
+        label = "{:04d}-{:02d}".format(y, m)
+        logger.info("\n" + "#" * 60)
+        logger.info("# [{}/{}] 月份 {}".format(i, len(months), label))
+        logger.info("#" * 60)
+        t0 = time.time()
+        try:
+            r = run_month(y, m, settings, seen, args)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.error("❌ {} 失败：{}".format(label, e))
+            logger.error(traceback.format_exc())
+            r = {"month": label, "status": "error", "error": str(e)}
+        r["elapsed_sec"] = round(time.time() - t0, 1)
+        results = [x for x in results if x.get("month") != label] + [r]
+        prog_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        logger.info("  ⏱️ {} 用时 {}s".format(label, r["elapsed_sec"]))
+
+    # 收尾：增量刷新文献索引（供论文项目 agent 检索；也是下次运行去重集的来源）
+    if not args.no_index:
+        try:
+            from src.scholar.notes_index import update_index, write_outputs
+            notes_dir = Path(settings.processing.notes_dir)
+            write_outputs(update_index(notes_dir), notes_dir)
+        except Exception as e:
+            logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))
+
+    ok = [r for r in results if r.get("status") == "ok"]
+    logger.info("\n" + "=" * 60)
+    logger.info("回填完成：成功 {} 个月 / 共 {}".format(len(ok), len(months)))
+    logger.info("札记目录: {}".format(settings.processing.notes_dir))
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

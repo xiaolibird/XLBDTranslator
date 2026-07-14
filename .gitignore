@@ -62,7 +62,7 @@ web-next/
 digest_project.py
 migrating_instructions.md
 config/credentials.json
-config/token.json
+config/token*.json
 
 # Generated content
 **/page_images/
@@ -101,8 +101,12 @@ Thumbs.db
 *.tmp
 *.temp
 *.sh
+!scripts/*.sh
 bfg-report/
 ..bfg-report/
-docs/
+docs/*
+!docs/scholar_notes_AGENTS.md
+!docs/paper_agent_prompt.md
+!docs/skills/
 .ruff_cache/
 .claude/

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  科研札记月度回填（launchd 用户代理）：每月 1 日 21:30 跑上一自然月的
+  backfill_notes.py（headless：Gmail+PubMed+arXiv → 三态筛选 → top-5 全文精读 →
+  科研札记 md/docx），收尾自动增量刷新 literature_index.json / INDEX.md / AGENTS.md。
+
+  由 scripts/install_monthly_backfill.sh 安装：占位符 __REPO_ROOT__ / __PYTHON_BIN__ /
+  __LOG_DIR__ 会被替换后拷入 ~/Library/LaunchAgents/。
+
+  与 weekly job（com.xlbd.scholar-digest，周一 09:00）的关系：
+  - 不冲突、互补：weekly 只出 digest 速览，monthly 出精读札记 + 索引。
+  - 时间错开（每月 1 日即使恰逢周一也相差 12.5h）+ 独立 Gmail token 副本
+    （--token-path config/token.monthly.json），无并发写 token 的窗口。
+  - 复用同一 python 实体二进制：TCC 完全磁盘访问授权绑定二进制、与参数无关，
+    weekly 已授权则 monthly 无需再授权。
+
+  月初重跑安全：上一月札记已存在时 backfill 自动跳过（只刷索引，秒级退出）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-monthly-backfill</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/backfill_notes.py</string>
+        <string>--prev-month</string>
+        <string>--token-path</string>
+        <string>config/token.monthly.json</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- 每月 1 日 21:30（错开 weekly 周一 09:00；睡眠错过会补跑） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_monthly.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_monthly.err.log</string>
+</dict>
+</plist>

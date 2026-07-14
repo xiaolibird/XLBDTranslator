@@ -11,7 +11,9 @@ An intelligent document translation tool powered by Google Gemini and state-driv
 - **State-Driven Architecture**: Entire translation pipeline driven by in-memory data structures with file persistence
 - **Resume Support**: Perfect recovery after interruptions, auto-skip translated segments
 - **Atomic Saves**: Auto-save progress after each batch, minimizing data loss
-- **Robust Error Handling**: Built-in API retry and JSON repair mechanisms
+- **Structured Output**: Gemini uses `response_schema`, DeepSeek/OpenAI-compatible use `response_format=json_object` to guarantee valid JSON at the source; local Ollama keeps a lightweight regex safety net.
+- **Post-translation QC loop**: after translation, failed markers and glossary violations are scanned and re-translated (one extra pass at most); residual failures are reported in `quality_report.json` instead of silently rendering `[Failed]` into the output (disable via `ENABLE_QUALITY_CHECK=false`).
+- **Robust Error Handling**: Built-in API retry with graceful keyword/regex fallback
 
 ### 🤖 Multi-Modal Translation
 - **Text Mode (Native)**: Direct text extraction for clean PDFs/EPUBs, fast processing
@@ -236,7 +238,13 @@ Page,Title,Level
 
 ## 🎓 Scholar Digest (Google Scholar Email Summaries)
 
-Besides document translation, the project ships a standalone Scholar Digest module: it reads Google Scholar alert emails from Gmail, filters papers by keyword, and calls an LLM to produce a Chinese digest of the papers.
+Besides document translation, the project ships a standalone Scholar Digest module: it reads Google Scholar alert emails from Gmail (optionally joined by PubMed/arXiv search), runs a two-stage filter, and calls an LLM to produce a Chinese digest of the papers.
+
+**Methodology-review three-state adjudication**: the blacklist stays a zero-cost deterministic keyword match that only removes unambiguously off-topic fields (kept conservative to avoid killing adversarial evidence); the relevance decision is delegated to an LLM methodology-review adjudication by default (`PROCESSING__FILTER_MODE=llm`, switchable back to `keyword`), emitting three states `INCLUDE / MAYBE / EXCLUDE` plus inclusion buckets, danger flags (`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`), a role (`MUST_ENGAGE`, etc.) and a one-line use. `MAYBE` is translated alongside `INCLUDE` (distinguished by a verdict badge in the output); `THREAT`/`MUST_ENGAGE` papers are pushed to the top of the priority order. Every verdict — decision, reason, model, and prompt version — is persisted together with the full metadata of excluded papers into `{run_id}_excluded.json`. If an LLM call fails, that batch falls back to keyword matching instead of aborting the run. Review dimensions live in `config/prompts/whitelist_filter_prompt.md`; the paper topic is injected via `PROCESSING__RESEARCH_INTERESTS`.
+
+**PubMed / arXiv sources**: beyond Gmail, the digest can fetch PubMed (E-utilities) and arXiv (Atom API) by query, dedup against email results, and feed the same filter→translate→summarize pipeline. Enabled by default for the weekly digest (`PROCESSING__EXTERNAL_SOURCES_ENABLED=true`, override with `--external`/`--no-external`). Public APIs, no keys required; `--dry-run` skips all network calls.
+
+**Zotero sync + pandoc research notes**: selected papers can be pushed into Zotero (local connector `saveItems`), where [Better BibTeX](https://retorque.re/zotero-better-bibtex/) assigns a stable citekey; the tool then emits pandoc-ready notes — one markdown per paper with YAML front matter, a body `[@citekey]` citation, the three-state decision badge, abstract and AI synthesis — plus a self-contained `references.json` (CSL-JSON). Together with Zotero's auto-exported `references.bib/json`, notes go straight through `pandoc --citeproc` to LaTeX/docx. Open-access full text (arXiv direct link / Unpaywall, legal & free) is attached for Zotero to fetch; non-OA falls back to abstract-only. Off by default (writing needs the Zotero desktop app running); the recommended flow is "cron produces the digest → run `python scholar_main.py zotero --input <run_id>.json` interactively", or pass `--zotero` on digest. See `PROCESSING__ZOTERO_*` / `PROCESSING__NOTES_*`.
 
 ### Setup
 
@@ -265,12 +273,56 @@ python scholar_main.py digest --provider deepseek
 # Backfill older emails (e.g. last 151 days); output is split into monthly Markdown files
 python scholar_main.py digest --days 151 --max-emails 0 --provider deepseek
 
+# Use the classic keyword whitelist (skip LLM adjudication)
+python scholar_main.py digest --filter-mode keyword
+
+# Join PubMed/arXiv search sources (on by default; override explicitly)
+python scholar_main.py digest --external
+python scholar_main.py digest --no-external   # Gmail only
+
 # Deep research mode
 python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
 
 # Batch-translate papers (needs GEMINI_API_KEY env var or --key)
 python batch_translate_scholar.py --json <papers.json>
 ```
+
+### Full-text close reading (sentence-level color tags)
+
+For each month's top-N papers (default 5), the pipeline resolves legal OA full text (arXiv / Unpaywall), extracts it with PyMuPDF, and has a strong model (`LLM__CLOSEREAD_MODEL`) produce a structured Chinese close reading (research question / methods & data / key findings / caveats / relevance to my research), tagging sentences related to the research agenda: `〔方法学创新〕` (methodological innovation, dark green) / `〔重要发现〕` (key finding, purple) / `〔研究背景〕` (background, blue) — rendered as real colors in the docx. Candidate selection prefers papers whose full text is actually obtainable; paywalled papers degrade to abstract-level reading, clearly labeled. Toggle via `PROCESSING__CLOSEREAD_ENABLED` or `--close-read`.
+
+### Monthly research-note backfill (headless)
+
+```bash
+python scripts/backfill_notes.py --since 2025-06 --until 2025-06   # one month / a range
+python scripts/backfill_notes.py --prev-month                      # previous calendar month (used by launchd)
+```
+
+Headless by design: no Zotero writes (metadata corrected via translation-server + Crossref; citekeys are human-readable fallback keys). Existing months are skipped (`--force` to overwrite); the cross-run dedup set is restored from the literature index so new months never re-collect papers already filed. For parallel historical backfills give each process its own `--token-path` copy.
+
+### Literature index (retrieval entry point for writing agents)
+
+The notes folder maintains a machine-readable index `output/scholar_notes/literature_index.json` (plus human-readable `INDEX.md` and agent guide `AGENTS.md`): one entry per paper with citekey/DOI/arXiv id, verdict, one-line relevance, priority, full-text-reading flag, tag counts, source note file + line, cross-month duplicate markers (`duplicate_of`), and **citekey collision warnings** (`citekey_collisions` — check before merging bibliographies).
+
+```bash
+python scripts/notes_index.py            # incremental (also refreshed automatically after note generation)
+python scripts/notes_index.py --full     # full rebuild
+python scripts/notes_index.py --since 2025-01 --until 2025-12   # force re-scan of a range
+```
+
+New notes emit a lossless sidecar `{note}.index.json`; legacy notes are parsed from markdown (format locked by `test/test_notes_index.py::test_roundtrip_md_parse`). Agents consume the library via the global skill `~/.claude/skills/scholar-notes/` (source in `docs/skills/scholar-notes/`) or by reading `AGENTS.md` inside the notes folder.
+
+### Automatic runs (launchd, two complementary jobs)
+
+```bash
+bash scripts/install_weekly_digest.sh       # Mondays 09:00: digest overview (no notes)
+bash scripts/install_monthly_backfill.sh    # 1st of month 21:30: previous month's notes + index refresh
+# Uninstall with --uninstall; trigger manually: launchctl kickstart gui/$(id -u)/<label>
+```
+
+The two jobs are time-staggered and use physically separate Gmail token copies (monthly uses `config/token.monthly.json`), so they never conflict; they share the same python binary, so Full Disk Access (TCC) needs to be granted only once. Logs go to `~/Library/Logs/xlbd-scholar-digest/cron_digest.log` and `cron_monthly.log`; missed schedules (sleep/shutdown) are re-run on wake.
+
+> ⚠️ If the repo lives in a macOS privacy-protected folder (`~/Documents` etc.), a one-time grant is required: System Settings > Privacy & Security > **Full Disk Access**, add the python binary path printed by the install script; otherwise background runs fail with `Operation not permitted`.
 
 ## 📁 Project Structure
 
@@ -288,13 +340,21 @@ XLBDTranslator/
 │   ├── modes.json         # Translation persona definitions
 │   ├── pdf_style.css      # PDF output styling
 │   └── prompts/           # Prompt templates
+├── scripts/               # Deployment & ops scripts
+│   ├── run_weekly_digest.sh          # Weekly digest runner
+│   ├── install_weekly_digest.sh      # launchd agent install/uninstall
+│   └── com.xlbd.scholar-digest.plist # launchd config template
 ├── src/                   # Source code
 │   ├── core/             # Core modules (Schema, Exceptions)
 │   ├── parser/           # Document parsers (PDF, EPUB)
 │   ├── translator/       # Translation engine (sync/async)
 │   ├── renderer/         # Renderers (Markdown, PDF, EPUB)
 │   ├── workflow/         # Translation workflow (builder, tester)
-│   ├── scholar/          # Scholar Digest (Gmail paper alert digest)
+│   ├── scholar/          # Scholar Digest (Gmail + PubMed/arXiv search)
+│   │   ├── academic_search.py # PubMed/arXiv search client
+│   │   ├── fulltext.py   # OA full-text resolver (arXiv / Unpaywall)
+│   │   ├── zotero_sync.py # Zotero connector writer + Better BibTeX citekey
+│   │   └── notes.py      # pandoc-ready research notes + CSL-JSON
 │   └── utils/            # Utility functions
 ├── output/               # Translation outputs (auto-generated)
 │   └── <file_md5>/      # Per-document cache and results
