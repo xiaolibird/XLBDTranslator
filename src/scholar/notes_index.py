@@ -20,13 +20,16 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3   # v3：条目加 highlights[]（句级角色可调取）；tag_counts 归一到 role slug
 INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"
 AGENTS_MD = "AGENTS.md"
 
-# 成品札记三件套的 md 命名（天然排除 demo/ideal/validate/digest_* 等杂档）
-NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2})_全文精读\.md$")
+# 成品札记 md 命名：_全文精读=自动流水线；_手动精读=手动 PDF 深度精读
+# （天然排除 demo/ideal/validate/digest_* 等杂档）
+# 月份桶允许 YYYY-MM 或 YYYY-MM-DD（后者用于同月内另起的专题批次，如按论文攻防立场组织的深读）
+NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?)_(全文精读|手动精读)\.md$")
+_SERIES_MAP = {"全文精读": "auto", "手动精读": "manual"}
 
 # 每篇论文小节标题行（notes._paper_section 第 92 行的格式契约）：
 #   ## 🔴 高 2. Title ... [@citekey]
@@ -41,7 +44,10 @@ _FLAGS_RE = re.compile(r"⚑ (\S+)")
 _DOI_RE = re.compile(r"^\*\*DOI\*\*: \[([^\]]+)\]")
 _URL_RE = re.compile(r"^\*\*链接\*\*: (\S+)")
 _CLOSEREAD_RE = re.compile(r"^### (全文精读|精读（仅摘要降级）)(?: · 来源 `(.+?)`)?")
-_TAG_LINE_RE = re.compile(r"^- 〔(方法学创新|重要发现|研究背景)〕")
+_CR_SECTION_RE = re.compile(r"^\*\*【(.+?)】\*\*\s*$")   # 精读分节标题（供 highlights 溯源 section）
+# 句级角色标记行：捕获 tag（新旧六类）+ 句子文本（供 highlights 从 md 无损回填）
+_TAG_LINE_RE = re.compile(
+    r"^- 〔(可引用证据|可反驳观点|方法论借鉴|方法学创新|重要发现|研究背景)〕(.*)$")
 _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}|[a-z\-]+/\d{7})")
 
 _TIER_MAP = {"🔴 高": "high", "🔴": "high", "🟠 中": "mid", "🟢 低": "low"}
@@ -70,10 +76,36 @@ def dedup_key_fields(doi: Optional[str], arxiv_id: Optional[str], title: Optiona
     return "id:" + (str(fallback or "").strip() or "unknown")
 
 
+# ---------------- 句级角色 → highlights（工作流可调取的核心结构） ----------------
+
+def _collect_highlights(triples):
+    """把 (section_heading, tag, text) 三元组流聚合成 highlights[] + tag_counts。
+
+    - tag 经 schema.TAG_TO_ROLE 归一到英文 role slug（citable/refutable/method）；
+      映射为 None 的（如旧「研究背景」）丢弃，天然去噪。
+    - highlights 项：{role, tag(原始中文), section, text}，供工作流按 role 跨库 jq 检索。
+    - tag_counts 键为 role slug，口径与 highlights 一致（历史/新数据可比）。
+    """
+    from .schema import TAG_TO_ROLE
+    highlights: List[Dict[str, Any]] = []
+    tag_counts: Dict[str, int] = {}
+    for heading, tag, text in triples:
+        if not tag:
+            continue
+        role = TAG_TO_ROLE.get(tag)
+        if role is None:
+            continue
+        highlights.append({"role": role, "tag": tag,
+                           "section": heading or "", "text": (text or "").strip()})
+        tag_counts[role] = tag_counts.get(role, 0) + 1
+    return highlights, tag_counts
+
+
 # ---------------- 从内存对象构造条目（write_notes sidecar 复用，无损） ----------------
 
 def entry_from_segment(seg, citekey: str, rank: int, total: int,
-                       citekey_source: str = "fallback") -> Dict[str, Any]:
+                       citekey_source: str = "fallback",
+                       series: str = "auto") -> Dict[str, Any]:
     """从 PaperSegment 直接构造索引条目（不含 month/note_file 等落盘上下文，索引时补）。"""
     from .notes import _priority_tier  # 延迟导入，避免与 notes.py 的 sidecar 钩子成环
     meta = seg.metadata
@@ -86,16 +118,15 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
     elif getattr(meta, "email_received_at", None):
         year = meta.email_received_at.year
 
-    tag_counts: Dict[str, int] = {}
-    if cr:
-        for sec in cr.sections:
-            for st in sec.sentences:
-                if st.tag:
-                    tag_counts[st.tag] = tag_counts.get(st.tag, 0) + 1
+    highlights, tag_counts = _collect_highlights(
+        (sec.heading, st.tag, st.text)
+        for sec in (cr.sections if cr else [])
+        for st in sec.sentences)
 
     return {
         "citekey": citekey,
         "citekey_source": citekey_source,
+        "series": series,
         "doi": meta.doi or None,
         "arxiv_id": meta.arxiv_id or None,
         "title": meta.title or "",
@@ -116,6 +147,7 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "has_full_text_reading": bool(cr and cr.from_full_text),
         "reading_source": (cr.source if cr else None),
         "tag_counts": tag_counts,
+        "highlights": highlights,
         "dedup_key": dedup_key_fields(meta.doi, meta.arxiv_id, meta.title,
                                       fallback=meta.paper_id),
     }
@@ -135,6 +167,7 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
             cur = {
                 "citekey": citekey,
                 "citekey_source": "unknown",  # md 无法区分 Zotero 键/兜底键
+                "series": "auto",             # 由 build_month_entries 按文件名权威覆盖
                 "doi": None, "arxiv_id": None,
                 "title": title.strip(), "title_zh": None,
                 "authors": [], "year": None, "journal": None, "url": None,
@@ -143,8 +176,8 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
                 "decision": None, "one_line": "", "bucket": [], "role": None,
                 "confidence": None, "flags": [],
                 "has_full_text_reading": False, "reading_source": None,
-                "tag_counts": {},
-                "note_heading": line, "note_line": i,
+                "tag_counts": {}, "highlights": [],
+                "note_heading": line, "note_line": i, "_cur_section": "",
             }
             ym = re.match(r"[a-z]*?(\d{4})", citekey)
             if ym:
@@ -204,11 +237,19 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
             cur["has_full_text_reading"] = crm.group(1) == "全文精读"
             cur["reading_source"] = crm.group(2)
             continue
+        sm = _CR_SECTION_RE.match(line)
+        if sm:
+            cur["_cur_section"] = sm.group(1).strip()
+            continue
         tm = _TAG_LINE_RE.match(line)
         if tm:
-            tc = cur["tag_counts"]
-            tc[tm.group(1)] = tc.get(tm.group(1), 0) + 1
+            hl, tc = _collect_highlights([(cur.get("_cur_section", ""),
+                                           tm.group(1), tm.group(2))])
+            for h in hl:
+                cur["highlights"].append(h)
+                cur["tag_counts"][h["role"]] = cur["tag_counts"].get(h["role"], 0) + 1
     for e in entries:
+        e.pop("_cur_section", None)
         e["dedup_key"] = dedup_key_fields(e["doi"], e["arxiv_id"], e["title"],
                                           fallback=e["citekey"])
     return entries
@@ -280,8 +321,12 @@ def _locate_headings(md_path: Path) -> Dict[str, Any]:
 
 def build_month_entries(month: str, md_path: Path,
                         ref_path: Optional[Path],
-                        sidecar_path: Optional[Path]) -> List[Dict[str, Any]]:
-    """单月条目：sidecar 优先（无损）；否则 md 解析 + CSL 合并。补齐落盘上下文字段。"""
+                        sidecar_path: Optional[Path],
+                        series: str = "auto") -> List[Dict[str, Any]]:
+    """单月条目：sidecar 优先（无损）；否则 md 解析 + CSL 合并。补齐落盘上下文字段。
+
+    series 按文件名权威决定（_全文精读=auto / _手动精读=manual），覆盖 sidecar 里的值。
+    """
     entries: List[Dict[str, Any]] = []
     source = "md-parse"
     if sidecar_path and Path(sidecar_path).exists():
@@ -301,13 +346,22 @@ def build_month_entries(month: str, md_path: Path,
         source = "md-parse"
     else:
         locs = _locate_headings(md_path)
+        # 历史 sidecar（v2 及更早）无 highlights/新口径 tag_counts —— 从 md 句级标记回填（近似，
+        # 按 citekey 匹配）。新 sidecar（v3+，含 highlights）直接沿用，不触碰。
+        hl_map = ({m["citekey"]: m for m in parse_note_md(md_path)}
+                  if any("highlights" not in e for e in entries) else {})
         for e in entries:
             loc = locs.get(e.get("citekey"))
             e["note_line"] = loc[0] if loc else None
             e["note_heading"] = loc[1] if loc else None
+            if "highlights" not in e:
+                src_e = hl_map.get(e.get("citekey"))
+                e["highlights"] = src_e.get("highlights", []) if src_e else []
+                e["tag_counts"] = src_e.get("tag_counts", {}) if src_e else {}
     has_refs = bool(ref_path and Path(ref_path).exists())
     for e in entries:
         e["month"] = month
+        e["series"] = series          # 文件名权威（覆盖 sidecar/md 默认）
         e["note_file"] = Path(md_path).name
         e["references_json"] = Path(ref_path).name if has_refs else None
         e["_source"] = source
@@ -318,13 +372,16 @@ def build_month_entries(month: str, md_path: Path,
 
 # ---------------- 索引构建（增量/全量/区间） ----------------
 
-def _note_files(notes_dir: Path) -> Dict[str, Path]:
-    """month -> md 路径（只认成品命名）。"""
+def _note_files(notes_dir: Path) -> Dict[str, tuple]:
+    """文件 stem -> (month, series, md 路径)（只认成品命名）。
+
+    键改用 stem（而非 month）：同月 `_全文精读` 与 `_手动精读` 两系列可共存。
+    """
     out = {}
     for p in sorted(Path(notes_dir).glob("*.md")):
         m = NOTE_MD_RE.match(p.name)
         if m:
-            out[m.group(1)] = p
+            out[p.name[:-3]] = (m.group(1), _SERIES_MAP.get(m.group(2), "auto"), p)
     return out
 
 
@@ -344,23 +401,35 @@ def _entry_keys(e: Dict[str, Any]) -> List[str]:
     return keys
 
 
+def _keeper_rank(e: Dict[str, Any]) -> tuple:
+    """keeper 优先级（越小越优先当权威）：手动深读 > 最早月份 > 更高优先级排名。
+
+    手动 PDF 深度精读是论文 agent 应优先读到的权威版本，即使月份晚于自动浅读。
+    """
+    return (0 if e.get("series") == "manual" else 1,
+            e["month"], e.get("priority_rank") or 9999)
+
+
 def _global_pass(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """全局排序 + 跨月去重标记（最早月优先）+ 撞键检测的前置排序。"""
+    """全局排序 + 跨月去重标记（keeper 规则见 _keeper_rank）+ 撞键检测的前置排序。"""
     papers.sort(key=lambda e: (e["month"], e.get("priority_rank") or 9999))
-    first: Dict[str, Dict[str, Any]] = {}
     for e in papers:
         e["duplicate_months"] = []
         e["duplicate_of"] = None
+    # 先按 keeper 优先级选出每个身份键的权威条目（手动优先，其次最早月）
+    keeper_by_key: Dict[str, Dict[str, Any]] = {}
+    for e in sorted(papers, key=_keeper_rank):
+        for k in _entry_keys(e):
+            keeper_by_key.setdefault(k, e)
+    # 再标记重复：在条目**全部身份键**指向的 keeper 里取最优者（防条目经自己的一级键
+    # 匹配到自身、漏掉经二级标题键指向的更早 keeper —— 预印本/正刊同文双收场景）
     for e in papers:
-        keys = _entry_keys(e)
-        keeper = next((first[k] for k in keys if k in first), None)
+        cands = [keeper_by_key[k] for k in _entry_keys(e) if k in keeper_by_key]
+        keeper = min(cands, key=_keeper_rank) if cands else None
         if keeper is not None and keeper is not e:
             if e["month"] not in keeper["duplicate_months"]:
                 keeper["duplicate_months"].append(e["month"])
             e["duplicate_of"] = "{}@{}".format(keeper["dedup_key"], keeper["month"])
-        else:
-            for k in keys:
-                first.setdefault(k, e)
     return papers
 
 
@@ -398,31 +467,32 @@ def update_index(notes_dir: Path, *, full: bool = False,
     old_papers = old.get("papers", [])
 
     files = _note_files(notes_dir)
-    months_meta: Dict[str, Any] = {}
+    months_meta: Dict[str, Any] = {}     # 键为文件 stem（v2）
     papers: List[Dict[str, Any]] = []
     reparsed = kept = 0
     range_mode = since is not None or until is not None
-    for month, md_path in sorted(files.items()):
+    for stem, (month, series, md_path) in sorted(files.items()):
         in_range = (since is None or month >= since) and (until is None or month <= until)
         st = md_path.stat()
-        prev = old_months.get(month)
+        prev = old_months.get(stem)
         unchanged = (prev and prev.get("md_mtime") == st.st_mtime
                      and prev.get("md_size") == st.st_size)
         force = full or (range_mode and in_range)   # 区间模式：区间内强制重扫
         if (not in_range and prev) or (unchanged and not force):
-            # 沿用旧条目（区间外月份即使变化也不动，除非它根本不在旧索引里）
-            entries = [e for e in old_papers if e.get("month") == month]
-            months_meta[month] = prev
+            # 沿用旧条目（区间外文件即使变化也不动，除非它根本不在旧索引里）
+            entries = [e for e in old_papers if e.get("note_file") == md_path.name]
+            months_meta[stem] = prev
             kept += 1
         else:
-            stem = md_path.name[:-3]
             entries = build_month_entries(
                 month, md_path,
                 ref_path=notes_dir / "{}.references.json".format(stem),
-                sidecar_path=notes_dir / "{}.index.json".format(stem))
-            months_meta[month] = {"md_mtime": st.st_mtime, "md_size": st.st_size,
-                                  "papers": len(entries),
-                                  "source": entries[0]["_source"] if entries else "empty"}
+                sidecar_path=notes_dir / "{}.index.json".format(stem),
+                series=series)
+            months_meta[stem] = {"month": month, "series": series,
+                                 "md_mtime": st.st_mtime, "md_size": st.st_size,
+                                 "papers": len(entries),
+                                 "source": entries[0]["_source"] if entries else "empty"}
             reparsed += 1
         papers.extend(entries)
 
@@ -436,7 +506,7 @@ def update_index(notes_dir: Path, *, full: bool = False,
         "citekey_collisions": _citekey_collisions(papers),
         "papers": papers,
     }
-    logger.info("  索引：{} 个月（重解析 {}，沿用 {}），共 {} 篇，撞键 {} 组".format(
+    logger.info("  索引：{} 个札记文件（重解析 {}，沿用 {}），共 {} 篇，撞键 {} 组".format(
         len(months_meta), reparsed, kept, len(papers), len(index["citekey_collisions"])))
     return index
 
@@ -464,13 +534,16 @@ def build_index_md(index: Dict[str, Any]) -> str:
     papers = [e for e in index["papers"] if not e.get("duplicate_of")]
     n_inc = sum(1 for e in papers if e.get("decision") == "INCLUDE")
     n_ft = sum(1 for e in papers if e.get("has_full_text_reading"))
+    n_manual = sum(1 for e in papers if e.get("series") == "manual")
+    all_months = sorted({e["month"] for e in index["papers"]})
     lines = ["# 科研札记文献索引", "",
              "机器可读版：`literature_index.json`（查询配方见 `AGENTS.md`）。", "",
              "- 覆盖月份：**{}**（{} → {}）".format(
-                 len(index["months"]),
-                 min(index["months"]) if index["months"] else "-",
-                 max(index["months"]) if index["months"] else "-"),
-             "- 论文：**{}** 篇（INCLUDE {} · 全文精读 {}）".format(len(papers), n_inc, n_ft)]
+                 len(all_months),
+                 all_months[0] if all_months else "-",
+                 all_months[-1] if all_months else "-"),
+             "- 论文：**{}** 篇（INCLUDE {} · 全文精读 {} · 手动深读 {}）".format(
+                 len(papers), n_inc, n_ft, n_manual)]
     if index["citekey_collisions"]:
         lines.append("- ⚠️ **citekey 撞键 {} 组**（不同论文同键，合并 bibliography 前必须处理）：{}".format(
             len(index["citekey_collisions"]),
@@ -479,16 +552,18 @@ def build_index_md(index: Dict[str, Any]) -> str:
     lines.append("")
     esc = lambda s: (s or "").replace("|", "/")
     tier_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
-    for month in sorted(index["months"], reverse=True):
+    for month in sorted(all_months, reverse=True):
         rows = [e for e in papers if e["month"] == month]
         if not rows:
             continue
         lines.extend(["## {}".format(month), "",
-                      "| # | 优先级 | 裁决 | citekey | 标题 | 一句话用处 | DOI |",
-                      "|:-:|:-:|:-:|---|---|---|---|"])
-        for e in sorted(rows, key=lambda x: x.get("priority_rank") or 9999):
-            lines.append("| {} | {} | {} | `{}` | {} | {} | {} |".format(
+                      "| # | 优先级 | 系列 | 裁决 | citekey | 标题 | 一句话用处 | DOI |",
+                      "|:-:|:-:|:-:|:-:|---|---|---|---|"])
+        for e in sorted(rows, key=lambda x: (x.get("series") != "manual",
+                                             x.get("priority_rank") or 9999)):
+            lines.append("| {} | {} | {} | {} | `{}` | {} | {} | {} |".format(
                 e.get("priority_rank") or "", tier_emoji.get(e.get("priority_tier"), ""),
+                "📘手动" if e.get("series") == "manual" else "自动",
                 e.get("decision") or "", e.get("citekey") or "",
                 esc(e.get("title")), esc(e.get("one_line")), e.get("doi") or ""))
         lines.append("")
@@ -620,6 +695,9 @@ def load_seen_keys(index_path: Path,
     按**键**整体剔除而非按条目 month 过滤——同一 dedup_key 可能同时以 keeper 身份
     落在重跑月、又以 duplicate_of 身份落在别的月；只剔本月条目会让该键残留在
     seen 里，重跑时把这篇论文 dedup 掉（丢篇）。
+
+    只剔除 series=="auto" 的条目键：手动深读（manual）的键恒留在 seen 里，令自动回填
+    始终跳过已被手动深度精读的论文（避免同一篇又生成一条浅读重复条目）——这是期望行为。
     """
     p = Path(index_path)
     if not p.exists():
@@ -631,5 +709,7 @@ def load_seen_keys(index_path: Path,
         return set()
     papers = [e for e in data.get("papers", []) if e.get("dedup_key")]
     excl_months = exclude_months or set()
-    excluded_keys = {e["dedup_key"] for e in papers if e.get("month") in excl_months}
+    # 缺 series 字段的旧条目按 auto 处理（向后兼容）
+    excluded_keys = {e["dedup_key"] for e in papers
+                     if e.get("month") in excl_months and e.get("series", "auto") == "auto"}
     return {e["dedup_key"] for e in papers if e["dedup_key"] not in excluded_keys}

@@ -133,6 +133,40 @@ def crossref_lookup(
                 pass
 
 
+def crossref_by_doi(
+    doi: str,
+    email: str = "",
+    client: Optional[httpx.Client] = None,
+    timeout: float = 15.0,
+) -> Optional[Dict[str, Any]]:
+    """按 DOI 直查 Crossref（works/{doi}），返回规范元数据 dict；404/异常返回 None（不抛出）。
+
+    DOI 是精确标识，无需标题相似度门槛（与 crossref_lookup 的按标题模糊检索不同）。
+    """
+    doi = (doi or "").strip().replace("https://doi.org/", "").strip("/")
+    if not doi:
+        return None
+    own = client is None
+    c = client or ipv4_client(timeout=timeout)
+    try:
+        params = {"mailto": email} if email else {}
+        resp = c.get("{}/{}".format(CROSSREF_API, doi), params=params)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        item = (resp.json() or {}).get("message")
+        return parse_crossref_work(item) if item else None
+    except Exception as e:
+        logger.warning("  ⚠️ Crossref DOI 直查失败（{}）: {}".format(doi, e))
+        return None
+    finally:
+        if own:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
 def enrich_metadata(
     meta: PaperMetadata,
     email: str = "",

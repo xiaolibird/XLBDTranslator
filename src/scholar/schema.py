@@ -236,14 +236,34 @@ class FilterDecision(BaseModel):
 
 # ==================== 全文精读结果 ====================
 
-# 句级联想标记：关联研究主线的三类角色（可空=普通句子）
-CloseReadTag = Literal["方法学创新", "重要发现", "研究背景"]
+# 句级角色标记：按「对后续工作流的用途」分三类（可空=普通句子）。
+#   可引用证据 citable   —— 带具体数字/效应量/可溯源结果，写作时可直接取证
+#   可反驳观点 refutable —— 作者的主张/立场/可质疑处，写 critique 时的靶子
+#   方法论借鉴 method    —— 可迁移到自身研究的手法
+# 旧三类（方法学创新/重要发现/研究背景）保留在 Literal 中仅为**向后兼容加载历史 bundle**，
+# 新产出只用新三类（见 ROLE_TAGS）；索引层用 TAG_TO_ROLE 把中文 tag 归一到英文 role slug。
+ROLE_TAGS = ("可引用证据", "可反驳观点", "方法论借鉴")
+CloseReadTag = Literal[
+    "可引用证据", "可反驳观点", "方法论借鉴",
+    "方法学创新", "重要发现", "研究背景",  # legacy（历史 bundle 反序列化用）
+]
+
+# 中文 tag → 英文 role slug（工作流按 slug 检索）。None = 不进 highlights（去噪）。
+TAG_TO_ROLE = {
+    "可引用证据": "citable",
+    "可反驳观点": "refutable",
+    "方法论借鉴": "method",
+    # 历史近似映射（换轴前的旧三类，不重跑 LLM）：
+    "方法学创新": "method",
+    "重要发现": "citable",
+    "研究背景": None,
+}
 
 
 class CloseReadSentence(BaseModel):
-    """精读正文的一个句子/片段，可带一个三色联想标记。"""
+    """精读正文的一个句子/片段，可带一个句级角色标记。"""
     text: str = Field(description="句子文本（中文）")
-    tag: Optional[CloseReadTag] = Field(None, description="句级联想标记：方法学创新/重要发现/研究背景，或无")
+    tag: Optional[CloseReadTag] = Field(None, description="句级角色：可引用证据/可反驳观点/方法论借鉴，或无")
 
 
 class CloseReadSection(BaseModel):

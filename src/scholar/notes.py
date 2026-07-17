@@ -21,8 +21,11 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# 句级联想标记（与 docx 三色一致）：方法学创新=墨绿 / 重要发现=紫 / 研究背景=蓝
-_TAG_MARK = {"方法学创新", "重要发现", "研究背景"}
+# 句级角色标记（渲染为〔〕marker；docx 对应三色）。收新旧六类：
+#   新（换轴后）：可引用证据 / 可反驳观点 / 方法论借鉴
+#   旧（历史 bundle，原样保留以诚实反映当时标注）：方法学创新 / 重要发现 / 研究背景
+_TAG_MARK = {"可引用证据", "可反驳观点", "方法论借鉴",
+             "方法学创新", "重要发现", "研究背景"}
 
 _STOP_WORDS = {"the", "a", "an", "of", "for", "and", "with", "using", "based",
                "from", "into", "via", "toward", "towards", "study", "novel"}
@@ -191,7 +194,7 @@ def build_digest_note(segments: List[PaperSegment], citekeys: Dict[str, Optional
     fm = ["---", "title: {}".format(json.dumps(title, ensure_ascii=False)),
           'lang: zh', "---", ""]
     lines: List[str] = ["# {}".format(title), "", "共 {} 篇（按优先级降序）。".format(total), "",
-                        "> 句级联想标记：〔方法学创新〕〔重要发现〕〔研究背景〕（关联研究主线；docx 版对应墨绿/紫/蓝三色）。", ""]
+                        "> 句级角色标记：〔可引用证据〕〔可反驳观点〕〔方法论借鉴〕（按对后续工作流的用途；docx 版对应墨绿/紫/蓝三色）。历史札记可能保留旧标记〔方法学创新〕〔重要发现〕〔研究背景〕。", ""]
     if instruction:
         lines.append("<!-- 归纳指令: {} -->".format(instruction))
         lines.append("")
@@ -273,6 +276,7 @@ def write_notes(
     cjk_font: str = "",
     fallback_citekeys: bool = False,
     emit_index_sidecar: bool = True,
+    index_series: str = "auto",
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
@@ -334,7 +338,7 @@ def write_notes(
                 src = ("zotero" if seg.paper_id in zotero_keyed
                        else "missing" if key.startswith("MISSING-KEY-") else "fallback")
                 entries.append(entry_from_segment(seg, key, rank=i, total=len(ordered),
-                                                  citekey_source=src))
+                                                  citekey_source=src, series=index_series))
             sidecar_path = out_dir / "{}.index.json".format(slug)
             with open(sidecar_path, "w", encoding="utf-8") as f:
                 json.dump({"schema_version": 1, "papers": entries}, f,

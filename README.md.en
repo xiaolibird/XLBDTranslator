@@ -289,7 +289,7 @@ python batch_translate_scholar.py --json <papers.json>
 
 ### Full-text close reading (sentence-level color tags)
 
-For each month's top-N papers (default 5), the pipeline resolves legal OA full text (arXiv / Unpaywall), extracts it with PyMuPDF, and has a strong model (`LLM__CLOSEREAD_MODEL`) produce a structured Chinese close reading (research question / methods & data / key findings / caveats / relevance to my research), tagging sentences related to the research agenda: `〔方法学创新〕` (methodological innovation, dark green) / `〔重要发现〕` (key finding, purple) / `〔研究背景〕` (background, blue) — rendered as real colors in the docx. Candidate selection prefers papers whose full text is actually obtainable; paywalled papers degrade to abstract-level reading, clearly labeled. Toggle via `PROCESSING__CLOSEREAD_ENABLED` or `--close-read`.
+For each month's top-N papers (default 5), the pipeline resolves legal OA full text (arXiv / Unpaywall), extracts it with PyMuPDF, and has a strong model (`LLM__CLOSEREAD_MODEL`) produce a structured Chinese close reading (research question / methods & data / key findings / caveats / relevance to my research), tagging sentences by their **use to downstream workflows**: `〔可引用证据〕` (citable evidence — numbers/effect sizes, dark green) / `〔可反驳观点〕` (refutable claim — the author's positions, a target for critique, purple) / `〔方法论借鉴〕` (methodological borrowing, blue) — rendered as real colors in the docx. These sentences are aggregated into each index entry's `highlights[]`, so workflows can `jq` them across the whole library by role (citable/refutable/method) without opening the md. Legacy notes keep the old three tags (methodological innovation/key finding/background); the index layer maps them to the new roles approximately. Candidate selection prefers papers whose full text is actually obtainable; paywalled papers degrade to abstract-level reading, clearly labeled. Toggle via `PROCESSING__CLOSEREAD_ENABLED` or `--close-read`.
 
 ### Monthly research-note backfill (headless)
 
@@ -299,6 +299,26 @@ python scripts/backfill_notes.py --prev-month                      # previous ca
 ```
 
 Headless by design: no Zotero writes (metadata corrected via translation-server + Crossref; citekeys are human-readable fallback keys). Existing months are skipped (`--force` to overwrite); the cross-run dedup set is restored from the literature index so new months never re-collect papers already filed. For parallel historical backfills give each process its own `--token-path` copy.
+
+### Manual PDF deep close-reading (agent reads + script cross-check)
+
+When you have a PDF and want a **more thorough read than the automatic top-N**, archived into the library. Three stages:
+
+```bash
+# 1) ingest: extract full text (no truncation) + authoritative metadata (Crossref/arXiv) + chunked read → draft bundle
+PYTHONPATH=. python scripts/read_pdf.py ingest paper.pdf            # archives to current month; --month YYYY-MM
+# 2) agent reads: read the whole PDF with the Read tool, verify every number/claim/method against the script draft,
+#    write the merged final into the bundle's close_reading_final + cross_check_report, set status=final (see skill: read-paper)
+# 3) finalize: rebuild the month's manual-notes quartet from all final bundles + refresh index (idempotent, appendable)
+PYTHONPATH=. python scripts/read_pdf.py finalize <bundle.json>
+```
+
+Output is a separate series `科研札记_YYYY-MM_手动精读.{md,docx,references.json,index.json}`, kept **out of** the
+automatic `_全文精读` series (so the monthly launchd job doesn't skip the month as "already exists"). In the index the
+manual deep-read is the keeper — a writing agent filtering `duplicate_of == null` reads the most thorough version. The
+script's chunked read and Claude's own read **cross-check** each other; discrepancies resolve to what's verified in the
+PDF, with corrections/additions logged into a final "cross-check record" section. Trigger the skill by telling Claude
+"close-read this PDF / deep-read this paper" in this repo with a PDF.
 
 ### Literature index (retrieval entry point for writing agents)
 

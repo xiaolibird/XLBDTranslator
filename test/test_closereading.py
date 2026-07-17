@@ -19,13 +19,13 @@ def test_parse_closeread_tags_and_fences():
     resp = '''```json
 {"sections":[
   {"heading":"方法与数据","sentences":[
-     {"text":"用可学习掩码嵌入。","tag":"方法学创新"},
+     {"text":"用可学习掩码嵌入。","tag":"方法论借鉴"},
      {"text":"数据来自 MIMIC-IV。","tag":null},
-     {"text":"结论稳健。","tag":"重要发现"}]}]}
+     {"text":"结论稳健。","tag":"可引用证据"}]}]}
 ```'''
     out = cr.parse_closeread(resp)
     tags = [s.tag for s in out.sections[0].sentences]
-    assert tags == ["方法学创新", None, "重要发现"]
+    assert tags == ["方法论借鉴", None, "可引用证据"]
 
 
 def test_parse_closeread_drops_invalid_tag():
@@ -71,12 +71,12 @@ class _FakeLLM:
 
 
 def test_close_read_builds_closereading():
-    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":[{"text":"发现X。","tag":"重要发现"}]}]}')
+    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":[{"text":"发现X。","tag":"可引用证据"}]}]}')
     out = cr.close_read(_seg(), "全文正文……", "我的研究主线 MNAR/MA-GCT", llm,
                         model="strong-model", from_full_text=True, source="arxiv")
     assert out is not None
     assert out.from_full_text is True and out.model == "strong-model" and out.source == "arxiv"
-    assert out.sections[0].sentences[0].tag == "重要发现"
+    assert out.sections[0].sentences[0].tag == "可引用证据"
     assert llm.calls[0]["json_mode"] is True                 # 请求了结构化 JSON
     assert "我的研究主线 MNAR/MA-GCT" in llm.calls[0]["prompt"]  # 注入了研究主线
 

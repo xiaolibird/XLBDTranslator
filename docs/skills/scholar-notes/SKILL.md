@@ -21,9 +21,24 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
           | [.citekey, .month, .priority_tier, .has_full_text_reading, .title] | @tsv' literature_index.json
    ```
    常用过滤字段:`decision=="INCLUDE"`、`has_full_text_reading`、`priority_tier=="high"`、
-   `month >= "2025-01"`、`tag_counts["方法学创新"]`。
+   `month >= "2025-01"`、`tag_counts.citable`（口径为 role slug:citable/refutable/method）。
+1b. **句级调取(highlights)**:每条论文带 `highlights[]`,项为 `{role, tag, section, text}`,
+   `role` ∈ `citable`(可引用证据) / `refutable`(可反驳观点) / `method`(方法论借鉴)。
+   工作流按用途跨全库直取句子(不必打开 md):
+   ```bash
+   # 某主题下所有"可引用证据"(带出处):
+   jq -r '.papers[] | select(.duplicate_of==null)
+          | . as $p | .highlights[] | select(.role=="citable")
+          | [$p.citekey, .section, .text] | @tsv' literature_index.json
+   # 某篇的所有"可反驳靶子"(写 critique 用):
+   jq -r '.papers[] | select(.citekey=="<citekey>")
+          | .highlights[] | select(.role=="refutable") | .text' literature_index.json
+   # 全库"方法论借鉴"灵感库:  select(.role=="method")
+   ```
+   历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃);
+   手动精读的 refutable 还含对抗核验的纠错条。新精读由 LLM/subagent 直接精确产出三类。
 2. **读原文**:`grep -nF '[@<citekey>]' <note_file>` 拿行号,Read 该小节——重点是「全文精读」节
-   (句级标记:`〔方法学创新〕`方法借鉴 / `〔重要发现〕`实证结论 / `〔研究背景〕`背景动机,以及「对我研究的联想」小节)。
+   (句级标记:`〔可引用证据〕`取证 / `〔可反驳观点〕`靶子 / `〔方法论借鉴〕`方法思路,以及「对我研究的联想」小节;历史札记可能仍是旧标记〔方法学创新/重要发现/研究背景〕)。
 3. **引用**:论文正文用 pandoc 语法 `[@citekey]`。
 4. **书目**:`jq -s 'add | unique_by(.id)' 科研札记_*_全文精读.references.json > bibliography.json`
    ——合并前必须确认 `jq '.citekey_collisions' literature_index.json` 为 `[]`,否则撞键会静默吞掉一篇。

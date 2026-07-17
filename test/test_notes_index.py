@@ -28,10 +28,10 @@ def _segments():
     """三篇：全字段+精读 / arXiv-only无DOI / 极简无裁决。标题含 | 和 [ 的刁钻字符。"""
     cr = CloseReading(from_full_text=True, source="arxiv", sections=[
         CloseReadSection(heading="方法与数据", sentences=[
-            CloseReadSentence(text="可学习掩码嵌入。", tag="方法学创新"),
+            CloseReadSentence(text="可学习掩码嵌入。", tag="方法论借鉴"),
             CloseReadSentence(text="普通句子。", tag=None)]),
         CloseReadSection(heading="关键结论", sentences=[
-            CloseReadSentence(text="AUPRC 提升。", tag="重要发现")])])
+            CloseReadSentence(text="AUPRC 提升。", tag="可引用证据")])])
     a = PaperSegment(
         segment_id=1, paper_id="pa", priority_score=0.9, translated_title="深度EHR模型",
         metadata=PaperMetadata(paper_id="pa", title="Deep | EHR [Models] under MNAR",
@@ -83,7 +83,12 @@ def test_roundtrip_md_parse(tmp_path):
     assert a["authors"] == ["Jane Public", "Wei Chen"]
     assert a["year"] == 2025                                    # CSL issued 合并
     assert a["has_full_text_reading"] and a["reading_source"] == "arxiv"
-    assert a["tag_counts"] == {"方法学创新": 1, "重要发现": 1}
+    assert a["tag_counts"] == {"method": 1, "citable": 1}   # 口径归一到 role slug
+    # highlights 从 md 句级标记无损回填（含 section 溯源 + 文本）
+    hl = {h["role"]: h for h in a["highlights"]}
+    assert set(hl) == {"method", "citable"}
+    assert hl["method"]["section"] == "方法与数据" and hl["method"]["text"] == "可学习掩码嵌入。"
+    assert hl["citable"]["tag"] == "可引用证据"
     assert a["dedup_key"] == "doi:10.1/aaa"
     assert a["note_line"] and "[@public2025Deep]" in a["note_heading"]
 
@@ -217,11 +222,15 @@ def test_citekey_collision_detected():
 # ---------------- 目录扫描过滤 ----------------
 
 def test_note_files_filter(tmp_path):
-    for name in ["科研札记_2025-03_全文精读.md", "demo_yahei.md", "digest_20260712_154534.md",
+    for name in ["科研札记_2025-03_全文精读.md", "科研札记_2025-03_手动精读.md",
+                 "demo_yahei.md", "digest_20260712_154534.md",
                  "科研札记_2025-03_全文精读_validate.md", "INDEX.md"]:
         (tmp_path / name).write_text("x", encoding="utf-8")
     files = ni._note_files(tmp_path)
-    assert list(files) == ["2025-03"]
+    # 键为文件 stem；同月 auto/manual 双系列共存
+    assert set(files) == {"科研札记_2025-03_全文精读", "科研札记_2025-03_手动精读"}
+    assert files["科研札记_2025-03_全文精读"][:2] == ("2025-03", "auto")
+    assert files["科研札记_2025-03_手动精读"][:2] == ("2025-03", "manual")
 
 
 # ---------------- 增量 + 幂等 ----------------
@@ -231,10 +240,11 @@ def test_incremental_and_idempotent(tmp_path):
     _write_month(tmp_path, month="2025-04", sidecar=False,
                  citekeys={"pa": "other2025Key", "pb": None, "pc": None})
 
+    s3, s4 = "科研札记_2025-03_全文精读", "科研札记_2025-04_全文精读"
     idx1 = ni.update_index(tmp_path, full=True)
-    assert set(idx1["months"]) == {"2025-03", "2025-04"}
-    assert idx1["months"]["2025-03"]["source"] == "sidecar"
-    assert idx1["months"]["2025-04"]["source"] == "md-parse"
+    assert set(idx1["months"]) == {s3, s4}          # v2：months 按文件 stem 键
+    assert idx1["months"][s3]["source"] == "sidecar"
+    assert idx1["months"][s4]["source"] == "md-parse"
     # 2025-04 与 2025-03 同一批论文 → 全部标为 2025-03 的重复
     dups = [e for e in idx1["papers"] if e["duplicate_of"]]
     assert len(dups) == 3 and all(e["month"] == "2025-04" for e in dups)
@@ -254,14 +264,14 @@ def test_incremental_and_idempotent(tmp_path):
     md4 = tmp_path / "科研札记_2025-04_全文精读.md"
     md4.write_text(md4.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     idx3 = ni.update_index(tmp_path, since="2025-03", until="2025-03")
-    assert idx3["months"]["2025-04"] == idx1["months"]["2025-04"]   # 区间外：变化不采集
+    assert idx3["months"][s4] == idx1["months"][s4]   # 区间外：变化不采集
     idx4 = ni.update_index(tmp_path, since="2025-04", until="2025-04")
-    assert idx4["months"]["2025-04"] != idx1["months"]["2025-04"]   # 区间内：重扫到新 mtime
+    assert idx4["months"][s4] != idx1["months"][s4]   # 区间内：重扫到新 mtime
 
     # 月份 md 删除 → 条目随之消失（months 以磁盘为准）
     md4.unlink()
     idx5 = ni.update_index(tmp_path)
-    assert set(idx5["months"]) == {"2025-03"}
+    assert set(idx5["months"]) == {s3}
     assert all(e["month"] == "2025-03" for e in idx5["papers"])
 
 
@@ -323,3 +333,108 @@ def test_references_json_field_none_when_file_absent(tmp_path):
                                      ref_path=tmp_path / (stem + ".references.json"),
                                      sidecar_path=None)
     assert entries and all(e["references_json"] is None for e in entries)
+
+
+# ---------------- 手动精读系列（series）+ keeper 规则 ----------------
+
+def _write_manual_month(tmp_path, month="2026-07", segs=None):
+    """写一篇手动精读札记（series=manual）。默认复用 pa（与自动系列同 DOI，触发 keeper 竞争）。"""
+    segs = segs if segs is not None else [_segments()[0]]
+    keys = {s.paper_id: None for s in segs}
+    return write_notes(segs, keys, out_dir=tmp_path,
+                       digest_title="科研札记 · {}（手动深度精读）".format(month),
+                       filename="科研札记_{}_手动精读".format(month),
+                       fallback_citekeys=True, emit_index_sidecar=True,
+                       index_series="manual")
+
+
+def test_note_md_re_accepts_both_series_rejects_others():
+    assert ni.NOTE_MD_RE.match("科研札记_2026-07_全文精读.md")
+    assert ni.NOTE_MD_RE.match("科研札记_2026-07_手动精读.md")
+    assert ni.NOTE_MD_RE.match("科研札记_2026-07_全文精读_validate.md") is None
+    assert ni.NOTE_MD_RE.match("digest_20260712.md") is None
+    # 专题批次:YYYY-MM-DD 桶（同月另起文件）
+    m = ni.NOTE_MD_RE.match("科研札记_2026-07-17_手动精读.md")
+    assert m and m.group(1) == "2026-07-17" and m.group(2) == "手动精读"
+
+
+def test_both_series_coexist_same_month(tmp_path):
+    """同月 auto + manual 双系列均入索引，各成一条 note file。"""
+    _write_month(tmp_path, month="2026-07", sidecar=True)
+    # 手动系列换一篇不同论文，避免与自动版去重（本测试只验证共存）
+    solo = PaperSegment(segment_id=1, paper_id="pm", priority_score=1.0,
+                        metadata=PaperMetadata(paper_id="pm", title="Manual Only Paper",
+                                               doi="10.9/manual"))
+    _write_manual_month(tmp_path, month="2026-07", segs=[solo])
+    idx = ni.update_index(tmp_path, full=True)
+    stems = set(idx["months"])
+    assert "科研札记_2026-07_全文精读" in stems and "科研札记_2026-07_手动精读" in stems
+    series = {e["series"] for e in idx["papers"]}
+    assert series == {"auto", "manual"}
+    manual = [e for e in idx["papers"] if e["series"] == "manual"]
+    assert manual and manual[0]["note_file"] == "科研札记_2026-07_手动精读.md"
+
+
+def test_manual_is_keeper_over_auto_even_if_later(tmp_path):
+    """同一论文（同 DOI）自动版在早月、手动深读在晚月：手动为 keeper，自动被标 duplicate。"""
+    _write_month(tmp_path, month="2025-03", sidecar=True)          # pa DOI 10.1/aaa
+    _write_manual_month(tmp_path, month="2026-07")                 # 同 pa，同 DOI
+    idx = ni.update_index(tmp_path, full=True)
+    pa = [e for e in idx["papers"] if e.get("doi") == "10.1/aaa"]
+    keeper = [e for e in pa if not e.get("duplicate_of")]
+    dup = [e for e in pa if e.get("duplicate_of")]
+    assert len(keeper) == 1 and keeper[0]["series"] == "manual" and keeper[0]["month"] == "2026-07"
+    assert len(dup) == 1 and dup[0]["series"] == "auto" and dup[0]["month"] == "2025-03"
+    assert dup[0]["duplicate_of"].endswith("@2026-07")
+    assert "2025-03" in keeper[0]["duplicate_months"]
+
+
+def test_load_seen_keys_excludes_only_auto(tmp_path):
+    """--force 重跑某月：只剔除该月 auto 键；同月 manual 键恒留 seen（自动回填应跳过已手动深读的论文）。"""
+    idx = {"papers": [
+        {"month": "2026-07", "dedup_key": "doi:10.1/auto", "series": "auto"},
+        {"month": "2026-07", "dedup_key": "doi:10.1/manual", "series": "manual"},
+        {"month": "2026-06", "dedup_key": "doi:10.1/old", "series": "auto"},
+    ]}
+    p = tmp_path / "literature_index.json"
+    p.write_text(json.dumps(idx), encoding="utf-8")
+    # 全量 seen 含全部键
+    assert ni.load_seen_keys(p) == {"doi:10.1/auto", "doi:10.1/manual", "doi:10.1/old"}
+    # --force 剔 2026-07：auto 键去掉，manual 键仍在
+    got = ni.load_seen_keys(p, exclude_months={"2026-07"})
+    assert got == {"doi:10.1/manual", "doi:10.1/old"}
+
+
+def test_schema_version_is_v3():
+    assert ni.SCHEMA_VERSION == 3
+
+
+def test_legacy_tags_map_to_role_highlights():
+    """历史 bundle 的旧三色 tag 经 entry_from_segment → 映射为 role highlights（不重跑 LLM）。"""
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        CloseReadSection(heading="方法", sentences=[
+            CloseReadSentence(text="用图变换器聚合。", tag="方法学创新")]),
+        CloseReadSection(heading="结论", sentences=[
+            CloseReadSentence(text="AUC 0.9。", tag="重要发现")]),
+        CloseReadSection(heading="背景", sentences=[
+            CloseReadSentence(text="EHR 常缺失。", tag="研究背景")])])  # 研究背景→丢弃
+    seg = PaperSegment(
+        segment_id=1, paper_id="lg", priority_score=0.5,
+        metadata=PaperMetadata(paper_id="lg", title="Legacy Tagged Paper"),
+        close_reading=cr)
+    e = ni.entry_from_segment(seg, "leg2020Paper", rank=0, total=1)
+    assert e["tag_counts"] == {"method": 1, "citable": 1}   # 研究背景不计
+    roles = sorted(h["role"] for h in e["highlights"])
+    assert roles == ["citable", "method"]
+    assert all(h["role"] != "refutable" for h in e["highlights"])  # 浅读无 refutable
+
+
+def test_collect_highlights_drops_null_and_background():
+    hl, tc = ni._collect_highlights([
+        ("结果", "可引用证据", "P<0.05"),
+        ("方法", None, "普通句"),
+        ("背景", "研究背景", "综述"),          # legacy→None，丢弃
+        ("质疑", "可反驳观点", "作者高估效应"),
+    ])
+    assert [h["role"] for h in hl] == ["citable", "refutable"]
+    assert tc == {"citable": 1, "refutable": 1}

@@ -337,9 +337,9 @@ python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.j
 python batch_translate_scholar.py --json <papers.json>
 ```
 
-### 全文精读（句级三色联想）
+### 全文精读（句级角色标记 + 可调取 highlights）
 
-对每月优先级 top-N（默认 5）论文做**全文级**精读：解析 OA 全文（arXiv 直链 / Unpaywall，合法免费）→ 下载 PDF → PyMuPDF 抽文本 → 强模型（`LLM__CLOSEREAD_MODEL`）输出结构化中文精读（研究问题 / 方法与数据 / 关键结论 / 可质疑点 / **对我研究的联想**），并对与研究主线相关的句子打三色联想标记：`〔方法学创新〕`墨绿 / `〔重要发现〕`紫 / `〔研究背景〕`蓝（docx 版真三色着色）。候选层做 **OA 择优**：在高优先级候选里优先挑能拿到全文的，避免 top-N 恰好全是付费墙；无全文则降级为摘要级精读并明确标注。开关 `PROCESSING__CLOSEREAD_ENABLED` 或 CLI `--close-read`。
+对每月优先级 top-N（默认 5）论文做**全文级**精读：解析 OA 全文（arXiv 直链 / Unpaywall，合法免费）→ 下载 PDF → PyMuPDF 抽文本 → 强模型（`LLM__CLOSEREAD_MODEL`）输出结构化中文精读（研究问题 / 方法与数据 / 关键结论 / 可质疑点 / **对我研究的联想**），并按**对后续工作流的用途**给句子打角色标记：`〔可引用证据〕`墨绿（含数字/效应量，写作取证）/ `〔可反驳观点〕`紫（作者主张/可质疑处，写 critique 的靶子）/ `〔方法论借鉴〕`蓝（可迁移方法思路）（docx 版真三色着色）。这些句子聚合成索引条目的 `highlights[]`，工作流可按 role（citable/refutable/method）跨全库 `jq` 直取，无需打开 md。历史札记保留旧三色标记（方法学创新/重要发现/研究背景），索引层自动近似映射到新 role。候选层做 **OA 择优**：在高优先级候选里优先挑能拿到全文的，避免 top-N 恰好全是付费墙；无全文则降级为摘要级精读并明确标注。开关 `PROCESSING__CLOSEREAD_ENABLED` 或 CLI `--close-read`。
 
 ### 按月科研札记回填（headless）
 
@@ -352,9 +352,28 @@ python scripts/backfill_notes.py --prev-month          # 上一自然月（月�
 
 headless 设计：不写 Zotero 库（元数据由 translation-server + Crossref 矫正；citekey 用「作者姓+年+标题词」人读兜底键，需要权威键时人在再 `zotero --input` 推库）。已存在的月份自动跳过（`--force` 覆盖）；**跨运行去重**——`seen` 集从文献索引恢复，新月份不会与历史月重复收录同一篇。并行分片跑历史时给每个进程独立 `--token-path`，避免并发刷新 Gmail token 写坏。
 
+### 手动 PDF 深度精读（agent 亲读 + 脚本交叉核验）
+
+自己手上有一篇 PDF、想做**比自动 top-N 更彻底的通读**并归档进文献库时用。三段式：
+
+```bash
+# 1) ingest：抽全文（不截断）+ 拉 Crossref/arXiv 权威元数据 + 分块逐块通读 → draft bundle
+PYTHONPATH=. python scripts/read_pdf.py ingest paper.pdf            # 默认归档当月，可 --month YYYY-MM
+# 2) agent 亲读：用 Read 工具读完整本 PDF，逐条核验脚本草稿的数字/结论/方法，
+#    把合并终稿写回 bundle 的 close_reading_final + cross_check_report，status=final（协议见 skill: read-paper）
+# 3) finalize：从当月全部 final bundle 重建手动精读四件套 + 刷索引（同月可多篇追加、幂等）
+PYTHONPATH=. python scripts/read_pdf.py finalize <bundle.json>
+```
+
+产物为独立系列 `科研札记_YYYY-MM_手动精读.{md,docx,references.json,index.json}`，**不并入**自动
+`_全文精读`（避免月度 launchd 见"当月已存在"而跳过整月）。在索引里手动深读是 keeper——论文写作
+agent 检索时（过滤 `duplicate_of == null`）读到的就是最彻底那版精读。脚本深读与 Claude 亲读**交叉核验**：
+每个效应量/数字回 PDF 原文核对，分歧以亲证为准，纠错与补漏记入札记末节「交叉核验记录」。触发 skill：
+在本仓库对 Claude 说"精读这篇 PDF / 深读这篇论文"并给出 PDF 即可。
+
 ### 文献索引（论文写作 agent 的检索入口）
 
-札记目录会维护一份机器可读总索引 `output/scholar_notes/literature_index.json`（+人读 `INDEX.md`、agent 使用说明 `AGENTS.md`），每篇一条：citekey/DOI/arXiv id、标题、裁决、一句话用处、优先级、是否全文精读、三色标记计数、所在札记文件+行号、跨月重复标记（`duplicate_of`）与 **citekey 撞键警告**（`citekey_collisions`，合并 bibliography 前必查）。
+札记目录会维护一份机器可读总索引 `output/scholar_notes/literature_index.json`（+人读 `INDEX.md`、agent 使用说明 `AGENTS.md`），每篇一条：citekey/DOI/arXiv id、标题、裁决、一句话用处、优先级、是否全文精读、角色标记计数（`tag_counts`:citable/refutable/method）、**句级可调取 `highlights[]`**（{role,tag,section,text}）、所在札记文件+行号、跨月重复标记（`duplicate_of`）与 **citekey 撞键警告**（`citekey_collisions`，合并 bibliography 前必查）。
 
 ```bash
 python scripts/notes_index.py                       # 增量（写札记时也会自动刷新）

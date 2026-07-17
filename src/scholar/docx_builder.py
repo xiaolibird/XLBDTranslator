@@ -22,8 +22,12 @@ logger = get_logger(__name__)
 
 # tier emoji → 单元格底纹色
 _TIER_FILL = {"🔴": "FFC7CE", "🟠": "FFEB9C", "🟢": "C6EFCE"}
-# 句级联想 tag → 字体颜色（墨绿/紫/蓝）
+# 句级角色 tag → 字体颜色（墨绿/紫/蓝）。新三类 + 旧三类（历史 bundle 兼容）。
 _TAG_COLOR = {
+    "方法论借鉴": RGBColor(0x00, 0x64, 0x00),   # 墨绿
+    "可引用证据": RGBColor(0x80, 0x00, 0x80),   # 紫
+    "可反驳观点": RGBColor(0x00, 0x00, 0xCD),   # 蓝
+    # legacy：
     "方法学创新": RGBColor(0x00, 0x64, 0x00),
     "重要发现": RGBColor(0x80, 0x00, 0x80),
     "研究背景": RGBColor(0x00, 0x00, 0xCD),
