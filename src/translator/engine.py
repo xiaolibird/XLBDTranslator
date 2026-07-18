@@ -29,6 +29,16 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _reraise_if_provider_fatal(exc: Exception) -> None:
+    """欠费/认证失败/模型下线级错误不能吞成 [Failed:] 字符串：
+    必须上抛，让上层重试与回退链（FallbackTranslator）感知到 provider 已不可用，
+    否则视觉段落会被永久写成失败译文而回退链永不触发。"""
+    from .fallback import classify_fatal
+    if classify_fatal(exc) == 'hard':
+        raise exc
+
+
 # 文本翻译的结构化输出 schema：强制模型返回 [{"id": int, "translation": str}] 数组。
 # 仅用于文本批量翻译（字段固定）；术语表/标题翻译是动态键字典，无法用固定 schema 约束，故不设。
 _TRANSLATION_LIST_SCHEMA = types.Schema(
@@ -669,6 +679,7 @@ class GeminiTranslator(BaseTranslator):
                     current_context = current_context[-self.settings.processing.max_context_length:]
 
             except Exception as e:
+                _reraise_if_provider_fatal(e)
                 logger.error(f"❌ Vision翻译失败 (segment {seg.segment_id}): {e}")
                 results.append(f"[Failed: {str(e)}]")
                 continue
@@ -729,6 +740,7 @@ class GeminiTranslator(BaseTranslator):
             return "[Failed: Invalid JSON Response]"
 
         except Exception as e:
+            _reraise_if_provider_fatal(e)
             logger.error(f"❌ Vision API调用失败 for {img_path}: {e}")
             return f"[Failed: {str(e)}]"
 
@@ -1136,6 +1148,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         final_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
+                _reraise_if_provider_fatal(result)
                 logger.error(f"❌ 视觉翻译失败 (segment {segments[i].segment_id}): {result}")
                 final_results.append(f"[Failed: {str(result)}]")
             else:
@@ -1587,6 +1600,7 @@ Return ONLY the JSON object.
                 return str(parsed['translation'])
             return "[Failed: Invalid JSON Response]"
         except Exception as e:
+            _reraise_if_provider_fatal(e)
             logger.error(f"❌ OpenAI-compatible Vision API 调用失败 for {img_path}: {e}")
             return f"[Failed: {str(e)}]"
 
@@ -1943,6 +1957,7 @@ class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
         final: List[str] = []
         for r in results:
             if isinstance(r, Exception):
+                _reraise_if_provider_fatal(r)
                 final.append(f"[Failed: {str(r)}]")
             else:
                 final.append(r)

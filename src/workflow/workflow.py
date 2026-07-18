@@ -320,6 +320,29 @@ class TranslationWorkflow:
         """初始化翻译器和缓存管理器"""
         provider = (getattr(self.settings.api, 'translator_provider', 'gemini') or 'gemini').lower()
 
+        # 配置了回退链时，用 FallbackTranslator 包装整条 provider 链：
+        # 主 provider 欠费/认证失败/配额耗尽时自动切换到下一个
+        fallback_raw = getattr(self.settings.api, 'fallback_providers', '') or ''
+        fallback_chain = [p.strip().lower() for p in fallback_raw.split(',') if p.strip()]
+        if fallback_chain:
+            from ..translator.fallback import (
+                FallbackTranslator, SUPPORTED_PROVIDERS, canonical_provider,
+            )
+            # 主 provider 拼写错误必须快速失败：否则会被链构造静默丢弃，
+            # 整本书悄悄落到兜底 provider 上
+            if provider not in SUPPORTED_PROVIDERS:
+                raise TranslationError(f"未知 translator_provider: {provider}")
+            # 按实际后端去重：'claude' 与 'claude-agent' 等别名是同一个后端
+            fallback_chain = [
+                p for p in fallback_chain
+                if canonical_provider(p) != canonical_provider(provider)
+            ]
+        if fallback_chain:
+            self.cache_manager = None
+            self.translator = FallbackTranslator(self.settings, [provider] + fallback_chain)
+            logger.info(f"✅ 回退翻译器已初始化: {provider} → {' → '.join(fallback_chain)}")
+            return
+
         if provider == 'gemini':
             # 创建缓存管理器（如果启用 Gemini Context Caching）
             if self.settings.processing.enable_gemini_caching:
@@ -338,6 +361,14 @@ class TranslationWorkflow:
             self.cache_manager = None
             self.translator = OpenAICompatibleTranslator(self.settings)
             logger.info(f"✅ OpenAI-compatible 翻译器已初始化 (provider={provider})")
+            return
+
+        if provider in {'claude-agent', 'claude_agent', 'agent', 'claude'}:
+            # Claude Agent (headless CLI)：走本机 claude 订阅，通常作为回退链兜底
+            from ..translator import ClaudeAgentTranslator
+            self.cache_manager = None
+            self.translator = ClaudeAgentTranslator(self.settings)
+            logger.info("✅ Claude Agent 翻译器已初始化 (headless CLI)")
             return
         
         # Ollama已集成到OpenAI-compatible provider中

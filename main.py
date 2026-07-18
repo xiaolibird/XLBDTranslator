@@ -7,7 +7,6 @@ import os
 import sys
 import argparse
 from pathlib import Path
-import traceback
 
 from src.core.schema import Settings
 from src.core.exceptions import TranslationError, APIError, APITimeoutError, JSONParseError, ConfigError
@@ -284,21 +283,23 @@ def main():
         logger.info("🎉 翻译任务成功完成！")
         logger.info("=" * 60)
 
+    # loguru 会对 message.format(*args, **kwargs) 二次格式化：错误信息里带花括号
+    # （如 API 返回的 JSON body）时 f-string 直接内插会触发 KeyError 掩盖真实错误，
+    # 必须用 "{}" 占位符让 loguru 安全替换
     except TranslationError as e:
-        logger.critical(f"💥 翻译错误: {e}", exc_info=True)
+        logger.opt(exception=True).critical("💥 翻译错误: {}", str(e))
         sys.exit(1)
     except APIError as e:
-        logger.critical(f"💥 API 错误: {e}", exc_info=True)
+        logger.opt(exception=True).critical("💥 API 错误: {}", str(e))
         sys.exit(1)
     except APITimeoutError as e:
-        logger.critical(f"💥 API 超时: {e}", exc_info=True)
+        logger.opt(exception=True).critical("💥 API 超时: {}", str(e))
         sys.exit(1)
     except JSONParseError as e:
-        logger.critical(f"💥 JSON 解析错误: {e}", exc_info=True)
+        logger.opt(exception=True).critical("💥 JSON 解析错误: {}", str(e))
         sys.exit(1)
     except Exception as e:
-        logger.critical(f"💥 发生未预期的严重错误: {e}", exc_info=True)
-        logger.critical(traceback.format_exc())
+        logger.opt(exception=True).critical("💥 发生未预期的严重错误: {}", str(e))
         sys.exit(1)
     finally:
         logger.info("系统关闭。")

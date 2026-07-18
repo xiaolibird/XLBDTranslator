@@ -790,21 +790,29 @@ class CachePersistenceManager:
 class PromptManager:
     """Prompt 模板管理器，在初始化时加载所有模板和配置"""
     
-    def __init__(self, settings: 'Settings'):
+    def __init__(self, settings: 'Settings', force_simple: bool = False):
         """
         初始化 Prompt 管理器
-        
+
         Args:
             settings: 全局设置对象，包含 translation_mode_entity
+            force_simple: 强制使用简化版 prompt（claude-agent 用：完整版的
+                ❌/✅ 对照表会触发 Claude API 输出内容过滤器的误报）
         """
         self.settings = settings
         self.mode_entity = settings.processing.translation_mode_entity
-        
+
         # 根据translator provider选择prompt版本
+        # claude 系列也算云端：主 provider 为 claude-agent 时，回退链中的
+        # gemini/deepseek 翻译器不能因此被降级到简化版 prompt
+        # （ClaudeAgentTranslator 自身通过 force_simple=True 显式选简化版）
         provider = getattr(settings.api, 'translator_provider', 'gemini').lower()
-        is_cloud_provider = provider in {'deepseek', 'openai', 'openai-compatible', 'openai_compatible', 'gemini'}
-        
-        if is_cloud_provider:
+        is_cloud_provider = provider in {
+            'deepseek', 'openai', 'openai-compatible', 'openai_compatible', 'gemini',
+            'claude-agent', 'claude_agent', 'agent', 'claude',
+        }
+
+        if is_cloud_provider and not force_simple:
             # 云端API使用完整版本的prompt（更好的翻译质量）
             self.system_instruction_base = self._load_prompt_template("system_instruction.md")
             self.text_translation_prompt = self._load_prompt_template("text_translation_prompt.md")

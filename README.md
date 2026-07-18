@@ -130,8 +130,20 @@ cp config/config.env.template config/config.env
     API__TRANSLATOR_PROVIDER=openai-compatible
     API__OPENAI_API_KEY="sk-your-deepseek-api-key"
     API__OPENAI_BASE_URL="https://api.deepseek.com"
-    API__OPENAI_MODEL="deepseek-chat"
+    API__OPENAI_MODEL="deepseek-v4-flash"
     ```
+
+    **多供应商自动回退** (可选):
+    ```dotenv
+    # 主 provider 欠费(402)/认证失败(401/403)/模型下线(404)/配额连续耗尽(429)
+    # 时自动切换到回退链中的下一个，无需人工干预，断点续传不受影响。
+    # gemini 与 deepseek 是平行的主力选项（改 TRANSLATOR_PROVIDER 切换）。
+    API__TRANSLATOR_PROVIDER=deepseek
+    API__FALLBACK_PROVIDERS=gemini
+    ```
+    另有实验性的 `claude-agent` provider（本机 claude CLI headless，订阅计费无需
+    API key），但 Claude API 的版权输出过滤器对整段翻译版权书籍会概率性拦截，
+    书籍翻译场景不可靠，不建议放入默认回退链。
 
 3.  **文档路径 (必需)**:
     ```dotenv
