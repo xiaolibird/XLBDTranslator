@@ -404,6 +404,77 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ==================== 设置路由表 ====================
+#
+# key（PRESETS / builder 链式方法使用的名字） -> (Settings 子对象属性名, 子对象内实际字段名)
+#
+# 数据驱动写法：所有能路由到 Settings 的键都在此列出一次；_apply_setting 只需查表，
+# 不必再维护一长串 if/elif（后者曾导致 temperature/top_p/glossary_* 等键被遗漏而静默丢弃）。
+# 绝大多数键在子对象里同名，只有极少数（如 model_name -> gemini_model）需要改名，
+# 直接在表里写清楚即可，无需额外的"改名映射"。
+_SETTING_ROUTES: Dict[str, tuple] = {
+    # --- processing（ProcessingSettings） ---
+    "translation_mode": ("processing", "translation_mode"),
+    "translation_mode_entity": ("processing", "translation_mode_entity"),
+    "batch_size": ("processing", "batch_size"),
+    "max_context_length": ("processing", "max_context_length"),
+    "temperature": ("processing", "temperature"),
+    "top_p": ("processing", "top_p"),
+    "top_k": ("processing", "top_k"),
+    "max_output_tokens": ("processing", "max_output_tokens"),
+    "glossary_preamble_ratio": ("processing", "glossary_preamble_ratio"),
+    "glossary_min_terms": ("processing", "glossary_min_terms"),
+    "glossary_max_terms": ("processing", "glossary_max_terms"),
+    "enable_glossary_edit": ("processing", "enable_glossary_edit"),
+    "skip_pretranslate_if_glossary_exists": ("processing", "skip_pretranslate_if_glossary_exists"),
+    "reprocess_pretranslated": ("processing", "reprocess_pretranslated"),
+    "enable_progressive_glossary": ("processing", "enable_progressive_glossary"),
+    "glossary_stop_threshold": ("processing", "glossary_stop_threshold"),
+    "max_retries": ("processing", "max_retries"),
+    "request_timeout": ("processing", "request_timeout"),
+    "rate_limit_delay": ("processing", "rate_limit_delay"),
+    "vision_rate_limit_delay": ("processing", "vision_rate_limit_delay"),
+    "min_chunk_size": ("processing", "min_chunk_size"),
+    "max_chunk_size": ("processing", "max_chunk_size"),
+    "enable_async": ("processing", "enable_async"),
+    "async_threshold": ("processing", "async_threshold"),
+    "async_max_workers": ("processing", "async_max_workers"),
+    "enable_gemini_caching": ("processing", "enable_gemini_caching"),
+    "cache_ttl_hours": ("processing", "cache_ttl_hours"),
+    "enable_checkpoint": ("processing", "enable_checkpoint"),
+    "checkpoint_interval": ("processing", "checkpoint_interval"),
+    "enable_cache": ("processing", "enable_cache"),
+    "use_breadcrumb": ("processing", "use_breadcrumb"),
+    "render_page_markers": ("processing", "render_page_markers"),
+    "use_vision_mode": ("processing", "use_vision_mode"),
+    "retain_original": ("processing", "retain_original"),
+    "json_repair_retries": ("processing", "json_repair_retries"),
+    "use_rich_progress": ("processing", "use_rich_progress"),
+    "enable_quality_check": ("processing", "enable_quality_check"),
+    "qc_semantic": ("processing", "qc_semantic"),
+
+    # --- files（FileSettings） ---
+    "document_path": ("files", "document_path"),
+    "output_base_dir": ("files", "output_base_dir"),
+    "final_output_dir": ("files", "final_output_dir"),
+    "log_file": ("files", "log_file"),
+    "modes_config_path": ("files", "modes_config_path"),
+
+    # --- api（APISettings）---
+    "translator_provider": ("api", "translator_provider"),
+    "gemini_api_key": ("api", "gemini_api_key"),
+    "model_name": ("api", "gemini_model"),  # 对外名沿用历史命名，实际落到 gemini_model 字段
+    "openai_api_key": ("api", "openai_api_key"),
+    "openai_base_url": ("api", "openai_base_url"),
+    "openai_model": ("api", "openai_model"),
+    "fallback_providers": ("api", "fallback_providers"),
+    "agent_model": ("api", "agent_model"),
+
+    # --- logging（LoggingSettings） ---
+    "log_level": ("logging", "log_level"),
+}
+
+
 class SettingsBuilder:
     """
     Settings Builder - 使用 Builder Pattern 构建配置
@@ -657,45 +728,22 @@ class SettingsBuilder:
         return self._settings
     
     def _apply_setting(self, key: str, value: Any) -> None:
-        """应用单个设置项到 Settings 对象"""
-        # Processing 相关设置
-        if key in ['batch_size', 'enable_gemini_caching', 'enable_async', 
-                   'async_threshold', 'async_max_workers', 'translation_mode', 
-                   'enable_checkpoint', 'checkpoint_interval', 'cache_ttl_hours', 
-                   'max_retries', 'max_context_length', 'json_repair_retries', 
-                   'request_timeout', 'rate_limit_delay', 'enable_cache',
-                   'use_breadcrumb', 'render_page_markers', 'use_vision_mode',
-                   'retain_original', 'use_rich_progress', 'translation_mode_entity',
-                   'vision_rate_limit_delay']:
-            setattr(self._settings.processing, key, value)
-        
-        # Files 相关设置
-        elif key in ['document_path', 'output_base_dir', 'final_output_dir', 
-                     'log_file', 'modes_config_path']:
-            setattr(self._settings.files, key, value)
-        
-        # API 相关设置
-        elif key in ['translator_provider', 'gemini_api_key', 'model_name', 'openai_api_key', 'openai_base_url', 'openai_model']:
-            if key == 'translator_provider':
-                setattr(self._settings.api, 'translator_provider', value)
-            elif key == 'model_name':
-                setattr(self._settings.api, 'gemini_model', value)
-            elif key == 'gemini_api_key':
-                setattr(self._settings.api, 'gemini_api_key', value)
-            elif key == 'openai_api_key':
-                setattr(self._settings.api, 'openai_api_key', value)
-            elif key == 'openai_base_url':
-                setattr(self._settings.api, 'openai_base_url', value)
-            elif key == 'openai_model':
-                setattr(self._settings.api, 'openai_model', value)
-        
-        # Logging 相关设置
-        elif key in ['log_level']:
-            setattr(self._settings.logging, key, value)
-        
-        # 未知设置（静默忽略）
+        """应用单个设置项到 Settings 对象
+
+        路由表 _SETTING_ROUTES 是数据驱动的唯一真源：key -> (子对象名, 子对象内实际字段名)。
+        之前用一长串 if/elif 手工枚举，PRESETS 里新增的 temperature/top_p/glossary_* 等
+        十几个键根本没被枚举到，落到 else 分支被 logger.debug 静默丢弃——设了等于没设。
+        改为路由表后，只要 Settings 子对象里有对应字段，键就一定能落位；新增字段时
+        也只需在表里加一行，不必再改这段逻辑。
+        """
+        route = _SETTING_ROUTES.get(key)
+        if route is not None:
+            sub_obj_name, field_name = route
+            setattr(getattr(self._settings, sub_obj_name), field_name, value)
         else:
-            logger.debug(f"自定义设置: {key} = {value}")
+            # 未知设置：Settings 中确实找不到归属，明确告警而非静默调试日志，
+            # 避免"配置项拼错/改名后没人发现"的问题再次发生
+            logger.warning(f"⚠️ 未知设置项，未生效: {key} = {value}")
     
     def _validate_settings(self) -> None:
         """验证设置的有效性"""

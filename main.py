@@ -13,7 +13,7 @@ from src.core.exceptions import TranslationError, APIError, APITimeoutError, JSO
 from src.utils.logger import setup_logging, logger
 from src.utils.ui import get_mode_selection, get_user_strategy, load_modes_config
 from src.workflow import TranslationWorkflow
-from src.workflow.builder import SettingsBuilder
+from src.workflow.builder import SettingsBuilder, PRESETS
 
  
 def main():
@@ -45,7 +45,16 @@ def main():
             default='config/config.env',
             help='配置文件路径（默认: config/config.env）'
         )
-        
+
+        # 配置预设参数（覆盖 config.env 中的性能/质量默认值；其他显式 CLI 参数仍最后生效并覆盖预设）
+        preset_help = "；".join(f"{name}={cfg['description']}" for name, cfg in PRESETS.items())
+        parser.add_argument(
+            '--preset',
+            type=str,
+            choices=list(PRESETS.keys()),
+            help=f'配置预设（覆盖 config.env 默认值，其他显式命令行参数最后生效）: {preset_help}'
+        )
+
         # 翻译模式参数
         parser.add_argument(
             '--mode',
@@ -98,6 +107,12 @@ def main():
 
         # 使用 Builder 统一构建最终 Settings（避免在 main 中直接改 settings 字段）
         builder = SettingsBuilder(base_settings)
+
+        # 应用预设（须在下方各显式 CLI 参数之前调用，保证预设覆盖 config.env 默认值，
+        # 而用户显式传入的其他 CLI flag——如 --mode/--retain-original 等——仍在 build() 之后
+        # 直接作用于 settings 对象，最后生效、覆盖预设）
+        if args.preset:
+            builder.use_preset(args.preset)
 
         # 命令行参数覆盖文档路径
         if args.file_path:

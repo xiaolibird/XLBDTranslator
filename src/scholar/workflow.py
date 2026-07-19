@@ -119,6 +119,11 @@ class ScholarWorkflow:
 
         # 显式日期区间 [start,end]（按月回填时由 CLI 设置；None=用相对 days_to_fetch）
         self.date_range: Optional[Tuple[date, date]] = None
+
+        # 幂等标记：过滤裁决加成（THREAT/MUST_ENGAGE 等）是否已经累加过一次。
+        # _sort_by_priority 会把加成原地写入 seg.priority_score 并随 digest JSON 落盘，
+        # 若未来有代码把落盘数据重新读回再排序，没有这个标记会导致加成被重复叠加。
+        self._priority_bonus_applied: bool = False
         
         # 输出
         self.output_dir = settings.processing.output_dir
@@ -684,12 +689,9 @@ class ScholarWorkflow:
                 source_score, field_score, recency_score, type_score, citation_score
             )
 
-            # 方法学审稿加成：THREAT/MUST_ENGAGE 置顶（对抗性证据最需优先阅读）
-            bonus, bonus_reason = self._filter_priority_bonus(seg)
-            if bonus:
-                seg.priority_score += bonus
-                seg.priority_reason += " " + bonus_reason
-
+        # 方法学审稿加成（THREAT/MUST_ENGAGE 置顶）统一在 _sort_by_priority 中应用，
+        # 这样规则路径与 LLM 覆盖路径（_parse_llm_response 会覆盖 priority_score）
+        # 都能在排序前恰好加成一次，避免此处提前加成后被 LLM 结果覆盖导致失效
         self._sort_by_priority()
 
     def _filter_priority_bonus(self, seg: PaperSegment) -> tuple:
@@ -802,7 +804,26 @@ class ScholarWorkflow:
             return 0.5
     
     def _sort_by_priority(self):
-        """按优先级对论文排序"""
+        """按优先级对论文排序（排序前统一应用一次过滤裁决加成）
+
+        注：无论 priority_score 来自规则计算(_calculate_rule_based_priority)还是
+        被 LLM 响应覆盖(_parse_llm_response)，本方法都是两条路径共同且唯一的排序入口，
+        所以在这里统一加成可以保证 THREAT/MUST_ENGAGE 等加成在两条路径下都恰好生效一次。
+
+        幂等性：加成是原地累加到 seg.priority_score 并落盘的（下游 notes.py 按此字段
+        排序也需要看到加成后的分数，不能只在 sort key 里临时加而不写回）。因此用
+        self._priority_bonus_applied 做实例级幂等标记——同一个 workflow 实例内，加成
+        只会被应用一次；本方法被重复调用时（例如未来有代码把落盘数据重新读回再排序），
+        之后的调用只做排序、不会重复叠加分数。
+        """
+        if not self._priority_bonus_applied:
+            for seg in self.segments:
+                bonus, bonus_reason = self._filter_priority_bonus(seg)
+                if bonus:
+                    seg.priority_score += bonus
+                    seg.priority_reason = (seg.priority_reason or "") + " " + bonus_reason
+            self._priority_bonus_applied = True
+
         self.segments.sort(key=lambda x: x.priority_score, reverse=True)
         logger.info("论文已按优先级排序（最高分: {:.2f}）".format(
             self.segments[0].priority_score if self.segments else 0
