@@ -24,8 +24,9 @@ logger = get_logger(__name__)
 
 VAULT_SCHEMA_VERSION = 1
 
-GEN_BEGIN = "<!-- BEGIN GENERATED v{} · 由 scripts/build_vault.py 生成 · 手改此块会在重建时丢失 -->"
-GEN_BEGIN_RE = re.compile(r"^<!-- BEGIN GENERATED v(\d+)\b.*-->\s*$")
+GEN_BEGIN = ("<!-- BEGIN GENERATED v{} h={} · 由 scripts/build_vault.py 生成 · "
+             "此块会被重建覆盖，请写在下面的「我的札记」里 -->")
+GEN_BEGIN_RE = re.compile(r"^<!-- BEGIN GENERATED v(\d+)(?: h=([0-9a-f]{8}))?\b.*-->\s*$")
 GEN_END = "<!-- END GENERATED · 以下内容属于你，生成器永不触碰 -->"
 USER_HEADING = "## 我的札记"
 DEFAULT_USER_ZONE = "\n{}\n\n".format(USER_HEADING)
@@ -69,6 +70,10 @@ LEGACY_WARN = ("> [!warning]- 关于句级角色的口径\n"
                "> 标注的。引用前请回原文核实，尤其别把「重要发现」直接当作者给出的可引用效应量。")
 
 _FN_BAD = re.compile(r'[/\\:*?"<>|#^\[\]%]')
+# 可裸写的 YAML 键（字母数字/下划线/连字符/点/中日韩），其余一律加引号
+_SAFE_KEY = re.compile(r"^[A-Za-z_一-鿿][A-Za-z0-9_\-.一-鿿]*$")
+# YAML 1.1 会把这些裸词解析成 bool/null，键名必须加引号才保原义
+_YAML_WORDS = frozenset("y yes no n true false on off null nan inf".split())
 _META_LINE = re.compile(r"^\*\*(优先级|裁决|一句话用处|作者|期刊/来源|DOI|链接)\*\*")
 _CN_CHAR = re.compile(r"[一-鿿]")
 _EN_WORD = re.compile(r"[a-z]{3,}")
@@ -96,7 +101,7 @@ def select_papers(index: Dict[str, Any], *, include_maybe: bool = False) -> List
 def slice_section(lines: List[str], note_line: Optional[int], citekey: str) -> Optional[List[str]]:
     """从月度 md 切出该论文的小节体。失败返回 None（调用方跳过并计入 slice_failures）。
 
-    终止于下一个 `## ` **或 `# `**——后者不可省：全库 59 处 `# 参考文献` 都在最后一篇之后，
+    终止于下一个 `## ` **或 `# `**——后者不可省：全库 69 处 `# 参考文献` 都在最后一篇之后，
     漏了会把参考文献和 `::: {#refs}` 吞进正文。尾部单独一行的 `---` 是小节分隔线，剥掉。
     """
     if not note_line or note_line < 1 or note_line > len(lines):
@@ -160,7 +165,11 @@ def load_bodies(entries: List[Dict[str, Any]], notes_dir: Path
             if body is None:
                 failures.append("{}@{}".format(e["citekey"], e.get("month") or "?"))
                 continue
-            bodies[e["citekey"]] = strip_meta_lines(body)
+            stripped = strip_meta_lines(body)
+            if not stripped:
+                # md 里没有任何 `### ` 小节（格式演进）→ 整节内容会静默消失，必须出声
+                logger.warning("  {} 切片后正文为空（该小节无 ### 分节？）".format(e["citekey"]))
+            bodies[e["citekey"]] = stripped
     return bodies, failures
 
 
@@ -227,8 +236,14 @@ def build_tags(e: Dict[str, Any]) -> List[str]:
 
 
 def merge_tags(new: List[str], old: Any) -> List[str]:
-    """新受管 tag ∪（旧 tags − 受管前缀）——用户自加的 `待复现` 不被吃掉。"""
-    if isinstance(old, str):
+    """新受管 tag ∪（旧 tags − 受管前缀）——用户自加的 `待复现` 不被吃掉。
+
+    old 可能是任何形状：字符串、数字（`tags: 2024`）、dict、None。非序列一律裹成单元素列表，
+    否则 `for t in old` 会抛 TypeError 把整轮构建带崩。
+    """
+    if old is None:
+        old = []
+    elif not isinstance(old, (list, tuple, set)):
         old = [old]
     kept = []
     for t in (old or []):
@@ -283,7 +298,12 @@ def build_frontmatter(e: Dict[str, Any], preserved: Optional[Dict[str, Any]] = N
     for k, v in (preserved or {}).items():
         if k in MANAGED_KEYS:
             continue
-        lines.append("{}: {}".format(k, _dump_preserved(v)))
+        # 键名也要消毒：含 `: ` `#` 或空串的键裸拼会写出**语法错误的 YAML**，
+        # 等于我们主动把用户能打开的笔记改成 Obsidian 读不出来的文件，此后永久 conflict。
+        # 另：raw 的 `~`/`yes` 会被 YAML 解析成 null/True，加引号才保原义。
+        ks = str(k)
+        key = ks if (_SAFE_KEY.match(ks) and ks.lower() not in _YAML_WORDS) else _y(k)
+        lines.append("{}: {}".format(key, _dump_preserved(v)))
     lines.append("---")
     return "\n".join(lines)
 
@@ -369,14 +389,44 @@ def extract_user_zone(body: str) -> Optional[str]:
     return body[idx + len(GEN_END):]
 
 
+def generated_block_tampered(body: str) -> bool:
+    """生成块内是否被改过（BEGIN 行记录的哈希与实际内容不符）。
+
+    老文件没有 h= 记录时返回 False（不把历史文件全判成冲突）。
+    """
+    lines = body.splitlines()
+    begin = end = None
+    for i, line in enumerate(lines):
+        m = GEN_BEGIN_RE.match(line.strip())
+        if m and begin is None:
+            begin, recorded = i, m.group(2)
+        if line.strip() == GEN_END and begin is not None:
+            end = i
+            break
+    if begin is None or end is None:
+        return False
+    recorded = GEN_BEGIN_RE.match(lines[begin].strip()).group(2)
+    if not recorded:
+        return False
+    return _gen_hash("\n".join(lines[begin + 1:end])) != recorded
+
+
+def _gen_hash(gen_block: str) -> str:
+    return hashlib.sha1(gen_block.strip().encode("utf-8")).hexdigest()[:8]
+
+
 def assemble(fm: str, gen_block: str, user_zone: str) -> str:
     """三段拼装：frontmatter / 哨兵包裹的生成块 / 用户区。
 
     用户区首尾空行归一化（内容本身一字不动）——否则 `split_frontmatter` 的 splitlines 重组
     会吞掉结尾空行，使「重建→再重建」每次都差一个换行，幂等永远不成立。
+
+    BEGIN 行带生成块内容哈希：用户若在生成块**内部**写了批注，重建时哈希对不上即判 conflict，
+    不再静默丢弃（哨兵文案虽已警告，但顺手在某条 highlight 下写一句是很自然的动作）。
     """
+    body = gen_block.rstrip("\n")
     return "{}\n\n{}\n{}\n{}\n\n{}\n".format(
-        fm, GEN_BEGIN.format(VAULT_SCHEMA_VERSION), gen_block.rstrip("\n"),
+        fm, GEN_BEGIN.format(VAULT_SCHEMA_VERSION, _gen_hash(body)), body,
         GEN_END, user_zone.strip("\n"))
 
 
@@ -394,6 +444,8 @@ def merge_note(entry: Dict[str, Any], gen_block: str, existing: Optional[str]
         return None, "conflict"
     user_zone = extract_user_zone(body)
     if user_zone is None:
+        return None, "conflict"
+    if generated_block_tampered(body):        # 用户在生成块内部写了东西，别静默覆盖
         return None, "conflict"
     return assemble(build_frontmatter(entry, preserved=fm), gen_block, user_zone), "merged"
 
@@ -436,25 +488,27 @@ def compute_neighbors(entries: List[Dict[str, Any]], k: int = 5
         vecs.append(vec)
         for t, v in vec.items():
             inverted.setdefault(t, []).append((i, v))
-    # 极高频词对相似度贡献小却拖慢累加，跳过它们。下限 30 篇是必须的：
-    # 小语料（--limit / 小库）里簇内共享词天然占 50%+，只按比例会把主题词全滤掉、邻居全空。
-    hot = {t for t, post in inverted.items() if len(post) > max(0.3 * n, 30)}
+    # 不做高频词过滤：实测按 df>30% 砍词会丢掉本库的主干词（缺失 45% / 预测 44% / 模型 38% /
+    # learning 33% / ehr 33%），改动 19% 节点的近邻，却只省 0.1 秒（端到端 2.2 秒）。
+    # IDF 本身已经在给高频词降权，再砍一刀是净损失。
     out: Dict[str, List[Tuple[str, float]]] = {}
     for i, vec in enumerate(vecs):
         scores: Dict[int, float] = {}
         for t, v in vec.items():
-            if t in hot:
-                continue
             for j, w in inverted.get(t, ()):
                 if j != i:
                     scores[j] = scores.get(j, 0.0) + v * w
         top = sorted(scores.items(), key=lambda kv: (-kv[1], keys[kv[0]]))[:k]
-        out[keys[i]] = [(keys[j], round(s, 3)) for j, s in top if s > 0.02]
+        out[keys[i]] = [(keys[j], round(s, 3)) for j, s in top]
     # 双向补全：A→B 则 B→A，让簇更结实（单向链在图上看着是断的）
     for a, nbrs in list(out.items()):
         for b, s in nbrs:
             if all(x != a for x, _ in out.get(b, [])):
                 out.setdefault(b, []).append((a, s))
+    # 补全会把反向边追加到末尾，不重排的话「相邻文献」列表就不是按相似度递减的，
+    # 用户会把前几条当最相似（实测 377/936 篇非单调）。
+    for key2 in out:
+        out[key2] = sorted(out[key2], key=lambda kv: (-kv[1], kv[0]))
     return out
 
 
@@ -561,7 +615,9 @@ _TABLE_HEAD = ["| 优先级 | 文献 | 年份 | 一句话用处 | 收录月 |",
 def _moc_page(title: str, desc: str, rows: List[Dict[str, Any]]) -> str:
     body = ["# {}".format(title), "", "{}　共 **{}** 篇。".format(desc, len(rows)), ""]
     body += _TABLE_HEAD
-    for e in sorted(rows, key=lambda x: (x.get("month") or "", x.get("priority_rank") or 999),
+    # 月份新→旧，月内优先级高→低。注意不能对整个元组 reverse：那会把 priority_rank 也倒过来，
+    # 让 rank 1(🔴高) 沉到最后、无 rank 的兜底值 999 冒到最前。
+    for e in sorted(rows, key=lambda x: (x.get("month") or "", -(x.get("priority_rank") or 999)),
                     reverse=True):
         body.append(_row(e))
     body += ["", "> [!tip] 图谱里想看真实语义簇，搜索框输入 `-path:_MOC` 过滤掉索引页（Obsidian 内置）。", ""]
@@ -674,33 +730,44 @@ def build_evidence_pages(entries: List[Dict[str, Any]]) -> Dict[str, str]:
         if len(items) <= SHARD_THRESHOLD:
             pages["{}/证据/{}.md".format(MOC_DIR, label)] = _evidence_page(label, role, items)
             continue
-        # 两级分片：先按维度，仍超阈值的再按年份——手动深读条目 bucket 恒为空，
-        # 只按维度切会把 800+ 条全塞进「未分维度」一页。
-        groups: Dict[str, List[Tuple]] = {}
-        for e, h, bid in items:
-            groups.setdefault((e.get("bucket") or ["未分维度"])[0], []).append((e, h, bid))
+        # 逐级细分（维度→年份→优先级），任何一级切不动或仍超阈值就定长切块。
+        # 手动深读条目 bucket 恒为空，只按维度切会把 800+ 条全塞进「未分维度」一页。
+        shards = _split_until_small(items, _EVIDENCE_KEYS, label)
         idx = ["# {} {}".format(ROLE_EMOJI[role], label), "",
-               "共 **{}** 条，分片如下。".format(len(items)), "", LEGACY_WARN, ""]
-        for key in sorted(groups):
-            rows = groups[key]
-            sub = "{}-{}".format(label, key)
-            if len(rows) <= SHARD_THRESHOLD:
-                pages["{}/证据/{}.md".format(MOC_DIR, sub)] = _evidence_page(sub, role, rows)
-                idx.append("- [[{}]]（{} 条）".format(sub, len(rows)))
-                continue
-            by_year: Dict[str, List[Tuple]] = {}
-            for e, h, bid in rows:
-                by_year.setdefault(str(e.get("year") or "未知年"), []).append((e, h, bid))
-            idx.append("- **{}**（{} 条）：{}".format(
-                sub, len(rows),
-                " · ".join("[[{}-{}]]（{} 条）".format(sub, y, len(by_year[y]))
-                           for y in sorted(by_year, reverse=True))))
-            for y, rows_y in by_year.items():
-                pages["{}/证据/{}-{}.md".format(MOC_DIR, sub, y)] = _evidence_page(
-                    "{}-{}".format(sub, y), role, rows_y)
+               "共 **{}** 条，分 {} 片。".format(len(items), len(shards)), "", LEGACY_WARN, ""]
+        for name, rows in shards:
+            pages["{}/证据/{}.md".format(MOC_DIR, name)] = _evidence_page(name, role, rows)
+            idx.append("- [[{}]]（{} 条）".format(name, len(rows)))
         idx.append("")
         pages["{}/证据/{}.md".format(MOC_DIR, label)] = "\n".join(idx)
     return pages
+
+
+_EVIDENCE_KEYS = (
+    lambda t: (t[0].get("bucket") or ["未分维度"])[0],
+    lambda t: str(t[0].get("year") or "未知年"),
+    lambda t: t[0].get("priority_tier") or "none",
+)
+
+
+def _split_until_small(items: List[Tuple], keyfuncs, label: str) -> List[Tuple[str, List[Tuple]]]:
+    """按 keyfuncs 逐级细分到每片 ≤ 阈值；键用尽仍超则定长切块（保证有界）。"""
+    if len(items) <= SHARD_THRESHOLD:
+        return [(label, items)]
+    if not keyfuncs:
+        return [("{}-{}".format(label, i // SHARD_THRESHOLD + 1),
+                 items[i:i + SHARD_THRESHOLD])
+                for i in range(0, len(items), SHARD_THRESHOLD)]
+    key, rest = keyfuncs[0], keyfuncs[1:]
+    groups: Dict[str, List[Tuple]] = {}
+    for it in items:
+        groups.setdefault(key(it), []).append(it)
+    if len(groups) <= 1:                       # 这一级切不动，直接下一级
+        return _split_until_small(items, rest, label)
+    out: List[Tuple[str, List[Tuple]]] = []
+    for g in sorted(groups, reverse=True):
+        out.extend(_split_until_small(groups[g], rest, "{}-{}".format(label, g)))
+    return out
 
 
 def _evidence_page(title: str, role: str, items: List[Tuple]) -> str:
@@ -842,12 +909,20 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
         return report
 
     for path, gen, e in files:
-        existing = path.read_text(encoding="utf-8") if path.exists() else None
-        content, status = merge_note(e, gen, existing)
+        try:
+            existing = path.read_text(encoding="utf-8") if path.exists() else None
+            content, status = merge_note(e, gen, existing)
+        except OSError:
+            raise                              # 权限/磁盘问题交给 CLI 统一提示
+        except Exception as exc:
+            # 「YAML 解析成功但形状意外」不该把整轮构建带崩——降级成 conflict，原文件不动
+            logger.warning("  {} 合并失败（{}），按冲突处理".format(e["citekey"], type(exc).__name__))
+            content, status = None, "conflict"
         if status == "conflict":
             report["conflicts"].append(e["citekey"])
             conflict = path.with_suffix(".conflict.md")
-            write_if_changed(conflict, assemble(build_frontmatter(e), gen, DEFAULT_USER_ZONE))
+            if write_if_changed(conflict, assemble(build_frontmatter(e), gen, DEFAULT_USER_ZONE)):
+                report["written"] += 1
             continue
         if status == "new":
             report["new"] += 1

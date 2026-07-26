@@ -598,3 +598,87 @@ def test_prune_never_touches_paper_notes(notes_dir, index, tmp_path):
     rep = V.write_vault(index, notes_dir, vd, k=2)
     assert orphan.exists() and "重要手写" in orphan.read_text(encoding="utf-8")
     assert "old2019Dropped" in rep["orphan_papers"]
+
+
+# ---------------- K. 第二轮审查修复的回归 ----------------
+
+def test_preserved_key_with_colon_stays_valid_yaml(index):
+    """回归：键名不消毒会写出语法错误的 YAML，等于我们主动把用户笔记改成读不出来的文件。"""
+    e = _entry(index, "public2025Deep")
+    for weird in ("a: b", "a #c", "", "~", "yes", "with space"):
+        fm = V.build_frontmatter(e, preserved={weird: 1})
+        data = yaml.safe_load(fm.split("---")[1])           # 必须仍可解析
+        assert data is not None
+        assert any(str(k) == weird for k in data), (weird, list(data))
+
+
+@pytest.mark.parametrize("bad_tags", [2024, 1.5, {"a": 1}, None, True])
+def test_merge_tags_survives_non_list(bad_tags):
+    """回归：`tags: 2024` 曾抛 TypeError 把整轮构建带崩。"""
+    out = V.merge_tags(["scholar", "tier/mid"], bad_tags)
+    assert "scholar" in out and isinstance(out, list)
+
+
+def test_build_survives_weird_frontmatter(notes_dir, index, tmp_path):
+    """单篇形状意外应降级为 conflict，而不是让整轮构建崩掉。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    note = vd / V.PAPERS_DIR / "public2025Deep.md"
+    note.write_text(note.read_text(encoding="utf-8").replace(
+        'tags: ["scholar"', 'tags: 2024\nx_tags: ["scholar"'), encoding="utf-8")
+    rep = V.write_vault(index, notes_dir, vd, k=2)          # 不抛异常
+    assert rep["selected"] >= 1
+
+
+def test_moc_sorts_high_priority_first():
+    """回归：reverse=True 作用在整个元组上，曾让 rank 1(🔴高) 沉到表格最后。"""
+    rows = [{"citekey": "low", "priority_tier": "low", "priority_rank": 46,
+             "month": "2025-01", "year": 2025, "one_line": "x"},
+            {"citekey": "high", "priority_tier": "high", "priority_rank": 1,
+             "month": "2025-01", "year": 2025, "one_line": "y"}]
+    page = V._moc_page("t", "d", rows)
+    lines = [l for l in page.splitlines() if l.startswith("| ")][1:]   # 跳过表头行
+    assert "[[high]]" in lines[0] and "[[low]]" in lines[1]
+
+
+def test_neighbors_sorted_by_similarity():
+    """回归：双向补全把反向边 append 到末尾，曾致 377/936 篇的列表非单调。"""
+    nb = V.compute_neighbors(_corpus(20), k=4)
+    for key, lst in nb.items():
+        sims = [s for _, s in lst]
+        assert sims == sorted(sims, reverse=True), (key, sims)
+
+
+def test_tampering_generated_block_is_conflict(notes_dir, index, tmp_path):
+    """用户在生成块内部写批注：此前会被静默丢弃，现在判 conflict 不覆盖。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    note = vd / V.PAPERS_DIR / "public2025Deep.md"
+    t = note.read_text(encoding="utf-8")
+    t = t.replace("## 句级证据", "我在生成块里写了一句批注\n\n## 句级证据")
+    note.write_text(t, encoding="utf-8")
+    before = note.stat().st_mtime_ns, note.read_text(encoding="utf-8")
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert "public2025Deep" in rep["conflicts"]
+    assert (note.stat().st_mtime_ns, note.read_text(encoding="utf-8")) == before
+    assert "我在生成块里写了一句批注" in note.read_text(encoding="utf-8")
+
+
+def test_untampered_rebuild_is_not_conflict(notes_dir, index, tmp_path):
+    """哈希守卫不能把正常重建误判成冲突。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert rep["conflicts"] == [] and rep["written"] == 0
+
+
+def test_evidence_third_level_shard_keeps_pages_small():
+    entries = [{"citekey": "k{}".format(i), "year": 2025, "priority_tier": ["high", "mid", "low"][i % 3],
+                "bucket": [], "highlights": [
+                    {"role": "citable", "tag": "可引用证据", "section": "结果",
+                     "text": "证据 {}-{}".format(i, j)} for j in range(4)]}
+               for i in range(120)]
+    pages = V.build_evidence_pages(entries)
+    biggest = max(len([l for l in t.splitlines() if l.startswith("- [[")])
+                  for t in pages.values())
+    assert biggest <= V.SHARD_THRESHOLD
