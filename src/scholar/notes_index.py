@@ -521,14 +521,20 @@ def _stable(index: Dict[str, Any]) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
-def _write_if_changed(path: Path, content: str) -> bool:
+def write_if_changed(path: Path, content: str) -> bool:
+    """内容未变则不写盘（mtime 不抖）。vault 生成器复用同一份实现，避免行为漂移。"""
+    path = Path(path)
     try:
         if path.exists() and path.read_text(encoding="utf-8") == content:
             return False
     except Exception:
         pass
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return True
+
+
+_write_if_changed = write_if_changed        # 旧名别名（模块内既有调用点仍在用）
 
 
 def build_index_md(index: Dict[str, Any]) -> str:
