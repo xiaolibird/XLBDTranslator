@@ -12,6 +12,7 @@
 """
 import json
 import re
+from itertools import product
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -749,6 +750,18 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
     return True
 
 
+def _suffix_seq(max_len: int = 3):
+    """消歧后缀序列：b…z、bb…zz、bbb…（仿 BBT）。
+
+    恒为纯小写字母——曾用 chr(ord('b')+n) 递增，'z' 之后落到 '{' '|'，
+    而 pandoc 会在这些字符处截断 citekey，把引用**静默指到基键那篇论文**。
+    """
+    letters = [chr(c) for c in range(ord("b"), ord("z") + 1)]
+    for n in range(1, max_len + 1):
+        for combo in product(letters, repeat=n):
+            yield "".join(combo)
+
+
 def fix_citekey_collisions(notes_dir: Path) -> int:
     """自动修复撞键：同 citekey 指向不同论文时，保最早月不动，
     后出现者加 b/c… 后缀（仿 BBT 消歧），就地改 md + references.json。
@@ -768,11 +781,12 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
             continue
         group.sort(key=lambda e: (e["month"], e.get("priority_rank") or 9999))
         for e in group[1:]:                      # 最早月保留原键
-            suf = ord("b")
-            new = "{}{}".format(key, chr(suf))
-            while new in all_keys:
-                suf += 1
-                new = "{}{}".format(key, chr(suf))
+            new = None
+            for suf in _suffix_seq():
+                cand = "{}{}".format(key, suf)
+                if cand not in all_keys:
+                    new = cand
+                    break
             if _rename_citekey_in_note(notes_dir, e, key, new):
                 all_keys.add(new)
                 renamed += 1

@@ -514,3 +514,29 @@ def test_all_references_written_by_write_outputs(tmp_path):
     refs = json.loads((tmp_path / ni.ALL_REFS_JSON).read_text(encoding="utf-8"))
     assert {r["id"] for r in refs} >= {"public2025Deep", "lee2025Graph"}
     assert ni.write_outputs(index, tmp_path)["all_references"] is False    # 幂等
+
+
+def test_suffix_seq_is_always_alphabetic():
+    """消歧后缀恒为纯字母：曾用 chr(ord('b')+n) 递增，'z' 后落到 '{' '|'，
+    而 pandoc 会在这些字符处截断 citekey，把引用静默指到基键那篇论文。"""
+    import re as _re
+    seq = list(ni._suffix_seq())
+    first = seq[:30]
+    assert first[:3] == ["b", "c", "d"] and "z" in first
+    assert first[first.index("z") + 1] == "bb"        # z 之后进两字母，不是 '{'
+    assert all(_re.fullmatch(r"[b-z]+", s) for s in seq)
+    assert len(seq) == len(set(seq)) and len(seq) > 600
+
+
+def test_fix_collisions_generates_parsable_key(tmp_path):
+    """撞键改名产出的新键不含 pandoc 会截断的字符。"""
+    _write_month(tmp_path, month="2025-03")
+    _write_month(tmp_path, month="2025-04", citekeys={"pa": "public2025Deep",   # 同键不同文
+                                                      "pb": "other2025Key", "pc": None})
+    # 让 2025-04 的 pa 变成另一篇论文：改其 DOI 使 dedup_key 不同
+    md2 = tmp_path / "科研札记_2025-04_全文精读.md"
+    md2.write_text(md2.read_text(encoding="utf-8").replace("10.1/aaa", "10.1/zzz"),
+                   encoding="utf-8")
+    ni.fix_citekey_collisions(tmp_path)
+    keys = {e["citekey"] for e in ni.update_index(tmp_path)["papers"] if e.get("citekey")}
+    assert not any(set(k) & set("{|}[]() ") for k in keys)
