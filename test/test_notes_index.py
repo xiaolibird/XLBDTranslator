@@ -438,3 +438,79 @@ def test_collect_highlights_drops_null_and_background():
     ])
     assert [h["role"] for h in hl] == ["citable", "refutable"]
     assert tc == {"citable": 1, "refutable": 1}
+
+
+# ---------------- 全局书目合并（build_all_references） ----------------
+
+def _idx(papers, collisions=()):
+    return {"schema_version": ni.SCHEMA_VERSION, "papers": papers,
+            "citekey_collisions": list(collisions)}
+
+
+def _p(citekey, *, doi=None, title="T", ref="r.references.json", **kw):
+    e = {"citekey": citekey, "doi": doi, "title": title, "authors": ["Ann Lee"],
+         "year": 2025, "journal": "J", "url": None, "arxiv_id": None,
+         "references_json": ref, "duplicate_of": None, "month": "2025-03"}
+    e.update(kw)
+    return e
+
+
+def test_all_references_matches_by_doi_not_blind_id(tmp_path):
+    """references.json 里两条目 id 被历史 --fix-collisions 改岔时，必须按 DOI 匹对。
+
+    P0 回归：盲按 id 取会让 pandoc 安静地引到另一篇论文（曾致 9 条 DOI/11 条标题错配）。
+    """
+    (tmp_path / "r.references.json").write_text(json.dumps([
+        {"id": "keyB", "title": "Paper A", "DOI": "10.1/aaa"},   # id 与 DOI 对调
+        {"id": "keyA", "title": "Paper B", "DOI": "10.1/bbb"},
+    ]), encoding="utf-8")
+    refs = ni.build_all_references(
+        _idx([_p("keyA", doi="10.1/aaa", title="Paper A"),
+              _p("keyB", doi="10.1/bbb", title="Paper B")]), tmp_path)
+    by = {r["id"]: r for r in refs}
+    assert by["keyA"]["DOI"] == "10.1/aaa" and by["keyA"]["title"] == "Paper A"
+    assert by["keyB"]["DOI"] == "10.1/bbb" and by["keyB"]["title"] == "Paper B"
+
+
+def test_all_references_drops_collided_keys(tmp_path):
+    """撞键整键剔除：宁可 pandoc 输出 ???，也不要静默引成另一篇。"""
+    (tmp_path / "r.references.json").write_text(json.dumps(
+        [{"id": "dup2020Key", "title": "X"}, {"id": "ok2021Key", "title": "Y"}]), encoding="utf-8")
+    refs = ni.build_all_references(
+        _idx([_p("dup2020Key"), _p("ok2021Key")],
+             collisions=[{"citekey": "dup2020Key", "months": ["2020-01", "2021-02"]}]), tmp_path)
+    assert [r["id"] for r in refs] == ["ok2021Key"]
+
+
+def test_all_references_keeper_only_sorted_and_fallback(tmp_path):
+    """只收 keeper、按 id 升序；月度文件缺条目时兜底且字段与 build_csl_item 对齐。"""
+    (tmp_path / "r.references.json").write_text(json.dumps(
+        [{"id": "zzz2020Have", "title": "Has CSL"}]), encoding="utf-8")
+    refs = ni.build_all_references(_idx([
+        _p("zzz2020Have"),
+        _p("aaa2021Miss", doi="10.1/miss", title="No CSL entry"),
+        _p("dup2019Skip", duplicate_of="zzz2020Have@2020-01"),
+    ]), tmp_path)
+    assert [r["id"] for r in refs] == ["aaa2021Miss", "zzz2020Have"]   # 去重复 + 排序
+    fb = refs[0]
+    assert fb["type"] == "article-journal" and fb["DOI"] == "10.1/miss"
+    assert fb["author"] == [{"family": "Lee", "given": "Ann"}]
+    assert fb["issued"] == {"date-parts": [[2025]]}
+
+
+def test_all_references_accepts_str_notes_dir(tmp_path):
+    """notes_dir 传 str 不得静默全量降级为兜底（曾因 str/Path 相除抛错被 except 吞掉）。"""
+    (tmp_path / "r.references.json").write_text(json.dumps(
+        [{"id": "s2025Key", "title": "From CSL", "volume": "12"}]), encoding="utf-8")
+    refs = ni.build_all_references(_idx([_p("s2025Key")]), str(tmp_path))
+    assert refs[0]["title"] == "From CSL" and refs[0].get("volume") == "12"
+
+
+def test_all_references_written_by_write_outputs(tmp_path):
+    _write_month(tmp_path, sidecar=True)
+    index = ni.update_index(tmp_path)
+    wrote = ni.write_outputs(index, tmp_path)
+    assert wrote["all_references"] is True
+    refs = json.loads((tmp_path / ni.ALL_REFS_JSON).read_text(encoding="utf-8"))
+    assert {r["id"] for r in refs} >= {"public2025Deep", "lee2025Graph"}
+    assert ni.write_outputs(index, tmp_path)["all_references"] is False    # 幂等

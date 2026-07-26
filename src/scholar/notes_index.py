@@ -24,6 +24,7 @@ SCHEMA_VERSION = 3   # v3：条目加 highlights[]（句级角色可调取）；
 INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"
 AGENTS_MD = "AGENTS.md"
+ALL_REFS_JSON = "all_references.json"
 
 # 成品札记 md 命名：_全文精读=自动流水线；_手动精读=手动 PDF 深度精读
 # （天然排除 demo/ideal/validate/digest_* 等杂档）
@@ -577,6 +578,93 @@ def _agents_source() -> Optional[Path]:
     return p if p.exists() else None
 
 
+def _fallback_csl(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """月度 CSL 文件缺条目时，从索引字段构造最小 CSL 条目（authors 为字符串列表）。"""
+    item: Dict[str, Any] = {
+        "id": entry["citekey"],
+        "type": "article-journal" if not entry.get("arxiv_id") or entry.get("doi") else "article",
+        "title": entry.get("title") or "",
+    }
+    authors = []
+    for n in (entry.get("authors") or []):
+        n = (n or "").strip()
+        if not n:
+            continue
+        if "," in n:
+            last, _, first = n.partition(",")
+            authors.append({"family": last.strip(), "given": first.strip()})
+        else:
+            parts = n.split()
+            if len(parts) == 1:
+                authors.append({"family": parts[0]})
+            else:
+                authors.append({"family": parts[-1], "given": " ".join(parts[:-1])})
+    if authors:
+        item["author"] = authors
+    if entry.get("journal"):
+        item["container-title"] = entry["journal"]
+    if entry.get("doi"):
+        item["DOI"] = entry["doi"]
+    if entry.get("url"):
+        item["URL"] = entry["url"]
+    if entry.get("year"):
+        item["issued"] = {"date-parts": [[entry["year"]]]}
+    return item
+
+
+def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[str, Any]]:
+    """合并全部月度 references.json → 全局 CSL-JSON 书目（按 id 排序）。
+
+    只收 `duplicate_of == null` 的条目（keeper）：跨月重复自然以 keeper 元数据为准，
+    但**被判重条目自己的 citekey 不在本书目内**——渲染月度 md 请仍用同名 references.json。
+
+    取 CSL 条目走 `_match_csl`（DOI 优先，citekey 仅在文件内唯一时才用）而非盲按 id 索引：
+    历史 --fix-collisions 曾把 md 与 references.json 的键改岔，盲取会安静地引到另一篇论文。
+    命中后强制改写 id 为索引的 citekey（DOI 命中时二者可能不同）。
+
+    取不到时用 `_fallback_csl` 兜底（缺卷/期/页、issued 只有年份），逐条 warning 报出。
+    citekey 撞键（不同论文同键）时整键剔除：宁可让 pandoc 输出显眼的 `???`，
+    也不要静默把某篇的引用渲染成另一篇。
+    """
+    notes_dir = Path(notes_dir)
+    dropped: Set[str] = set()
+    for c in (index.get("citekey_collisions") or []):
+        if c.get("citekey"):
+            dropped.add(c["citekey"])
+    if dropped:
+        logger.warning("  ⚠️ citekey 撞键 {} 组，这些键已从 all_references.json 整体剔除"
+                       "（引用会渲染成 ???）；跑 notes_index.py --fix-collisions 修复后重建：{}".format(
+                           len(dropped), ", ".join(sorted(dropped))))
+    csl_cache: Dict[str, List[Dict[str, Any]]] = {}
+    merged: Dict[str, Dict[str, Any]] = {}
+    fallbacks: List[str] = []
+    for e in index["papers"]:
+        if e.get("duplicate_of") or not e.get("citekey"):
+            continue
+        key = e["citekey"]
+        if key in dropped or key in merged:
+            continue
+        ref_file = e.get("references_json")
+        item = None
+        if ref_file:
+            if ref_file not in csl_cache:
+                csl_cache[ref_file] = load_csl_items(notes_dir / ref_file)
+            hit = _match_csl(e, csl_cache[ref_file])
+            if hit is not None:
+                item = dict(hit)        # 浅拷贝：不污染缓存
+                item["id"] = key        # DOI 命中的条目 id 可能≠citekey，以索引为准
+        if item is None:
+            item = _fallback_csl(e)
+            fallbacks.append("{}@{}".format(key, e.get("month") or "?"))
+        merged[key] = item
+    if fallbacks:
+        logger.warning("  all_references：{} 条未匹配到月度 CSL 条目，已按索引字段兜底"
+                       "（缺卷期页、作者可能被 md 的 et al. 截断）：{}{}".format(
+                           len(fallbacks), ", ".join(fallbacks[:8]),
+                           " …" if len(fallbacks) > 8 else ""))
+    return [merged[k] for k in sorted(merged)]
+
+
 def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
     """写 literature_index.json + INDEX.md + 部署 AGENTS.md。内容未变不落盘（mtime 不抖）。"""
     notes_dir = Path(notes_dir)
@@ -605,6 +693,13 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
     if src:
         wrote["agents_md"] = _write_if_changed(notes_dir / AGENTS_MD,
                                                src.read_text(encoding="utf-8"))
+
+    refs = build_all_references(index, notes_dir)
+    wrote["all_references"] = _write_if_changed(
+        notes_dir / ALL_REFS_JSON,
+        json.dumps(refs, ensure_ascii=False, indent=2) + "\n")
+    if wrote["all_references"]:
+        logger.info("  📚 all_references.json：全局书目 {} 条".format(len(refs)))
     return wrote
 
 

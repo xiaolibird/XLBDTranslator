@@ -40,8 +40,13 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 2. **读原文**:`grep -nF '[@<citekey>]' <note_file>` 拿行号,Read 该小节——重点是「全文精读」节
    (句级标记:`〔可引用证据〕`取证 / `〔可反驳观点〕`靶子 / `〔方法论借鉴〕`方法思路,以及「对我研究的联想」小节;历史札记可能仍是旧标记〔方法学创新/重要发现/研究背景〕)。
 3. **引用**:论文正文用 pandoc 语法 `[@citekey]`。
-4. **书目**:`jq -s 'add | unique_by(.id)' 科研札记_*_全文精读.references.json > bibliography.json`
-   ——合并前必须确认 `jq '.citekey_collisions' literature_index.json` 为 `[]`,否则撞键会静默吞掉一篇。
+4. **书目**:直接用现成的全局书目 `all_references.json`(全库去重合并,含全文精读+手动精读两个系列,
+   由 `scripts/notes_index.py` 自动刷新、勿手改):
+   ```bash
+   pandoc draft.md --citeproc --bibliography=output/scholar_notes/all_references.json -o draft.docx
+   ```
+   用前确认 `jq '.citekey_collisions' literature_index.json` 为 `[]`(非空先跑 `notes_index.py --fix-collisions`)。
+   写作取证的完整流程(按 role 轴 query → 写稿 → 出稿)见 skill `scholar-write`。
 
 ## 注意
 

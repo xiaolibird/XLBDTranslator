@@ -11,6 +11,7 @@
 |---|---|
 | `literature_index.json` | **机器可读总索引**(先查这个,再读原文) |
 | `INDEX.md` | 人读索引(统计 + 按月表格) |
+| `all_references.json` | **全局书目**(全库去重合并的 CSL-JSON,pandoc 直接挂;自动刷新,勿手改。只含 `duplicate_of==null` 的键——渲染月度 md 本身请仍用同月 references.json) |
 | `科研札记_YYYY-MM_全文精读.md` | **自动**月度札记(`series:"auto"`):Gmail/检索 → 三态筛选 → top-5 全文精读 |
 | `科研札记_YYYY-MM_手动精读.md` | **手动**深度精读(`series:"manual"`):人给 PDF,agent 亲读整本 + 脚本交叉核验,通读更彻底 |
 | `科研札记_YYYY-MM_{全文,手动}精读.references.json` | 该札记 CSL-JSON 参考文献(pandoc 可直接用) |
@@ -23,7 +24,7 @@
 1. **先查索引**:`jq` 过滤 `literature_index.json` 的 `papers[]`,拿到 citekey / note_file / note_line;
 2. **再读原文**:按 `note_file` 打开对应月札记,`grep -nF '[@<citekey>]'` 定位到该篇小节,读裁决、摘要与「全文精读」节(`〔可引用证据〕〔可反驳观点〕〔方法论借鉴〕` 是句级角色标记;历史札记可能仍是旧标记 `〔方法学创新〕〔重要发现〕〔研究背景〕`)。**句级取证不必打开 md**——直接查条目的 `highlights[]`(见下);
 3. **引用**:正文用 pandoc 语法 `[@citekey]`;
-4. **配书目**:把用到的月份的 `references.json` 合并进论文的 bibliography(配方见下)。
+4. **配书目**:直接挂全局书目 `all_references.json`(已全库去重合并,不必自己拼月度文件;配方见下)。
 
 ## 索引 schema(`papers[]` 每条)
 
@@ -72,9 +73,10 @@ jq -r '.papers[] | select(.duplicate_of == null)
 # 定位并阅读某篇的精读原文
 grep -nF '[@xu2026Development]' 科研札记_2026-05_全文精读.md   # 拿行号后 Read 该节
 
-# 合并 bibliography(⚠️ 合并前先看撞键警告,见下节)
-jq -r '.citekey_collisions' literature_index.json               # 必须为 [] 才能安全合并
-jq -s 'add | unique_by(.id)' 科研札记_*_全文精读.references.json > bibliography.json
+# 配书目:直接用全局书目(已全库去重合并,含全文精读+手动精读两系列)
+jq -r '.citekey_collisions' literature_index.json               # 必须为 [] 才能安全引用
+pandoc draft.md --citeproc --bibliography=all_references.json -o draft.docx
+# (按 role 取证 → 写稿 → 出稿的完整写作流:skill `scholar-write`;检索 CLI:scripts/notes_query.py)
 
 # 体检:索引是否落后于札记(数量不一致→先跑 scripts/notes_index.py)
 ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_index.json
@@ -83,7 +85,7 @@ ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_inde
 ## ⚠️ citekey 注意事项(重要)
 
 - 多数 citekey 是 **headless 兜底键**(`作者姓+年+标题词`,`citekey_source: "fallback"`),**不是** Zotero/Better BibTeX 权威键。跨系统对账(Zotero、他人书目)一律以 **DOI / dedup_key** 为论文身份,citekey 只在「本索引 + 对应月 references.json」闭包内有效。
-- `citekey_collisions` 非空 = 不同论文共用同一键,`jq unique_by(.id)` 合并会**静默吞掉一篇**;在 XLBDTranslator-dev 仓库跑 `python scripts/notes_index.py --fix-collisions` 自动改键(保最早月不动,后出现者加 b/c 后缀,md+references.json 同步改)后再合并。
+- `citekey_collisions` 非空 = 不同论文共用同一键,合并书目时同键**只保留 keeper 那篇**(另一篇引不到);在 XLBDTranslator-dev 仓库跑 `python scripts/notes_index.py --fix-collisions` 自动改键(保最早月不动,后出现者加 b/c 后缀,md+references.json 同步改)后再合并。
 - **升级为权威键的路径**(人在时做):按索引 DOI 批量导入 Zotero → BBT 生成正式 citekey → 论文 md 里 `sed` 替换旧键 → bibliography 换 BBT 自动导出。
 
 ## 可拷贝到论文项目 CLAUDE.md 的片段
@@ -92,8 +94,9 @@ ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_inde
 ## 文献库
 精选文献札记库(按月,含全文精读)在:
 `/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev/output/scholar_notes/`
-找文献四步法:1) jq 查该目录 literature_index.json(过滤 duplicate_of==null);
+找文献四步法:1) jq 查该目录 literature_index.json(过滤 duplicate_of==null),
+或按 role 取证 `python scripts/notes_query.py <关键词> --role citable|refutable|method`;
 2) 按 note_file+citekey grep 定位札记原文精读节;3) 正文引用 [@citekey];
-4) 合并对应月 references.json 进 bibliography(先确认 citekey_collisions 为空)。
+4) 书目挂该目录 all_references.json(全库已去重合并;先确认 citekey_collisions 为空)。
 详细配方读该目录的 AGENTS.md。⚠️ citekey 是兜底键,跨系统对账以 DOI 为准。
 ```
