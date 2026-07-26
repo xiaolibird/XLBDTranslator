@@ -436,8 +436,9 @@ def compute_neighbors(entries: List[Dict[str, Any]], k: int = 5
         vecs.append(vec)
         for t, v in vec.items():
             inverted.setdefault(t, []).append((i, v))
-    # 极高频词对相似度贡献小却拖慢累加，跳过出现在 >30% 文档里的词
-    hot = {t for t, post in inverted.items() if len(post) > 0.3 * n}
+    # 极高频词对相似度贡献小却拖慢累加，跳过它们。下限 30 篇是必须的：
+    # 小语料（--limit / 小库）里簇内共享词天然占 50%+，只按比例会把主题词全滤掉、邻居全空。
+    hot = {t for t, post in inverted.items() if len(post) > max(0.3 * n, 30)}
     out: Dict[str, List[Tuple[str, float]]] = {}
     for i, vec in enumerate(vecs):
         scores: Dict[int, float] = {}
@@ -459,8 +460,16 @@ def compute_neighbors(entries: List[Dict[str, Any]], k: int = 5
 
 # ---------------- 单篇生成块 ----------------
 
+def _alias(text: str) -> str:
+    """wikilink 显示文本消毒：裸 `[` `]` 会提前闭合 `[[...]]`，让链接退化成字面文本。
+
+    highlight 正文里常有文献编号（`[13]`）与数学式（`1[β^⊤X`），实测曾致 88 条证据链接点不进去。
+    """
+    return (text or "").replace("[", "(").replace("]", ")").replace("|", "/")
+
+
 def _moc_link(kind: str, name: str) -> str:
-    return "[[{}/{}/{}|{}]]".format(MOC_DIR, kind, name, name)
+    return "[[{}/{}/{}|{}]]".format(MOC_DIR, kind, name, _alias(name))
 
 
 def render_generated_block(e: Dict[str, Any], body: List[str],
@@ -541,7 +550,7 @@ SHARD_THRESHOLD = 150
 def _row(e: Dict[str, Any]) -> str:
     return "| {} | [[{}]] | {} | {} | {} |".format(
         TIER_EMOJI.get(e.get("priority_tier") or "", ""), e["citekey"],
-        e.get("year") or "", (e.get("one_line") or "").replace("|", "/")[:70],
+        e.get("year") or "", _alias((e.get("one_line") or "")[:70]),
         e.get("month") or "")
 
 
@@ -559,12 +568,14 @@ def _moc_page(title: str, desc: str, rows: List[Dict[str, Any]]) -> str:
     return "\n".join(body)
 
 
+def month_key(e: Dict[str, Any]) -> str:
+    """收录月归一到 YYYY-MM：索引里有 `2026-07-17` 这类专题批次的日期桶，
+    照收会让同一批精读被劈成 `月度/2026-07` 与 `月度/2026-07-17` 两页、月份总数虚高。"""
+    return (e.get("month") or "未知月")[:7]
+
+
 def _shard_year(e: Dict[str, Any]) -> str:
     return str(e.get("year") or "未知年")
-
-
-def _shard_month(e: Dict[str, Any]) -> str:
-    return str(e.get("month") or "未知月")
 
 
 def _sharded(kind: str, title: str, desc: str, rows: List[Dict[str, Any]],
@@ -622,16 +633,18 @@ def build_moc_pages(entries: List[Dict[str, Any]]) -> Dict[str, str]:
     journals: Dict[str, List[Dict[str, Any]]] = {}
     for e in entries:
         if e.get("month"):
-            months.setdefault(e["month"], []).append(e)
+            months.setdefault(month_key(e), []).append(e)
         if e.get("year"):
             years.setdefault(str(e["year"]), []).append(e)
         if e.get("journal"):
             journals.setdefault(e["journal"], []).append(e)
     for name, rows in months.items():
         pages["{}/月度/{}.md".format(MOC_DIR, name)] = _moc_page(name, "收录月 {}".format(name), rows)
+    # 年份不分片：按收录月切会产出 `2023-2021-06` 这种语义混乱的页，且大半只含 1–2 篇；
+    # 一页 200 余行的列表本来就读得动。
     for name, rows in years.items():
-        pages.update(_sharded("年份", name, "发表年 {}".format(name), rows,
-                              shard_key=_shard_month))
+        pages["{}/年份/{}.md".format(MOC_DIR, name)] = _moc_page(
+            name, "发表年 {}".format(name), rows)
     # 期刊只为 ≥5 篇的建页（长尾建了就是死页）
     used: Set[str] = set()
     for name, rows in journals.items():
@@ -680,7 +693,7 @@ def build_evidence_pages(entries: List[Dict[str, Any]]) -> Dict[str, str]:
                 by_year.setdefault(str(e.get("year") or "未知年"), []).append((e, h, bid))
             idx.append("- **{}**（{} 条）：{}".format(
                 sub, len(rows),
-                " · ".join("[[{}-{}]]({})".format(sub, y, len(by_year[y]))
+                " · ".join("[[{}-{}]]（{} 条）".format(sub, y, len(by_year[y]))
                            for y in sorted(by_year, reverse=True))))
             for y, rows_y in by_year.items():
                 pages["{}/证据/{}-{}.md".format(MOC_DIR, sub, y)] = _evidence_page(
@@ -697,7 +710,7 @@ def _evidence_page(title: str, role: str, items: List[Tuple]) -> str:
     for e, h, bid in items:
         text = (h.get("text") or "").strip().replace("\n", " ")
         out.append("- [[{}#^{}|{}]] — {} {} · `[@{}]`".format(
-            e["citekey"], bid, text[:110].replace("|", "/"),
+            e["citekey"], bid, _alias(text[:110]),
             TIER_EMOJI.get(e.get("priority_tier") or "", ""), e.get("year") or "",
             e["citekey"]))
     out.append("")
@@ -710,7 +723,7 @@ def build_overview(entries: List[Dict[str, Any]], index: Dict[str, Any],
     n_ft = sum(1 for e in entries if e.get("has_full_text_reading"))
     n_manual = sum(1 for e in entries if e.get("series") == "manual")
     n_hl = sum(len(e.get("highlights") or []) for e in entries)
-    months = sorted({e.get("month") or "" for e in entries if e.get("month")})
+    months = sorted({month_key(e) for e in entries if e.get("month")})
     out = ["# 科研札记 vault 总览", "",
            "- 文献：**{}** 篇（全文精读 {} · 手动深读 {}）".format(n, n_ft, n_manual),
            "- 句级证据：**{}** 条".format(n_hl),
@@ -796,7 +809,7 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
 
     report: Dict[str, Any] = {
         "selected": len(entries), "written": 0, "new": 0, "merged": 0, "unchanged": 0,
-        "conflicts": [], "slice_failures": slice_failures, "moc_pages": 0,
+        "conflicts": [], "slice_failures": slice_failures, "moc_pages": 0, "pruned": [],
     }
 
     used_lower: Set[str] = set()
@@ -854,10 +867,26 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
         if write_if_changed(vault_dir / rel, text.rstrip("\n") + "\n"):
             report["written"] += 1
 
+    # 清理过期索引页：_MOC/ 下全是生成内容（无用户数据），分片规则一变旧页就成幽灵，
+    # 会继续出现在图谱和搜索里。01-文献/ 含用户手写，只报告不删。
+    keep = {(vault_dir / rel).resolve() for rel in pages}
+    for stale in sorted((vault_dir / MOC_DIR).rglob("*.md")):
+        if stale.resolve() not in keep:
+            stale.unlink()
+            report["pruned"].append(str(stale.relative_to(vault_dir)))
+    for d in sorted((vault_dir / MOC_DIR).rglob("*"), reverse=True):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+
     # _meta.json 是运行记录（每次都变），别让它一直脏着 git status；已存在则尊重用户的版本
     gi = vault_dir / ".gitignore"
     if not gi.exists():
         gi.write_text("{}\n.obsidian/workspace*.json\n".format(META_JSON), encoding="utf-8")
+
+    known = {safe_filename(e["citekey"], set()) for e in entries}
+    report["orphan_papers"] = sorted(
+        p.stem for p in (vault_dir / PAPERS_DIR).glob("*.md")
+        if p.stem not in known and not p.name.endswith(".conflict.md"))
 
     meta = {"vault_schema": VAULT_SCHEMA_VERSION,
             "generated_at": datetime.now().isoformat(timespec="seconds"),

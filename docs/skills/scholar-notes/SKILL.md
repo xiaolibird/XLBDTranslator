@@ -11,6 +11,13 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 覆盖 2023-01 至今,每月一篇 `科研札记_YYYY-MM_全文精读.md` + 同名 `references.json`(CSL-JSON)。
 总索引:`literature_index.json`;完整使用说明:该目录 `AGENTS.md`(先读它)。
 
+**另有一份 per-paper 视图**:`~/Documents/ScholarVault/`(Obsidian vault,936 篇 = INCLUDE ∨ 已精读)。
+一篇论文一个文件 `01-文献/<citekey>.md`,带 YAML frontmatter(citekey/doi/year/bucket/role/flags/
+n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),正文含句级证据 callout + TF-IDF 相邻文献 +
+`_MOC/` 静态索引页。**它是索引的派生视图,不是真相源**——数字与全文以 `literature_index.json` 和月度 md 为准;
+索引更新后需手动重跑 `PYTHONPATH=. python scripts/build_vault.py --vault-dir ~/Documents/ScholarVault`。
+⚠️ 该目录含用户手写内容(`## 我的札记` 与自加的 frontmatter 键/tag),**不要直接编辑或覆盖那部分**。
+
 ## 四步法
 
 1. **查索引**(始终过滤 `duplicate_of == null`):

@@ -30,6 +30,10 @@ def main() -> int:
     ap.add_argument("--force-regen", action="store_true",
                     help="强制重写生成块（用户区仍保留）")
     args = ap.parse_args()
+    if args.limit < 0:                      # 负值会走 Python 负切片，静默少生成几篇
+        ap.error("--limit 不能为负（0=不限）")
+    if args.neighbors < 0:
+        ap.error("--neighbors 不能为负（0=关闭相似边）")
 
     notes_dir = Path(args.notes_dir)
     index_path = notes_dir / INDEX_JSON
@@ -45,15 +49,28 @@ def main() -> int:
         return 2
 
     vault_dir = Path(args.vault_dir).expanduser()
-    rep = write_vault(index, notes_dir, vault_dir,
-                      include_maybe=args.include_maybe, k=args.neighbors,
-                      dry_run=args.dry_run, limit=args.limit, force_regen=args.force_regen)
+    try:
+        rep = write_vault(index, notes_dir, vault_dir,
+                          include_maybe=args.include_maybe, k=args.neighbors,
+                          dry_run=args.dry_run, limit=args.limit,
+                          force_regen=args.force_regen)
+    except OSError as exc:
+        # 权限/磁盘满等：给可读提示而不是裸 traceback，且与 conflict 的退出码 1 区分开。
+        # 注意此时可能已写入部分文件（无事务），提示用户重跑即可收敛。
+        print("写盘失败（{}）：{}\n已写入的部分文件保留，修复后重跑即可收敛。".format(
+            type(exc).__name__, exc), file=sys.stderr)
+        return 2
 
     print("\n{}".format("=" * 66))
     print("{} vault: {}".format("【dry-run】" if args.dry_run else "✅", vault_dir))
     print("  文献 {} 篇（新建 {} · 更新 {} · 未变 {}）· 索引页 {} 个 · 写盘 {} 个文件".format(
         rep["selected"], rep["new"], rep["merged"], rep["unchanged"],
         rep["moc_pages"], rep["written"]))
+    if rep.get("pruned"):
+        print("  🧹 清理过期索引页 {} 个（分片规则变更后的残留）".format(len(rep["pruned"])))
+    if rep.get("orphan_papers"):
+        print("  ℹ️ {} 篇笔记已不在入选范围（未删除，可能含你的手写内容）：{}".format(
+            len(rep["orphan_papers"]), ", ".join(rep["orphan_papers"][:5])))
     if rep["slice_failures"]:
         print("  ⚠️ {} 篇切不出正文（索引与 md 失步）：{}".format(
             len(rep["slice_failures"]), ", ".join(rep["slice_failures"][:6])))

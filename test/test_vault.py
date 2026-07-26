@@ -316,13 +316,66 @@ def test_legacy_tag_warning_present():
 
 # ---------------- G. 邻居 ----------------
 
-def test_neighbors_no_self_no_dangling(index):
-    entries = V.select_papers(index, include_maybe=True)
+def _corpus(n=12):
+    """够真实的语料：两个主题簇，保证 TF-IDF 相似度高于阈值真能产出邻居。
+
+    此前这里只有 3 篇玩具论文，相似度全部低于 0.02 → 邻居恒为空列表 →
+    「不含自身」「不指向集外」两个 all() 在空列表上恒真，等于没测。
+    """
+    out = []
+    for i in range(n):
+        if i % 2 == 0:
+            title = "Missing data imputation under MNAR mechanism in EHR cohort {}".format(i)
+            one = "缺失机制 MNAR 插补 电子健康记录 队列"
+            hl = "MNAR missingness indicator imputation EHR clinical prediction"
+        else:
+            title = "Graph transformer representation learning for clinical notes {}".format(i)
+            one = "图变换器 表示学习 临床文本"
+            hl = "graph transformer attention representation learning clinical text"
+        out.append({"citekey": "k{:02d}".format(i), "title": title, "one_line": one,
+                    "year": 2020 + i % 5, "month": "2025-01", "priority_tier": "mid",
+                    "bucket": ["G"] if i % 2 else ["A"], "duplicate_of": None,
+                    "decision": "INCLUDE", "highlights": [
+                        {"role": "citable", "tag": "可引用证据", "section": "结果", "text": hl}]})
+    return out
+
+
+def test_neighbors_are_actually_produced():
+    """回归：语料太小时曾整体退化为空邻居，使下面两条断言空转。"""
+    nb = V.compute_neighbors(_corpus(), k=3)
+    assert sum(len(v) for v in nb.values()) > 0
+    assert all(len(v) > 0 for v in nb.values())          # 无孤立节点
+
+
+def test_neighbors_no_self_no_dangling():
+    entries = _corpus()
     nb = V.compute_neighbors(entries, k=3)
     keys = {e["citekey"] for e in entries}
+    total = 0
     for key, lst in nb.items():
         assert all(other != key for other, _ in lst)
-        assert all(other in keys for other, _ in lst)   # 防幽灵节点
+        assert all(other in keys for other, _ in lst)    # 防幽灵节点
+        total += len(lst)
+    assert total > 0                                     # 防再次空转
+
+
+def test_neighbors_are_symmetric():
+    nb = V.compute_neighbors(_corpus(), k=2)
+    for a, lst in nb.items():
+        for b, _ in lst:
+            assert any(x == a for x, _ in nb[b])         # 双向补全
+
+
+def test_neighbors_prefer_same_topic():
+    """同主题簇应互为近邻——否则相似度算法退化成噪声。"""
+    nb = V.compute_neighbors(_corpus(), k=3)
+    for key, lst in nb.items():
+        same_parity = [o for o, _ in lst if int(o[1:]) % 2 == int(key[1:]) % 2]
+        assert len(same_parity) >= 2, (key, lst)
+
+
+def test_neighbors_disabled_when_k_zero():
+    assert all(v == [] for v in V.compute_neighbors(_corpus(), k=0).values())
 
 
 # ---------------- H. 编排（write_vault） ----------------
@@ -408,15 +461,6 @@ def test_no_pointless_shard_when_key_does_not_split():
     assert len(pages) == 1 and "分片如下" not in next(iter(pages.values()))
 
 
-def test_year_moc_shards_by_month_not_year():
-    """年份 MOC 若按年份再切会产出 `2025-2025` 这种废页。"""
-    rows = [{"citekey": "k{}".format(i), "year": 2025, "priority_tier": "mid", "one_line": "x",
-             "month": "2025-{:02d}".format(1 + i % 4)} for i in range(300)]
-    pages = V._sharded("年份", "2025", "发表年 2025", rows, shard_key=V._shard_month)
-    assert "{}/年份/2025-2025.md".format(V.MOC_DIR) not in pages
-    assert "{}/年份/2025-2025-01.md".format(V.MOC_DIR) in pages
-
-
 def test_evidence_pages_stay_readable():
     """两级分片：手动深读条目 bucket 恒为空，只按维度切会撑出 800+ 条的单页。"""
     entries = [{"citekey": "k{}".format(i), "year": 2020 + i % 5, "priority_tier": "mid",
@@ -428,3 +472,129 @@ def test_evidence_pages_stay_readable():
     biggest = max(len([l for l in t.splitlines() if l.startswith("- [[")])
                   for t in pages.values())
     assert biggest <= 120 and len(pages) > 2
+
+
+# ---------------- I. 链接消毒 / 月份归一 / 年份不分片 ----------------
+
+def test_evidence_alias_strips_brackets():
+    """回归：highlight 里的 `[13]` 会提前闭合 wikilink，实测曾致 88 条证据链接点不进去。"""
+    entries = [{"citekey": "k1", "year": 2025, "priority_tier": "mid", "bucket": [],
+                "highlights": [{"role": "citable", "tag": "可引用证据", "section": "结果",
+                                "text": "纠错（p.29）：引自 [13] 的公式 1[β^⊤X 有误"}]}]
+    page = V.build_evidence_pages(entries)["{}/证据/可引用证据.md".format(V.MOC_DIR)]
+    link = next(l for l in page.splitlines() if l.startswith("- [["))
+    inner = link[link.index("[[") + 2:link.index("]]")]
+    assert "[" not in inner and "]" not in inner      # 别名里不得有裸方括号
+    assert "(13)" in inner                            # 内容仍可读，只是换成圆括号
+
+
+def test_moc_row_alias_strips_brackets():
+    row = V._row({"citekey": "k", "priority_tier": "mid", "year": 2025, "month": "2025-01",
+                  "one_line": "见 [Fig. 2] 与 |表 3|"})
+    cell = row.split("|")[4]
+    assert "[" not in cell and "]" not in cell
+
+
+def test_month_key_normalizes_dated_buckets():
+    """索引里有 `2026-07-17` 这类专题批次桶，照收会劈成两页并让月份总数虚高。"""
+    assert V.month_key({"month": "2026-07-17"}) == "2026-07"
+    assert V.month_key({"month": "2026-07"}) == "2026-07"
+    assert V.month_key({}) == "未知月"
+
+
+def test_month_moc_merges_dated_bucket():
+    entries = [{"citekey": "a", "month": "2026-07", "year": 2026, "priority_tier": "mid",
+                "one_line": "x", "bucket": [], "highlights": []},
+               {"citekey": "b", "month": "2026-07-17", "year": 2026, "priority_tier": "mid",
+                "one_line": "y", "bucket": [], "highlights": []}]
+    pages = V.build_moc_pages(entries)
+    assert "{}/月度/2026-07.md".format(V.MOC_DIR) in pages
+    assert "{}/月度/2026-07-17.md".format(V.MOC_DIR) not in pages
+    assert "[[a]]" in pages["{}/月度/2026-07.md".format(V.MOC_DIR)]
+    assert "[[b]]" in pages["{}/月度/2026-07.md".format(V.MOC_DIR)]
+
+
+def test_year_moc_is_not_sharded():
+    """回归：按收录月切年份会产出 `2023-2021-06` 这种页，86 个子页里 27 个只含 1 篇。"""
+    entries = [{"citekey": "k{}".format(i), "year": 2025, "priority_tier": "mid",
+                "one_line": "x", "bucket": [], "highlights": [],
+                "month": "2025-{:02d}".format(1 + i % 12)} for i in range(300)]
+    pages = V.build_moc_pages(entries)
+    year_pages = [p for p in pages if p.startswith("{}/年份/".format(V.MOC_DIR))]
+    assert year_pages == ["{}/年份/2025.md".format(V.MOC_DIR)]
+
+
+# ---------------- J. CLI（此前零覆盖） ----------------
+
+import subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_REPO = _Path(__file__).resolve().parents[1]
+
+
+def _cli(*args, cwd=None):
+    return subprocess.run([_sys.executable, "scripts/build_vault.py", *args],
+                          cwd=cwd or _REPO, capture_output=True, text=True)
+
+
+def test_cli_exit_2_on_missing_index(tmp_path):
+    r = _cli("--vault-dir", str(tmp_path / "v"), "--notes-dir", str(tmp_path / "nope"))
+    assert r.returncode == 2 and "notes_index.py" in r.stderr
+    assert not (tmp_path / "v").exists()
+
+
+def test_cli_exit_2_on_corrupt_index(tmp_path):
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    (nd / "literature_index.json").write_text("{not json", encoding="utf-8")
+    r = _cli("--vault-dir", str(tmp_path / "v"), "--notes-dir", str(nd))
+    assert r.returncode == 2 and "损坏" in r.stderr
+
+
+def test_cli_rejects_negative_limit(tmp_path, notes_dir):
+    """argparse 层校验，不依赖索引落盘。"""
+    """回归：负值走 Python 负切片会静默少生成几篇且退出码 0。"""
+    r = _cli("--vault-dir", str(tmp_path / "v"), "--notes-dir", str(notes_dir), "--limit", "-3")
+    assert r.returncode == 2 and "--limit" in r.stderr      # argparse error → 2
+
+
+@pytest.fixture
+def notes_dir_on_disk(notes_dir, index):
+    """CLI 走的是磁盘上的 literature_index.json，需要真落盘（index fixture 只在内存里）。"""
+    ni.write_outputs(index, notes_dir)
+    return notes_dir
+
+
+def test_cli_dry_run_and_build(tmp_path, notes_dir_on_disk):
+    notes_dir = notes_dir_on_disk
+    vd = tmp_path / "v"
+    r = _cli("--vault-dir", str(vd), "--notes-dir", str(notes_dir), "--dry-run")
+    assert r.returncode == 0 and not vd.exists()
+    r = _cli("--vault-dir", str(vd), "--notes-dir", str(notes_dir))
+    assert r.returncode == 0 and (vd / V.OVERVIEW).exists()
+    r = _cli("--vault-dir", str(vd), "--notes-dir", str(notes_dir))
+    assert r.returncode == 0 and "写盘 0 个文件" in r.stdout   # 幂等
+
+
+def test_stale_moc_pages_are_pruned(notes_dir, index, tmp_path):
+    """分片规则变更后旧页会成幽灵，继续出现在图谱和搜索里——必须清掉。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    ghost = vd / V.MOC_DIR / "年份" / "2099-2099-01.md"
+    ghost.parent.mkdir(parents=True, exist_ok=True)
+    ghost.write_text("# 过期分片\n", encoding="utf-8")
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert not ghost.exists() and any("2099" in p for p in rep["pruned"])
+
+
+def test_prune_never_touches_paper_notes(notes_dir, index, tmp_path):
+    """01-文献/ 含用户手写，落选也只报告不删。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    orphan = vd / V.PAPERS_DIR / "old2019Dropped.md"
+    orphan.write_text("---\ncitekey: old2019Dropped\n---\n\n## 我的札记\n\n重要手写\n",
+                      encoding="utf-8")
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert orphan.exists() and "重要手写" in orphan.read_text(encoding="utf-8")
+    assert "old2019Dropped" in rep["orphan_papers"]
