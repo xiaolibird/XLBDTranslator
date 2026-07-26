@@ -87,13 +87,21 @@ one two three new non via per within without across among also both each other
 
 # ---------------- 选取与切片 ----------------
 
-def select_papers(index: Dict[str, Any], *, include_maybe: bool = False) -> List[Dict[str, Any]]:
-    """keeper ∧（INCLUDE ∨ 已精读）。include_maybe=True 时放宽为 keeper 全集。"""
+def select_papers(index: Dict[str, Any], *, include_maybe: bool = False,
+                  include_abstract_only: bool = False) -> List[Dict[str, Any]]:
+    """默认只收**已精读**的 keeper（约 299 篇）。
+
+    此前默认是「INCLUDE ∨ 已精读」（936 篇），但其中 637 篇只有一行摘要、无句级证据，
+    且摘要多含 Google Scholar 抓取残渣——图谱里三分之二节点是空壳。收紧后证据句仍保住 98%
+    （3740/3804）。`include_abstract_only` 恢复旧口径；`include_maybe` 放宽到 keeper 全集。
+    """
     out = []
     for e in index.get("papers") or []:
         if not isinstance(e, dict) or e.get("duplicate_of") or not e.get("citekey"):
             continue
-        if include_maybe or e.get("decision") == "INCLUDE" or e.get("has_full_text_reading"):
+        if (include_maybe
+                or e.get("has_full_text_reading")
+                or (include_abstract_only and e.get("decision") == "INCLUDE")):
             out.append(e)
     return out
 
@@ -587,7 +595,7 @@ def render_generated_block(e: Dict[str, Any], body: List[str],
         belong.append(_moc_link("维度", "未分维度"))
     belong.append(_moc_link("角色", e.get("role") or "未标角色"))
     if e.get("month"):
-        belong.append(_moc_link("月度", e["month"]))
+        belong.append(_moc_link("月度", month_key(e)))    # 与建页口径一致，否则链到不存在的日期页
     if e.get("year"):
         belong.append(_moc_link("年份", str(e["year"])))
     for f in (e.get("flags") or []):
@@ -863,11 +871,13 @@ PYTHONPATH=. python scripts/build_vault.py --vault-dir <这个目录>
 
 
 def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
-                include_maybe: bool = False, k: int = 5, dry_run: bool = False,
+                include_maybe: bool = False, include_abstract_only: bool = False,
+                k: int = 5, dry_run: bool = False,
                 limit: int = 0, force_regen: bool = False) -> Dict[str, Any]:
     """生成/更新 vault。返回 report（供 CLI 打印与退出码判定）。"""
     notes_dir, vault_dir = Path(notes_dir), Path(vault_dir)
-    entries = select_papers(index, include_maybe=include_maybe)
+    entries = select_papers(index, include_maybe=include_maybe,
+                            include_abstract_only=include_abstract_only)
     if limit:
         entries = entries[:limit]
     bodies, slice_failures = load_bodies(entries, notes_dir)
@@ -958,10 +968,25 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     if not gi.exists():
         gi.write_text("{}\n.obsidian/workspace*.json\n".format(META_JSON), encoding="utf-8")
 
+    # 落选笔记：口径收紧或论文退出索引后，旧笔记会滞留、不被任何 MOC 引用。
+    # 纯生成产物（用户区为空）直接删；写过东西的一律保留并报告——绝不替用户做删除决定。
     known = {safe_filename(e["citekey"], set()) for e in entries}
-    report["orphan_papers"] = sorted(
-        p.stem for p in (vault_dir / PAPERS_DIR).glob("*.md")
-        if p.stem not in known and not p.name.endswith(".conflict.md"))
+    kept_orphans: List[str] = []
+    for p in sorted((vault_dir / PAPERS_DIR).glob("*.md")):
+        if p.stem in known or p.name.endswith(".conflict.md"):
+            continue
+        try:
+            _, body = split_frontmatter(p.read_text(encoding="utf-8"))
+            zone = extract_user_zone(body or "")
+        except Exception:
+            zone = None
+        has_user_text = zone is None or zone.replace(USER_HEADING, "").strip()
+        if has_user_text:
+            kept_orphans.append(p.stem)
+        else:
+            p.unlink()
+            report["pruned"].append(str(p.relative_to(vault_dir)))
+    report["orphan_papers"] = kept_orphans
 
     meta = {"vault_schema": VAULT_SCHEMA_VERSION,
             "generated_at": datetime.now().isoformat(timespec="seconds"),

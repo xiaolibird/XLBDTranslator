@@ -160,16 +160,23 @@ def test_load_bodies_reports_failures(notes_dir, index):
 
 # ---------------- B. 选取 ----------------
 
-def test_select_include_or_fulltext(index):
-    keys = {e["citekey"] for e in V.select_papers(index)}
-    assert "public2025Deep" in keys          # INCLUDE
-    assert "lee2025Graph" not in keys        # MAYBE 且无精读
-    assert {e["citekey"] for e in V.select_papers(index, include_maybe=True)} >= keys | {"lee2025Graph"}
+def test_select_defaults_to_full_text_only(index):
+    """默认只收已精读：INCLUDE 但只有摘要的条目会被挡在外面（曾致 2/3 节点是空壳）。"""
+    default = {e["citekey"] for e in V.select_papers(index)}
+    assert "public2025Deep" in default        # 有精读
+    assert "lee2025Graph" not in default      # MAYBE 且无精读
+
+    abstract_only = {e["citekey"] for e in V.select_papers(index, include_abstract_only=True)}
+    assert abstract_only >= default           # 放宽后是超集
+    everything = {e["citekey"] for e in V.select_papers(index, include_maybe=True)}
+    assert "lee2025Graph" in everything and everything >= abstract_only
 
 
 def test_select_excludes_duplicates(index):
-    idx = {"papers": [{"citekey": "dup", "decision": "INCLUDE", "duplicate_of": "x@2020-01"},
-                      {"citekey": "keep", "decision": "INCLUDE", "duplicate_of": None}]}
+    idx = {"papers": [{"citekey": "dup", "has_full_text_reading": True,
+                       "duplicate_of": "x@2020-01"},
+                      {"citekey": "keep", "has_full_text_reading": True,
+                       "duplicate_of": None}]}
     assert [e["citekey"] for e in V.select_papers(idx)] == ["keep"]
 
 
@@ -588,16 +595,40 @@ def test_stale_moc_pages_are_pruned(notes_dir, index, tmp_path):
     assert not ghost.exists() and any("2099" in p for p in rep["pruned"])
 
 
-def test_prune_never_touches_paper_notes(notes_dir, index, tmp_path):
-    """01-文献/ 含用户手写，落选也只报告不删。"""
+def test_orphan_with_user_text_is_never_deleted(notes_dir, index, tmp_path):
+    """落选笔记里只要有手写内容就必须保留——口径收紧时这是唯一的数据安全底线。"""
     vd = tmp_path / "v"
     V.write_vault(index, notes_dir, vd, k=2)
     orphan = vd / V.PAPERS_DIR / "old2019Dropped.md"
-    orphan.write_text("---\ncitekey: old2019Dropped\n---\n\n## 我的札记\n\n重要手写\n",
-                      encoding="utf-8")
+    orphan.write_text(V.assemble(
+        '---\ncitekey: "old2019Dropped"\n---', "# 旧笔记\n\n生成内容",
+        "\n## 我的札记\n\n重要手写 ✍️\n"), encoding="utf-8")
     rep = V.write_vault(index, notes_dir, vd, k=2)
-    assert orphan.exists() and "重要手写" in orphan.read_text(encoding="utf-8")
+    assert orphan.exists() and "重要手写 ✍️" in orphan.read_text(encoding="utf-8")
     assert "old2019Dropped" in rep["orphan_papers"]
+
+
+def test_orphan_without_user_text_is_pruned(notes_dir, index, tmp_path):
+    """纯生成产物（用户区空）落选后直接删，否则口径收紧后会留下几百个幽灵节点。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    orphan = vd / V.PAPERS_DIR / "old2019Empty.md"
+    orphan.write_text(V.assemble('---\ncitekey: "old2019Empty"\n---', "# 旧笔记\n\n生成内容",
+                                 V.DEFAULT_USER_ZONE), encoding="utf-8")
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert not orphan.exists()
+    assert any("old2019Empty" in x for x in rep["pruned"])
+    assert "old2019Empty" not in rep["orphan_papers"]
+
+
+def test_conflict_file_is_never_pruned(notes_dir, index, tmp_path):
+    """.conflict.md 是待用户手工合并的产物，不能被当成落选笔记清掉。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    c = vd / V.PAPERS_DIR / "zzz2019Old.conflict.md"
+    c.write_text("待合并\n", encoding="utf-8")
+    V.write_vault(index, notes_dir, vd, k=2)
+    assert c.exists()
 
 
 # ---------------- K. 第二轮审查修复的回归 ----------------
@@ -682,3 +713,10 @@ def test_evidence_third_level_shard_keeps_pages_small():
     biggest = max(len([l for l in t.splitlines() if l.startswith("- [[")])
                   for t in pages.values())
     assert biggest <= V.SHARD_THRESHOLD
+
+
+def test_belong_month_link_matches_page(notes_dir, index, tmp_path):
+    """归属链接与建页必须同口径：曾用原始 `2026-07-17` 链到只按 `2026-07` 建的页。"""
+    e = dict(_entry(index, "public2025Deep"), month="2026-07-17")
+    block = V.render_generated_block(e, [], [], {})
+    assert "_MOC/月度/2026-07|" in block and "2026-07-17|" not in block

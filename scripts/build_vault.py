@@ -4,6 +4,8 @@
     PYTHONPATH=. python scripts/build_vault.py --vault-dir ~/Documents/ScholarVault --dry-run
     PYTHONPATH=. python scripts/build_vault.py --vault-dir ~/Documents/ScholarVault
 
+默认只收**已精读**的条目（约 299 篇）；`--include-abstract-only` 纳入仅摘要的 INCLUDE，
+`--include-maybe` 放宽到 keeper 全集。
 --vault-dir 必填无默认：vault 是用户资产（含手写札记），不能默认写进仓库或 iCloud 目录。
 退出码 0=成功 / 1=有 conflict 或切片失败 / 2=索引缺失或损坏。
 """
@@ -22,8 +24,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="把科研札记库生成为 Obsidian vault")
     ap.add_argument("--vault-dir", required=True, help="vault 目录（必填，建议自行 git init）")
     ap.add_argument("--notes-dir", default="output/scholar_notes")
+    ap.add_argument("--include-abstract-only", action="store_true",
+                    help="把 INCLUDE 但无精读的条目也纳入（默认只出已精读的）")
     ap.add_argument("--include-maybe", action="store_true",
-                    help="放宽为 keeper 全集（默认只出 INCLUDE 或已精读）")
+                    help="放宽为 keeper 全集（含 MAYBE）")
     ap.add_argument("--neighbors", type=int, default=5, help="语义近邻数，0=关闭（默认 5）")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 篇（调试用）")
     ap.add_argument("--dry-run", action="store_true", help="只算不写")
@@ -51,7 +55,9 @@ def main() -> int:
     vault_dir = Path(args.vault_dir).expanduser()
     try:
         rep = write_vault(index, notes_dir, vault_dir,
-                          include_maybe=args.include_maybe, k=args.neighbors,
+                          include_maybe=args.include_maybe,
+                          include_abstract_only=args.include_abstract_only,
+                          k=args.neighbors,
                           dry_run=args.dry_run, limit=args.limit,
                           force_regen=args.force_regen)
     except OSError as exc:
@@ -67,9 +73,11 @@ def main() -> int:
         rep["selected"], rep["new"], rep["merged"], rep["unchanged"],
         rep["moc_pages"], rep["written"]))
     if rep.get("pruned"):
-        print("  🧹 清理过期索引页 {} 个（分片规则变更后的残留）".format(len(rep["pruned"])))
+        notes = [x for x in rep["pruned"] if x.startswith("01-")]
+        print("  🧹 清理 {} 个过期文件（{} 篇落选笔记 + {} 个索引页；仅限无手写内容的）".format(
+            len(rep["pruned"]), len(notes), len(rep["pruned"]) - len(notes)))
     if rep.get("orphan_papers"):
-        print("  ℹ️ {} 篇笔记已不在入选范围（未删除，可能含你的手写内容）：{}".format(
+        print("  ✍️ {} 篇已落选但含你的手写内容，保留未删：{}".format(
             len(rep["orphan_papers"]), ", ".join(rep["orphan_papers"][:5])))
     if rep["slice_failures"]:
         print("  ⚠️ {} 篇切不出正文（索引与 md 失步）：{}".format(
