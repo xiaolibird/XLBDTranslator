@@ -209,11 +209,46 @@ def test_frontmatter_truncates_authors():
 
 
 def test_merge_tags_keeps_user_tags():
-    new = ["scholar", "tier/mid", "bucket/A"]
-    old = ["scholar", "tier/high", "待复现", "bucket/G"]
+    new = ["札记", "优先级/中", "维度/A-缺失机制方法学"]
+    old = ["札记", "优先级/高", "待复现", "维度/G-临床落地场景"]
     out = V.merge_tags(new, old)
-    assert "待复现" in out and "tier/mid" in out
-    assert "tier/high" not in out and "bucket/G" not in out       # 受管前缀被替换
+    assert "待复现" in out and "优先级/中" in out
+    assert "优先级/高" not in out and "维度/G-临床落地场景" not in out   # 受管前缀被替换
+
+
+def test_merge_tags_strips_retired_tags():
+    """回归：tag 改名后旧 tag 若被当成用户 tag 保留，每篇会同时挂新旧两套，永不收敛。"""
+    out = V.merge_tags(["札记", "优先级/中"],
+                       ["scholar", "tier/high", "bucket/G", "role/BACKGROUND",
+                        "flag/THREAT", "year/2025", "待复现"])
+    assert out == ["札记", "优先级/中", "待复现"]
+
+
+def test_managed_prefix_does_not_eat_lookalike_user_tag():
+    """`scholar` 是整串匹配，不能顺手吃掉用户的 `scholarship`。"""
+    out = V.merge_tags(["札记"], ["scholarship", "维度学习", "scholar"])
+    assert "scholarship" in out and "维度学习" in out and "scholar" not in out
+
+
+def test_tags_are_human_readable(index):
+    e = _entry(index, "public2025Deep")
+    tags = V.build_tags(dict(e, priority_tier="high", series="auto", decision="INCLUDE",
+                             reading_source="arxiv", year=2025, bucket=["E"],
+                             role="MUST_ENGAGE", flags=["THREAT"]))
+    assert tags == ["札记", "优先级/高", "系列/月度精读", "裁决/收录", "原文/arXiv",
+                    "年份/2025", "维度/E-对抗性证据", "角色/必须回应", "旗标/反向结论"]
+    assert all(" " not in t for t in tags)          # Obsidian tag 不允许空格
+
+
+def test_tags_fall_back_on_unknown_values(index):
+    """新增枚举值（如新 bucket H）不能静默丢 tag，也不能产出带空格的非法 tag。"""
+    e = _entry(index, "public2025Deep")
+    tags = V.build_tags(dict(e, priority_tier="urgent now", series=None, decision="NEW",
+                             reading_source="some source", year=None, bucket=["H"],
+                             role="NEW_ROLE", flags=["WEIRD FLAG"]))
+    assert "优先级/urgent-now" in tags and "维度/H" in tags and "旗标/WEIRD-FLAG" in tags
+    assert "裁决/NEW" in tags and "原文/some-source" in tags and "角色/NEW_ROLE" in tags
+    assert all(" " not in t for t in tags)
 
 
 # ---------------- D. 用户内容保护（安全核心） ----------------
@@ -240,12 +275,12 @@ def test_user_frontmatter_keys_and_tags_preserved(index):
     e = _entry(index, "public2025Deep")
     existing = _assembled(e).replace("vault_schema: 1",
                                      'vault_schema: 1\nstatus: "已读"\nrating: 5')
-    existing = existing.replace('tags: ["scholar"', 'tags: ["待复现", "scholar"')
+    existing = existing.replace('tags: ["札记"', 'tags: ["待复现", "札记"')
     merged, status = V.merge_note(e, "# T\n\nv2", existing)
     assert status == "merged"
     data = yaml.safe_load(merged.split("---")[1])
     assert data["status"] == "已读" and data["rating"] == 5
-    assert "待复现" in data["tags"] and "scholar" in data["tags"]
+    assert "待复现" in data["tags"] and "札记" in data["tags"]
 
 
 def test_missing_sentinel_is_conflict(index):
@@ -646,8 +681,8 @@ def test_preserved_key_with_colon_stays_valid_yaml(index):
 @pytest.mark.parametrize("bad_tags", [2024, 1.5, {"a": 1}, None, True])
 def test_merge_tags_survives_non_list(bad_tags):
     """回归：`tags: 2024` 曾抛 TypeError 把整轮构建带崩。"""
-    out = V.merge_tags(["scholar", "tier/mid"], bad_tags)
-    assert "scholar" in out and isinstance(out, list)
+    out = V.merge_tags(["札记", "优先级/中"], bad_tags)
+    assert "札记" in out and isinstance(out, list)
 
 
 def test_build_survives_weird_frontmatter(notes_dir, index, tmp_path):
@@ -656,7 +691,7 @@ def test_build_survives_weird_frontmatter(notes_dir, index, tmp_path):
     V.write_vault(index, notes_dir, vd, k=2)
     note = vd / V.PAPERS_DIR / "public2025Deep.md"
     note.write_text(note.read_text(encoding="utf-8").replace(
-        'tags: ["scholar"', 'tags: 2024\nx_tags: ["scholar"'), encoding="utf-8")
+        'tags: ["札记"', 'tags: 2024\nx_tags: ["札记"'), encoding="utf-8")
     rep = V.write_vault(index, notes_dir, vd, k=2)          # 不抛异常
     assert rep["selected"] >= 1
 

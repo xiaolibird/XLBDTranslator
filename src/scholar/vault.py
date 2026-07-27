@@ -45,7 +45,12 @@ MANAGED_KEYS = (
     "n_citable", "n_refutable", "n_method", "one_line", "origin",
     "tags", "cssclasses", "vault_schema",
 )
-MANAGED_TAG_PREFIXES = ("scholar", "tier/", "bucket/", "role/", "flag/",
+# 受管 tag 前缀：以 "/" 结尾的按前缀匹配，其余按整串相等（否则 `scholar` 会吃掉用户的
+# `scholarship`）。改名时**必须**把旧前缀挪进 RETIRED_TAG_PREFIXES，否则旧 tag 会被当成
+# 用户自加的而永久保留，每篇最后同时挂着新旧两套。
+MANAGED_TAG_PREFIXES = ("札记", "优先级/", "维度/", "角色/", "旗标/",
+                        "系列/", "裁决/", "原文/", "年份/")
+RETIRED_TAG_PREFIXES = ("scholar", "tier/", "bucket/", "role/", "flag/",
                         "series/", "decision/", "reading/", "year/")
 
 # 句级三色：对齐 docx_builder._TAG_COLOR（方法论借鉴=墨绿 / 可引用证据=紫 / 可反驳观点=蓝）。
@@ -54,6 +59,19 @@ ROLE_EMOJI = {"citable": "🟪", "refutable": "🟦", "method": "🟩"}
 ROLE_LABEL = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 ROLE_ORDER = ("citable", "refutable", "method")
 TIER_EMOJI = {"high": "🔴", "mid": "🟠", "low": "🟢"}
+
+# tag 用的中文名。语义取自 config/prompts/whitelist_filter_prompt.md：
+# THREAT=给出与本文相反的实证结论；BENCHMARK=≥3 个独立数据库外部验证；
+# OVERCLAIM_PRECEDENT=可作本文 scope statement 的反例。
+TIER_CN = {"high": "高", "mid": "中", "low": "低"}
+SERIES_CN = {"auto": "月度精读", "manual": "手动深读"}
+DECISION_CN = {"INCLUDE": "收录", "MAYBE": "待定", "EXCLUDE": "排除"}
+READING_CN = {"arxiv": "arXiv", "unpaywall": "Unpaywall", "manual-pdf": "手动PDF",
+              "manual_pdf": "手动PDF", "pmc": "PMC"}
+PAPER_ROLE_CN = {"MUST_ENGAGE": "必须回应", "CITE_SUPPORT": "支持性引用",
+                 "CITE_CONTRAST": "对比性引用", "BACKGROUND": "背景铺垫", "NONE": "无"}
+FLAG_CN = {"THREAT": "反向结论", "BENCHMARK": "多库外验",
+           "OVERCLAIM_PRECEDENT": "过度声称先例"}
 
 # bucket 中文语义取自 config/prompts/whitelist_filter_prompt.md（workflow.py:46-47 同源）
 BUCKET_LABEL = {
@@ -221,30 +239,51 @@ def _y_list(vals: List[Any]) -> str:
     return "[{}]".format(", ".join(_y(v) for v in vals))
 
 
+def _tag_safe(s: Any) -> str:
+    """Obsidian tag 不允许空格与多数标点；未知取值兜底成合法 slug 而不是丢掉。"""
+    return re.sub(r"[^\w一-鿿-]+", "-", str(s)).strip("-") or "未知"
+
+
 def build_tags(e: Dict[str, Any]) -> List[str]:
-    """受管 tag（ASCII 嵌套 slug；中文语义留给 MOC 页标题）。"""
-    tags = ["scholar"]
+    """受管 tag：中文语义名，与 MOC 页标题同名（`bucket/G` 看不出是什么，`维度/G-临床落地场景` 能）。
+
+    机读走 frontmatter 的结构化字段（bucket/role/priority_tier 仍是原始英文枚举），
+    tag 只服务人眼与 Obsidian 图谱分色。
+    """
+    tags = ["札记"]
     if e.get("priority_tier"):
-        tags.append("tier/{}".format(e["priority_tier"]))
+        tags.append("优先级/{}".format(TIER_CN.get(e["priority_tier"],
+                                                   _tag_safe(e["priority_tier"]))))
     if e.get("series"):
-        tags.append("series/{}".format(e["series"]))
+        tags.append("系列/{}".format(SERIES_CN.get(e["series"], _tag_safe(e["series"]))))
     if e.get("decision"):
-        tags.append("decision/{}".format(e["decision"]))
+        tags.append("裁决/{}".format(DECISION_CN.get(e["decision"], _tag_safe(e["decision"]))))
     if e.get("reading_source"):
-        tags.append("reading/{}".format(re.sub(r"[^A-Za-z0-9_-]+", "-", e["reading_source"])))
+        tags.append("原文/{}".format(READING_CN.get(e["reading_source"],
+                                                    _tag_safe(e["reading_source"]))))
     if e.get("year"):
-        tags.append("year/{}".format(e["year"]))
+        tags.append("年份/{}".format(e["year"]))
     for b in (e.get("bucket") or []):
-        tags.append("bucket/{}".format(b))
+        # 与 _MOC/维度/ 页名逐字一致，点 tag 和点归属链接落到同一个概念上
+        tags.append("维度/{}".format(
+            "{}-{}".format(b, BUCKET_LABEL[b]) if b in BUCKET_LABEL else _tag_safe(b)))
     if e.get("role"):
-        tags.append("role/{}".format(e["role"]))
+        tags.append("角色/{}".format(PAPER_ROLE_CN.get(e["role"], _tag_safe(e["role"]))))
     for f in (e.get("flags") or []):
-        tags.append("flag/{}".format(f))
+        tags.append("旗标/{}".format(FLAG_CN.get(f, _tag_safe(f))))
     return tags
 
 
+def _is_managed_tag(t: str) -> bool:
+    """以 "/" 结尾的按前缀匹配（`维度/` 吃 `维度/A-…`），其余按整串相等。"""
+    for p in MANAGED_TAG_PREFIXES + RETIRED_TAG_PREFIXES:
+        if t.startswith(p) if p.endswith("/") else t == p:
+            return True
+    return False
+
+
 def merge_tags(new: List[str], old: Any) -> List[str]:
-    """新受管 tag ∪（旧 tags − 受管前缀）——用户自加的 `待复现` 不被吃掉。
+    """新受管 tag ∪（旧 tags − 受管/已退役前缀）——用户自加的 `待复现` 不被吃掉。
 
     old 可能是任何形状：字符串、数字（`tags: 2024`）、dict、None。非序列一律裹成单元素列表，
     否则 `for t in old` 会抛 TypeError 把整轮构建带崩。
@@ -256,7 +295,7 @@ def merge_tags(new: List[str], old: Any) -> List[str]:
     kept = []
     for t in (old or []):
         t = str(t)
-        if not any(t == p or t.startswith(p) for p in MANAGED_TAG_PREFIXES):
+        if not _is_managed_tag(t):
             kept.append(t)
     out = list(new)
     for t in kept:
@@ -852,7 +891,25 @@ README = """# 科研札记 vault
 
 - 删掉 `END GENERATED` 哨兵或把 frontmatter 的 YAML 改坏，重建时该篇**不会被覆盖**，
   而是另存为 `<citekey>.conflict.md` 并在终端报错——手工合并后删掉 .conflict.md 即可。
-- frontmatter 里你自己加的键（如 `status:`）与自定 tag（不带 `tier/` `bucket/` 等受管前缀的）都会保留。
+- frontmatter 里你自己加的键（如 `status:`）与自定 tag（不带 `维度/` `优先级/` 等受管前缀的）都会保留。
+
+## tag 体系
+
+受管 tag 全是中文语义名，与 `_MOC/` 页标题同名，可直接在 tag 面板或搜索里点：
+
+| 前缀 | 取值 |
+|---|---|
+| `#札记` | 全库根标记 |
+| `#优先级/` | 高 · 中 · 低 |
+| `#维度/` | A-缺失机制方法学 · B-缺失感知建模 · C-缺失与因果 · D-跨域跨中心迁移 · E-对抗性证据 · F-多库ICU基准 · G-临床落地场景 |
+| `#角色/` | 必须回应 · 支持性引用 · 对比性引用 · 背景铺垫 |
+| `#旗标/` | 反向结论（THREAT）· 多库外验（BENCHMARK）· 过度声称先例（OVERCLAIM_PRECEDENT） |
+| `#裁决/` | 收录 · 待定 |
+| `#系列/` | 月度精读 · 手动深读 |
+| `#原文/` | arXiv · Unpaywall · 手动PDF |
+| `#年份/` | 2009 – 2026 |
+
+frontmatter 里的 `bucket` / `role` / `priority_tier` 仍是原始英文枚举，机读脚本用那些，别用 tag。
 
 ## 怎么用
 
