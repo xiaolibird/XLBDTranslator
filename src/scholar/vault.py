@@ -832,7 +832,11 @@ def build_overview(entries: List[Dict[str, Any]], index: Dict[str, Any],
         names = kinds.get(kind) or []
         if not names:
             continue
-        shown = names if kind != "月度" else names[-12:]
+        if kind == "证据":
+            # 85 个 role×维度×年 分片平铺出来就是一堵链接墙，总览只给 3 个 role 总页当入口
+            shown = [x for x in names if "-" not in x] or names[:12]
+        else:
+            shown = names if kind != "月度" else names[-12:]
         out.append("- **{}**：{}{}".format(
             kind, " · ".join("[[{}]]".format(x) for x in sorted(shown, reverse=True)),
             "　…共 {} 页".format(len(names)) if len(shown) < len(names) else ""))
