@@ -4,6 +4,8 @@
 三段式（详见 docs/skills/read-paper/SKILL.md 的 agent 协议）：
   1. ingest：抽全文 + 拉权威元数据 + 分块通读汇总 → draft bundle
         PYTHONPATH=. python scripts/read_pdf.py ingest paper.pdf
+        PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/      # 整个目录
+        PYTHONPATH=. python scripts/read_pdf.py ingest ~/Papers/ -r          # 递归子目录
   2. agent：用 Read 工具亲读整本 PDF，逐条核验脚本草稿的数字/结论/方法，
         把合并终稿写回 bundle 的 close_reading_final + cross_check_report，status=final
   3. finalize：从当月全部 final bundle 重建 科研札记_YYYY-MM_手动精读.{md,docx,references.json,index.json}
@@ -43,6 +45,36 @@ def _load_settings(config):
     return settings
 
 
+def _expand_pdfs(paths, recursive: bool = False):
+    """路径列表 → PDF 文件列表：目录展开成其中的 *.pdf（按名排序，稳定可复现）。
+
+    去重按 resolve() 后的真实路径，避免 `dir/ dir/a.pdf` 这类写法把同一篇读两遍
+    （一篇 PDF 走一遍分块通读是真金白银的 LLM 成本）。macOS 的 `._foo.pdf`
+    资源分叉文件不是 PDF，一并排除。
+    """
+    out, seen = [], set()
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            found = sorted(p.rglob("*.pdf") if recursive else p.glob("*.pdf"))
+            if not found:
+                logger.warning("⚠️ 目录里没有 PDF: {}".format(p))
+            cand = found
+        elif p.exists():
+            cand = [p]
+        else:
+            logger.error("❌ 路径不存在: {}".format(p))
+            continue
+        for f in cand:
+            if f.name.startswith("._"):
+                continue
+            key = f.resolve()
+            if key not in seen:
+                seen.add(key)
+                out.append(f)
+    return out
+
+
 def cmd_ingest(args):
     from src.scholar.pdf_ingest import ingest_pdf
     settings = _load_settings(args.config)
@@ -53,18 +85,21 @@ def cmd_ingest(args):
     llm = LLMClient(settings.llm)
     month = args.month or _cur_month()
 
+    pdfs = _expand_pdfs(args.pdf, recursive=args.recursive)
+    if not pdfs:
+        logger.error("❌ 没找到任何 PDF")
+        return 2
+    if len(pdfs) > len(args.pdf):
+        logger.info("展开目录后共 {} 篇 PDF".format(len(pdfs)))
+
     outs = []
-    for pdf in args.pdf:
-        pdf_path = Path(pdf).expanduser()
-        if not pdf_path.exists():
-            logger.error("❌ PDF 不存在: {}".format(pdf_path))
-            continue
+    for pdf_path in pdfs:
         try:
             r = ingest_pdf(
                 pdf_path, notes_dir, month, llm,
                 model=model, email=email,
                 research_interests=proc.research_interests,
-                title_override=(args.title or "") if len(args.pdf) == 1 else "",
+                title_override=(args.title or "") if len(pdfs) == 1 else "",
                 index_path=notes_dir / "literature_index.json")
             outs.append(r)
         except Exception as e:
@@ -226,7 +261,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_ing = sub.add_parser("ingest", help="抽元数据 + 分块通读 → draft bundle")
-    p_ing.add_argument("pdf", nargs="+", help="PDF 路径（可多篇）")
+    p_ing.add_argument("pdf", nargs="+", help="PDF 路径或目录（目录展开为其中全部 *.pdf）")
+    p_ing.add_argument("-r", "--recursive", action="store_true",
+                       help="目录递归下钻子目录（默认只取该目录一层）")
     p_ing.add_argument("--month", default=None, help="归档月份 YYYY-MM（默认当月）")
     p_ing.add_argument("--title", default=None, help="手动覆盖标题（单篇时；元数据解析用）")
     p_ing.set_defaults(func=cmd_ingest)

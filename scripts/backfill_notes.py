@@ -60,64 +60,10 @@ def month_range(y, m):
     return start, (end - timedelta(days=1))
 
 
-def dedup_key(meta):
-    """全局去重键（权威实现在 notes_index，与索引同源同规则）。"""
-    from src.scholar.notes_index import dedup_key_fields
-    return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
-
-
-def enrich_segments(segs, email, ts_url):
-    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + translation-server 权威解析。"""
-    from src.scholar.crossref import enrich_metadata
-    from src.scholar.academic_search import enrich_from_arxiv
-    from src.scholar.fulltext import ipv4_client
-    from src.scholar.translation_server import resolve_and_apply
-    cr = ax = ts = 0
-    with ipv4_client(timeout=30) as xc:
-        for seg in segs:
-            hit = False
-            try:
-                hit = enrich_metadata(seg.metadata, email=email, client=xc)
-                if hit:
-                    cr += 1
-            except Exception:
-                pass
-            if not hit and seg.metadata.arxiv_id:
-                try:
-                    if enrich_from_arxiv(seg.metadata, client=xc):
-                        ax += 1
-                except Exception:
-                    pass
-    if ts_url:
-        for seg in segs:
-            try:
-                if resolve_and_apply(seg.metadata, base_url=ts_url):
-                    ts += 1
-            except Exception:
-                pass
-    return cr, ax, ts
-
-
-def resolve_citekeys(segs, base_url):
-    """尽力回查 BBT citekey；Zotero 未开/拿不到则返回 None（札记用兜底键，自包含可渲染）。"""
-    citekeys = {seg.paper_id: None for seg in segs}
-    try:
-        from src.scholar.zotero_sync import ZoteroConnectorClient
-        cli = ZoteroConnectorClient(base_url=base_url)
-        if not cli.ping():
-            logger.info("  Zotero 未开，citekey 全用兜底键")
-            cli.close()
-            return citekeys
-        for seg in segs:
-            m = seg.metadata
-            try:
-                citekeys[seg.paper_id] = cli.resolve_citekey(doi=m.doi, title=m.title, retries=2, delay=0.5)
-            except Exception:
-                pass
-        cli.close()
-    except Exception as e:
-        logger.warning("  citekey 回查异常（全用兜底）: {}".format(e))
-    return citekeys
+# 元数据增强 / citekey 回查 / 去重键：与周度入库（scripts/ingest_notes.py）共用同一实现，
+# 否则两条链路各自演化，同一篇论文按月跑与按周跑会算出不同的 dedup_key 而重复入库。
+from src.scholar.ingest import (dedup_key, enrich_segments,  # noqa: E402,F401
+                                resolve_citekeys)
 
 
 def run_month(y, m, settings, seen: set, args) -> dict:

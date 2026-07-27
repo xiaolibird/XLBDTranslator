@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  周度入库：把周一 09:00 那轮 digest 判过的论文接上「精读 → 周札记」。
+
+  为什么是独立 job 而不是接在 digest 后面：
+  - digest 平均跑 6 分钟且长度随邮件量浮动，写死 sleep 不可靠；
+  - 入库失败（精读 API 欠费、Crossref 超时）不该把 digest 的产出一起标成失败；
+  - 分开后可以单独重跑入库而不重抓邮件、不重跑 LLM 筛选。
+  09:30 起跑，留 30 分钟余量；digest 若还没跑完，本轮读到的是上一轮的窗口，
+  下周会补上（跨库去重保证不重复）。
+
+  --auto = 本周 digest 入选的全部入库。想人工挑就别用这个 job，手动跑：
+      PYTHONPATH=. python scripts/ingest_notes.py --list
+      PYTHONPATH=. python scripts/ingest_notes.py --pick 2,3,5
+
+  安装：cp 到 ~/Library/LaunchAgents/ 后 launchctl load -w。
+  注意仓库在 ~/Documents 下受 TCC 保护，python 二进制需已在「完全磁盘访问权限」中授权
+  （com.xlbd.scholar-digest 用的是同一个解释器，已授权则无需再操作）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-weekly-ingest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12</string>
+        <string>scripts/ingest_notes.py</string>
+        <string>--auto</string>
+        <string>--top-n</string>
+        <string>5</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev</string>
+    </dict>
+
+    <!-- 每周一 09:30（digest 09:00 之后） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/xiaolibird/Library/Logs/xlbd-scholar-digest/cron_ingest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/xiaolibird/Library/Logs/xlbd-scholar-digest/cron_ingest.err.log</string>
+</dict>
+</plist>

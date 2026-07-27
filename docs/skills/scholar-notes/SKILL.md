@@ -8,10 +8,15 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 文献库(按月精选,LLM 三态筛选 + top-5 全文精读):
 `/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev/output/scholar_notes/`
 
-覆盖 2023-01 至今,每月一篇 `科研札记_YYYY-MM_全文精读.md` + 同名 `references.json`(CSL-JSON)。
-总索引:`literature_index.json`;完整使用说明:该目录 `AGENTS.md`(先读它)。
+覆盖 2023-01 至今。文件有三个系列,命名即口径:
+- `科研札记_YYYY-MM_全文精读.md` —— 历史按月回填(2023-01 → 2026-06)
+- `科研札记_YYYY-MM-DD_全文精读.md` —— **周札记**(周一日期),2026-07 起改为每周一自动入库
+- `科研札记_YYYY-MM(-DD)_手动精读.md` —— 手动 PDF 深度精读(agent 交叉核验)
 
-**另有一份 per-paper 视图**:`~/Documents/ScholarVault/`(Obsidian vault,936 篇 = INCLUDE ∨ 已精读)。
+每篇 md 配同名 `references.json`(CSL-JSON)。总索引:`literature_index.json`;
+完整使用说明:该目录 `AGENTS.md`(先读它)。
+
+**另有一份 per-paper 视图**:`~/Documents/ScholarVault/`(Obsidian vault,299 篇 = 已全文精读的)。
 一篇论文一个文件 `01-文献/<citekey>.md`,带 YAML frontmatter(citekey/doi/year/bucket/role/flags/
 n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),正文含句级证据 callout + TF-IDF 相邻文献 +
 `_MOC/` 静态索引页。**它是索引的派生视图,不是真相源**——数字与全文以 `literature_index.json` 和月度 md 为准;
@@ -54,6 +59,26 @@ n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),�
    ```
    用前确认 `jq '.citekey_collisions' literature_index.json` 为 `[]`(非空先跑 `notes_index.py --fix-collisions`)。
    写作取证的完整流程(按 role 轴 query → 写稿 → 出稿)见 skill `scholar-write`。
+
+## 往库里加论文
+
+三条入口,都在 XLBDTranslator-dev 仓库里跑:
+
+```bash
+# 1) 本周 Scholar 告警(周一 09:00 digest 已判过,复用裁决不重跑筛选)
+PYTHONPATH=. python scripts/ingest_notes.py --list          # 先看判出了什么
+PYTHONPATH=. python scripts/ingest_notes.py --pick 2,3,5    # 只入这几篇
+PYTHONPATH=. python scripts/ingest_notes.py --auto          # 全入（launchd 周一 09:30 自动跑这条）
+
+# 2) 任意 DOI / arXiv id / 标题(可能压根没在告警里出现过),一行一个
+PYTHONPATH=. python scripts/ingest_notes.py --papers papers.txt
+
+# 3) 本地 PDF(单篇、整个目录、或递归)——走三段式 agent 交叉核验,见 skill `read-paper`
+PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/
+```
+
+前两条产出周札记 `科研札记_YYYY-MM-DD_全文精读.md` 并自动刷索引;第三条产出手动精读系列。
+三条都做**跨库去重**(dedup_key 从 `literature_index.json` 恢复),重复的论文不会二次入库。
 
 ## 注意
 
