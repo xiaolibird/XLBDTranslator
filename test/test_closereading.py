@@ -124,3 +124,80 @@ def test_close_read_segments_prefers_full_text_available(monkeypatch):
     assert set(read_order) == {"p3", "p5", "p6"}
     # 全部命中全文
     assert all(s.close_reading.from_full_text for s in segs if s.paper_id in oa_ids)
+
+
+# ---------------- Europe PMC 全文回退（PDF 被出版商 403 挡住时） ----------------
+
+_JATS = """<article>
+  <front><article-meta>
+    <title-group><article-title>Tiered early warning</article-title></title-group>
+    <abstract><p>We built a two-stage framework.</p></abstract>
+    <contrib-group><contrib>Someone</contrib></contrib-group>
+  </article-meta></front>
+  <body>
+    <sec><title>Methods</title>
+      <p>AUROC was 0.91 <xref ref-type="bibr" rid="b1">12</xref> across sites.</p>
+    </sec>
+    <sec><title>Results</title><p>False alarms dropped.</p>
+      <table-wrap><caption><p>Table 1</p></caption></table-wrap>
+    </sec>
+  </body>
+  <back><ref-list><ref><p>Reference one</p></ref></ref-list></back>
+</article>"""
+
+
+def test_jats_to_text_keeps_body_drops_refs_and_xref():
+    from src.scholar.fulltext import jats_to_text
+    txt = jats_to_text(_JATS)
+    assert "Tiered early warning" in txt          # 标题
+    assert "two-stage framework" in txt           # 摘要
+    assert "AUROC was 0.91" in txt                # 正文
+    assert "Methods" in txt and "Results" in txt  # 小节标题
+    assert "12" not in txt                        # 引文角标不该混进句子
+    assert "Reference one" not in txt             # 参考文献表不进精读正文
+    assert "Table 1" not in txt                   # 表格版面不进精读正文
+
+
+def test_jats_to_text_falls_back_when_unparseable():
+    """DTD 外部实体等导致 XML 解析失败时，剥标签也好过丢掉整篇全文。"""
+    from src.scholar.fulltext import jats_to_text
+    txt = jats_to_text("<article><body><p>half broken &undefinedEntity; text</p>")
+    assert "half broken" in txt and "text" in txt
+
+
+def test_europepmc_pmcid_requires_in_epmc():
+    """只有 pmcid 而 inEPMC=N 的条目取全文会 404，不能当成可得。"""
+    from src.scholar.fulltext import europepmc_pmcid
+
+    def handler(req):
+        q = req.url.params.get("query", "")
+        in_epmc = "Y" if "10.1/yes" in q else "N"
+        return httpx.Response(200, json={"resultList": {"result": [
+            {"pmcid": "PMC1", "inEPMC": in_epmc}]}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert europepmc_pmcid(doi="10.1/yes", client=client) == "PMC1"
+    assert europepmc_pmcid(doi="10.1/no", client=client) is None
+    assert europepmc_pmcid(client=client) is None          # 无 DOI/PMID 直接放弃，不发请求
+
+
+def test_close_read_segment_falls_back_to_europepmc_when_pdf_blocked(monkeypatch):
+    """回归：Elsevier/MDPI/OUP 对机器人下 PDF 回 403，此时必须走 EPMC 全文而非降级成摘要。"""
+    seg = _seg(doi="10.1016/j.patter.2023.100795")
+    monkeypatch.setattr(cr, "resolve_oa_pdf", lambda meta, email="": _OA("http://blocked/x.pdf"))
+    monkeypatch.setattr(cr, "download_pdf", lambda url, dest, **kw: None)   # 403 → None
+    monkeypatch.setattr(cr, "europepmc_fulltext",
+                        lambda doi=None, pmid=None: "全文正文，含 AUROC 0.91。")
+    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":[{"text":"x","tag":null}]}]}')
+    out = cr.close_read_segment(seg, "ri", llm)
+    assert out.from_full_text is True and out.source == "europepmc"
+    assert "全文正文" in llm.calls[0]["prompt"] and "全文：" in llm.calls[0]["prompt"]
+
+
+def test_close_read_segment_degrades_to_abstract_when_no_source(monkeypatch):
+    seg = _seg(doi="10.1/closed")
+    monkeypatch.setattr(cr, "resolve_oa_pdf", lambda meta, email="": None)
+    monkeypatch.setattr(cr, "europepmc_fulltext", lambda doi=None, pmid=None: None)
+    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":[{"text":"x","tag":null}]}]}')
+    out = cr.close_read_segment(seg, "ri", llm)
+    assert out.from_full_text is False and out.source == "abstract"

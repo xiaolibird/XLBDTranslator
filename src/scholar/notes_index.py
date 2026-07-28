@@ -29,8 +29,11 @@ ALL_REFS_JSON = "all_references.json"
 
 # 成品札记 md 命名：_全文精读=自动流水线；_手动精读=手动 PDF 深度精读
 # （天然排除 demo/ideal/validate/digest_* 等杂档）
-# 月份桶允许 YYYY-MM 或 YYYY-MM-DD（后者用于同月内另起的专题批次，如按论文攻防立场组织的深读）
-NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?)_(全文精读|手动精读)\.md$")
+# 月份桶允许 YYYY-MM、YYYY-MM-DD，或 YYYY-MM-DD-<批次名>（后两者用于同月内另起的专题批次：
+# 前者如按论文攻防立场组织的深读，后者如按作者语料通读的 2026-07-27-HuiyingLiang）。
+# 批次名不含下划线——`_` 是与系列后缀（全文精读/手动精读）的分隔符，让开不会有歧义。
+# vault.month_key 取前 7 位折回 YYYY-MM，专题批次因此不会在图谱里劈出多余的月度页。
+NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?(?:-[^_]+)?)_(全文精读|手动精读)\.md$")
 _SERIES_MAP = {"全文精读": "auto", "手动精读": "manual"}
 
 # 每篇论文小节标题行（notes._paper_section 第 92 行的格式契约）：
@@ -753,6 +756,26 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
                               encoding="utf-8")
         except Exception as e:
             logger.warning("  ⚠️ 同步 references.json 失败（{}）: {}".format(ref_name, e))
+
+    # sidecar `{stem}.index.json` 在 build_month_entries 里**优先于 md** 被采信，
+    # 不同步改这里的话，下一次索引重建会把 md 里改好的键覆盖回旧值——撞键永远修不掉。
+    sc = Path(notes_dir) / "{}.index.json".format(Path(entry["note_file"]).stem)
+    if sc.exists():
+        try:
+            data = json.loads(sc.read_text(encoding="utf-8"))
+            rows = data if isinstance(data, list) else data.get("papers", [])
+            doi = (entry.get("doi") or "").lower()
+            cand = [r for r in rows if isinstance(r, dict) and r.get("citekey") == old]
+            tgt = next((r for r in cand if doi and (r.get("doi") or "").lower() == doi),
+                       cand[0] if cand else None)
+            if tgt is not None:
+                tgt["citekey"] = new
+                sc.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+            else:
+                logger.warning("  ⚠️ sidecar {} 中未找到 {}，改键可能被回滚".format(sc.name, old))
+        except Exception as e:
+            logger.warning("  ⚠️ 同步 sidecar 失败（{}）: {}".format(sc.name, e))
     return True
 
 

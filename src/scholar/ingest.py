@@ -55,12 +55,12 @@ def dedup_key(meta: PaperMetadata) -> str:
 
 def enrich_segments(segs: Sequence[PaperSegment], email: str,
                     ts_url: str) -> Tuple[int, int, int]:
-    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + translation-server 权威解析。"""
+    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + PubMed 补摘要 + translation-server 权威解析。"""
     from .crossref import enrich_metadata
-    from .academic_search import enrich_from_arxiv
+    from .academic_search import enrich_from_arxiv, enrich_abstract_from_pubmed
     from .fulltext import ipv4_client
     from .translation_server import resolve_and_apply
-    cr = ax = ts = 0
+    cr = ax = ts = pm = 0
     with ipv4_client(timeout=30) as xc:
         for seg in segs:
             hit = False
@@ -76,6 +76,18 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
                         ax += 1
                 except Exception:
                     pass
+            # 无摘要的论文若拿不到 OA 全文，精读会因空正文整篇落空——先去 PubMed 补一份
+            if not (seg.original_abstract or "").strip():
+                try:
+                    abs_ = enrich_abstract_from_pubmed(
+                        seg.metadata, seg.original_abstract, client=xc, email=email)
+                    if abs_:
+                        seg.original_abstract = abs_
+                        pm += 1
+                except Exception:
+                    pass
+    if pm:
+        logger.info("  PubMed 补摘要：{} 篇（原本无摘要，避免精读空转）".format(pm))
     if ts_url:
         for seg in segs:
             try:

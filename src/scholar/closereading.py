@@ -14,7 +14,9 @@ from typing import Optional
 from .schema import (
     PaperSegment, CloseReading, CloseReadSection, CloseReadSentence,
 )
-from .fulltext import ipv4_client, resolve_oa_pdf
+from .fulltext import (
+    ipv4_client, resolve_oa_pdf, europepmc_fulltext, europepmc_pmcid,
+)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -159,6 +161,10 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
                source: Optional[str] = None) -> Optional[CloseReading]:
     """对单篇论文做精读。llm 为 LLMClient；body_text 为全文或摘要。失败返回 None。"""
     if not body_text or not body_text.strip():
+        # 既无 OA 全文又无摘要 → 这篇在札记里会整篇没有精读内容。别静默，否则
+        # 只能靠事后数 highlights 才发现（2026-07-27 实测踩过）。
+        logger.warning("  ⚠️ 无全文也无摘要，跳过精读({}): {}".format(
+            seg.paper_id[:8], (seg.metadata.title or "")[:50]))
         return None
     prompt = _CLOSEREAD_PROMPT.format(
         research_interests=research_interests or "（未提供研究主线）",
@@ -200,6 +206,12 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
             if full_text.strip():
                 from_full, source = True, oa.source
     if not from_full:
+        # PDF 拿不到不等于没有全文：Elsevier/Cell、MDPI、OUP 对机器人下 PDF 回 403，
+        # 但同一篇的 OA 全文在 Europe PMC 有干净 XML。降级成摘要前先走这条。
+        epmc = europepmc_fulltext(doi=seg.metadata.doi, pmid=seg.metadata.pmid)
+        if epmc and epmc.strip():
+            full_text, from_full, source = epmc, True, "europepmc"
+    if not from_full:
         # 降级：用摘要
         full_text = seg.translated_abstract or seg.original_abstract or ""
         source = "abstract"
@@ -229,6 +241,17 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                 oa = None
             oa_map[id(seg)] = oa
         has_ft = [s for s in cand if oa_map.get(id(s)) and oa_map[id(s)].pdf_url]
+        # 无 OA PDF 的再问一次 Europe PMC——否则 Elsevier/MDPI/OUP 这批（PDF 被反爬挡死、
+        # 但 EPMC 有全文）会被择优逻辑系统性判成"拿不到全文"而让位给摘要降级篇。
+        for seg in cand:
+            if seg in has_ft:
+                continue
+            try:
+                if europepmc_pmcid(doi=seg.metadata.doi, pmid=seg.metadata.pmid):
+                    has_ft.append(seg)
+            except Exception:
+                pass
+        has_ft = sorted(has_ft, key=lambda s: s.priority_score, reverse=True)
         no_ft = [s for s in cand if s not in has_ft]
         chosen = (has_ft[:n] + no_ft)[:n]  # 先全文可得（已按优先级），不足补高优先级降级
         chosen = sorted(chosen, key=lambda s: s.priority_score, reverse=True)

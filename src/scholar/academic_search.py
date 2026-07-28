@@ -332,6 +332,62 @@ def enrich_from_arxiv(meta, client: httpx.Client) -> bool:
     return True
 
 
+def fetch_pubmed_by_id(doi: str = "", pmid: str = "", *, client: httpx.Client,
+                       email: str = "", tool: str = "xlbd-scholar-digest",
+                       timeout: float = 20.0) -> Optional[Dict[str, Any]]:
+    """按 DOI 或 PMID 精确查 PubMed，返回归一化 dict；无结果/异常返回 None。"""
+    pid = (pmid or "").strip()
+    if not pid:
+        doi = (doi or "").strip()
+        if not doi:
+            return None
+        params = {"db": "pubmed", "term": "{}[AID]".format(doi), "retmode": "json",
+                  "retmax": 1, "tool": tool}
+        if email:
+            params["email"] = email
+        resp = client.get("{}/esearch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
+        resp.raise_for_status()
+        ids = (resp.json().get("esearchresult") or {}).get("idlist") or []
+        if not ids:
+            return None
+        pid = ids[0]
+        time.sleep(0.34)          # NCBI 礼貌限速（<3 req/s）
+    params = {"db": "pubmed", "id": pid, "retmode": "xml", "tool": tool}
+    if email:
+        params["email"] = email
+    resp = client.get("{}/efetch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
+    resp.raise_for_status()
+    items = AcademicSearchClient.parse_pubmed(resp.text)
+    return items[0] if items else None
+
+
+def enrich_abstract_from_pubmed(meta, abstract: str, client: httpx.Client,
+                                email: str = "") -> Optional[str]:
+    """缺摘要时去 PubMed 补一份，返回补到的摘要（补不到返回 None）。
+
+    Crossref 极少给摘要、translation-server 又常回 501，临床医学论文因此会出现
+    「既无 OA 全文、又无摘要」的空正文——精读函数拿到空串直接返回 None，那篇论文
+    就完全没有精读内容。而这些论文几乎都被 PubMed 收录且带结构化摘要，补这一路
+    能把「无精读」救回「摘要级精读」。
+    """
+    if (abstract or "").strip():
+        return None
+    if not getattr(meta, "doi", None) and not getattr(meta, "pmid", None):
+        return None
+    try:
+        it = fetch_pubmed_by_id(doi=meta.doi or "", pmid=getattr(meta, "pmid", "") or "",
+                                client=client, email=email)
+    except Exception as e:
+        logger.warning("  ⚠️ PubMed 补摘要失败（{}）: {}".format(
+            meta.doi or getattr(meta, "pmid", ""), e))
+        return None
+    if not it:
+        return None
+    if it.get("pmid") and not getattr(meta, "pmid", None):
+        meta.pmid = it["pmid"]
+    return (it.get("abstract") or "").strip() or None
+
+
 def fetch_external_papers(
     arxiv_query: str,
     pubmed_query: str,

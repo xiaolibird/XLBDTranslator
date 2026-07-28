@@ -11,6 +11,7 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
 from src.scholar.academic_search import (
@@ -194,3 +195,62 @@ def test_enrich_from_arxiv_no_id_returns_false():
     meta = PaperMetadata(paper_id="p", title="x", authors=["A"], arxiv_id=None)
     client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=ARXIV_XML)))
     assert enrich_from_arxiv(meta, client) is False
+
+
+# ---------------- PubMed 补摘要（Crossref 不给摘要、translation-server 501 时的兜底） ----------------
+
+_PUBMED_XML = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+  <PMID>12345678</PMID>
+  <Article>
+    <ArticleTitle>New Criterion for AKI</ArticleTitle>
+    <Abstract><AbstractText Label="BACKGROUND">Creatinine reference change.</AbstractText>
+              <AbstractText Label="RESULTS">AUC was 0.82.</AbstractText></Abstract>
+    <AuthorList><Author><LastName>Xu</LastName><Initials>X</Initials></Author></AuthorList>
+    <Journal><ISOAbbrev>Am J Nephrol</ISOAbbrev></Journal>
+    <ELocationID EIdType="doi">10.1159/000506664</ELocationID>
+  </Article>
+</MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+
+
+def _pubmed_transport():
+    def handler(req):
+        if "esearch" in str(req.url):
+            return httpx.Response(200, json={"esearchresult": {"idlist": ["12345678"]}})
+        return httpx.Response(200, text=_PUBMED_XML)
+    return httpx.MockTransport(handler)
+
+
+def test_enrich_abstract_from_pubmed_fills_missing_abstract():
+    """回归：临床论文常「无 OA 全文 + Crossref 无摘要」，不补摘要就整篇没有精读。"""
+    from src.scholar.academic_search import enrich_abstract_from_pubmed
+    from src.scholar.schema import PaperMetadata
+    meta = PaperMetadata(paper_id="p1", title="New Criterion for AKI", doi="10.1159/000506664")
+    client = httpx.Client(transport=_pubmed_transport())
+    abs_ = enrich_abstract_from_pubmed(meta, "", client=client)
+    assert abs_ and "AUC was 0.82" in abs_
+    assert meta.pmid == "12345678"          # 顺手回填 PMID，后续 Europe PMC 可直接用
+
+
+def test_enrich_abstract_from_pubmed_skips_when_already_has_one():
+    """已有摘要就不该白发一次网络请求。"""
+    from src.scholar.academic_search import enrich_abstract_from_pubmed
+    from src.scholar.schema import PaperMetadata
+
+    def boom(req):
+        raise AssertionError("已有摘要时不应请求 PubMed")
+
+    meta = PaperMetadata(paper_id="p1", title="t", doi="10.1/x")
+    client = httpx.Client(transport=httpx.MockTransport(boom))
+    assert enrich_abstract_from_pubmed(meta, "已有摘要", client=client) is None
+
+
+def test_enrich_abstract_from_pubmed_needs_an_identifier():
+    from src.scholar.academic_search import enrich_abstract_from_pubmed
+    from src.scholar.schema import PaperMetadata
+
+    def boom(req):
+        raise AssertionError("无 DOI/PMID 时不应请求 PubMed")
+
+    meta = PaperMetadata(paper_id="p1", title="只有标题")
+    client = httpx.Client(transport=httpx.MockTransport(boom))
+    assert enrich_abstract_from_pubmed(meta, "", client=client) is None

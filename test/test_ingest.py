@@ -80,6 +80,25 @@ def test_week_label_is_accepted_by_notes_index_and_vault():
     assert month_key({"month": "2026-07-27"}) == "2026-07"
 
 
+@pytest.mark.parametrize("label,ok", [
+    ("2026-07", True),                    # 月度回填
+    ("2026-07-27", True),                 # 周札记 / 日期专题批次
+    ("2026-07-27-HuiyingLiang", True),    # 作者语料通读批次
+    ("2026-07-27-审稿人A", True),          # 批次名允许中文
+    ("2026-07-27_HuiyingLiang", False),   # 下划线是系列分隔符，不能出现在批次名里
+    ("2026年7月", False),
+])
+def test_batch_label_is_accepted_by_notes_index(label, ok):
+    """带批次名的专题札记也必须进索引——否则精读了却在文献库里检索不到。"""
+    from src.scholar.notes_index import NOTE_MD_RE
+    from src.scholar.vault import month_key
+    m = NOTE_MD_RE.match("科研札记_{}_全文精读.md".format(label))
+    assert bool(m) is ok
+    if ok:
+        assert m.group(1) == label
+        assert month_key({"month": label}) == "2026-07"   # 图谱仍折回同一个月度页
+
+
 # ---------------- B. digest 复用 ----------------
 
 def test_undecided_segments_are_never_ingested(digest_dir):
