@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.schema import ScholarSettings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
+from src.scholar.paths import repo_path  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 logger = get_logger("read_pdf")
@@ -42,6 +43,8 @@ def _load_settings(config):
     # 与既有 pipeline 一致：gemini 模型名走 deepseek provider
     if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
         settings.llm.provider = "deepseek"
+    # notes_dir 默认是相对路径，语义是「仓库里的那个目录」——锚死，别随 cwd 漂（见 paths.repo_path）
+    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
     return settings
 
 
@@ -92,7 +95,7 @@ def cmd_ingest(args):
     if len(pdfs) > len(args.pdf):
         logger.info("展开目录后共 {} 篇 PDF".format(len(pdfs)))
 
-    outs = []
+    outs, failed = [], []
     for pdf_path in pdfs:
         try:
             r = ingest_pdf(
@@ -100,40 +103,91 @@ def cmd_ingest(args):
                 model=model, email=email,
                 research_interests=proc.research_interests,
                 title_override=(args.title or "") if len(pdfs) == 1 else "",
-                index_path=notes_dir / "literature_index.json")
+                index_path=notes_dir / "literature_index.json",
+                force=args.force)
             outs.append(r)
         except Exception as e:
             logger.error("❌ ingest 失败 {}: {}".format(pdf_path.name, e))
+            failed.append((pdf_path.name, str(e)))
 
+    fresh = [r for r in outs if not r.get("skipped")]
     print("\n" + "=" * 66)
-    print("已 ingest {} 篇 → draft bundle（待 agent 亲读交叉核验）".format(len(outs)))
+    print("已 ingest {} 篇 → draft bundle（待 agent 亲读交叉核验）".format(len(fresh)))
     any_api_err = False
     for r in outs:
         print("\n📄 {}".format(r["title"]))
         print("   bundle       : {}".format(r["bundle"]))
         print("   PDF          : {}".format(r["pdf_path"]))
+        if r.get("skipped") == "final":
+            print("   ⛔ 已 final，本次跳过（未覆盖）。确需重跑：--force（会丢弃已有核验成果）")
+            continue
         print("   元数据来源    : {} | DOI={} | arXiv={}".format(
             r["meta_source"], r["doi"], r["arxiv_id"]))
+        print("   亲读范围      : {}".format(_read_plan(r.get("n_pages"))))
         print("   分块通读      : {}/{} 块成功 | 脚本草稿 {} | draft_status={}".format(
             r["chunk_ok"], r["chunks"],
             "有" if r["has_close_reading"] else "无", r["draft_status"]))
         if r["draft_status"] == "api_error":
             any_api_err = True
             print("   ⚠️ LLM API 无额度/鉴权失败：脚本草稿这一轨不可用。")
-        if r["duplicate"]:
-            d = r["duplicate"]
-            print("   ⚠️ 索引里已有同文: {} @ {}（[@{}]）——finalize 后手动深读将成为 keeper".format(
-                d["note_file"], d["month"], d["citekey"]))
     if any_api_err:
         print("\n🔁 回退协议（API 没钱）：不依赖脚本草稿，改用**两个 subagent 对抗生成**——")
         print("   Opus 亲读整本 PDF 出深读初稿 → Sonnet 亲读同一 PDF 逐条对抗核验+纠错 →")
         print("   主 agent 合并为 close_reading_final + cross_check_report（记录分歧裁决）→ finalize。")
         print("   详见 skill: read-paper 的「回退」节。")
-    elif outs:
-        print("\n下一步（agent）：亲读 PDF → 核验脚本草稿 → 写回 close_reading_final + "
+    elif fresh:
+        print("\n下一步（agent）：**按上面的「亲读范围」把 PDF 读到最后一页**"
+              "（附录里的表格常是核验关键）→ 核验脚本草稿 → 写回 close_reading_final + "
               "cross_check_report + status=final → finalize。协议见 skill: read-paper。")
+    _print_attention(outs, failed)
     print("=" * 66)
     return 0 if outs else 1
+
+
+def _read_plan(n_pages, size: int = 20) -> str:
+    """把总页数渲染成亲读窗口提示。
+
+    没有这一行时 agent 只能靠猜决定读到第几页——实际发生过读到 12 页就断言草稿引用的
+    附录表格是编造的，而那本 PDF 有 31 页、表都在后半本，每个数都对。
+    """
+    from src.scholar.pdf_ingest import read_windows
+    wins = read_windows(n_pages, size=size)
+    if not wins:
+        return "页数未知（PyMuPDF 读不出）——务必自行确认总页数后再判断草稿真伪"
+    return "{} 页 → {} 个 {} 页窗口：{}".format(
+        n_pages, len(wins), size, ", ".join("{}-{}".format(a, b) for a, b in wins))
+
+
+def _print_attention(outs, failed):
+    """把「必须有人看一眼」的事项汇总到输出最末。
+
+    单篇时散在中间也看得见，21 篇一批时必被淹掉——今天正是这样漏掉一条「索引里已有同文」，
+    白读了一篇几个月前已精读过的论文。
+    """
+    dups = [r for r in outs if r.get("duplicate")]
+    thin = [r for r in outs if not r.get("skipped")
+            and (r.get("meta_source") == "pdf-only" or not r.get("authors_n"))]
+    skipped = [r for r in outs if r.get("skipped") == "final"]
+    n = len(dups) + len(thin) + len(skipped) + len(failed)
+    if not n:
+        return
+    print("\n" + "-" * 66)
+    print("⚠️ 需要注意（{} 项）".format(n))
+    for r in dups:
+        d = r["duplicate"]
+        print("  · 索引里已有同文：{} —— {} @ {}（[@{}]）".format(
+            r["title"][:48], d["note_file"], d["month"], d["citekey"]))
+    if dups:
+        print("    → 先确认是否值得重读；继续 finalize 则手动深读成为 keeper（旧条目标 duplicate）")
+    for r in thin:
+        print("  · 元数据不全（来源 {}、作者 {} 位）：{}".format(
+            r.get("meta_source"), r.get("authors_n", 0), r["title"][:48]))
+    if thin:
+        print("    → citekey 会退化成 anon*、bibliography 缺卷期页；可加 --title \"精确标题\" 重跑")
+    for r in skipped:
+        print("  · 已 final 未覆盖：{}".format(r["title"][:48]))
+    for name, err in failed:
+        print("  · ingest 失败：{} —— {}".format(name, err[:80]))
 
 
 def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
@@ -163,8 +217,9 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     if not segments:
         logger.info("  {} 无 final bundle，跳过重建（草稿 {} 篇）".format(month, len(skipped)))
         # 仍刷一次索引（若该月手动 md 曾存在但现无 final，索引以磁盘为准）
-        write_outputs(update_index(notes_dir), notes_dir)
-        return {"month": month, "papers": 0, "skipped_drafts": skipped}
+        idx = update_index(notes_dir)
+        write_outputs(idx, notes_dir)
+        return {"month": month, "papers": 0, "skipped_drafts": skipped, "index": idx}
 
     citekeys = {seg.paper_id: None for seg in segments}
     res = write_notes(
@@ -174,9 +229,11 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         filename="科研札记_{}_手动精读".format(month),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True, index_series="manual")
-    write_outputs(update_index(notes_dir), notes_dir)
+    # 这份索引直接带给 _report_final 复用：全量重建要扫全部札记 md，跑两遍纯属白等
+    idx = update_index(notes_dir)
+    write_outputs(idx, notes_dir)
     return {"month": month, "papers": len(segments), "skipped_drafts": skipped,
-            "md": res["note_path"], "docx": res.get("docx_path")}
+            "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
 
 
 def _inject_cross_check(seg, report):
@@ -235,8 +292,10 @@ def cmd_regen(args):
 
 
 def _report_final(r, notes_dir):
-    from src.scholar.notes_index import update_index
-    idx = update_index(notes_dir)
+    idx = r.get("index")
+    if idx is None:                       # 兜底：调用方没带索引时才重建
+        from src.scholar.notes_index import update_index
+        idx = update_index(notes_dir)
     collisions = idx.get("citekey_collisions", [])
     print("\n" + "=" * 66)
     print("✅ 手动精读归档 · {}：{} 篇".format(r["month"], r["papers"]))
@@ -266,6 +325,8 @@ def main():
                        help="目录递归下钻子目录（默认只取该目录一层）")
     p_ing.add_argument("--month", default=None, help="归档月份 YYYY-MM（默认当月）")
     p_ing.add_argument("--title", default=None, help="手动覆盖标题（单篇时；元数据解析用）")
+    p_ing.add_argument("--force", action="store_true",
+                       help="覆盖已 final 的 bundle（默认跳过——覆盖会丢弃 agent 已写的核验成果）")
     p_ing.set_defaults(func=cmd_ingest)
 
     p_fin = sub.add_parser("finalize", help="从 final bundle 重建当月手动精读札记")

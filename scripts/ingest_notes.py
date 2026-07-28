@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar import ingest as ing                        # noqa: E402
+from src.scholar.paths import repo_path                         # noqa: E402
 from src.scholar.schema import ScholarSettings               # noqa: E402
 from src.utils.logger import get_logger                      # noqa: E402
 
@@ -97,6 +98,8 @@ def main() -> int:
     settings = ScholarSettings.from_env_file(cfg)
     if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
         settings.llm.provider = "deepseek"      # 与既有 pipeline 一致
+    # notes_dir 默认相对，语义是「仓库里的那个目录」——锚死，别随 cwd 漂（见 paths.repo_path）
+    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
 
     # ---- 收集候选 ----
     if args.papers:

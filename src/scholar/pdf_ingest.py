@@ -51,6 +51,29 @@ def extract_pdf_text(path: Path, max_chars: int = 1_000_000) -> str:
     return pdf_to_text(Path(path), max_chars=max_chars)
 
 
+def pdf_page_count(path: Path) -> Optional[int]:
+    """PDF 页数；读不出返回 None。
+
+    这个数必须传给 agent：亲读协议是「20 页窗口读到尾」，agent 不知道总页数就无从判断
+    自己有没有读完。实际踩过——只读到 12 页就认定草稿引用的 Table 15/21/24 是编造的，
+    而那些表在第 13 页之后的附录里，每个数都对（PDF 共 31 页）。
+    """
+    try:
+        import fitz  # PyMuPDF
+        with fitz.open(str(path)) as doc:
+            return doc.page_count
+    except Exception as e:
+        logger.warning("  ⚠️ 读取 PDF 页数失败: {}".format(e))
+        return None
+
+
+def read_windows(n_pages: Optional[int], size: int = 20) -> List[Tuple[int, int]]:
+    """把总页数切成 agent 亲读用的 [(起页, 止页)] 窗口（1-based 闭区间）。"""
+    if not n_pages or n_pages < 1:
+        return []
+    return [(s, min(s + size - 1, n_pages)) for s in range(1, n_pages + 1, size)]
+
+
 def _clean_doi(raw: str) -> str:
     d = (raw or "").strip().rstrip(").,;")
     # 去掉误粘的尾随标记（如 doi 后跟 "Received"）
@@ -222,6 +245,19 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                 from datetime import date
                 pub = date(year, 1, 1)
             t = (data.get("title") or title or "").strip()
+            # LLM 抽出的标题比「首页第一行够长的行」这种启发式干净得多（后者常抓到页眉、
+            # 会议名、作者行）。拿它再查一次 Crossref：命中就能补齐作者/年份/卷期页，
+            # 直接避免这篇落成 anon* 兜底键、bibliography 里缺卷期页。
+            if t and t.lower() != title.lower():
+                try:
+                    hit = crossref_lookup(t, email=email)
+                except Exception:
+                    hit = None
+                if hit:
+                    meta = _meta_from_crossref(hit)
+                    if arxiv_id and not meta.arxiv_id:
+                        meta.arxiv_id = arxiv_id
+                    return meta, "crossref-title"
             meta = PaperMetadata(
                 paper_id=_generate_paper_id(t, authors),
                 title=t, authors=authors,
@@ -486,11 +522,14 @@ def write_bundle(bundle_file: Path, *, status: str, month: str, pdf_path: str,
                  close_reading_script: Optional[CloseReading],
                  close_reading_final: Optional[dict] = None,
                  cross_check_report: Optional[dict] = None,
-                 draft_status: str = "ok", draft_note: str = "") -> Path:
+                 draft_status: str = "ok", draft_note: str = "",
+                 n_pages: Optional[int] = None) -> Path:
     """落盘/更新 bundle JSON。
 
     draft_status：脚本深读草稿状态——"ok"（有草稿）/ "api_error"（LLM 无额度/鉴权失败，
     应回退到 subagent 对抗生成）/ "degraded"（部分块失败）/ "empty"（无可用块）。
+
+    n_pages：PDF 总页数，给 agent 定亲读窗口用（见 pdf_page_count 的说明）。
     """
     bundle_file = Path(bundle_file)
     bundle_file.parent.mkdir(parents=True, exist_ok=True)
@@ -501,6 +540,7 @@ def write_bundle(bundle_file: Path, *, status: str, month: str, pdf_path: str,
         "draft_note": draft_note,
         "month": month,
         "pdf_path": pdf_path,
+        "n_pages": n_pages,
         "metadata_source": metadata_source,
         "paper_id": segment.paper_id,
         "segment": segment.model_dump(mode="json"),
@@ -535,22 +575,110 @@ def segment_from_bundle(data: Dict[str, Any]) -> PaperSegment:
     return seg
 
 
+def find_duplicate(index_path: Optional[Path], meta: PaperMetadata) -> Optional[Dict[str, Any]]:
+    """索引里是否已有同文（按 dedup_key）。不阻断 ingest，只把结果交给上层提示。
+
+    读索引失败**必须出声**：静默 None 与「确实没有重复」不可区分，而这条提示正是
+    发现「这篇几个月前已经精读过」的唯一途径——吞掉就等于白读一遍。
+    """
+    if not index_path or not Path(index_path).exists():
+        return None
+    try:
+        from .notes_index import dedup_key_fields
+        key = dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
+        data = json.loads(Path(index_path).read_text(encoding="utf-8"))
+        for e in data.get("papers", []):
+            if e.get("dedup_key") == key and not e.get("duplicate_of"):
+                return {"month": e.get("month"), "note_file": e.get("note_file"),
+                        "citekey": e.get("citekey")}
+    except Exception as e:
+        logger.warning("  ⚠️ 查重失败（{}: {}）——本篇是否与索引已有文献重复**未知**，请手动确认"
+                       .format(type(e).__name__, e))
+    return None
+
+
+def find_final_bundle(notes_dir: Path, month: str, pdf_path: Path,
+                      paper_id: str) -> Optional[Path]:
+    """本月是否已有一个 final bundle 在保护这篇 PDF。没有返回 None。
+
+    两条判据缺一不可：
+      · paper_id 命中——O(1)，覆盖绝大多数情况；
+      · **同一个 PDF 路径**命中——paper_id 是「标题+前三作者」的哈希，而元数据每次都要重新解析：
+        Crossref 超时、DOI 抽取粘连、LLM 抽出的标题措辞不同，都会让同一个 PDF 算出不同的
+        paper_id、落到不同的文件名。此时 paper_id 判据完全失效，靠这条兜住。
+    """
+    mdir = Path(notes_dir) / "manual" / month
+    by_id = bundle_path(notes_dir, month, paper_id)
+    if by_id.exists():
+        try:
+            if load_bundle(by_id).get("status") == "final":
+                return by_id
+        except Exception:
+            pass
+    if not mdir.is_dir():
+        return None
+    try:
+        target = Path(pdf_path).resolve()
+    except Exception:
+        return None
+    for bf in sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))):
+        if bf == by_id:
+            continue
+        try:
+            d = load_bundle(bf)
+            if d.get("status") != "final" or not d.get("pdf_path"):
+                continue
+            if Path(d["pdf_path"]).resolve() == target:
+                return bf
+        except Exception:
+            continue
+    return None
+
+
 def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
                model: Optional[str] = None, email: str = "",
                research_interests: str = "", title_override: str = "",
-               index_path: Optional[Path] = None) -> Dict[str, Any]:
-    """端到端 ingest 一篇 PDF，落 draft bundle。返回 {bundle, paper_id, meta_source, dup, chunks, ...}。"""
+               index_path: Optional[Path] = None,
+               force: bool = False) -> Dict[str, Any]:
+    """端到端 ingest 一篇 PDF，落 draft bundle。返回 {bundle, paper_id, meta_source, dup, chunks, ...}。
+
+    force=False 时**拒绝覆盖已 final 的 bundle**：bundle 路径由 paper_id（标题+作者的哈希）决定，
+    同一个 PDF 重跑必然落回同一个文件，而 write_bundle 会把 status 写回 draft 且
+    close_reading_final / cross_check_report 归 None——agent 亲读核验的成果就此静默消失。
+    拦截点放在元数据解析之后、摘要与分块通读之前，顺带省掉整篇的 LLM 开销。
+    """
     pdf_path = Path(pdf_path)
     logger.info("📄 ingest: {}".format(pdf_path.name))
     full_text = extract_pdf_text(pdf_path)
     if not full_text.strip():
         raise ValueError("PDF 抽不出文本（可能是扫描件/加密）：{}".format(pdf_path))
+    n_pages = pdf_page_count(pdf_path)
     first_pages = full_text[:12000]
     ids = extract_pdf_ids(pdf_path, first_pages)
     meta, meta_source = resolve_metadata(
         ids, llm=llm, email=email, first_pages_text=first_pages,
         title_override=title_override)
     logger.info("  元数据来源: {} | {} | DOI={}".format(meta_source, meta.title[:50], meta.doi))
+
+    bundle = bundle_path(notes_dir, month, meta.paper_id)
+    if not force:
+        guard = find_final_bundle(notes_dir, month, pdf_path, meta.paper_id)
+        if guard is not None:
+            old = load_bundle(guard)
+            logger.warning("  ⛔ 已有 final bundle，跳过（要重跑加 --force，会丢弃已有核验成果）: {}"
+                           .format(guard))
+            return {
+                "bundle": str(guard), "paper_id": old.get("paper_id") or meta.paper_id,
+                "title": meta.title,
+                "meta_source": old.get("metadata_source") or meta_source,
+                "doi": meta.doi, "arxiv_id": meta.arxiv_id,
+                "authors_n": len(meta.authors or []), "n_pages": old.get("n_pages") or n_pages,
+                "chunks": 0, "chunk_ok": 0, "has_close_reading": True,
+                "draft_status": old.get("draft_status") or "ok",
+                "pdf_path": str(pdf_path.resolve()),
+                "duplicate": find_duplicate(index_path, meta), "month": month,
+                "skipped": "final",
+            }
 
     abstract_en, abstract_zh = extract_abstract(full_text, llm)
     if not abstract_en:
@@ -575,30 +703,17 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
         draft_status, draft_note = "degraded", "汇总步失败但部分块可用"
 
     seg = build_segment(meta, abstract_en, abstract_zh, cr, one_line)
+    dup = find_duplicate(index_path, meta)
 
-    # 查已有索引里是否已有同文（不阻断，提示 agent）
-    dup = None
-    if index_path and Path(index_path).exists():
-        try:
-            from .notes_index import dedup_key_fields
-            key = dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
-            data = json.loads(Path(index_path).read_text(encoding="utf-8"))
-            for e in data.get("papers", []):
-                if e.get("dedup_key") == key and not e.get("duplicate_of"):
-                    dup = {"month": e.get("month"), "note_file": e.get("note_file"),
-                           "citekey": e.get("citekey")}
-                    break
-        except Exception:
-            pass
-
-    bundle = bundle_path(notes_dir, month, meta.paper_id)
     write_bundle(bundle, status="draft", month=month, pdf_path=str(pdf_path.resolve()),
                  metadata_source=meta_source, segment=seg, close_reading_script=cr,
-                 draft_status=draft_status, draft_note=draft_note)
+                 draft_status=draft_status, draft_note=draft_note, n_pages=n_pages)
     return {
         "bundle": str(bundle), "paper_id": meta.paper_id, "title": meta.title,
         "meta_source": meta_source, "doi": meta.doi, "arxiv_id": meta.arxiv_id,
+        "authors_n": len(meta.authors or []), "n_pages": n_pages,
         "chunks": len(chunks), "chunk_ok": n_ok,
         "has_close_reading": cr is not None, "draft_status": draft_status,
         "pdf_path": str(pdf_path.resolve()), "duplicate": dup, "month": month,
+        "skipped": None,
     }

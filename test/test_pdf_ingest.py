@@ -335,3 +335,257 @@ def test_finalize_rebuild_month(tmp_path, monkeypatch):
     idx = ni.update_index(notes_dir, full=True)
     manual = [e for e in idx["papers"] if e.get("series") == "manual"]
     assert len(manual) == 2
+
+
+# ---------------- final bundle 保护（数据安全核心）----------------
+
+def _stub_ingest_env(monkeypatch, tmp_path, title="Manual Paper", authors=("Jane Doe",)):
+    """把 ingest_pdf 的外部依赖全部打桩，只留「读磁盘上的 bundle → 决定写不写」这条主线。"""
+    monkeypatch.setattr(pi, "extract_pdf_text", lambda p, **k: "full text " * 500)
+    monkeypatch.setattr(pi, "pdf_page_count", lambda p: 31)
+    monkeypatch.setattr(pi, "extract_pdf_ids",
+                        lambda p, t="": {"doi": None, "arxiv_id": None, "title": title})
+    meta = PaperMetadata(paper_id="pm", title=title, authors=list(authors), doi="10.5/m")
+    monkeypatch.setattr(pi, "resolve_metadata",
+                        lambda ids, **k: (meta, "crossref-doi"))
+    monkeypatch.setattr(pi, "extract_abstract", lambda t, llm: ("en", "zh"))
+    monkeypatch.setattr(pi, "deep_read_chunks",
+                        lambda *a, **k: [{"_chunk": 1, "claims": ["c"]}])
+    monkeypatch.setattr(
+        pi, "synthesize_deep_read",
+        lambda *a, **k: (CloseReading(from_full_text=True, source="manual-pdf", sections=[
+            CloseReadSection(heading="研究问题", sentences=[
+                CloseReadSentence(text="脚本草稿。", tag=None)])]), "一句话", False))
+
+
+def test_ingest_refuses_to_clobber_final_bundle(tmp_path, monkeypatch):
+    """回归（数据安全）：同一个 PDF 重跑 ingest，绝不能把 agent 写好的终稿冲成 draft。
+
+    bundle 路径 = paper_id（标题+作者哈希）→ 重跑必然落回同一文件；旧实现无条件 write_bundle，
+    close_reading_final 与 cross_check_report 直接归 None，几小时的亲读核验静默蒸发。
+    """
+    _stub_ingest_env(monkeypatch, tmp_path)
+    seg = _make_segment()
+    bf = pi.bundle_path(tmp_path, "2026-07", "pm")
+    final_cr = seg.close_reading.model_dump(mode="json")
+    pi.write_bundle(bf, status="final", month="2026-07", pdf_path="/a.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=final_cr,
+                    cross_check_report={"verified_count": 42})
+    before = bf.read_bytes()
+
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-07", llm=None)
+
+    assert r["skipped"] == "final"
+    assert bf.read_bytes() == before                     # 一个字节都没动
+    data = pi.load_bundle(bf)
+    assert data["status"] == "final"
+    assert data["close_reading_final"] == final_cr
+    assert data["cross_check_report"]["verified_count"] == 42
+
+
+def test_ingest_final_guard_fires_before_expensive_llm_steps(tmp_path, monkeypatch):
+    """拦截点必须在摘要抽取与分块通读之前——21 篇重跑不该白烧一遍 LLM 额度。"""
+    _stub_ingest_env(monkeypatch, tmp_path)
+    called = []
+    monkeypatch.setattr(pi, "extract_abstract",
+                        lambda *a, **k: called.append("abstract") or ("", ""))
+    monkeypatch.setattr(pi, "deep_read_chunks",
+                        lambda *a, **k: called.append("chunks") or [])
+    seg = _make_segment()
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-07", "pm"), status="final",
+                    month="2026-07", pdf_path="/a.pdf", metadata_source="crossref-doi",
+                    segment=seg, close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+    pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-07", llm=None)
+    assert called == []
+
+
+def test_ingest_guard_survives_paper_id_drift(tmp_path, monkeypatch):
+    """回归：paper_id 变了也不能重读。
+
+    paper_id = md5(标题 + 前三作者)，而元数据每次 ingest 都重新解析——Crossref 超时、
+    DOI 抽取粘连、LLM 换个措辞，同一个 PDF 就算出另一个 paper_id、落到另一个文件名。
+    只认 paper_id 的话保护形同虚设：不是覆盖旧终稿，而是又白读一遍并留下一个孤儿 draft。
+    兜底判据是 PDF 路径。
+    """
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    _stub_ingest_env(monkeypatch, tmp_path)
+    seg = _make_segment()
+    old_bf = pi.bundle_path(tmp_path, "2026-07", "OLD_ID_FROM_LAST_RUN")
+    pi.write_bundle(old_bf, status="final", month="2026-07", pdf_path=str(pdf),
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+
+    # 本次解析出的 paper_id 与上次不同（标题措辞变了）
+    r = pi.ingest_pdf(pdf, tmp_path, "2026-07", llm=None)
+
+    assert r["skipped"] == "final"
+    assert Path(r["bundle"]) == old_bf
+    assert not pi.bundle_path(tmp_path, "2026-07", "pm").exists()   # 没留下孤儿 draft
+
+
+def test_find_final_bundle_ignores_other_pdfs_and_drafts(tmp_path):
+    seg = _make_segment()
+    other = tmp_path / "other.pdf"
+    mine = tmp_path / "mine.pdf"
+    for f in (other, mine):
+        f.write_bytes(b"%PDF")
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-07", "aaa"), status="final",
+                    month="2026-07", pdf_path=str(other), metadata_source="x",
+                    segment=seg, close_reading_script=None,
+                    close_reading_final={"sections": []})
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-07", "bbb"), status="draft",
+                    month="2026-07", pdf_path=str(mine), metadata_source="x",
+                    segment=seg, close_reading_script=None)
+    assert pi.find_final_bundle(tmp_path, "2026-07", mine, "ccc") is None
+
+
+def test_ingest_force_overwrites_final(tmp_path, monkeypatch):
+    _stub_ingest_env(monkeypatch, tmp_path)
+    seg = _make_segment()
+    bf = pi.bundle_path(tmp_path, "2026-07", "pm")
+    pi.write_bundle(bf, status="final", month="2026-07", pdf_path="/a.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-07", llm=None, force=True)
+    assert r["skipped"] is None
+    assert pi.load_bundle(bf)["status"] == "draft"
+
+
+def test_ingest_overwrites_draft_without_force(tmp_path, monkeypatch):
+    """draft 没有需要保护的人工成果，重跑照旧覆盖（否则修草稿要先删文件）。"""
+    _stub_ingest_env(monkeypatch, tmp_path)
+    seg = _make_segment()
+    bf = pi.bundle_path(tmp_path, "2026-07", "pm")
+    pi.write_bundle(bf, status="draft", month="2026-07", pdf_path="/a.pdf",
+                    metadata_source="pdf-only", segment=seg, close_reading_script=None)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-07", llm=None)
+    assert r["skipped"] is None
+    assert pi.load_bundle(bf)["metadata_source"] == "crossref-doi"
+
+
+# ---------------- 页数 / 亲读窗口 ----------------
+
+def test_read_windows_covers_last_page():
+    """回归：末窗必须盖到最后一页——差一页就可能把附录整段判成「脚本编造」。"""
+    assert pi.read_windows(31) == [(1, 20), (21, 31)]
+    assert pi.read_windows(20) == [(1, 20)]
+    assert pi.read_windows(21) == [(1, 20), (21, 21)]
+    assert pi.read_windows(1) == [(1, 1)]
+    assert pi.read_windows(46) == [(1, 20), (21, 40), (41, 46)]
+    assert pi.read_windows(46)[-1][1] == 46
+
+
+def test_read_windows_unknown_pages_is_empty_not_guessed():
+    """页数读不出时返回空——CLI 据此提示「务必自行确认」，而不是编一个 1-20 让人以为读完了。"""
+    assert pi.read_windows(None) == [] and pi.read_windows(0) == []
+
+
+def test_n_pages_written_into_bundle(tmp_path, monkeypatch):
+    _stub_ingest_env(monkeypatch, tmp_path)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-07", llm=None)
+    assert r["n_pages"] == 31
+    assert pi.load_bundle(Path(r["bundle"]))["n_pages"] == 31
+
+
+# ---------------- 查重不再静默 ----------------
+
+def test_find_duplicate_hits_by_dedup_key(tmp_path):
+    from src.scholar.notes_index import dedup_key_fields
+    meta = PaperMetadata(paper_id="pm", title="T", authors=[], doi="10.5/m")
+    key = dedup_key_fields("10.5/m", None, "T", fallback="pm")
+    ip = tmp_path / "literature_index.json"
+    ip.write_text(json.dumps({"papers": [
+        {"dedup_key": key, "month": "2026-06", "note_file": "科研札记_2026-06_手动精读.md",
+         "citekey": "old2026Key"}]}), encoding="utf-8")
+    assert pi.find_duplicate(ip, meta)["citekey"] == "old2026Key"
+
+
+def test_find_duplicate_ignores_entries_already_marked_duplicate(tmp_path):
+    from src.scholar.notes_index import dedup_key_fields
+    meta = PaperMetadata(paper_id="pm", title="T", authors=[], doi="10.5/m")
+    key = dedup_key_fields("10.5/m", None, "T", fallback="pm")
+    ip = tmp_path / "literature_index.json"
+    ip.write_text(json.dumps({"papers": [
+        {"dedup_key": key, "duplicate_of": "someone", "citekey": "dup"}]}), encoding="utf-8")
+    assert pi.find_duplicate(ip, meta) is None
+
+
+def test_find_duplicate_warns_on_broken_index(tmp_path):
+    """回归：索引读坏时必须出声——静默 None 与「确实没重复」不可区分，等于白读一篇。
+
+    日志走 loguru（caplog/capfd 都拿不到它绑定的 sink），所以临时挂一个自己的 sink 来收。
+    """
+    from loguru import logger as _lg
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        ip = tmp_path / "literature_index.json"
+        ip.write_text("{not json", encoding="utf-8")
+        meta = PaperMetadata(paper_id="pm", title="T", authors=[], doi="10.5/m")
+        assert pi.find_duplicate(ip, meta) is None
+    finally:
+        _lg.remove(sink)
+    assert any("查重失败" in s for s in lines)
+
+
+# ---------------- LLM 标题回查 Crossref（少产 anon* 键）----------------
+
+def test_llm_title_is_retried_against_crossref(monkeypatch):
+    """首行启发式标题查不中，但 LLM 抽出的干净标题能中——此时应升级为 crossref-title，
+    拿回作者/年份/卷期页，而不是留个空作者的 pdf-llm 条目落成 anon* 键。"""
+    import src.scholar.crossref as cr
+    monkeypatch.setattr(cr, "crossref_by_doi", lambda *a, **k: None)
+    hit = {"title": "Real Clean Title", "authors": ["Jane Doe", "John Roe"],
+           "journal": "JAMIA", "doi": "10.9/z", "publication_date": date(2025, 3, 1),
+           "volume": "32", "issue": "3", "pages": "e100", "url": None}
+    seen = []
+
+    def _lookup(t, **k):
+        seen.append(t)
+        return hit if t == "Real Clean Title" else None
+
+    monkeypatch.setattr(cr, "crossref_lookup", _lookup)
+    llm = _FakeLLM([json.dumps({"title": "Real Clean Title", "authors": ["X Y"],
+                                "journal": "J", "year": 2023})])
+    meta, source = pi.resolve_metadata(
+        {"doi": None, "arxiv_id": None, "title": "PROCEEDINGS OF THE 41ST CONFERENCE"},
+        llm=llm, first_pages_text="front page")
+    assert source == "crossref-title"
+    assert meta.authors == ["Jane Doe", "John Roe"] and meta.pages == "e100"
+    assert seen == ["PROCEEDINGS OF THE 41ST CONFERENCE", "Real Clean Title"]
+
+
+def test_llm_title_retry_does_not_duplicate_query_when_title_unchanged(monkeypatch):
+    import src.scholar.crossref as cr
+    monkeypatch.setattr(cr, "crossref_by_doi", lambda *a, **k: None)
+    seen = []
+    monkeypatch.setattr(cr, "crossref_lookup",
+                        lambda t, **k: seen.append(t) or None)
+    llm = _FakeLLM([json.dumps({"title": "Same Title", "authors": ["X Y"], "year": 2023})])
+    meta, source = pi.resolve_metadata(
+        {"doi": None, "arxiv_id": None, "title": "Same Title"},
+        llm=llm, first_pages_text="front page")
+    assert source == "pdf-llm" and seen == ["Same Title"]
+
+
+def test_llm_title_retry_survives_crossref_exception(monkeypatch):
+    """回查只是锦上添花——它抛异常不能把整篇 ingest 拖垮。"""
+    import src.scholar.crossref as cr
+    monkeypatch.setattr(cr, "crossref_by_doi", lambda *a, **k: None)
+
+    def _boom(t, **k):
+        if t == "LLM Title":
+            raise RuntimeError("network down")
+        return None
+
+    monkeypatch.setattr(cr, "crossref_lookup", _boom)
+    llm = _FakeLLM([json.dumps({"title": "LLM Title", "authors": ["X Y"], "year": 2023})])
+    meta, source = pi.resolve_metadata({"doi": None, "arxiv_id": None, "title": "heuristic"},
+                                       llm=llm, first_pages_text="front page")
+    assert source == "pdf-llm" and meta.title == "LLM Title"

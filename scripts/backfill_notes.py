@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.schema import ScholarSettings, DigestOutput, DigestStatus  # noqa: E402
 from src.scholar.workflow import ScholarWorkflow  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
@@ -164,6 +165,8 @@ def main():
         args.since = args.until = prev_month_label()
 
     settings = ScholarSettings.from_env_file(Path(args.config))
+    # 相对 notes_dir 锚死仓库根，别随 cwd 漂（见 paths.repo_path）
+    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
     # 并行分片：每个进程用独立 token 副本，避免多进程刷新时并发写 config/token.json 损坏
     if args.token_path:
         import shutil

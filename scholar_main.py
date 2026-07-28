@@ -28,6 +28,7 @@ def _parse_month_range(args):
         return (start, end)
     return None
 
+from src.scholar.paths import repo_path
 from src.scholar.schema import ScholarSettings
 from src.scholar.workflow import ScholarWorkflow
 from src.utils.logger import setup_logging, logger
@@ -474,6 +475,9 @@ def main():
         else:
             settings = ScholarSettings()
             logger.warning("配置文件不存在: {}，使用默认配置".format(config_path))
+        # notes_dir/output_dir 默认是相对路径，语义是「仓库里的那个目录」；不锚定的话
+        # 从别处（或 launchd 里 cwd 未设对）启动就会静默写去另一棵目录树。见 paths.repo_path
+        settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
         
         # 设置调试日志
         if args.debug:

@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.notes_index import (  # noqa: E402
     update_index, write_outputs, fix_citekey_collisions,
 )
@@ -26,7 +27,7 @@ def main():
                     help="自动修复 citekey 撞键（后出现月加 b/c 后缀，改 md+references.json）")
     args = ap.parse_args()
 
-    notes_dir = Path(args.notes_dir)
+    notes_dir = repo_path(args.notes_dir)   # 相对路径锚死仓库根，别随 cwd 漂
     if not notes_dir.is_dir():
         print("❌ 札记目录不存在: {}".format(notes_dir))
         return 1

@@ -17,14 +17,23 @@ description: 手动把一篇 PDF 文献做**深度全文精读**并归档进本�
 cd /Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
 PYTHONPATH=. python scripts/read_pdf.py ingest <pdf 路径> [--month YYYY-MM] [--title "手动标题"]
 ```
-它抽全文、拉 Crossref/arXiv 权威元数据、分块通读出**脚本草稿**，落 `output/scholar_notes/manual/<月>/<paper_id>.paper.json`（status=draft）。记下打印的 **bundle 路径**。
+它抽全文、拉 Crossref/arXiv 权威元数据、分块通读出**脚本草稿**，落 `output/scholar_notes/manual/<月>/<paper_id>.paper.json`（status=draft）。记下打印的 **bundle 路径**与 **「亲读范围」那一行**（总页数 + 20 页窗口切分，第 2 步照它读）。
+
+已 final 的 bundle **不会被覆盖**，只打印 `⛔ 已 final，本次跳过`（确需重跑加 `--force`，会丢弃已有核验成果）。
+
+输出最末的 **「⚠️ 需要注意」块** 必看：索引里已有同文（别白读一遍几个月前已精读的）、元数据不全（会退化成 `anon*` 键、书目缺卷期页，可加 `--title "精确标题"` 重跑）、ingest 失败。
 
 **看 `draft_status`**：若为 `ok`，走下面正常协议（2–5 步，你亲读核验脚本草稿）；
 若为 **`api_error`**（LLM 无额度/鉴权失败，如 DeepSeek 402），脚本草稿这一轨作废，改走「回退协议」。
 
 ### 2. 亲读整本 PDF（不可跳过）
-用 **Read 工具**按 20 页窗口**从头读到尾**读完整篇 PDF（`Read <pdf>` 带 `pages` 参数循环），
+用 **Read 工具**按 ingest 打印的「亲读范围」窗口**从头读到尾**读完整篇 PDF（`Read <pdf>` 带 `pages` 参数循环），
 **不允许**只读摘要/结论就下笔。边读边记：研究问题、方法与数据、关键数字与效应量、图表/附录要点、局限。
+
+**判草稿「编造」之前，必须先确认自己已读到最后一页。** 曾经只读到 31 页 PDF 的第 12 页，
+就断言草稿引用的 Table 15/21/24 是脚本瞎编——那些表在第 13 页之后的附录里，每个数都对。
+附录（补充表、敏感性分析、完整超参）恰恰是脚本草稿最爱引、也最容易被误判为伪造的地方。
+若「亲读范围」显示**页数未知**（PyMuPDF 读不出），自己先确认总页数再动笔。
 
 ### 3. 交叉核验（先独立、后对照）
 - 先基于**你自己的通读**写分节精读；
@@ -70,6 +79,7 @@ PYTHONPATH=. python scripts/read_pdf.py finalize <bundle 路径>
 
 ## 硬规则
 - **不得**只读摘要就精读；数字/结论必须 PDF 亲证。
+- **不得**在没读到最后一页时断言草稿造假——先核对总页数（见第 2 步）。
 - **不得**编造 PDF 里没有的引用、数据或结论。
 - 跨系统对账以 **DOI** 为论文身份（citekey 是本库兜底键）。
 - ingest 失败常见原因：PDF 是扫描件/加密（抽不出文本）——反馈用户换可选中文字的 PDF。

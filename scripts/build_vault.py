@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.scholar.paths import repo_path               # noqa: E402
 from src.scholar.vault import write_vault          # noqa: E402
 from src.scholar.notes_index import INDEX_JSON     # noqa: E402
 
@@ -39,7 +40,7 @@ def main() -> int:
     if args.neighbors < 0:
         ap.error("--neighbors 不能为负（0=关闭相似边）")
 
-    notes_dir = Path(args.notes_dir)
+    notes_dir = repo_path(args.notes_dir)   # 相对路径锚死仓库根，别随 cwd 漂
     index_path = notes_dir / INDEX_JSON
     if not index_path.exists():
         print("找不到索引：{}\n先跑：PYTHONPATH=. python scripts/notes_index.py".format(index_path),
