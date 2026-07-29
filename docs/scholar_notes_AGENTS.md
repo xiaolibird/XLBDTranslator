@@ -98,5 +98,7 @@ ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_inde
 或按 role 取证 `python scripts/notes_query.py <关键词> --role citable|refutable|method`;
 2) 按 note_file+citekey grep 定位札记原文精读节;3) 正文引用 [@citekey];
 4) 书目挂该目录 all_references.json(全库已去重合并;先确认 citekey_collisions 为空)。
+要读原文 PDF:`python scripts/locate_pdf.py <citekey|DOI|arXiv号|标题>` 直接给出本地路径
+(Zotero→札记索引→Spotlight 三级回退;退出码 1=本地没有,需去下载)。
 详细配方读该目录的 AGENTS.md。⚠️ citekey 是兜底键,跨系统对账以 DOI 为准。
 ```

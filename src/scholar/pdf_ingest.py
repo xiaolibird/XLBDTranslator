@@ -382,17 +382,22 @@ def chunk_text(full_text: str, size: int = 12000, overlap: int = 600) -> List[st
     return chunks
 
 
-_CHUNK_PROMPT = """你在为一位研究者逐块精读一篇论文（这是第 {idx}/{total} 块，可能承接上一块）。
-研究者的研究主线：
-{research_interests}
+# 注意：这一步**故意不提供**研究者画像。
+# 2026-07 实测教训：画像放在通读 prompt 顶部会形成强锚定，模型把"这段与读者相关"写成
+# "原文在讲这个"——65 篇里至少 7 次把原文的 "non-random"/"违反 MAR" 升格成 MNAR，
+# 甚至把读者自己的方法构想（"缺失条件依赖结构"）写进论文的方法节。分块通读只做客观抽取，
+# 与读者课题的关联留到 _SYNTH_PROMPT 汇总阶段再做，让"复述原文"和"主观联想"在流程上分开。
+_CHUNK_PROMPT = """你在逐块通读一篇论文（这是第 {idx}/{total} 块，可能承接上一块）。
 
-请从**这一块文本**里，抽取以下要点（只记这一块里确有的，宁缺勿造），输出 JSON：
+请从**这一块文本**里，抽取以下要点，输出 JSON。
+硬要求：**只记这一块原文里确有的内容，宁缺勿造**；用原文自己的措辞，
+不要把原文的表述换成更强或更专业的同义术语（例如原文写 "non-random" 就记 "non-random"，
+不要写成 "MNAR"；原文写"违反某假设"就照记，不要替它归类到某个理论框架）。
 {{
   "method_details": ["方法/建模/统计细节，带原文关键词或数值依据"],
   "key_numbers": ["关键数字/效应量/样本量/指标，含上下文（如 AUC=0.87, n=1200）"],
   "claims": ["作者的结论主张"],
-  "limitations": ["局限/威胁/边界条件"],
-  "relevance": ["与研究主线的关联点（方法可借鉴/发现可引用/背景）"]
+  "limitations": ["局限/威胁/边界条件"]
 }}
 
 这一块文本：
@@ -408,18 +413,18 @@ def is_credit_error(exc) -> bool:
 
 
 def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
-                     research_interests: str) -> List[Dict[str, Any]]:
+                     research_interests: str = "") -> List[Dict[str, Any]]:
     """每块一次强模型调用，产出结构化块笔记。失败块记 error 并继续（不中断整篇）。
 
     额度/鉴权类失败额外标 `_api_error`，供上层决定是否回退到 subagent 对抗生成。
+
+    `research_interests` 保留在签名里只为兼容既有调用，**本步刻意不使用**——
+    见 `_CHUNK_PROMPT` 上方注释：画像进通读 prompt 会让模型把主观关联写成原文事实。
     """
     notes: List[Dict[str, Any]] = []
     total = len(chunks)
     for i, chunk in enumerate(chunks, 1):
-        prompt = _CHUNK_PROMPT.format(
-            idx=i, total=total,
-            research_interests=research_interests or "（未提供）",
-            chunk=chunk)
+        prompt = _CHUNK_PROMPT.format(idx=i, total=total, chunk=chunk)
         try:
             resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
             data = _loads_lenient(resp)
@@ -436,8 +441,19 @@ def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
 
 
 _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结构化的深度精读，供研究者引用。
-研究者的研究主线：
+
+研究者的研究主线（**仅用于写「对我研究的联想」一节**）：
 {research_interests}
+
+⚠️ 画像的使用边界（违反会让札记库长期失真，务必遵守）：
+1. 除「对我研究的联想」外，**其余各节只能复述块笔记里确有的内容**，不得引入画像里的术语、
+   框架或方法构想。原文没出现的词（如 MNAR、缺失指纹、跨中心迁移等）就不许出现在
+   研究问题/方法与数据/结果与效应量/图表要点/局限各节里。
+2. **不要把原文措辞升格**：原文写 "non-random"、"违反 MAR 假设"、"非完全随机缺失"，
+   就照原样写，不要替它归类成 MNAR 或别的理论框架。
+3. **不要把研究者的想法写成论文提出的东西**。「对我研究的联想」里的每一句都要能看出
+   是"我由此想到"，而不是"该文提出"。
+4. 若这篇论文其实与研究主线关系不大，「对我研究的联想」写一两句实话即可，**不要硬凑关联**。
 
 逐块笔记（JSON 数组）：
 {chunk_notes}

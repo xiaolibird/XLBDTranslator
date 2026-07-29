@@ -7,6 +7,10 @@
 提供商：gemini（google-genai）与 openai-compatible（deepseek 等）。凭据缺失时回退复用
 config/config.env 的 OpenAI 兼容凭据（与原 workflow 行为一致）。
 """
+import json
+import re
+import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -20,6 +24,18 @@ logger = get_logger(__name__)
 
 class _RetryableHTTP(Exception):
     """内部：可重试的 HTTP 状态（429/5xx）。"""
+
+
+# claude CLI headless（走 Claude 订阅，不需要 API key）。DeepSeek 欠费时的主力路径。
+_AGENT_PROVIDERS = {'claude-agent', 'claude_agent', 'claude', 'agent'}
+_AGENT_TIMEOUT = 600
+# 每个 claude -p 是独立 node 实例，内存开销大；全局限并发（对齐 translator/agent.py 的做法）
+_AGENT_SEMAPHORE = threading.Semaphore(4)
+# claude 的会话历史按「工作目录」分桶。若在仓库目录下调用，流水线每跑一块就往用户
+# 本项目的 resume 列表里塞一条（一篇论文 7+ 条），把真人会话淹掉。故固定在专用目录下
+# 起子进程，历史落到独立桶里。注意：不能改用 CLAUDE_CONFIG_DIR 隔离——那会连登录态
+# 一起隔离，headless 直接报 "Not logged in"。
+_AGENT_CWD = Path.home() / '.claude-pipeline-cwd'
 
 
 class LLMClient:
@@ -37,6 +53,15 @@ class LLMClient:
 
     def _create(self) -> dict:
         provider = self.settings.provider.lower()
+
+        if provider in _AGENT_PROVIDERS:
+            import shutil
+            cli = shutil.which('claude')
+            if not cli:
+                raise ValueError(
+                    "claude CLI 未安装或不在 PATH，无法使用 claude-agent provider"
+                    "（npm install -g @anthropic-ai/claude-code）")
+            return {'cli_path': cli, 'model': self.settings.model, 'provider': 'claude-agent'}
 
         if provider == 'gemini':
             from google import genai
@@ -90,6 +115,9 @@ class LLMClient:
         last_exc = None
         for attempt in range(max_retries):
             try:
+                if provider == 'claude-agent':
+                    return self._call_agent(prompt, model or conn['model'], json_mode)
+
                 if provider == 'gemini':
                     from google.genai import types
                     cfg = dict(temperature=temp, max_output_tokens=mtok)
@@ -121,7 +149,8 @@ class LLMClient:
                     raise _RetryableHTTP("HTTP {}".format(resp.status_code))
                 resp.raise_for_status()
                 return resp.json()['choices'][0]['message']['content']
-            except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError) as e:
+            except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
+                    subprocess.TimeoutExpired) as e:
                 last_exc = e
                 if attempt < max_retries - 1:
                     time.sleep(2.0 * (2 ** attempt))  # 2s,4s,8s 退避
@@ -129,3 +158,41 @@ class LLMClient:
                 raise
         if last_exc:
             raise last_exc
+
+    # ------------------------------------------------------------------
+    # claude CLI headless：用订阅额度跑，不消耗 API key
+    # ------------------------------------------------------------------
+
+    def _call_agent(self, prompt: str, model: str, json_mode: bool) -> str:
+        conn = self.conn
+        if json_mode:
+            # claude CLI 没有原生 json_mode，靠指令约束 + 事后剥 ``` 围栏
+            prompt = prompt + "\n\n【输出要求】只输出一个合法 JSON 对象，不要任何解释文字或 Markdown 代码围栏。"
+
+        cmd = [conn['cli_path'], '-p', '--output-format', 'json', '--model', model]
+        try:
+            _AGENT_CWD.mkdir(parents=True, exist_ok=True)
+            cwd = str(_AGENT_CWD)
+        except OSError:
+            cwd = None  # 建不出来就退回默认行为，不因此让调用失败
+        with _AGENT_SEMAPHORE:
+            proc = subprocess.run(cmd, input=prompt, capture_output=True,
+                                  text=True, timeout=_AGENT_TIMEOUT, cwd=cwd)
+
+        try:
+            envelope = json.loads(proc.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise _RetryableHTTP(
+                "claude CLI 输出非 JSON（rc={}）: {}".format(proc.returncode, (proc.stderr or proc.stdout)[:200]))
+
+        if proc.returncode != 0 or envelope.get('is_error'):
+            msg = str(envelope.get('result') or proc.stderr or '')[:300]
+            # 用量上限/限流可重试；其余（如内容被拒）直接抛，避免空转
+            if any(k in msg.lower() for k in ('rate limit', 'usage limit', 'overloaded', 'timeout', '529')):
+                raise _RetryableHTTP("claude CLI 可重试错误: {}".format(msg))
+            raise RuntimeError("claude CLI 调用失败: {}".format(msg))
+
+        text = (envelope.get('result') or '').strip()
+        if json_mode and text.startswith('```'):
+            text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.S).strip()
+        return text
