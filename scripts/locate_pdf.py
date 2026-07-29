@@ -182,9 +182,32 @@ def tier3_spotlight(kind, value, title=None, arxiv_id=None):
     return sorted(candidates.values(), key=lambda c: c["score"], reverse=True)
 
 
+def tier0_citekey_filename(value):
+    """手动精读批次的 PDF 按 <citekey>.pdf 归档，直接命中即可，无需搜索。
+
+    加这一级是因为 tier3 的 Spotlight 兜底按「文件名 vs 论文标题」的 difflib 相似度排序，
+    而 citekey 文件名与标题字面差得远：实测 erickson2025Tabarena.pdf 只得 0.49，
+    反被同目录树下另一篇正文提到 TabArena 的 PDF（0.53）压过去，返回错的文件。
+    """
+    hits = []
+    for d in SEARCH_DIRS:
+        if not d.is_dir():
+            continue
+        for p in d.rglob(value + ".pdf"):
+            if p.is_file():
+                hits.append({"path": str(p), "score": 1.0, "source": "citekey-filename"})
+    return hits
+
+
 def locate(query):
     kind, value = classify(query)
     print("[locate_pdf] 识别为 {}: {}".format(kind, value), file=sys.stderr)
+
+    if kind == "citekey":
+        results = tier0_citekey_filename(value)
+        if results:
+            print("[locate_pdf] 文件名直接命中 citekey", file=sys.stderr)
+            return kind, results
 
     results = tier1_zotero(kind, value, query)
     if results:
