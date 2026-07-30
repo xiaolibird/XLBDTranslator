@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  札记库 → Obsidian vault 自动同步（launchd 用户代理）。
+
+  触发方式是 **WatchPaths 而非定时**：literature_index.json 一变就跟着重建，
+  这正是「vault 落后于札记库」这个问题的因果链——定时反而两头不靠（周期短了空转、
+  长了 vault 一直是陈的）。空转成本已被 sync_vault.py 的陈旧判定压到近零。
+
+  由 scripts/install_vault_sync.sh 安装：__REPO_ROOT__ / __PYTHON_BIN__ /
+  __LOG_DIR__ / __VAULT_DIR__ 会被替换后拷入 ~/Library/LaunchAgents/。
+
+  与另两个 job 的关系（com.xlbd.scholar-digest 周一 09:00、
+  com.xlbd.scholar-monthly-backfill 每月 1 日 21:30）：
+  - 本 job 是它们的下游。monthly 收尾会刷索引 → 文件变动 → 本 job 自动接上。
+  - 不会打架：两个上游只写 output/scholar_notes，本 job 只写 vault 目录。
+  - 复用同一 python 实体二进制，TCC 完全磁盘访问授权已由 weekly 覆盖，无需再授权。
+
+  ThrottleInterval 120：一次索引刷新会连带写 all_references.json / INDEX.md 等多个文件，
+  且裸 write_text 可能先触发一次截断态。节流 + sync_vault.py 的就绪重试共同去抖。
+
+  RunAtLoad true：睡眠/关机期间发生的索引变动 WatchPaths 抓不到，靠登录时补一次。
+  因为有陈旧判定，本就最新时这一次是秒级空转。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-vault</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/sync_vault.py</string>
+        <string>--vault-dir</string>
+        <string>__VAULT_DIR__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__</string>
+    </dict>
+
+    <!-- 索引一变就跑 -->
+    <key>WatchPaths</key>
+    <array>
+        <string>__REPO_ROOT__/output/scholar_notes/literature_index.json</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>120</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_vault.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_vault.err.log</string>
+</dict>
+</plist>
