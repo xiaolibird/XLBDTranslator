@@ -180,6 +180,19 @@ def test_select_excludes_duplicates(index):
     assert [e["citekey"] for e in V.select_papers(idx)] == ["keep"]
 
 
+def test_select_excludes_missing_key_placeholders():
+    """MISSING-KEY 占位键不得生成 vault 笔记——sidecar 写明「消费方据此过滤」，此处即消费方。"""
+    idx = {"papers": [{"citekey": "MISSING-KEY-10.1/x", "has_full_text_reading": True,
+                       "duplicate_of": None, "citekey_source": "missing"},
+                      {"citekey": "odd2024Key", "has_full_text_reading": True,
+                       "duplicate_of": None, "citekey_source": "missing"},  # 键被改过名但源头仍是占位
+                      {"citekey": "keep2025Ok", "has_full_text_reading": True,
+                       "duplicate_of": None, "citekey_source": "zotero"}]}
+    assert [e["citekey"] for e in V.select_papers(idx)] == ["keep2025Ok"]
+    # 放宽口径同样不得放行占位键
+    assert [e["citekey"] for e in V.select_papers(idx, include_maybe=True)] == ["keep2025Ok"]
+
+
 # ---------------- C. frontmatter ----------------
 
 def test_frontmatter_roundtrips_through_yaml(index):

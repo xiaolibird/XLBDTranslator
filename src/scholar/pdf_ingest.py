@@ -14,6 +14,9 @@ academic_search.fetch_arxiv_by_id、fulltext.ipv4_client、schema.PaperSegment/P
 import hashlib
 import json
 import re
+import threading
+# CancelledError 自 py3.8 起继承 BaseException，except Exception 接不住，须显式捕获
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -413,30 +416,66 @@ def is_credit_error(exc) -> bool:
 
 
 def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
-                     research_interests: str = "") -> List[Dict[str, Any]]:
+                     research_interests: str = "",
+                     max_workers: int = 4) -> List[Dict[str, Any]]:
     """每块一次强模型调用，产出结构化块笔记。失败块记 error 并继续（不中断整篇）。
 
     额度/鉴权类失败额外标 `_api_error`，供上层决定是否回退到 subagent 对抗生成。
 
     `research_interests` 保留在签名里只为兼容既有调用，**本步刻意不使用**——
     见 `_CHUNK_PROMPT` 上方注释：画像进通读 prompt 会让模型把主观关联写成原文事实。
+
+    各块相互独立，用线程池并发（`max_workers=4`，与 llm_client 的 _AGENT_SEMAPHORE
+    对齐；回退串行传 1 即可）。结果按块序号回填后依序拼装，输出与串行版逐块一致。
+    遇 402/401 类致命错误时取消未开始的块避免空转，但被取消块仍按块号补
+    `{"_chunk": i, "_error": True, "_api_error": True}` 占位——下游 ingest_pdf 靠
+    notes 长度与 n_ok/n_api 计数判 draft_status="api_error"，占位保证判定不漂移
+    （串行版遇 402 会把每一块都试一遍并逐块记 _api_error，语义等价）。
     """
-    notes: List[Dict[str, Any]] = []
     total = len(chunks)
-    for i, chunk in enumerate(chunks, 1):
+    fatal_evt = threading.Event()  # 402/401 类致命错误：所有后续调用只会重复烧钱空转
+
+    def _read_one(i: int, chunk: str) -> Dict[str, Any]:
+        # 主线程的 cancel() 与线程池取下一个任务之间有竞态（快调用时 cancel 常常
+        # 赶不上）；worker 自己查事件短路，保证致命错误后不再发起任何 LLM 调用
+        if fatal_evt.is_set():
+            return {"_chunk": i, "_error": True, "_api_error": True}
         prompt = _CHUNK_PROMPT.format(idx=i, total=total, chunk=chunk)
         try:
             resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
-            data = _loads_lenient(resp)
-            if isinstance(data, dict):
-                data["_chunk"] = i
-                notes.append(data)
-                logger.info("  📖 通读块 {}/{} ✓".format(i, total))
-                continue
-            notes.append({"_chunk": i, "_error": True})
         except Exception as e:
             logger.warning("  ⚠️ 通读块 {}/{} 失败: {}".format(i, total, e))
-            notes.append({"_chunk": i, "_error": True, "_api_error": is_credit_error(e)})
+            api = is_credit_error(e)
+            if api:
+                fatal_evt.set()
+            return {"_chunk": i, "_error": True, "_api_error": api}
+        data = _loads_lenient(resp)
+        if isinstance(data, dict):
+            data["_chunk"] = i
+            logger.info("  📖 通读块 {}/{} ✓".format(i, total))
+            return data
+        return {"_chunk": i, "_error": True}
+
+    results: Dict[int, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_read_one, i, chunk): i
+                   for i, chunk in enumerate(chunks, 1)}
+        cancelled = False
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except CancelledError:
+                continue  # 被取消的块收尾统一补占位
+            if not cancelled and results[i].get("_api_error"):
+                cancelled = True  # 未开始的 future 直接取消（事件短路兜底竞态窗口）
+                for f in futures:
+                    f.cancel()
+
+    notes: List[Dict[str, Any]] = []
+    for i in range(1, total + 1):
+        # 被取消/未运行的块补占位条目（见 docstring 的致命路径契约）
+        notes.append(results.get(i) or {"_chunk": i, "_error": True, "_api_error": True})
     return notes
 
 
@@ -698,7 +737,9 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
 
     abstract_en, abstract_zh = extract_abstract(full_text, llm)
     if not abstract_en:
-        abstract_en = meta.title  # 兜底不留空
+        # 不拿标题冒充摘要：占位值与标题一字不差、无任何标记，读者无从分辨降级。
+        # schema 里 original_abstract 默认空串是安全的，notes.py 渲染层会显式落成 *摘要暂无*。
+        logger.warning("  摘要抽取失败，札记将显示摘要暂无")
 
     chunks = chunk_text(full_text)
     logger.info("  分块通读: {} 块（全文 {} 字符）".format(len(chunks), len(full_text)))

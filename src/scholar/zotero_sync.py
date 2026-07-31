@@ -417,24 +417,26 @@ def sync_segments_to_zotero(
         # 1) + 2) 解析 OA + 构造 item + 一次性写入（notes-only 时跳过）
         if write_to_zotero:
             items: List[Dict[str, Any]] = []
-            for seg in segments:
-                oa = None
-                if attach_pdf:
-                    oa = resolve_oa_pdf(seg.metadata, email=email)
-                    results[seg.paper_id].oa_status = oa.oa_status
-                    results[seg.paper_id].pdf_url = oa.pdf_url
-                ts_item = ts_items.get(seg.paper_id)
-                if ts_item:
-                    # 权威 item：加我们的标签 + OA 附件 + 摘要
-                    item = _augment_translator_item(ts_item, seg, oa)
-                else:
-                    item = paper_to_zotero_item(
-                        seg.metadata,
-                        abstract=seg.original_abstract,
-                        oa=oa,
-                        extra_tags=decision_tags(seg),
-                    )
-                items.append(item)
+            # 与上面 Crossref 增强阶段同一写法：整批共享连接，别对 Unpaywall 逐篇重建 TLS
+            with ipv4_client(timeout=timeout) as xc:
+                for seg in segments:
+                    oa = None
+                    if attach_pdf:
+                        oa = resolve_oa_pdf(seg.metadata, email=email, client=xc)
+                        results[seg.paper_id].oa_status = oa.oa_status
+                        results[seg.paper_id].pdf_url = oa.pdf_url
+                    ts_item = ts_items.get(seg.paper_id)
+                    if ts_item:
+                        # 权威 item：加我们的标签 + OA 附件 + 摘要
+                        item = _augment_translator_item(ts_item, seg, oa)
+                    else:
+                        item = paper_to_zotero_item(
+                            seg.metadata,
+                            abstract=seg.original_abstract,
+                            oa=oa,
+                            extra_tags=decision_tags(seg),
+                        )
+                    items.append(item)
 
             saved = c.save_items(items)
             for seg in segments:

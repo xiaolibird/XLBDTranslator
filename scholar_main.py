@@ -6,10 +6,25 @@ Scholar Digest 主入口
 """
 import os
 import sys
+import json
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import date, timedelta
 import traceback
+
+
+def notify(title, text):
+    """失败时弹系统通知（同 scripts/backfill_notes.py，本文件内复制以免跨脚本 import）。
+    launchd 周一 09:00 无人值守跑 digest，失败只落 err.log 无人翻——Gmail 凭据/TCC
+    路径问题历史上真实发生过。osascript 不可用就静默，告警本身不该把任务再弄挂。"""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
+            capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def _parse_month_range(args):
@@ -304,6 +319,8 @@ def run_zotero_sync(args, settings):
             segments, proc.research_interests, LLMClient(settings.llm),
             top_n=proc.closeread_top_n, email=email,
             model=(settings.llm.closeread_model or settings.llm.model),
+            deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+            max_chunks=proc.closeread_max_chunks,
         )
 
     # 聚合札记：一个时间窗一篇，文件名取 digest 输入名
@@ -498,10 +515,12 @@ def main():
     except FileNotFoundError as e:
         logger.error("文件未找到: {}".format(e))
         logger.error("   请确保 Gmail API 凭据文件存在")
+        notify("Scholar digest 失败", "文件未找到（疑似 Gmail 凭据/TCC）：{}".format(str(e)[:200]))
         sys.exit(1)
     except Exception as e:
         logger.critical("发生错误: {}".format(e))
         traceback.print_exc()
+        notify("Scholar digest 失败", "{}: {}".format(type(e).__name__, str(e)[:200]))
         sys.exit(1)
     finally:
         logger.info("系统关闭。")

@@ -11,6 +11,7 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from datetime import datetime, date
 import json
+import os
 
 
 class DigestStatus(str, Enum):
@@ -211,11 +212,12 @@ class FilterDecision(BaseModel):
     """单篇论文的过滤裁决记录（写入 excluded sidecar，保证可审计性）
 
     方法学审稿三态：decision(INCLUDE/MAYBE/EXCLUDE) + bucket/flags/role/one_line/confidence。
-    verdict 保留为二值（included/excluded）以兼容旧 sidecar 消费方：INCLUDE/MAYBE→included，EXCLUDE→excluded。
+    verdict 兼容旧 sidecar 消费方：INCLUDE/MAYBE→included，EXCLUDE→excluded；
+    undecided 仅用于 LLM 裁决失败的关键词回退——白名单未命中≠确认无关，不能冒充 excluded。
     """
     paper_id: str = Field(description="论文唯一标识")
     title: str = Field(description="论文标题")
-    verdict: Literal["included", "excluded"] = Field(description="二值裁决（向后兼容）")
+    verdict: Literal["included", "excluded", "undecided"] = Field(description="裁决结论（向后兼容二值 + 回退未决态）")
     decision: Optional[Literal["INCLUDE", "MAYBE", "EXCLUDE"]] = Field(
         None, description="三态裁决（LLM 方法学审稿；关键词阶段为 None）"
     )
@@ -280,6 +282,24 @@ class CloseReading(BaseModel):
     source: Optional[str] = Field(None, description="全文来源：arxiv/unpaywall/abstract")
     read_at: datetime = Field(default_factory=datetime.now, description="精读时间")
 
+    # ---- 阅读深度量尺（全部 Optional 且默认 None：老 bundle / 老 digest JSON 反序列化不炸）----
+    # 这几个字段只回答一个问题：这篇的「精读」到底喂进去了多少正文、有没有被截断、读了几跳。
+    # 不装这把尺子就只能靠事后数 highlights 猜深浅，auto 薄输出会被静默当成正常精读。
+    body_chars: Optional[int] = Field(None, description="真正喂进 LLM 的正文字符数")
+    # body_chars_raw 的语义只有一条：抽取源的全部原始长度，**不受单页上限(page_max_chars)影响**，
+    # 也不受 max_chars 截断影响。cap 之后的长度已由 body_chars 表达；raw 若也按 cap 收，
+    # truncated 会自证为假（raw == body_chars 恒成立），量尺就废了。
+    # 边界：EPMC 路线仅当文章正文超过 2,000,000 字符时 body_chars_raw 退化为下界。
+    body_chars_raw: Optional[int] = Field(None, description="抽取到的原始正文长度（未经任何截断）")
+    truncated: Optional[bool] = Field(None, description="正文是否被截断：body_chars_raw > body_chars")
+    n_chunks: Optional[int] = Field(None, description="分块精读的块数（单跳为 1）")
+    # reading_depth 四态（与 AGENTS.md 逐字一致，不得有第二套定义）：
+    #   'chunked'        = manual 全部 + 开关打开后的 auto
+    #   'single-call'    = auto 单跳
+    #   'unknown-legacy' = 仅 auto 存量条目（由回填写入）
+    #   缺失 / None      = 只可能出现在 has_full_text_reading == false 的非精读条目上
+    reading_depth: Optional[str] = Field(None, description="阅读深度：single-call / chunked / unknown-legacy")
+
 
 # 解析 PaperSegment 的前向引用（FilterDecision / CloseReading 定义在其后）
 PaperSegment.model_rebuild()
@@ -342,6 +362,11 @@ class DigestOutput(BaseModel):
     
     # 内容
     segments: List[PaperSegment] = Field(default_factory=list, description="论文片段列表")
+    # LLM 裁决失败回退时白名单未命中的论文：单独成列，segments 全链只含 included，
+    # 下游消费方（enrich/close_read/write_notes/zotero）结构上碰不到未决论文；旧 digest JSON 无此字段可正常加载。
+    undecided_segments: List[PaperSegment] = Field(
+        default_factory=list, description="待人工复核的论文（LLM 裁决失败且未命中白名单）"
+    )
     emails_processed: List[EmailMetadata] = Field(default_factory=list, description="已处理的邮件列表")
     
     # 统计
@@ -378,10 +403,14 @@ class DigestOutput(BaseModel):
         """保存到JSON文件"""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
+
+        # tmp+replace 原子写（同 merge_final.py）：digest JSON 是周度入库唯一裁决来源，
+        # 半写文件会让整周论文静默不入库；一处改动同时保护 Step 4 首写与 Step 4.5 精读回写
+        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(self.model_dump(mode='json'), f, ensure_ascii=False, indent=2, default=str)
-        
+        os.replace(tmp_path, output_path)
+
         return output_path
 
     @classmethod
@@ -458,9 +487,27 @@ class DigestOutput(BaseModel):
             
             if seg.summary:
                 lines.extend(["", "#### AI总结", "", seg.summary])
-            
+
             lines.extend(["", "---", ""])
-        
+
+        # 回退未决论文必须在人读的 digest 里显式露出（此前只藏在 sidecar，等于静默丢弃）
+        if self.undecided_segments:
+            lines.extend(["## 待人工复核（LLM 裁决失败回退）", ""])
+            for i, seg in enumerate(self.undecided_segments, 1):
+                meta = seg.metadata
+                lines.append("### {}. {}".format(i, meta.title))
+                lines.append("")
+                if meta.source_type and meta.source_type != "unknown":
+                    lines.append("**来源**: {}".format(meta.source_type))
+                if meta.doi:
+                    lines.append("**DOI**: [{0}](https://doi.org/{0})".format(meta.doi))
+                elif meta.url:
+                    lines.append("**链接**: {}".format(meta.url))
+                fd = seg.filter_decision
+                if fd and fd.reason:
+                    lines.append("**原因**: {}".format(fd.reason))
+                lines.extend(["", "---", ""])
+
         return "\n".join(lines)
 
 
@@ -672,6 +719,27 @@ class ProcessingSettings(BaseModel):
         5,
         validation_alias=AliasChoices("closeread_top_n", "CLOSEREAD_TOP_N"),
         description="每次精读覆盖的高优先级论文数（控成本）"
+    )
+    # 分块深读（复用 manual 精读的 chunk→synth 通路）。**默认关**：它是唯一真正抬高
+    # 无人值守产线成本的开关（单批 top_n=5 约 42 次 LLM 调用，最坏 65 次），
+    # 不打开则全部产线行为与今天逐字节一致，回退 = 把开关关回去。
+    closeread_deep: bool = Field(
+        False,
+        validation_alias=AliasChoices("closeread_deep", "CLOSEREAD_DEEP"),
+        description="精读是否走分块深读（切块逐块通读 + 汇总），关闭则维持单跳精读"
+    )
+    # 120000 的依据：263 篇实测正文长度 p75=100,086、p90=128,272，120k 覆盖 p75；
+    # 该上限下实测最坏块数 11，正好被下面 12 的块顶卡住（两个数是配套的，改一个要重算另一个）。
+    closeread_max_chars: int = Field(
+        120000,
+        validation_alias=AliasChoices("closeread_max_chars", "CLOSEREAD_MAX_CHARS"),
+        description="深读模式下喂进模型的正文上限（仅 closeread_deep=True 生效；"
+                    "关闭时一律沿用 AUTO_MAX_CHARS=40000）"
+    )
+    closeread_max_chunks: int = Field(
+        12,
+        validation_alias=AliasChoices("closeread_max_chunks", "CLOSEREAD_MAX_CHUNKS"),
+        description="深读模式下的块数硬顶（防病态长 PDF 切出几十块吃掉整夜窗口）"
     )
     # 样式化 docx 输出
     notes_emit_docx: bool = Field(

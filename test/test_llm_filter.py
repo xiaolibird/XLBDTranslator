@@ -6,6 +6,7 @@
 2. 白名单裁决支持 llm / keyword 两种模式，llm 模式下每次裁决
    （判定+理由+模型+prompt 版本）都写入 excluded sidecar；
 3. LLM 单批失败/单篇缺失时回退关键词白名单，不中断整体流程；
+   回退时白名单未命中不得静默 EXCLUDE——挂 undecided 进 DigestOutput.undecided_segments 待人工复核；
 4. scholar_main 不再硬编码覆盖 env 配置的黑白名单。
 
 全部 mock LLM 调用，不发真实请求、不涉及真实密钥。
@@ -198,6 +199,55 @@ def test_filter_by_llm_batch_failure_falls_back(tmp_path, monkeypatch):
     assert wf.included_decisions[0].stage == "keyword_fallback"
     assert wf.excluded[0]["stage"] == "keyword_fallback"
     assert wf._filter_fallback_count == 2
+
+
+def test_filter_by_llm_batch_failure_undecided_not_excluded(tmp_path, monkeypatch):
+    """LLM 整批失败：未命中白名单不再静默 EXCLUDE，进 undecided_segments 待人工复核"""
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    wf.segments = [
+        _make_paper(1, "EHR risk prediction"),
+        _make_paper(2, "Quasar spectroscopy"),
+    ]
+
+    def boom(prompt, model=None):
+        raise RuntimeError("API down")
+
+    monkeypatch.setattr(wf, "_call_llm", boom)
+    wf._step_filter_papers()
+    output = wf._step_generate_output()
+
+    # 命中白名单者照常入选；未命中者进独立待复核队列，结构上不进 segments
+    assert [p.paper_id for p in output.segments] == ["paper_1"]
+    assert [p.paper_id for p in output.undecided_segments] == ["paper_2"]
+    assert output.undecided_segments[0].filter_decision.verdict == "undecided"
+
+    # sidecar 仍固化该论文供审计，但 keyword_fallback 路径不得再产生 excluded 裁决
+    sidecar = json.loads(
+        (wf.output_dir / "{}_excluded.json".format(wf.run_id)).read_text(encoding="utf-8"))
+    rec = next(p for p in sidecar["papers"] if p["paper_id"] == "paper_2")
+    assert rec["stage"] == "keyword_fallback"
+    assert rec["decision"]["verdict"] == "undecided"
+    assert not any(
+        p["stage"] == "keyword_fallback" and p["decision"]["verdict"] == "excluded"
+        for p in sidecar["papers"]
+    )
+
+    # digest markdown 显式露出待复核小节（含标题与原因）
+    md = output.to_markdown()
+    assert "待人工复核" in md
+    assert "Quasar spectroscopy" in md
+    assert "LLM 裁决失败且未命中白名单" in md
+
+    # stats 记录 undecided_count
+    stats = json.loads(
+        (wf.output_dir / "{}_stats.json".format(wf.run_id)).read_text(encoding="utf-8"))
+    assert stats["undecided_count"] == 1
+
+    # 固化 JSON 可正常 round-trip（undecided_segments 随 digest 落盘）
+    from src.scholar.schema import DigestOutput
+    reloaded = DigestOutput.load_from_file(wf.output_dir / "{}.json".format(wf.run_id))
+    assert [p.paper_id for p in reloaded.undecided_segments] == ["paper_2"]
 
 
 # ==================== 响应解析 ====================

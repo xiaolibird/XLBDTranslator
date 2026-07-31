@@ -11,6 +11,7 @@
 本模块即权威实现，backfill delegate 到这里。重复条目不删除，标 `duplicate_of` 供消费方过滤。
 """
 import json
+import os
 import re
 from itertools import product
 from datetime import datetime
@@ -21,7 +22,12 @@ from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 3   # v3：条目加 highlights[]（句级角色可调取）；tag_counts 归一到 role slug
+# v4：条目加阅读深度量尺 fulltext_chars / fulltext_chars_raw / fulltext_truncated / reading_depth。
+# reading_depth 四态（与 AGENTS.md 逐字一致）：'chunked' = manual 全部 + 开关打开后的 auto；
+# 'single-call' = auto 单跳；'unknown-legacy' = 仅 auto 存量条目（由回填写入）；
+# 键缺失或 null 只可能出现在 has_full_text_reading == false 的非精读条目上。
+# fulltext_truncated：缺失 = 未知，false = 确认未截断——下游禁止把「缺失」当作「未截断」。
+SCHEMA_VERSION = 4
 INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"
 AGENTS_MD = "AGENTS.md"
@@ -108,6 +114,17 @@ def _collect_highlights(triples):
 
 # ---------------- 从内存对象构造条目（write_notes sidecar 复用，无损） ----------------
 
+def _reading_depth(cr, series: str) -> Optional[str]:
+    """条目的阅读深度。manual 链路必须兜住：pdf_ingest.synthesize_deep_read 不写 reading_depth，
+    而 manual 正是全库读得最深的一批（逐块深读）；不兜的话量尺上最深的条目反倒落成 null。
+    """
+    if cr is None:
+        return None
+    if series == "manual" or cr.source == "manual-pdf":
+        return getattr(cr, "reading_depth", None) or "chunked"
+    return getattr(cr, "reading_depth", None)
+
+
 def entry_from_segment(seg, citekey: str, rank: int, total: int,
                        citekey_source: str = "fallback",
                        series: str = "auto") -> Dict[str, Any]:
@@ -151,6 +168,10 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "flags": list(fd.flags) if fd and fd.flags else [],
         "has_full_text_reading": bool(cr and cr.from_full_text),
         "reading_source": (cr.source if cr else None),
+        "fulltext_chars": (cr.body_chars if cr else None),
+        "fulltext_chars_raw": (cr.body_chars_raw if cr else None),
+        "fulltext_truncated": (cr.truncated if cr else None),
+        "reading_depth": _reading_depth(cr, series),
         "tag_counts": tag_counts,
         "highlights": highlights,
         "dedup_key": dedup_key_fields(meta.doi, meta.arxiv_id, meta.title,
@@ -367,6 +388,21 @@ def build_month_entries(month: str, md_path: Path,
     for e in entries:
         e["month"] = month
         e["series"] = series          # 文件名权威（覆盖 sidecar/md 默认）
+        # 存量精读条目回填 reading_depth（两条并列的对称规则；series 已由文件名权威定死）。
+        # 不重跑任何存量精读——只在量尺上标出「这批读到什么程度」，让下游能显式区分两代札记。
+        # (a) auto 存量：既没有 reading_depth 又确实做过精读的，只可能是加分块开关之前跑的单跳，
+        #     且当时的正文上限会把长文砍在前 40k 字符 —— 深度不可考，标 'unknown-legacy'。
+        # (b) manual：pdf_ingest 的 synthesize_deep_read 只写 from_full_text/model/source，
+        #     从不写 reading_depth，但它按构造就是 chunk_text + deep_read_chunks 的分块深读；
+        #     不兜的话全库读得最深的这批会和 auto 存量一起沉在「无值」里，与 has_full_text_reading
+        #     直接打架。与 entry_from_segment 的 _reading_depth() 同一口径。
+        # 两条规则都只补 reading_depth：fulltext_chars / fulltext_chars_raw / fulltext_truncated
+        # 一律保持缺失（缺失=未知）——猜填 false 会让「确认未截断」和「不知道」混为一谈。
+        if "reading_depth" not in e:
+            if series == "manual":
+                e["reading_depth"] = "chunked"
+            elif series == "auto" and e.get("has_full_text_reading"):
+                e["reading_depth"] = "unknown-legacy"
         e["note_file"] = Path(md_path).name
         e["references_json"] = Path(ref_path).name if has_refs else None
         e["_source"] = source
@@ -533,7 +569,11 @@ def write_if_changed(path: Path, content: str) -> bool:
     except Exception:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # tmp+replace 原子写（同 merge_final.py）：all_references.json 等经此落盘，
+    # 半写 JSON 会直接毒害 pandoc/vault 消费方；tmp 同目录避免跨设备 replace
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
     return True
 
 
@@ -622,6 +662,16 @@ def _fallback_csl(entry: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
+def is_missing_citekey(entry: Dict[str, Any]) -> bool:
+    """该条目的 citekey 是否为 MISSING-KEY 占位键（write_notes 未开 fallback_citekeys 的兜底）。
+
+    notes.py 写 sidecar 时承诺「消费方据此过滤」——占位键不对应任何真实文献，
+    进全局书目/vault 只会渲染成 [@MISSING-KEY-...] 死引用，消费方必须在此拦截。
+    """
+    key = entry.get("citekey") or ""
+    return key.startswith("MISSING-KEY-") or entry.get("citekey_source") == "missing"
+
+
 def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[str, Any]]:
     """合并全部月度 references.json → 全局 CSL-JSON 书目（按 id 排序）。
 
@@ -648,8 +698,12 @@ def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[st
     csl_cache: Dict[str, List[Dict[str, Any]]] = {}
     merged: Dict[str, Dict[str, Any]] = {}
     fallbacks: List[str] = []
+    missing: List[str] = []
     for e in index["papers"]:
         if e.get("duplicate_of") or not e.get("citekey"):
+            continue
+        if is_missing_citekey(e):
+            missing.append("{}@{}".format(e["citekey"], e.get("month") or "?"))
             continue
         key = e["citekey"]
         if key in dropped or key in merged:
@@ -672,6 +726,11 @@ def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[st
                        "（缺卷期页、作者可能被 md 的 et al. 截断）：{}{}".format(
                            len(fallbacks), ", ".join(fallbacks[:8]),
                            " …" if len(fallbacks) > 8 else ""))
+    if missing:
+        logger.warning("  ⚠️ all_references：{} 条 MISSING-KEY 占位条目已跳过"
+                       "（Zotero/BBT 当时未解析出 citekey；补键重跑索引后自动收录）：{}{}".format(
+                           len(missing), ", ".join(missing[:8]),
+                           " …" if len(missing) > 8 else ""))
     return [merged[k] for k in sorted(merged)]
 
 
@@ -692,7 +751,10 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
     else:
         wrote["index_json"] = True
     if wrote["index_json"]:
-        index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 索引是跨运行去重的真理源，截断即触发 load_seen_keys fail-fast——原子写掉
+        tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, index_path)
 
     md = build_index_md(index)
     old_md = (notes_dir / INDEX_MD)
@@ -843,8 +905,11 @@ def load_seen_keys(index_path: Path,
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
-        logger.warning("  ⚠️ 读索引失败，去重集置空: {}".format(e))
-        return set()
+        # 索引存在却读不出来时以空集继续会让整窗论文重复入库——比中止更难收拾，
+        # 宁可让 backfill/ingest fail-fast，人工修好索引再跑
+        raise RuntimeError(
+            "文献索引 {} 存在但解析失败（{}），拒绝以空去重集继续入库".format(p, e)
+        ) from e
     papers = [e for e in data.get("papers", []) if e.get("dedup_key")]
     excl_months = exclude_months or set()
     # 缺 series 字段的旧条目按 auto 处理（向后兼容）

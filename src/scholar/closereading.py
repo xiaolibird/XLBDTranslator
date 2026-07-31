@@ -26,6 +26,14 @@ _VALID_TAGS = {"可引用证据", "可反驳观点", "方法论借鉴"}
 
 # ---------------- PDF 下载 + 抽文本 ----------------
 
+# auto 精读的抽文本预算：总量 40000 字符，单页最多 20000 字符。
+# 单页上限的依据：本地 4829 页实测 median 3940 / p99 12852，超过 20000 的只有 16 页（0.33%），
+# 全是图表矢量文字层的病态页——一页就能吃光整篇预算，让精读永远读不到正文后半。
+# 取 20000 而非更小值是为了不误伤正常长页；把覆盖面推到后半篇是总预算的职责，不靠压低单页上限硬挤。
+AUTO_MAX_CHARS = 40000
+AUTO_PAGE_MAX_CHARS = 20000
+
+
 def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
                  max_bytes: int = 40_000_000) -> Optional[Path]:
     """下载 PDF 到 dest。非 200 / 非 PDF / 超限 / 异常 → None（不抛出）。"""
@@ -60,29 +68,53 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
                 pass
 
 
-def pdf_to_text(path: Path, max_chars: int = 40000) -> str:
-    """用 PyMuPDF(fitz) 抽全文纯文本，截断到 max_chars。失败返回空串。"""
+def _pdf_text_with_stats(path: Path, max_chars: int = 40000,
+                         page_max_chars: Optional[int] = None):
+    """抽全文并同时给出「原始长度」：返回 (text, raw_chars)。失败返回 ("", 0)。
+
+    raw_chars = 全部页 get_text 的原长之和，**不受 page_max_chars / max_chars 影响**——
+    它要回答的是「这篇论文有多长」，而 text 回答的是「我们喂进去多少」，二者相减才是截断量。
+    若 raw 也按单页上限收，truncated 判定会自证为假（cap 后的长度 == 喂进去的长度）。
+    只遍历一次 PDF：抽两遍要多付一次解析开销，且两次结果不保证逐字节一致。
+    """
     try:
         import fitz  # PyMuPDF
     except Exception as e:
         logger.warning("  ⚠️ 未安装 PyMuPDF，无法抽全文: {}".format(e))
-        return ""
+        return "", 0
     try:
         parts = []
-        total = 0
+        raw_chars = 0
+        # 不再在页循环里按累计长度提前 break：读完所有页、末尾统一截断。
+        # 对输出逐字节无影响（原 break 发生在越界页 append 之后），但让后续统计能拿到全页原始长度。
         with fitz.open(str(path)) as doc:
             for page in doc:
                 t = page.get_text("text", sort=True)
                 if not t:
                     continue
+                raw_chars += len(t)          # 先记原长，再做任何截断
+                if page_max_chars is not None:
+                    t = t[:page_max_chars]
                 parts.append(t)
-                total += len(t)
-                if total >= max_chars:
-                    break
-        return "".join(parts)[:max_chars]
+        return "".join(parts)[:max_chars], raw_chars
     except Exception as e:
         logger.warning("  ⚠️ 抽全文失败({}): {}".format(path, e))
-        return ""
+        return "", 0
+
+
+def pdf_to_text(path: Path, max_chars: int = 40000,
+                page_max_chars: Optional[int] = None) -> str:
+    """用 PyMuPDF(fitz) 抽全文纯文本，截断到 max_chars。失败返回空串。
+
+    page_max_chars 非 None 时，每页先截到该上限再拼接：避免单张图表矢量文字层页
+    （实测有 45000+ 字符的病态页）把整篇预算吃光，导致精读只覆盖到论文最前面几页。
+    默认 None = 保持原有单页语义，manual 链路（pdf_ingest.extract_pdf_text）不传即行为不变，
+    分块边界不漂移、历史札记与新札记可比。
+
+    薄包装：真正的抽取在 _pdf_text_with_stats，签名与返回类型保持向后兼容。
+    """
+    return _pdf_text_with_stats(path, max_chars=max_chars,
+                                page_max_chars=page_max_chars)[0]
 
 
 # ---------------- 精读 prompt + 解析 ----------------
@@ -158,8 +190,12 @@ def parse_closeread(response: str) -> Optional[CloseReading]:
 
 def close_read(seg: PaperSegment, body_text: str, research_interests: str,
                llm, model: Optional[str] = None, from_full_text: bool = True,
-               source: Optional[str] = None) -> Optional[CloseReading]:
-    """对单篇论文做精读。llm 为 LLMClient；body_text 为全文或摘要。失败返回 None。"""
+               source: Optional[str] = None,
+               raw_chars: Optional[int] = None) -> Optional[CloseReading]:
+    """对单篇论文做精读。llm 为 LLMClient；body_text 为全文或摘要。失败返回 None。
+
+    raw_chars 为抽取源的原始长度（未截断），由调用方从抽取环节透传；None = 未知。
+    """
     if not body_text or not body_text.strip():
         # 既无 OA 全文又无摘要 → 这篇在札记里会整篇没有精读内容。别静默，否则
         # 只能靠事后数 highlights 才发现（2026-07-27 实测踩过）。
@@ -184,45 +220,111 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
     cr.from_full_text = from_full_text
     cr.model = model
     cr.source = source
+    # 量尺：喂进去多少 / 源有多长 / 是否被截断。auto 走的是一次性单跳，故 n_chunks=1。
+    cr.body_chars = len(body_text)
+    cr.body_chars_raw = raw_chars
+    cr.truncated = (raw_chars is not None and raw_chars > len(body_text))
+    cr.reading_depth = "single-call"
+    cr.n_chunks = 1
+    return cr
+
+
+def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
+                    llm, model: Optional[str] = None, source: Optional[str] = None,
+                    from_full_text: bool = True,
+                    max_chunks: int = 12) -> Optional[CloseReading]:
+    """分块深读：切块 → 逐块通读 → 汇总成扩展分节精读。失败返回 None（调用方回落单跳）。
+
+    完全复用 manual 精读的三个纯函数与两个 prompt——分节补齐（结果与效应量 / 图表与补充
+    材料要点 / 逐节通读要点）与「保留关键数值」的硬要求都是免费带来的，auto 侧不另写 prompt。
+
+    截断量三件套（body_chars/body_chars_raw/truncated）由调用方补：raw_chars 只有抽取
+    环节知道，这里拿不到，放在一处落盘才不会两边算法不一致。
+    """
+    # 函数内 import：pdf_ingest 模块级已 `from .closereading import pdf_to_text`，
+    # 这里再在模块级反向 import 会成环。
+    from .pdf_ingest import chunk_text, deep_read_chunks, synthesize_deep_read
+
+    chunks = chunk_text(body_text)[:max_chunks]
+    if not chunks:
+        return None
+    notes = deep_read_chunks(chunks, llm, model, max_workers=4)
+    cr, _one_line, _api_err = synthesize_deep_read(notes, llm, model, research_interests)
+    if cr is None:
+        # 全块失败或汇总失败：交回调用方走单跳，保证最差不比现状差
+        return None
+    # synthesize_deep_read 是给 manual 链路写的，它把 source 写死 'manual-pdf'、
+    # 并**无条件**置 from_full_text=True。两项都必须由 auto 侧覆写回真实值：
+    # source 关系到 reading_source 统计与 series 语义；from_full_text 一旦被污染，
+    # notes_index 的 has_full_text_reading、vault 选集、ingest/backfill 的 full_text
+    # 计数会一起失真，且写进 sidecar 后不可逆。
+    cr.source = source
+    cr.from_full_text = from_full_text
+    cr.reading_depth = "chunked"
+    cr.n_chunks = len(chunks)
     return cr
 
 
 def close_read_segment(seg: PaperSegment, research_interests: str, llm,
                        email: str = "", model: Optional[str] = None,
-                       scratch_dir: Optional[Path] = None, oa=None) -> Optional[CloseReading]:
+                       scratch_dir: Optional[Path] = None, oa=None,
+                       deep: bool = False, max_chars: Optional[int] = None,
+                       max_chunks: int = 12) -> Optional[CloseReading]:
     """端到端精读一篇：解析 OA → 下 PDF → 抽全文 → 精读；无全文则用摘要降级。
 
     oa 非空时复用预解析结果（close_read_segments 择优时已解析，避免重复网络请求）。
+    deep=True 时走分块深读（预算放宽到 max_chars），失败回落单跳；默认值即现行行为。
     """
     scratch_dir = Path(scratch_dir or "output/scholar_pdfs")
     if oa is None:
         oa = resolve_oa_pdf(seg.metadata, email=email)
     full_text, from_full, source = "", False, None
+    raw_chars: Optional[int] = None
+    # 预算必须对 PDF 与 EPMC 两条全文来源同时生效：只放宽 PDF 那条的话，
+    # EPMC 正文仍被钉死在 40k，对现存的 europepmc 条目是净回退。
+    eff_max_chars = max_chars if (deep and max_chars) else AUTO_MAX_CHARS
     if oa and oa.pdf_url:
         dest = scratch_dir / "{}.pdf".format(seg.paper_id[:16])
         pdf = download_pdf(oa.pdf_url, dest)
         if pdf:
-            full_text = pdf_to_text(pdf)
+            full_text, pdf_raw = _pdf_text_with_stats(
+                pdf, max_chars=eff_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
             if full_text.strip():
-                from_full, source = True, oa.source
+                from_full, source, raw_chars = True, oa.source, pdf_raw
     if not from_full:
         # PDF 拿不到不等于没有全文：Elsevier/Cell、MDPI、OUP 对机器人下 PDF 回 403，
         # 但同一篇的 OA 全文在 Europe PMC 有干净 XML。降级成摘要前先走这条。
-        epmc = europepmc_fulltext(doi=seg.metadata.doi, pmid=seg.metadata.pmid)
+        # return_stats=True 时被调方在所有出口（含 return None 那几条）一律返回 2-元组，
+        # 解包才安全——这行对每一篇拿不到 PDF 的论文都会执行，绝大多数走的正是失败出口。
+        epmc, epmc_raw = europepmc_fulltext(doi=seg.metadata.doi, pmid=seg.metadata.pmid,
+                                            max_chars=eff_max_chars, return_stats=True)
         if epmc and epmc.strip():
-            full_text, from_full, source = epmc, True, "europepmc"
+            full_text, from_full, source, raw_chars = epmc, True, "europepmc", epmc_raw
     if not from_full:
-        # 降级：用摘要
+        # 降级：用摘要。摘要本身就是全部可得文本，不存在截断
         full_text = seg.translated_abstract or seg.original_abstract or ""
         source = "abstract"
+        raw_chars = len(full_text)
+    if deep and from_full:
+        # 摘要降级篇一律走单跳：几千字符切块无意义，且这是 from_full_text 被污染的唯一入口
+        cr = deep_close_read(seg, full_text, research_interests, llm, model=model,
+                             source=source, from_full_text=from_full,
+                             max_chunks=max_chunks)
+        if cr is not None:
+            cr.body_chars = len(full_text)
+            cr.body_chars_raw = raw_chars
+            cr.truncated = (raw_chars is not None and raw_chars > len(full_text))
+            return cr
     return close_read(seg, full_text, research_interests, llm, model=model,
-                      from_full_text=from_full, source=source)
+                      from_full_text=from_full, source=source, raw_chars=raw_chars)
 
 
 def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                         email: str = "", model: Optional[str] = None,
                         scratch_dir: Optional[Path] = None,
-                        prefer_full_text: bool = True, candidate_factor: int = 4) -> int:
+                        prefer_full_text: bool = True, candidate_factor: int = 4,
+                        deep: bool = False, max_chars: Optional[int] = None,
+                        max_chunks: int = 12) -> int:
     """对高优先级 top-N 篇做精读，就地写入 seg.close_reading。返回成功篇数。
 
     prefer_full_text=True：在优先级前 candidate_factor*top_n 候选里预解析 OA，
@@ -234,23 +336,26 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
     oa_map = {}
     if prefer_full_text and 0 < n < len(ranked):
         cand = ranked[:max(n, candidate_factor * n)]
-        for seg in cand:
-            try:
-                oa = resolve_oa_pdf(seg.metadata, email=email)
-            except Exception:
-                oa = None
-            oa_map[id(seg)] = oa
-        has_ft = [s for s in cand if oa_map.get(id(s)) and oa_map[id(s)].pdf_url]
-        # 无 OA PDF 的再问一次 Europe PMC——否则 Elsevier/MDPI/OUP 这批（PDF 被反爬挡死、
-        # 但 EPMC 有全文）会被择优逻辑系统性判成"拿不到全文"而让位给摘要降级篇。
-        for seg in cand:
-            if seg in has_ft:
-                continue
-            try:
-                if europepmc_pmcid(doi=seg.metadata.doi, pmid=seg.metadata.pmid):
-                    has_ft.append(seg)
-            except Exception:
-                pass
+        # 候选逐篇都打同两个 API（Unpaywall/EPMC），共享连接免得每篇重做 TCP+TLS 握手；
+        # timeout 取两者默认的较大值（europepmc_pmcid 的 20s）
+        with ipv4_client(timeout=20.0) as xc:
+            for seg in cand:
+                try:
+                    oa = resolve_oa_pdf(seg.metadata, email=email, client=xc)
+                except Exception:
+                    oa = None
+                oa_map[id(seg)] = oa
+            has_ft = [s for s in cand if oa_map.get(id(s)) and oa_map[id(s)].pdf_url]
+            # 无 OA PDF 的再问一次 Europe PMC——否则 Elsevier/MDPI/OUP 这批（PDF 被反爬挡死、
+            # 但 EPMC 有全文）会被择优逻辑系统性判成"拿不到全文"而让位给摘要降级篇。
+            for seg in cand:
+                if seg in has_ft:
+                    continue
+                try:
+                    if europepmc_pmcid(doi=seg.metadata.doi, pmid=seg.metadata.pmid, client=xc):
+                        has_ft.append(seg)
+                except Exception:
+                    pass
         has_ft = sorted(has_ft, key=lambda s: s.priority_score, reverse=True)
         no_ft = [s for s in cand if s not in has_ft]
         chosen = (has_ft[:n] + no_ft)[:n]  # 先全文可得（已按优先级），不足补高优先级降级
@@ -265,7 +370,8 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
         try:
             cr = close_read_segment(seg, research_interests, llm, email=email,
                                     model=model, scratch_dir=scratch_dir,
-                                    oa=oa_map.get(id(seg)))
+                                    oa=oa_map.get(id(seg)), deep=deep,
+                                    max_chars=max_chars, max_chunks=max_chunks)
         except Exception as e:
             logger.warning("  ⚠️ 精读失败({}): {}".format(seg.paper_id[:8], e))
             cr = None
@@ -274,5 +380,14 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
             done += 1
             if cr.from_full_text:
                 ft += 1
+            # 分篇级薄输出告警：整批 done/N 只能发现「全挂」，发现不了「都成功但每篇都很薄」。
+            # 8 条取自 manual 精读样本的下界（可取证句子数远高于此），低于它基本等于没读进去。
+            # 只告警不抛：整批 0/N 的 RuntimeError 语义（ingest.py）不能因为薄输出而更容易触发。
+            n_tagged = sum(1 for sec in cr.sections for st in sec.sentences if st.tag)
+            if n_tagged < 8 or cr.truncated:
+                logger.warning(
+                    "  ⚠️ 精读偏薄({}): 可取证句 {} 条，正文 {}/{} 字符{}".format(
+                        seg.paper_id[:8], n_tagged, cr.body_chars, cr.body_chars_raw,
+                        "（已截断）" if cr.truncated else ""))
     logger.info("  全文精读 {}/{} 篇（其中真全文 {}，top-{}）".format(done, len(chosen), ft, top_n))
     return done

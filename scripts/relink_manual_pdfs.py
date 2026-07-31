@@ -91,7 +91,12 @@ def build_plan(month, pdf_dir, notes_dir, expect):
         _die("citekey 撞键，先跑 notes_index.py --fix-collisions", sorted(cks))
     for p in plan:
         p["already"] = p["src"].resolve() == p["dst"].resolve() if p["src"].name else False
-        if p["already"]:
+        # 半完成识别：上次 --apply 在「mv 成功、bundle 回填前」中断时，src（bundle 里的
+        # 旧路径）已不存在而 dst 已就位——dst 名由 citekey 决定论推出，不是猜测。此时
+        # 视为 mv 已完成，本次跳过 mv 只补写 pdf_path，让「重跑自愈」真正成立而非整体 abort。
+        p["backfill_only"] = (not p["already"] and bool(p["src"].name)
+                              and not p["src"].is_file() and p["dst"].is_file())
+        if p["already"] or p["backfill_only"]:
             continue
         if not p["src"].is_file():
             _die("源 PDF 不存在: {}".format(p["src"]))
@@ -118,11 +123,13 @@ def main():
     print("{:28} {:6} {:38} → {}".format("citekey", "配法", "当前文件名", "目标文件名"))
     print("-" * 118)
     for p in sorted(plan, key=lambda x: x["citekey"]):
-        mark = "＝" if p["already"] else "→"
+        mark = "＝" if p["already"] else ("补" if p["backfill_only"] else "→")
         print("{:28} {:6} {:38} {} {}".format(
             p["citekey"], p["matched_by"], p["src"].name or "(空)", mark, p["dst"].name))
-    todo = [p for p in plan if not p["already"]]
-    print("\n共 {} 篇，需改名 {} 篇，已就位 {} 篇".format(len(plan), len(todo), len(plan) - len(todo)))
+    todo = [p for p in plan if not p["already"] and not p["backfill_only"]]
+    backfill = [p for p in plan if p["backfill_only"]]
+    print("\n共 {} 篇，需改名 {} 篇，仅补回填 {} 篇，已就位 {} 篇".format(
+        len(plan), len(todo), len(backfill), len(plan) - len(todo) - len(backfill)))
 
     if not args.apply:
         print("（dry-run，未改动任何文件；加 --apply 执行）")
@@ -130,9 +137,10 @@ def main():
 
     # ---- 4) 先搬文件，再原子回写 bundle ----
     # 顺序不可颠倒：反过来的话 mv 失败会留下指向不存在文件的 pdf_path，更难查。
-    # 这个顺序下最坏是文件已改名而 bundle 未更新，重跑时走 already 分支自愈。
+    # 这个顺序下最坏是文件已改名而 bundle 未更新，重跑时经 backfill_only 半完成
+    # 识别（src 缺失且 dst 已就位）跳过 mv、只补回填 pdf_path，自愈闭环。
     for p in plan:
-        if not p["already"]:
+        if not p["already"] and not p["backfill_only"]:
             shutil.move(str(p["src"]), str(p["dst"]))
         p["data"]["pdf_path"] = str(p["dst"])
         tmp = p["bundle"].with_suffix(".tmp")

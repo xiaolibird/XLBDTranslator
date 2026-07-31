@@ -39,7 +39,8 @@ def _make_settings(tmp_path: Path):
     return settings
 
 
-def _make_paper(segment_id: int, title: str, priority_score: float = 0.5, filter_decision=None) -> PaperSegment:
+def _make_paper(segment_id: int, title: str, priority_score: float = 0.5, filter_decision=None,
+                **meta_kwargs) -> PaperSegment:
     return PaperSegment(
         segment_id=segment_id,
         paper_id="paper_{}".format(segment_id),
@@ -48,6 +49,7 @@ def _make_paper(segment_id: int, title: str, priority_score: float = 0.5, filter
             paper_id="paper_{}".format(segment_id),
             title=title,
             source_email_id="email_1",
+            **meta_kwargs,
         ),
         filter_decision=filter_decision,
     )
@@ -115,3 +117,78 @@ def test_sort_by_priority_ordering_stable_across_repeated_calls(tmp_path):
     wf._sort_by_priority()
     assert [s.segment_id for s in wf.segments] == [1, 2]
     assert [s.priority_score for s in wf.segments] == first_call_scores
+
+
+# ---------------- execute() 两开关皆关时的规则优先级（R2 回归） ----------------
+# 背景：月度回填 backfill_notes 把 translate_abstracts/generate_summary 双关，
+# 此前 execute() 的 Step 3 guard 直接跳过整个处理步骤，规则优先级从未计算，
+# priority_score 恒为 0.0，top-N 精读退化为邮件顺序。修复：guard 补 else 分支
+# 调 _calculate_rule_based_priority()。
+
+
+def _mock_pipeline_steps(wf, monkeypatch, segments):
+    """把 execute() 中涉及网络/落盘的步骤全部 mock 掉，只留 Step 3 的真实逻辑。"""
+    from src.scholar.schema import DigestOutput
+
+    monkeypatch.setattr(wf, "_step_fetch_emails", lambda: None)
+
+    def fake_parse():
+        wf.segments = segments
+
+    monkeypatch.setattr(wf, "_step_parse_emails", fake_parse)
+    monkeypatch.setattr(wf, "_step_fetch_external_sources", lambda: None)
+    monkeypatch.setattr(wf, "_step_filter_papers", lambda: None)
+    monkeypatch.setattr(wf, "_step_generate_output",
+                        lambda: DigestOutput(digest_id="t", segments=wf.segments))
+
+
+def test_execute_computes_rule_priority_when_both_switches_off(tmp_path, monkeypatch):
+    """双关开关跑 execute()：必须走规则优先级，THREAT/MUST_ENGAGE 加成生效且降序排列"""
+    from datetime import date
+
+    settings = _make_settings(tmp_path)
+    settings.processing.translate_abstracts = False
+    settings.processing.generate_summary = False
+    settings.processing.auto_mark_read = False       # 别去碰 Gmail
+    settings.processing.zotero_enabled = False
+    wf = ScholarWorkflow(settings)
+
+    # 邮件顺序：规则分高的普通论文在前（顶刊+今年+综述+高引，规则基分≈0.84），
+    # 含 THREAT/MUST_ENGAGE 裁决的论文在后（默认元数据，规则基分≈0.36 + 加成 1.8）
+    plain = _make_paper(1, "Strong journal paper", priority_score=0.0,
+                        journal="Nature Medicine", source_type="journal",
+                        publication_date=date.today(), paper_type="review",
+                        citation_count=1000)
+    threat = _make_paper(2, "Adversarial threat paper", priority_score=0.0,
+                         filter_decision=_threat_decision())
+    _mock_pipeline_steps(wf, monkeypatch, [plain, threat])
+
+    wf.execute()
+
+    # 含 THREAT/MUST_ENGAGE 标记的 segment 分数必须大于 0（此前恒为 0.0）
+    assert threat.priority_score > 0
+    assert "THREAT" in threat.priority_reason and "MUST_ENGAGE" in threat.priority_reason
+    assert plain.priority_score > 0
+    # 列表按 priority_score 降序，且加成把后位的 threat 论文顶到最前
+    scores = [s.priority_score for s in wf.segments]
+    assert scores == sorted(scores, reverse=True)
+    assert wf.segments[0] is threat
+
+
+def test_execute_switch_on_keeps_llm_path_unchanged(tmp_path, monkeypatch):
+    """对照组：任一开关开启时仍走 _step_process_papers，else 分支的规则计算不介入"""
+    settings = _make_settings(tmp_path)
+    settings.processing.translate_abstracts = False
+    settings.processing.generate_summary = True
+    settings.processing.auto_mark_read = False
+    settings.processing.zotero_enabled = False
+    wf = ScholarWorkflow(settings)
+
+    calls = []
+    _mock_pipeline_steps(wf, monkeypatch, [])
+    monkeypatch.setattr(wf, "_step_process_papers", lambda: calls.append("llm"))
+    monkeypatch.setattr(wf, "_calculate_rule_based_priority", lambda: calls.append("rule"))
+
+    wf.execute()
+
+    assert calls == ["llm"]  # LLM 路径照旧，规则分支未被误触发

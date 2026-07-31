@@ -44,11 +44,16 @@ class LLMClient:
     def __init__(self, llm_settings):
         self.settings = llm_settings  # scholar.schema.LLMSettings
         self._conn = None
+        # 手动精读并发化后，多线程可能同时首访 conn；无锁的懒加载会竞态双建连接
+        # （openai-compatible 分支还会泄漏一个 httpx.Client）。单线程调用方零感知。
+        self._conn_lock = threading.Lock()
 
     @property
     def conn(self) -> dict:
         if self._conn is None:
-            self._conn = self._create()
+            with self._conn_lock:
+                if self._conn is None:
+                    self._conn = self._create()
         return self._conn
 
     def _create(self) -> dict:

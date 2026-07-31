@@ -107,6 +107,7 @@ bfg-report/
 docs/*
 !docs/scholar_notes_AGENTS.md
 !docs/paper_agent_prompt.md
+!docs/closeread_deep_rollout.md
 !docs/skills/
 .ruff_cache/
 .claude/

@@ -109,6 +109,9 @@ class ScholarWorkflow:
         # 过滤审计数据：被排除论文（含完整元数据+裁决）与入选论文的裁决记录
         self.excluded: List[Dict[str, Any]] = []
         self.included_decisions: List[FilterDecision] = []
+        # LLM 裁决失败回退时白名单未命中的论文：不进 segments 也不算 excluded，
+        # 单独随 digest 输出供人工复核（关键词白名单远比三态审稿严格，未命中≠无关）
+        self.undecided_segments: List[PaperSegment] = []
         self._filter_prompt_template: Optional[str] = None
         self._filter_prompt_version: Optional[str] = None
         self._filter_fallback_count = 0
@@ -180,7 +183,14 @@ class ScholarWorkflow:
             # Step 3: 批量处理（翻译和摘要）
             if self.settings.processing.translate_abstracts or self.settings.processing.generate_summary:
                 self._step_process_papers()
-            
+            else:
+                # 两开关皆关（月度回填 backfill_notes 即此路径）也必须算规则优先级：
+                # 否则 priority_score 恒为默认 0.0，THREAT/MUST_ENGAGE 置顶加成从未应用，
+                # 下游 close_read_segments 的 top-N 精读与 write_notes 分层会退化为邮件顺序。
+                # 该方法内部会调 _sort_by_priority（带 _priority_bonus_applied 幂等标记），
+                # 加成只生效一次；LLM 路径（上面 if 分支）不经过这里，行为不变。
+                self._calculate_rule_based_priority()
+
             # Step 4: 生成输出
             output = self._step_generate_output()
 
@@ -441,6 +451,43 @@ class ScholarWorkflow:
                 self._record_exclusion(paper, excl)
         return kept
 
+    def _fallback_partition(self, papers: List[PaperSegment]) -> List[PaperSegment]:
+        """LLM 裁决失败时的回退分流：白名单命中者照常入选；未命中者挂 undecided 待人工复核。
+
+        不能沿用 _filter_by_whitelist 的 EXCLUDE 语义——审稿原则是「宁可 MAYBE 不可 EXCLUDE」，
+        而关键词只认 ~40 个词面，失败批的未命中远不足以判无关；此前直接 EXCLUDE 会让论文
+        静默消失且运行仍算成功。未命中者仍写 excluded sidecar 供审计
+        （周度入库的 DIGEST_RE 不读该文件，不会把未决论文误入库）。"""
+        whitelist = self.settings.processing.whitelist
+        kept: List[PaperSegment] = []
+        for paper in papers:
+            hit = self._match_keyword(paper, whitelist) if whitelist else "（白名单为空，默认入选）"
+            if hit:
+                decision = FilterDecision(
+                    paper_id=paper.paper_id,
+                    title=paper.metadata.title,
+                    verdict="included",
+                    decision="INCLUDE",
+                    stage="keyword_fallback",
+                    reason="白名单命中: {}".format(hit),
+                    one_line="白名单命中: {}".format(hit),
+                )
+                paper.filter_decision = decision
+                self.included_decisions.append(decision)
+                kept.append(paper)
+            else:
+                decision = FilterDecision(
+                    paper_id=paper.paper_id,
+                    title=paper.metadata.title,
+                    verdict="undecided",
+                    stage="keyword_fallback",
+                    reason="LLM 裁决失败且未命中白名单，待人工复核",
+                )
+                paper.filter_decision = decision
+                self.undecided_segments.append(paper)
+                self._record_exclusion(paper, decision)
+        return kept
+
     def _filter_by_llm(self, papers: List[PaperSegment]) -> List[PaperSegment]:
         """LLM 相关性裁决：分批送审；单批失败回退关键词白名单（不中断整体流程）"""
         model = self.settings.llm.filter_model or self.settings.llm.model
@@ -462,7 +509,7 @@ class ScholarWorkflow:
             except Exception as e:
                 logger.warning("  批次 {} LLM 裁决失败，回退关键词白名单: {}".format(batch_num, e))
                 self._filter_fallback_count += len(batch)
-                kept.extend(self._filter_by_whitelist(batch, stage="keyword_fallback"))
+                kept.extend(self._fallback_partition(batch))
                 continue
 
             for paper in batch:
@@ -471,7 +518,7 @@ class ScholarWorkflow:
                     # LLM 响应缺失该 id：单篇回退关键词判断
                     logger.warning("  [MISS] 裁决结果缺失 id={}，回退关键词".format(paper.segment_id))
                     self._filter_fallback_count += 1
-                    kept.extend(self._filter_by_whitelist([paper], stage="keyword_fallback"))
+                    kept.extend(self._fallback_partition([paper]))
                     continue
 
                 # 单篇裁决构造独立容错：flash 级模型常把 confidence 返回成 "high"、
@@ -481,7 +528,7 @@ class ScholarWorkflow:
                 except Exception as e:
                     logger.warning("  裁决字段异常 id={}，回退关键词: {}".format(paper.segment_id, e))
                     self._filter_fallback_count += 1
-                    kept.extend(self._filter_by_whitelist([paper], stage="keyword_fallback"))
+                    kept.extend(self._fallback_partition([paper]))
                     continue
 
                 # 裁决随论文进入输出（分节/排序用）
@@ -1016,10 +1063,15 @@ __PAPERS_JSON__
             title=f"Scholar Digest - {datetime.now().strftime('%Y-%m-%d')}",
             description=f"从 {len(self.processed_emails)} 封邮件中提取的 {len(self.segments)} 篇论文摘要",
             segments=self.segments,
+            undecided_segments=self.undecided_segments,
             emails_processed=self.processed_emails,
             status=DigestStatus.COMPLETED,
             created_at=datetime.now()
         )
+        # 有未决论文说明本次运行经历过 LLM 裁决失败——不显式喊出来就等于回到静默丢弃
+        if self.undecided_segments:
+            logger.warning("  ⚠️ {} 篇论文 LLM 裁决失败且未命中白名单，已列入 digest『待人工复核』小节".format(
+                len(self.undecided_segments)))
         
         # 保存 JSON 文件
         json_path = self.output_dir / f"{self.run_id}.json"
@@ -1058,6 +1110,7 @@ __PAPERS_JSON__
             'excluded_papers': len(self.excluded),
             'excluded_by_stage': stage_counts,
             'filter_fallback_count': self._filter_fallback_count,
+            'undecided_count': len(self.undecided_segments),
             'excluded_file': str(excluded_path) if excluded_path else None,
         }
         with open(stats_path, 'w', encoding='utf-8') as f:
@@ -1104,6 +1157,8 @@ __PAPERS_JSON__
                     self.segments, proc.research_interests, self.llm_client,
                     top_n=proc.closeread_top_n, email=email,
                     model=(self.settings.llm.closeread_model or self.settings.llm.model),
+                    deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+                    max_chunks=proc.closeread_max_chunks,
                 )
                 # 精读就地写入 segment，重写固化 JSON 使审计文件也带精读（否则 Step 4 的 JSON 为空）
                 if done and getattr(self, "_digest_output", None) is not None:

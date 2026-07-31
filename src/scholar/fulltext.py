@@ -119,14 +119,20 @@ def resolve_oa_pdf(
 
 # ---------------- Europe PMC 全文（不经 PDF） ----------------
 
-# 正文以外的成分：参考文献表、图表版面、公式、补充材料清单进了精读正文只会稀释 token；
+# 正文以外的成分：参考文献表、图片版面、公式进了精读正文只会稀释 token；
 # xref 是正文里的引文角标（"…如前人所示 12,13 …"），留着会把数字塞进句子中间。
-_JATS_SKIP = {"xref", "table-wrap", "fig", "graphic", "inline-graphic",
+# table-wrap / fig / supplementary-material 曾在此集合里，现已移出：精读要引用的效应量、
+# 样本量、置信区间基本只出现在 Results 的表格与图注里，整块丢掉等于把最硬的数字丢掉。
+# 真正的版面噪声是 graphic/inline-graphic（图片文件名），它们仍被跳过。
+_JATS_SKIP = {"xref", "graphic", "inline-graphic",
               "disp-formula", "inline-formula", "ref-list", "back",
-              "supplementary-material", "funding-group", "contrib-group",
+              "funding-group", "contrib-group",
               "aff", "author-notes", "journal-meta", "history", "permissions"}
-# 这些标签结束后补换行，否则整篇会连成一坨没有段落边界的长串
-_JATS_BLOCK = {"p", "title", "sec", "abstract", "caption", "list-item", "article-title"}
+# 这些标签结束后补换行，否则整篇会连成一坨没有段落边界的长串。
+# table-wrap/tr/td/th 是随表格解禁一并加入的：单元格之间没有任何分隔符，
+# 不补换行会把一行数字连成 "0.910.880.94" 这种无法归属的长串，并粘住前后正文。
+_JATS_BLOCK = {"p", "title", "sec", "abstract", "caption", "list-item", "article-title",
+               "table-wrap", "tr", "td", "th"}
 
 
 def _jats_walk(el, parts, budget):
@@ -145,10 +151,22 @@ def _jats_walk(el, parts, budget):
         parts.append(el.tail)
 
 
-def jats_to_text(xml_text: str, max_chars: int = 40000) -> str:
-    """JATS 全文 XML → 纯文本（标题 + 摘要 + 正文）。解析失败时退化为剥标签。"""
+# 只为「量出真长度」而设的 walk 预算：与 max_chars 解耦。
+# 原先传的是 max_chars*2，于是截断前的文本本身就被封顶在 ~2×max_chars，EPMC 路线的
+# 「原始长度」和 PDF 路线的真实长度不是同一量纲，截断比例统计会被系统性压低。
+# 取 2,000,000 只是为了给病态输入留个天花板；正文超过它时 raw 退化为下界。
+_JATS_RAW_BUDGET = 2_000_000
+
+
+def _jats_to_text_with_stats(xml_text: str, max_chars: int = 40000):
+    """JATS 全文 XML → (纯文本, 原始长度)。原始长度是 max_chars 截断**之前**的长度。
+
+    改用 _JATS_RAW_BUDGET 后 text 的返回值逐字节不变：原预算下被跳过的下钻只发生在
+    累计长度已 > 2×max_chars 之后，其产生的差异全部落在 > max_chars 的偏移上，
+    被末尾 [:max_chars] 切掉。
+    """
     if not xml_text or not xml_text.strip():
-        return ""
+        return "", 0
     import re as _re
     import xml.etree.ElementTree as ET
     try:
@@ -156,19 +174,26 @@ def jats_to_text(xml_text: str, max_chars: int = 40000) -> str:
     except Exception:
         # DTD 外部实体未定义等情况：粗暴剥标签也比丢掉整篇全文强
         stripped = _re.sub(r"<[^>]+>", " ", xml_text)
-        return _re.sub(r"\s+", " ", stripped).strip()[:max_chars]
+        text = _re.sub(r"\s+", " ", stripped).strip()
+        return text[:max_chars], len(text)
 
     parts: list = []
     for path in ("./front/article-meta/title-group/article-title",
                  "./front/article-meta/abstract",
                  "./body"):
         for node in root.findall(path):
-            _jats_walk(node, parts, max_chars * 2)
+            _jats_walk(node, parts, _JATS_RAW_BUDGET)
             parts.append("\n")
     text = "".join(parts)
     text = _re.sub(r"[ \t]+", " ", text)
     text = _re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()[:max_chars]
+    text = text.strip()
+    return text[:max_chars], len(text)
+
+
+def jats_to_text(xml_text: str, max_chars: int = 40000) -> str:
+    """JATS 全文 XML → 纯文本（标题 + 摘要 + 正文）。解析失败时退化为剥标签。"""
+    return _jats_to_text_with_stats(xml_text, max_chars=max_chars)[0]
 
 
 def europepmc_pmcid(doi: Optional[str] = None, pmid: Optional[str] = None,
@@ -207,23 +232,37 @@ def europepmc_pmcid(doi: Optional[str] = None, pmid: Optional[str] = None,
 def europepmc_fulltext(doi: Optional[str] = None, pmid: Optional[str] = None,
                        pmcid: Optional[str] = None,
                        client: Optional[httpx.Client] = None,
-                       timeout: float = 40.0, max_chars: int = 40000) -> Optional[str]:
-    """取 Europe PMC 的 OA 全文纯文本。取不到（非 OA/无收录/网络异常）返回 None。"""
+                       timeout: float = 40.0, max_chars: int = 40000,
+                       return_stats: bool = False):
+    """取 Europe PMC 的 OA 全文纯文本。取不到（非 OA/无收录/网络异常）返回 None。
+
+    return_stats=False（默认）→ 返回 Optional[str]，与旧签名逐字节一致，调用方零改动。
+    return_stats=True → **四条出口一律返回 2-元组**，取不到统一为 (None, 0)；
+      绝不允许 True 分支漏出裸 None：调用方对每篇拿不到 PDF 的论文都会解包，
+      而绝大多数论文非 OA、走的正是失败出口，漏一处就是每篇 TypeError → 精读全挂 →
+      done 归零 → 整批被判成 LLM 故障批而不写终稿。
+    """
     own = client is None
     c = client or ipv4_client(timeout=timeout)
+
+    def _fail():
+        return (None, 0) if return_stats else None
+
     try:
         pid = pmcid or europepmc_pmcid(doi=doi, pmid=pmid, client=c, timeout=timeout)
         if not pid:
-            return None
+            return _fail()
         resp = c.get("{}/{}/fullTextXML".format(EUROPEPMC_API, pid))
         if resp.status_code != 200:
             logger.warning("  ⚠️ Europe PMC 全文返回 {}（{}）".format(resp.status_code, pid))
-            return None
-        text = jats_to_text(resp.text, max_chars=max_chars)
-        return text or None
+            return _fail()
+        text, raw_chars = _jats_to_text_with_stats(resp.text, max_chars=max_chars)
+        if not text:
+            return _fail()
+        return (text, raw_chars) if return_stats else text
     except Exception as e:
         logger.warning("  ⚠️ Europe PMC 全文获取失败（{}）: {}".format(pmcid or doi or pmid, e))
-        return None
+        return _fail()
     finally:
         if own:
             try:

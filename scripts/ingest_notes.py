@@ -24,7 +24,10 @@
 退出码：0 成功 / 1 无论文可入 / 2 配置或输入错误。
 """
 import argparse
+import json
+import subprocess
 import sys
+import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -36,6 +39,19 @@ from src.scholar.schema import ScholarSettings               # noqa: E402
 from src.utils.logger import get_logger                      # noqa: E402
 
 logger = get_logger("ingest_cli")
+
+
+def notify(title, text):
+    """失败时弹系统通知（仿 scripts/backfill_notes.py）。launchd 周一 09:30 无人值守跑
+    --auto，退出码 1 只有翻日志才看得见，通知才是用户真正的告警面。osascript 不可用
+    就静默——告警本身不该反过来把入库弄挂。"""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
+            capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def parse_pick(spec: str, n: int) -> list:
@@ -207,3 +223,11 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n已中断", file=sys.stderr)
         sys.exit(130)
+    except Exception as e:
+        # --auto 的窗口是本自然周，下周一的运行不会回捞上周：失败那周若无人知晓，
+        # 该周 digest 判过的论文就永远不进札记库。fail-fast（run_ingest 的 0/N
+        # RuntimeError、load_seen_keys 的索引损坏 RuntimeError）必须配套当场告警，
+        # 「重跑即恢复」的前提——有人知道要重跑——才成立。
+        traceback.print_exc()
+        notify("周度札记入库失败", "{}: {}".format(type(e).__name__, str(e)[:200]))
+        sys.exit(1)

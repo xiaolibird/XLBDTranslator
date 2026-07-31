@@ -333,11 +333,19 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     if close_read:
         from .closereading import close_read_segments
         from .llm_client import LLMClient
-        close_read_segments(
+        done = close_read_segments(
             segs, proc.research_interests, LLMClient(settings.llm),
             top_n=top_n, email=email,
             model=(settings.llm.closeread_model or settings.llm.model),
-            scratch_dir=Path("output/scholar_pdfs"))
+            scratch_dir=Path("output/scholar_pdfs"),
+            deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+            max_chunks=proc.closeread_max_chunks)
+        if top_n > 0 and segs and done == 0:
+            # 0/N 成功几乎只出现在 claude-agent 限流/欠费这类通路级故障；照常写盘会让
+            # 降级札记被索引 seen 去重永久固化（周度没有 --force 入口）。宁可本批不写：
+            # digest JSON 还在，进程非零退出后重跑即恢复。done≥1 的部分成功照常写盘。
+            raise RuntimeError("全文精读 0/{}，视为 LLM 故障批，不写终稿".format(
+                min(top_n, len(segs))))
         full_text = sum(1 for s in segs if s.close_reading and s.close_reading.from_full_text)
 
     from .notes import write_notes

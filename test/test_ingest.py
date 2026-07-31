@@ -234,3 +234,65 @@ def test_cli_pick_and_auto_are_mutually_exclusive():
 def test_cli_empty_window_exits_1(tmp_path):
     r = _run("--digest-dir", str(tmp_path), "--list")
     assert r.returncode == 1
+
+
+# ---------------- F. 精读故障批门控 ----------------
+
+def _settings(tmp_path):
+    from src.scholar.schema import ScholarSettings
+    env_file = tmp_path / "scholar_test.env"
+    env_file.write_text(
+        "GMAIL__CREDENTIALS_PATH=fake/creds.json\n"
+        "GMAIL__TOKEN_PATH=fake/token.json\n"
+        "LLM__PROVIDER=gemini\n"
+        "LLM__GEMINI_API_KEY=FAKE_KEY_FOR_TEST\n"
+        "LLM__MODEL=fake-model\n",
+        encoding="utf-8",
+    )
+    s = ScholarSettings.from_env_file(env_file)
+    s.processing.notes_dir = tmp_path / "notes"
+    s.processing.output_dir = tmp_path / "out"
+    return s
+
+
+def _mock_pipeline(monkeypatch, done):
+    """把网络/LLM 依赖全 mock 掉，只留 run_ingest 的门控逻辑。done 为精读成功篇数。"""
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "resolve_citekeys",
+                        lambda segs, base: {s.paper_id: None for s in segs})
+    import src.scholar.closereading as closereading
+    monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: done)
+    import src.scholar.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: None)
+
+
+def test_closeread_zero_success_raises_and_writes_nothing(tmp_path, monkeypatch):
+    """精读 0/N 成功=LLM 通路故障批：必须 raise、不写终稿——否则降级札记被
+    seen 去重永久固化（周度没有 --force 入口），只能人工翻库才发现。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=0)
+    import src.scholar.notes as notes
+    written = []
+    monkeypatch.setattr(notes, "write_notes",
+                        lambda *a, **k: written.append(1))
+
+    segs = [_seg(1, "A", doi="10.1/a"), _seg(2, "B", doi="10.1/b")]
+    with pytest.raises(RuntimeError, match="全文精读 0/"):
+        ING.run_ingest(segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert not written
+    notes_dir = tmp_path / "notes"
+    assert not notes_dir.exists() or not list(notes_dir.glob("*.md"))  # 无新 md 落盘
+
+
+def test_closeread_partial_success_still_writes(tmp_path, monkeypatch):
+    """done>=1 的部分成功照常写盘（保守阈值）：正常周不因个别论文精读失败而拦截。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    import src.scholar.notes as notes
+    monkeypatch.setattr(
+        notes, "write_notes",
+        lambda *a, **k: {"note_path": str(tmp_path / "n.md"), "docx_path": None})
+
+    segs = [_seg(1, "A", doi="10.1/a"), _seg(2, "B", doi="10.1/b")]
+    rep = ING.run_ingest(segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert rep["status"] == "ok" and rep["count"] == 2

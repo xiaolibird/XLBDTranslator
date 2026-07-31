@@ -405,8 +405,100 @@ def test_load_seen_keys_excludes_only_auto(tmp_path):
     assert got == {"doi:10.1/manual", "doi:10.1/old"}
 
 
-def test_schema_version_is_v3():
-    assert ni.SCHEMA_VERSION == 3
+def test_schema_version_is_v4():
+    assert ni.SCHEMA_VERSION == 4
+
+
+# ---------------- 阅读深度量尺四键 ----------------
+
+_DEPTH_KEYS = ("fulltext_chars", "fulltext_chars_raw", "fulltext_truncated", "reading_depth")
+
+
+def _seg_with_cr(cr=None, pid="dp"):
+    return PaperSegment(segment_id=1, paper_id=pid, priority_score=0.5,
+                        metadata=PaperMetadata(paper_id=pid, title="Depth Probe"),
+                        close_reading=cr)
+
+
+def test_depth_keys_none_when_no_close_reading():
+    e = ni.entry_from_segment(_seg_with_cr(None), "no2020Read", rank=0, total=1)
+    assert [e[k] for k in _DEPTH_KEYS] == [None, None, None, None]
+
+
+def test_depth_keys_from_auto_close_reading():
+    cr = CloseReading(from_full_text=True, source="arxiv", body_chars=40000,
+                      body_chars_raw=221101, truncated=True, n_chunks=1,
+                      reading_depth="single-call",
+                      sections=[CloseReadSection(heading="结论", sentences=[
+                          CloseReadSentence(text="AUC 0.9。", tag="可引用证据")])])
+    e = ni.entry_from_segment(_seg_with_cr(cr), "au2025Paper", rank=0, total=1)
+    assert e["fulltext_chars"] == 40000
+    assert e["fulltext_chars_raw"] == 221101
+    assert e["fulltext_truncated"] is True
+    assert e["reading_depth"] == "single-call"
+
+
+def test_manual_series_reading_depth_defaults_to_chunked():
+    """pdf_ingest 不写 reading_depth，而 manual 正是读得最深的一批——不兜会落成 null。"""
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        CloseReadSection(heading="结论", sentences=[
+            CloseReadSentence(text="AUC 0.9。", tag="可引用证据")])])
+    assert cr.reading_depth is None
+    by_series = ni.entry_from_segment(_seg_with_cr(cr), "m2025A", rank=0, total=1,
+                                      series="manual")
+    assert by_series["reading_depth"] == "chunked"
+    # series 仍是 auto、但 source 标了 manual-pdf 的（relink 链路）同样兜住
+    by_source = ni.entry_from_segment(_seg_with_cr(cr), "m2025B", rank=0, total=1)
+    assert by_source["reading_depth"] == "chunked"
+
+
+def test_legacy_auto_entries_get_unknown_legacy_depth(tmp_path):
+    """存量 auto 精读（无 reading_depth 键）回填 'unknown-legacy'：不重跑，只在量尺上标出深度不可考。
+
+    非精读条目（has_full_text_reading=false）不写键——四态里「缺失」专属于非精读。
+    另三键（fulltext_chars/_raw/_truncated）保持缺失：猜填 false 会把「确认未截断」和「不知道」混同。
+    """
+    _write_month(tmp_path, sidecar=False)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=None)
+    by = {e["citekey"]: e for e in entries}
+    read = by["public2025Deep"]
+    assert read["has_full_text_reading"] and read["reading_depth"] == "unknown-legacy"
+    assert not any(k in read for k in
+                   ("fulltext_chars", "fulltext_chars_raw", "fulltext_truncated"))
+    unread = by["lee2025Graph"]
+    assert unread["has_full_text_reading"] is False
+    assert "reading_depth" not in unread
+
+
+def test_legacy_manual_entries_get_chunked_depth(tmp_path):
+    """存量 manual（同样无 reading_depth 键）回填 'chunked'：按构造就是逐块深读，
+    全库最深的一批不能和 auto 存量一起沉在「无值」里。与 entry_from_segment 同口径。"""
+    _write_month(tmp_path, sidecar=False)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=None, series="manual")
+    assert {e["reading_depth"] for e in entries} == {"chunked"}   # 含无精读节的那两篇
+
+
+def test_existing_reading_depth_not_overwritten(tmp_path):
+    """新 sidecar 已带 reading_depth（含 None）的条目不被回填覆盖——回填只补「键缺失」。"""
+    stem = "科研札记_2025-03_全文精读"
+    _write_month(tmp_path, sidecar=True)
+    p = tmp_path / (stem + ".index.json")
+    data = json.loads(p.read_text(encoding="utf-8"))
+    for e in data["papers"]:                      # 模拟切换后新产出的月份：键已就位
+        e["reading_depth"] = "single-call" if e["has_full_text_reading"] else None
+    p.write_text(json.dumps(data), encoding="utf-8")
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=p)
+    by = {e["citekey"]: e for e in entries}
+    assert by["public2025Deep"]["reading_depth"] == "single-call"   # 来自 sidecar，未被改写
+    assert by["lee2025Graph"]["reading_depth"] is None              # 显式 None 也不回填
 
 
 def test_legacy_tags_map_to_role_highlights():
@@ -498,6 +590,22 @@ def test_all_references_keeper_only_sorted_and_fallback(tmp_path):
     assert fb["issued"] == {"date-parts": [[2025]]}
 
 
+def test_all_references_skips_missing_key_placeholders(tmp_path):
+    """MISSING-KEY 占位键不得进全局书目：[@MISSING-KEY-...] 是渲染后无处可指的死引用。
+
+    两种判定都要生效：键名前缀（sidecar 缺失时 md 解析出的占位键）与
+    citekey_source=="missing"（键被后续流程改名但源头仍是占位的情形）。
+    """
+    (tmp_path / "r.references.json").write_text(json.dumps(
+        [{"id": "ok2025Key", "title": "Real"}]), encoding="utf-8")
+    refs = ni.build_all_references(_idx([
+        _p("ok2025Key"),
+        _p("MISSING-KEY-10.1/lost", doi="10.1/lost"),          # 仅前缀可辨（sidecar 缺失）
+        _p("odd2024Renamed", citekey_source="missing"),        # 仅来源可辨
+    ]), tmp_path)
+    assert [r["id"] for r in refs] == ["ok2025Key"]
+
+
 def test_all_references_accepts_str_notes_dir(tmp_path):
     """notes_dir 传 str 不得静默全量降级为兜底（曾因 str/Path 相除抛错被 except 吞掉）。"""
     (tmp_path / "r.references.json").write_text(json.dumps(
@@ -540,3 +648,49 @@ def test_fix_collisions_generates_parsable_key(tmp_path):
     ni.fix_citekey_collisions(tmp_path)
     keys = {e["citekey"] for e in ni.update_index(tmp_path)["papers"] if e.get("citekey")}
     assert not any(set(k) & set("{|}[]() ") for k in keys)
+
+
+# ---------------- 原子写 + 索引损坏 fail-fast（FIX-5） ----------------
+
+
+def test_load_seen_keys_corrupt_index_raises(tmp_path):
+    """索引存在但损坏（半写 JSON）：静默空集会让整窗论文重复入库，须 fail-fast。"""
+    import pytest
+    p = tmp_path / "literature_index.json"
+    p.write_text('{"papers": [{"month": "2023-01", "dedup', encoding="utf-8")   # 截断
+    with pytest.raises(RuntimeError):
+        ni.load_seen_keys(p)
+    # 文件不存在仍是"首次运行"语义，返回空集不抛
+    assert ni.load_seen_keys(tmp_path / "nope.json") == set()
+
+
+def test_write_if_changed_atomic_no_tmp_residue(tmp_path):
+    """写后目标 JSON 可解析且无 .tmp 残留；内容未变仍不写盘（mtime 不抖语义不变）。"""
+    p = tmp_path / "all_references.json"
+    content = json.dumps([{"id": "a2025Key", "title": "T"}], ensure_ascii=False)
+    assert ni.write_if_changed(p, content) is True
+    assert json.loads(p.read_text(encoding="utf-8"))[0]["id"] == "a2025Key"
+    assert not list(tmp_path.glob("*.tmp"))
+    assert ni.write_if_changed(p, content) is False
+
+
+def test_write_outputs_index_json_atomic(tmp_path):
+    """索引写盘走 tmp+replace：落盘后无 .tmp 残留且 JSON 完整可解析。"""
+    _write_month(tmp_path, sidecar=True)
+    wrote = ni.write_outputs(ni.update_index(tmp_path), tmp_path)
+    assert wrote["index_json"] is True
+    index = json.loads((tmp_path / ni.INDEX_JSON).read_text(encoding="utf-8"))
+    assert index["papers"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_digest_output_save_to_file_roundtrip(tmp_path):
+    """save_to_file 改原子写后 round-trip 不变：load 回来的内容与保存前一致、无 .tmp 残留。"""
+    from src.scholar.schema import DigestOutput
+    digest = DigestOutput(digest_id="d-2025-07", segments=_segments())
+    out = digest.save_to_file(tmp_path / "digest_test.json")
+    loaded = DigestOutput.load_from_file(out)
+    assert loaded.digest_id == "d-2025-07"
+    assert [s.paper_id for s in loaded.segments] == ["pa", "pb", "pc"]
+    assert loaded.total_papers == 3
+    assert not list(tmp_path.glob("*.tmp"))

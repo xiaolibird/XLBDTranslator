@@ -38,6 +38,41 @@
 **keeper 规则**:同一论文多处出现时,`series:"manual"`(手动深读)恒为 keeper(即使月份晚于自动版),
 自动浅读版被标 `duplicate_of`。所以按 `duplicate_of == null` 过滤后,你读到的就是**最彻底的那版精读**。
 
+## 阅读深度量尺 `reading_depth`(⚠️ 库里并存两代精读,取证前先看这个)
+
+条目上还有一把阅读深度量尺:`reading_depth, fulltext_chars(真正喂进 LLM 的正文字符数),
+fulltext_chars_raw(抽取到的原始正文长度), fulltext_truncated`。
+
+`reading_depth` **四态**(与仓库 `src/scholar/schema.py` 的字段注释逐字一致,全库只此一份定义):
+
+| 值 | 含义 |
+|---|---|
+| `chunked` | manual 全部 + 开关打开后的 auto |
+| `single-call` | auto 单跳 |
+| `unknown-legacy` | 仅 auto 存量条目(由回填写入) |
+| 键缺失 / null | 只可能出现在 `has_full_text_reading == false` 的非精读条目上 |
+
+**下游(`notes_query` / skill `scholar-write` / Obsidian vault)必须这样用**:
+
+- `unknown-legacy` = **深度未知**,可能只覆盖正文前 40k 字符、且集中在靠前的几页(方法/结果常被砍掉)。
+  这批条目一律**不重跑**(重跑要数千次 LLM 调用并改写全部历史 md/references/vault,爆炸半径远超收益);
+  真要引用其中某篇时,走 skill `read-paper` 对那一篇**手动重读**——个案实测能从十来条句级标记涨到 57 条,
+  是效果最好的补救。
+- **别按 `highlights` 条数横向排序取证**:新老两代精读的产出密度天差地别,按条数排会系统性偏向新札记。
+  要比"读得深不深"请看 `reading_depth`,不要拿 `tag_counts` 当代理指标。
+- `fulltext_truncated`:**缺失 = 未知**,`false` = 确认未截断,二者禁止混同(`fulltext_chars` /
+  `fulltext_chars_raw` 同理,存量回填一律留缺失,不猜不填)。
+
+```bash
+# 取证前先分层:看这批候选各是什么深度
+jq -r '.papers[] | select(.duplicate_of == null and .has_full_text_reading)
+       | [(.reading_depth // "MISSING"), .series, .citekey] | @tsv' literature_index.json | sort | uniq -c
+
+# 只要读得最彻底的(manual 深读 + 开关打开后的 auto 分块精读)
+jq -r '.papers[] | select(.duplicate_of == null and .reading_depth == "chunked")
+       | [.citekey, .month, .title] | @tsv' literature_index.json
+```
+
 ## 查询配方(在本目录下执行)
 
 ```bash

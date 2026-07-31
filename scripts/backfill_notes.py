@@ -24,6 +24,7 @@
 """
 import argparse
 import json
+import subprocess
 import sys
 import time
 import traceback
@@ -38,6 +39,19 @@ from src.scholar.workflow import ScholarWorkflow  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 logger = get_logger("backfill")
+
+
+def notify(title, text):
+    """失败时弹系统通知（仿 scripts/sync_vault.py）。launchd 月度 job 无人值守，
+    退出码 1 只有翻日志才看得见，通知才是用户真正的告警面。osascript 不可用就静默——
+    告警本身不该反过来把回填弄挂。"""
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
+            capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def month_list(since: str, until: str):
@@ -92,13 +106,17 @@ def run_month(y, m, settings, seen: set, args) -> dict:
     out = wf.execute()                   # fetch + 跨源去重 + filter + translate/summary + 出 JSON
     segs = out.segments
 
-    # 全局跨月去重：同一篇只留最早月份
+    # 全局跨月去重：同一篇只留最早月份。
+    # 本月新增键先收进局部 month_keys，write_notes 成功后才并入 seen——过早并入的话，
+    # 本月中途失败（Crossref 超时/写盘失败）后同一篇在后续月份会被幽灵键误判成
+    # 「早前月已收录」而静默丢失（实际从未落盘）。异常路径自然不并入。
     fresh = []
+    month_keys: set = set()
     for seg in segs:
         k = dedup_key(seg.metadata)
-        if k in seen:
+        if k in seen or k in month_keys:
             continue
-        seen.add(k)
+        month_keys.add(k)
         fresh.append(seg)
     dropped = len(segs) - len(fresh)
     logger.info("  {} 入选 {} 篇，跨月去重后 {} 篇（去掉 {} 篇早前月已收录）".format(
@@ -116,11 +134,21 @@ def run_month(y, m, settings, seen: set, args) -> dict:
     if not args.no_close_read:
         from src.scholar.closereading import close_read_segments
         from src.scholar.llm_client import LLMClient
-        close_read_segments(
+        done = close_read_segments(
             fresh, proc.research_interests, LLMClient(settings.llm),
             top_n=args.top_n, email=email,
             model=(settings.llm.closeread_model or settings.llm.model),
-            scratch_dir=Path("output/scholar_pdfs"))
+            scratch_dir=Path("output/scholar_pdfs"),
+            # 与周度 ingest 同一个开关：漏传会让 CLOSEREAD_DEEP 打开后周度深读、
+            # 月度回填仍单跳，两代札记在同一索引里无声混存
+            deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+            max_chunks=proc.closeread_max_chunks)
+        if args.top_n > 0 and fresh and done == 0:
+            # 0/N 成功几乎只有 LLM 通路整体故障（限流/欠费）一种解释；照常写盘会把
+            # 降级札记固化成"已完成"（note_md.exists() 永久跳过，--force 需要人先发现），
+            # 宁可本月不写、由 main 记 error 退非零，重跑即完整恢复。done≥1 照常写盘。
+            raise RuntimeError("全文精读 0/{}，视为 LLM 故障批，不写终稿".format(
+                min(args.top_n, len(fresh))))
         full_text = sum(1 for s in fresh if s.close_reading and s.close_reading.from_full_text)
 
     from src.scholar.notes import write_notes
@@ -131,6 +159,7 @@ def run_month(y, m, settings, seen: set, args) -> dict:
         filename="科研札记_{}_全文精读".format(label),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True)  # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
+    seen |= month_keys           # 落盘成功，本月键此刻才算真正「已收录」
 
     hit_ck = sum(1 for v in citekeys.values() if v)
     logger.info("  ✅ {} → {} 篇 | citekey {}/{} | 全文精读 {} | 增强 CR{}/AX{}/TS{}".format(
@@ -224,19 +253,36 @@ def main():
         logger.info("  ⏱️ {} 用时 {}s".format(label, r["elapsed_sec"]))
 
     # 收尾：增量刷新文献索引（供论文项目 agent 检索；也是下次运行去重集的来源）
+    # 刷新失败不再只 warning：索引就是下次运行的去重集，坏了会连锁到后续每次跑。
+    index_err = None
     if not args.no_index:
         try:
             from src.scholar.notes_index import update_index, write_outputs
             notes_dir = Path(settings.processing.notes_dir)
             write_outputs(update_index(notes_dir), notes_dir)
         except Exception as e:
+            index_err = e
             logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))
 
     ok = [r for r in results if r.get("status") == "ok"]
+    # 只统计本次 run_months：progress 文件跨运行续用，历史遗留的陈旧 error 条目
+    # 不该让这次全部成功的运行误报非零退出。
+    errs = [r for r in results if r.get("month") in run_months and r.get("status") == "error"]
     logger.info("\n" + "=" * 60)
     logger.info("回填完成：成功 {} 个月 / 共 {}".format(len(ok), len(months)))
     logger.info("札记目录: {}".format(settings.processing.notes_dir))
     logger.info("=" * 60)
+    if errs or index_err is not None:
+        # launchd 月度 job 无人值守：失败必须退非零 + 弹通知，否则整月缺失无人知晓
+        parts = []
+        if errs:
+            parts.append("失败月份: {}".format(", ".join(sorted(r.get("month", "?") for r in errs))))
+        if index_err is not None:
+            parts.append("收尾索引刷新失败: {}".format(index_err))
+        msg = "；".join(parts)
+        notify("Scholar 月度回填失败", msg)
+        logger.error("❌ {}".format(msg))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

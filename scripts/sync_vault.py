@@ -12,8 +12,8 @@
 2. **git 提交**：vault 是用户资产且不受仓库 git 管辖（在 ~/Documents 下自成一库）。
    自动写盘必须留回滚点，否则一次静默重建把手写内容写坏就找不回来了。
    只在真有改动时提交；无改动不留空提交。
-3. **失败告警**：冲突/切片失败走系统通知，成功只写日志——定时任务若成功也弹窗，
-   几周后就会被无视，真出事那次也一起被无视。
+3. **失败告警**：冲突/切片失败/索引损坏走系统通知，成功只写日志——定时任务若成功
+   也弹窗，几周后就会被无视，真出事那次也一起被无视。
 
 **为什么用 subprocess 调 build_vault.py 而不是直接 import write_vault**：让报告格式、
 默认口径（只收已精读）、退出码语义只有一个出处；重建后的权威状态从 vault 的 `_meta.json`
@@ -56,11 +56,13 @@ def notify(title, text):
 
 
 def read_index(index_path, tries, settle):
-    """读索引，容忍「正在被写入」。
+    """读索引。缺失返回 "missing"；重试耗尽仍解析失败返回 None——那是真损坏。
 
-    `notes_index.py` 写索引用的是裸 `write_text`（非 tmp+replace），所以按文件变动触发时
-    有机会读到截断的 JSON。这里把「解析不了」与「真的坏了」区分开：重试仍失败就返回
-    None，调用方当作「还没就绪」正常退出，等写完那一刻的下一次触发。
+    `notes_index.py` 写索引已是 tmp+os.replace 原子写，WatchPaths 触发时不会再读到
+    半写的 JSON。重试只是给外部竞态（编辑器保存、磁盘抖动）留的廉价保险；重试后
+    仍解析不了就只剩一种解释：索引真的损坏（磁盘故障/人为改坏）。调用方必须告警
+    而不是当「还没就绪」静默跳过——上游 backfill/ingest 遇同样损坏会 fail-fast，
+    索引从此不再变动、WatchPaths 不再触发，静默会让 vault 永久停摆。
     """
     for i in range(tries):
         if not index_path.exists():
@@ -72,7 +74,7 @@ def read_index(index_path, tries, settle):
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             pass
         if i < tries - 1:
-            log("索引尚未就绪，{}s 后重试（{}/{}）".format(settle, i + 1, tries))
+            log("索引解析失败，{}s 后重试（{}/{}）".format(settle, i + 1, tries))
             time.sleep(settle)
     return None
 
@@ -128,8 +130,8 @@ def main():
     ap.add_argument("--force", action="store_true", help="忽略陈旧判定，强制重建")
     ap.add_argument("--dry-run", action="store_true", help="只算不写，也不提交")
     ap.add_argument("--no-commit", action="store_true", help="重建但不在 vault 侧提交")
-    ap.add_argument("--settle", type=float, default=5.0, help="索引未就绪时的重试间隔秒（默认 5）")
-    ap.add_argument("--tries", type=int, default=3, help="索引就绪重试次数（默认 3）")
+    ap.add_argument("--settle", type=float, default=5.0, help="索引解析失败的重试间隔秒（默认 5）")
+    ap.add_argument("--tries", type=int, default=3, help="判定索引损坏前的解析尝试次数（默认 3）")
     ap.add_argument("--build-arg", action="append", default=[], metavar="ARG",
                     help="透传给 build_vault.py 的额外参数，可重复（如 --build-arg=--neighbors=8）")
     args = ap.parse_args()
@@ -146,8 +148,11 @@ def main():
         log("找不到索引：{}".format(index_path))
         return 2
     if index is None:
-        log("索引持续处于半写入状态，本次跳过（等写入完成后的下一次触发）")
-        return 0
+        # 原子写落地后「半写入」已不存在，解析失败即真损坏；退 0 会让 launchd
+        # 视为成功且此后再无触发（见 read_index docstring），必须报警并按 2 退出。
+        log("索引重试后仍解析失败，疑似损坏：{}".format(index_path))
+        notify("札记 vault 同步失败", "literature_index.json 重试后仍解析失败，疑似损坏")
+        return 2
 
     stamp = index.get("generated_at")
     have = vault_stamp(vault_dir)

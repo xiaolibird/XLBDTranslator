@@ -402,12 +402,10 @@ class GmailClient:
         scholar_emails = []
         for msg_info in messages:
             try:
-                # 即使在 fetch 过程中，我们也进行基本的解析以确保它是真正的 Scholar 邮件
-                message = self.get_message(msg_info['id'], format='metadata') # 先拿元数据
-                metadata = self.parse_email_metadata(message)
-                
-                # 获取正文（仅针对真正符合条件的，减少 API 调用）
+                # full 是 metadata 的超集（headers/labelIds/internalDate 全在），一次取回
+                # 同时喂元数据解析与正文提取——省掉每封邮件一次串行往返
                 details = self.get_message(msg_info['id'], format='full')
+                metadata = self.parse_email_metadata(details)
                 body = self.get_message_body(details)
                 
                 scholar_emails.append({

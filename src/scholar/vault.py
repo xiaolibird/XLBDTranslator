@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..utils.logger import get_logger
-from .notes_index import _SECTION_RE, write_if_changed
+from .notes_index import _SECTION_RE, is_missing_citekey, write_if_changed
 
 logger = get_logger(__name__)
 
@@ -114,13 +114,23 @@ def select_papers(index: Dict[str, Any], *, include_maybe: bool = False,
     （3740/3804）。`include_abstract_only` 恢复旧口径；`include_maybe` 放宽到 keeper 全集。
     """
     out = []
+    missing = []
     for e in index.get("papers") or []:
         if not isinstance(e, dict) or e.get("duplicate_of") or not e.get("citekey"):
+            continue
+        if is_missing_citekey(e):
+            # 占位键会生成 MISSING-KEY-*.md 的幽灵笔记，且引用无处可指——按 sidecar 约定过滤
+            missing.append(e["citekey"])
             continue
         if (include_maybe
                 or e.get("has_full_text_reading")
                 or (include_abstract_only and e.get("decision") == "INCLUDE")):
             out.append(e)
+    if missing:
+        logger.warning("  ⚠️ vault 选集：{} 条 MISSING-KEY 占位条目已跳过"
+                       "（补 citekey 重跑索引后自动收录）：{}{}".format(
+                           len(missing), ", ".join(missing[:8]),
+                           " …" if len(missing) > 8 else ""))
     return out
 
 
@@ -998,9 +1008,14 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
         if status == "new":
             report["new"] += 1
         if force_regen and existing is not None:
-            path.write_text(content, encoding="utf-8")
-            report["written"] += 1
-            report["merged"] += 1
+            # force 语义由本 if 分支保证（不看 status）；落盘必须与常规路径同走
+            # write_if_changed 的 tmp+os.replace——content 含用户手写区，裸 write_text
+            # 中途崩溃会截断用户唯一副本。unchanged 时不写也正确，计数随返回值走。
+            if write_if_changed(path, content):
+                report["written"] += 1
+                report["merged"] += 1
+            else:
+                report["unchanged"] += 1
             continue
         if write_if_changed(path, content):
             report["written"] += 1
@@ -1031,7 +1046,9 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
 
     # 落选笔记：口径收紧或论文退出索引后，旧笔记会滞留、不被任何 MOC 引用。
     # 纯生成产物（用户区为空）直接删；写过东西的一律保留并报告——绝不替用户做删除决定。
-    known = {safe_filename(e["citekey"], set()) for e in entries}
+    # known 必须复用写盘阶段实际产出的文件名（files 里的 path 含撞名时的 X-2 后缀）；
+    # 若用独立空集合重算 safe_filename，X-2.md 会被当成 orphan 在同一次运行里写完即删。
+    known = {p.stem for p, _, _ in files}
     kept_orphans: List[str] = []
     for p in sorted((vault_dir / PAPERS_DIR).glob("*.md")):
         if p.stem in known or p.name.endswith(".conflict.md"):
