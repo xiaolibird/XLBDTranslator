@@ -3,6 +3,7 @@
 整合：断点续传、缓存持久化管理、Prompt 管理
 """
 import json
+import os
 import time
 import hashlib
 import threading
@@ -78,8 +79,14 @@ class CheckpointManager:
             self.project_dir.mkdir(parents=True, exist_ok=True)
             self.checkpoint_data['last_update'] = datetime.now().isoformat()
             
-            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
+            # tmp+replace 原子写：checkpoint 被截断会让续传状态整体作废，
+            # tmp 与目标同目录规避 os.replace 跨设备问题
+            tmp_file = self.checkpoint_file.with_suffix(self.checkpoint_file.suffix + '.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.checkpoint_data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.checkpoint_file)
             
             completed = len(self.checkpoint_data.get('completed_segments', []))
             total = self.checkpoint_data.get('total_segments', 0)

@@ -4,7 +4,7 @@
 import asyncio
 import json, os, traceback, signal, threading
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Callable, Dict, Optional, List
 
 from ..core.schema import Settings, SegmentList, ContentSegment, contains_failed_marker
 from ..core.exceptions import TranslationError
@@ -23,6 +23,25 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+
+
+# OpenAI 兼容 provider 的别名集合：_initialize_translator 与
+# _optimize_batch_size_for_provider 共用同一常量。第一轮曾因两处集合漂移
+# （漏掉 'openai_compatible' 别名）让云端 provider 落进"本地模型"分支，
+# batch_size 不压且日志误报；单一常量从结构上杜绝复发。
+OPENAI_COMPATIBLE_PROVIDERS = frozenset({'deepseek', 'openai', 'openai-compatible', 'openai_compatible'})
+
+# provider 参数上限查表：(max_safe_chars, prompt_overhead, batch_size 硬上限或 None)。
+# 三组常量是原三分支复制代码的唯一实质差异，抽表后计算与日志各只留一份。
+# 键 None 为兜底：使用简化版 prompt 的 provider（本地 Ollama、claude-agent 等）。
+PROVIDER_LIMITS = {
+    # 云端API context limit 约32K-128K，考虑完整版prompt开销，保守设置为60K上限
+    'openai_compatible': (60000, 2000, 3),
+    # Gemini context window 较大 (1M+ tokens)，保守设置上限为20万字符
+    'gemini': (200000, 2000, 4),
+    # 简化版prompt开销较小，通常有更大的context window，不设硬上限
+    None: (100000, 500, None),
+}
 
 
 # 全局引用，用于信号处理器访问当前工作流实例
@@ -131,82 +150,41 @@ class TranslationWorkflow:
         
         # 估算每批次的字符量（不含prompt）
         estimated_chars_per_batch = original_batch_size * max_chunk_size
-        
-        # 根据provider调整batch_size
-        if provider in {'deepseek', 'openai', 'openai-compatible'}:
-            # 云端API使用完整版prompt，字符数较多，需要减少batch_size
-            # DeepSeek/OpenAI context limit 约32K-128K，但考虑prompt开销，保守设置为60K上限
-            max_safe_chars = 60000
-            prompt_overhead = 2000  # 估算完整版prompt的字符数
-            
-            # 计算安全的batch_size
-            safe_batch_size = max(1, (max_safe_chars - prompt_overhead) // max_chunk_size)
-            optimized_batch_size = min(original_batch_size, safe_batch_size, 3)  # 最多3作为硬上限
-            
-            logger.info(f"🔧 参数优化分析 ({provider.upper()}):")
-            logger.info(f"   📊 当前配置: batch_size={original_batch_size}, max_chunk_size={max_chunk_size}")
-            logger.info(f"   📏 估算字符量: {estimated_chars_per_batch:,} 字符/批次 (不含prompt)")
-            logger.info(f"   ⚠️  安全上限: {max_safe_chars:,} 字符/批次 (含{prompt_overhead:,}字符prompt开销)")
-            logger.info(f"   🎯 优化结果: batch_size {original_batch_size} → {optimized_batch_size}")
-            
-            if optimized_batch_size < original_batch_size:
-                new_estimated_chars = optimized_batch_size * max_chunk_size + prompt_overhead
-                logger.info(f"   ✅ 新配置字符量: {new_estimated_chars:,} 字符/批次 (安全范围内)")
-                logger.info(f"   💡 备选方案: 可考虑减少 max_chunk_size 至 {max_chunk_size//2} 以增加batch_size")
-            else:
-                logger.info(f"   ✅ 当前配置已安全: {estimated_chars_per_batch + prompt_overhead:,} 字符/批次")
-            
-            reason = f"云端API使用完整版prompt，减少batch_size避免超出context限制"
-            
+
+        # 查表取 provider 上限：集合常量与 _initialize_translator 共用（见模块头注释），
+        # 三组常量以外的差异只剩 reason 文案
+        if provider in OPENAI_COMPATIBLE_PROVIDERS:
+            limits_key = 'openai_compatible'
+            reason = "云端API使用完整版prompt，减少batch_size避免超出context限制"
         elif provider == 'gemini':
-            # Gemini使用完整版prompt，但context window较大 (1M+ tokens)
-            # 保守设置上限为20万字符
-            max_safe_chars = 200000
-            prompt_overhead = 2000
-            
-            safe_batch_size = max(1, (max_safe_chars - prompt_overhead) // max_chunk_size)
-            optimized_batch_size = min(original_batch_size, safe_batch_size, 4)  # 最多4
-            
-            logger.info(f"🔧 参数优化分析 (GEMINI):")
-            logger.info(f"   📊 当前配置: batch_size={original_batch_size}, max_chunk_size={max_chunk_size}")
-            logger.info(f"   📏 估算字符量: {estimated_chars_per_batch:,} 字符/批次 (不含prompt)")
-            logger.info(f"   ⚠️  安全上限: {max_safe_chars:,} 字符/批次 (含{prompt_overhead:,}字符prompt开销)")
-            logger.info(f"   🎯 优化结果: batch_size {original_batch_size} → {optimized_batch_size}")
-            
-            if optimized_batch_size < original_batch_size:
-                new_estimated_chars = optimized_batch_size * max_chunk_size + prompt_overhead
-                logger.info(f"   ✅ 新配置字符量: {new_estimated_chars:,} 字符/批次 (安全范围内)")
-                logger.info(f"   💡 备选方案: 可考虑减少 max_chunk_size 至 {max_chunk_size//2} 以增加batch_size")
-            else:
-                logger.info(f"   ✅ 当前配置已安全: {estimated_chars_per_batch + prompt_overhead:,} 字符/批次")
-            
-            reason = f"Gemini使用完整版prompt，适度减少batch_size保证稳定性"
-            
+            limits_key = 'gemini'
+            reason = "Gemini使用完整版prompt，适度减少batch_size保证稳定性"
         else:
-            # 本地模型使用简化版prompt，可以保持较大batch_size
-            # 本地模型通常有更大的context window
-            max_safe_chars = 100000  # 本地模型通常支持更大的上下文
-            prompt_overhead = 500     # 简化版prompt开销较小
-            
-            safe_batch_size = max(1, (max_safe_chars - prompt_overhead) // max_chunk_size)
-            optimized_batch_size = min(original_batch_size, safe_batch_size)
-            
-            logger.info(f"🔧 参数优化分析 ({provider.upper()}):")
-            logger.info(f"   📊 当前配置: batch_size={original_batch_size}, max_chunk_size={max_chunk_size}")
-            logger.info(f"   📏 估算字符量: {estimated_chars_per_batch:,} 字符/批次 (不含prompt)")
-            logger.info(f"   ⚠️  安全上限: {max_safe_chars:,} 字符/批次 (含{prompt_overhead:,}字符prompt开销)")
-            
-            if optimized_batch_size < original_batch_size:
-                logger.info(f"   🎯 优化结果: batch_size {original_batch_size} → {optimized_batch_size}")
-                new_estimated_chars = optimized_batch_size * max_chunk_size + prompt_overhead
-                logger.info(f"   ✅ 新配置字符量: {new_estimated_chars:,} 字符/批次 (安全范围内)")
-                logger.info(f"   💡 备选方案: 可考虑减少 max_chunk_size 至 {max_chunk_size//2} 以增加batch_size")
-            else:
-                logger.info(f"   ✅ 参数保持: batch_size = {original_batch_size} (当前配置已安全)")
-                logger.info(f"   📏 当前字符量: {estimated_chars_per_batch + prompt_overhead:,} 字符/批次")
-            
-            reason = f"本地模型使用简化版prompt，保持原有batch_size"
-        
+            # claude-agent 等云端 provider 也会走到这里（force_simple 同样用简化版 prompt），
+            # 文案不能断言"本地模型"
+            limits_key = None
+            reason = "该provider使用简化版prompt，保持原有batch_size"
+        max_safe_chars, prompt_overhead, hard_cap = PROVIDER_LIMITS[limits_key]
+
+        # 计算安全的batch_size（计算与日志各只有一份，替代原三分支复制）
+        safe_batch_size = max(1, (max_safe_chars - prompt_overhead) // max_chunk_size)
+        optimized_batch_size = min(original_batch_size, safe_batch_size)
+        if hard_cap is not None:
+            optimized_batch_size = min(optimized_batch_size, hard_cap)
+
+        logger.info(f"🔧 参数优化分析 ({provider.upper()}):")
+        logger.info(f"   📊 当前配置: batch_size={original_batch_size}, max_chunk_size={max_chunk_size}")
+        logger.info(f"   📏 估算字符量: {estimated_chars_per_batch:,} 字符/批次 (不含prompt)")
+        logger.info(f"   ⚠️  安全上限: {max_safe_chars:,} 字符/批次 (含{prompt_overhead:,}字符prompt开销)")
+        logger.info(f"   🎯 优化结果: batch_size {original_batch_size} → {optimized_batch_size}")
+
+        if optimized_batch_size < original_batch_size:
+            new_estimated_chars = optimized_batch_size * max_chunk_size + prompt_overhead
+            logger.info(f"   ✅ 新配置字符量: {new_estimated_chars:,} 字符/批次 (安全范围内)")
+            logger.info(f"   💡 备选方案: 可考虑减少 max_chunk_size 至 {max_chunk_size//2} 以增加batch_size")
+        else:
+            logger.info(f"   ✅ 当前配置已安全: {estimated_chars_per_batch + prompt_overhead:,} 字符/批次")
+
         # 应用优化后的batch_size
         optimized = optimized_batch_size != original_batch_size
         if optimized:
@@ -299,7 +277,22 @@ class TranslationWorkflow:
                     logger.info(f"✅ 已加载 {len(self.all_segments)} 个内容片段")
                     return
             except Exception as e:
-                logger.warning(f"⚠️ structure_map.json 损坏，将重新解析: {e}")
+                # 重解析会把所有 translated_text 归空并覆盖本文件——先把坏文件
+                # 改名保留现场，人工仍有机会从中找回已付费的译文。
+                corrupt_path = self.structure_path.with_name(
+                    f"{self.structure_path.name}.corrupt-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
+                try:
+                    os.replace(self.structure_path, corrupt_path)
+                    logger.error(
+                        f"❌ structure_map.json 损坏（{e}），将重新解析原文档——"
+                        f"已有译文可能丢失！坏文件已保留至 {corrupt_path}，可人工找回"
+                    )
+                except OSError as mv_err:
+                    logger.error(
+                        f"❌ structure_map.json 损坏（{e}）且保留现场失败（{mv_err}），"
+                        f"将重新解析原文档——已有译文可能丢失！"
+                    )
         
         # 2. 重新解析文档
         logger.info("⚙️ 解析文档结构...")
@@ -356,7 +349,7 @@ class TranslationWorkflow:
             logger.info("✅ Gemini 翻译器已初始化")
             return
 
-        if provider in {'deepseek', 'openai', 'openai-compatible', 'openai_compatible'}:
+        if provider in OPENAI_COMPATIBLE_PROVIDERS:
             # OpenAI-compatible provider (DeepSeek)
             self.cache_manager = None
             self.translator = OpenAICompatibleTranslator(self.settings)
@@ -620,7 +613,7 @@ class TranslationWorkflow:
             for seg, t in zip(batch, batch_results):
                 seg.translated_text = t
                 # 预翻译阶段也标记完成状态（如果启用了 checkpoint）
-                if self.checkpoint and t and not t.startswith("[Failed") and not t.endswith("Failed]"):
+                if self.checkpoint and t and not contains_failed_marker(t):
                     self.checkpoint.mark_segment_completed(seg.segment_id)
                 # 记录被阻断的段落以便人工复核
                 if isinstance(t, str) and t.startswith("[Failed: Blocked"):
@@ -671,18 +664,34 @@ class TranslationWorkflow:
                     
                 except Exception as e:
                     logger.warning(f"⚠️ Batch {batch_num} 术语提取失败: {e}")
-            
-            # 4. 保存阶段性结果
-            self._save_structure_map(self.all_segments)
-            if self.checkpoint:
-                self.checkpoint.save_checkpoint()
-            if self.glossary:
-                try:
-                    with open(glossary_path, 'w', encoding='utf-8') as gf:
-                        json.dump(self.glossary, gf, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logger.warning(f"⚠️ 保存阶段性术语表失败: {e}")
-        
+
+            # 4. 保存阶段性结果——按主循环同款 checkpoint_interval 取模节流：
+            # _save_structure_map 是全书 JSON 序列化 + fsync，每批全量落盘只为
+            # 多几段增量，大书上 60+ 次 MB 级重写纯属浪费；恢复粒度降为每
+            # interval 批，与主翻译循环持平
+            if batch_num % self.settings.processing.checkpoint_interval == 0:
+                self._save_structure_map(self.all_segments)
+                if self.checkpoint:
+                    self.checkpoint.save_checkpoint()
+                if self.glossary:
+                    try:
+                        with open(glossary_path, 'w', encoding='utf-8') as gf:
+                            json.dump(self.glossary, gf, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        logger.warning(f"⚠️ 保存阶段性术语表失败: {e}")
+
+        # 循环外补一次最终保存：覆盖非整 interval 的尾批与 max_terms/饱和
+        # 两个 break 提前退出路径，保证断点完整
+        self._save_structure_map(self.all_segments)
+        if self.checkpoint:
+            self.checkpoint.save_checkpoint()
+        if self.glossary:
+            try:
+                with open(glossary_path, 'w', encoding='utf-8') as gf:
+                    json.dump(self.glossary, gf, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"⚠️ 保存最终术语表失败: {e}")
+
         # 最终统计
         if self.glossary:
             logger.info(f"💾 术语表已保存到: {glossary_path}")
@@ -704,7 +713,6 @@ class TranslationWorkflow:
             logger.info(f"🧪 预翻译前 {pre_count} 个片段以构建术语表...")
             logger.info(f"   - 使用基础缓存（无 mode、无 glossary）")
             
-            translation_mode_config = self._build_translation_mode_config()
             # 为预翻译片段提供上下文（同步方式，使用原文作为上下文）
             translations = []
             batch_size = self.settings.processing.batch_size
@@ -722,7 +730,7 @@ class TranslationWorkflow:
             for seg, t in zip(pending_pre, translations):
                 seg.translated_text = t
                 # 传统预翻译阶段也标记完成状态（如果启用了 checkpoint）
-                if self.checkpoint and t and not t.startswith("[Failed") and not t.endswith("Failed]"):
+                if self.checkpoint and t and not contains_failed_marker(t):
                     self.checkpoint.mark_segment_completed(seg.segment_id)
                 if isinstance(t, str) and t.startswith("[Failed: Blocked"):
                     try:
@@ -853,47 +861,59 @@ class TranslationWorkflow:
             return
 
         logger.info("🔍 质检：扫描失败标记与术语违例段落...")
+        # 失败扫描不限 content_type：vision 模式下 image 段恰是最易产出 [Failed:] 的路径，
+        # 跳过它们会让报告在成品嵌着失败页时仍打 ✅（可见性缺口，见评审 fallback-book-7）
         failed: SegmentList = []
         term_violations: List[tuple] = []  # (seg, [(en,zh),...])
         for seg in self.all_segments:
-            if seg.content_type != "text":
-                continue
             tt = seg.translated_text or ""
             if not tt.strip() or contains_failed_marker(tt):
                 failed.append(seg)
+                continue
+            if seg.content_type != "text":
                 continue
             v = self._glossary_violations(seg)
             if v:
                 term_violations.append((seg, v))
 
-        if failed:
+        # 重译队列仍只收 text：image 段失败只报告不重译（不引入新的视觉重译行为）
+        retry_queue = [seg for seg in failed if seg.content_type == "text"]
+        image_failed_count = len(failed) - len(retry_queue)
+
+        if retry_queue:
             logger.info(
                 "🔁 质检触发定向重译：{} 段硬失败/空译文（上限 1 轮）；另有 {} 段术语违例仅报告不重译".format(
-                    len(failed), len(term_violations)
+                    len(retry_queue), len(term_violations)
                 )
             )
             # 仅对硬失败段清空译文并移出 completed，使其重新入队（无好译文可毁）
-            for seg in failed:
+            for seg in retry_queue:
                 seg.translated_text = ""
                 try:
                     self.checkpoint.remove_from_completed(seg.segment_id)
                 except Exception:
                     pass
             try:
-                self._run_sync_translation(list(failed))
+                self._run_sync_translation(list(retry_queue))
             except Exception as e:
                 logger.error(f"❌ 质检定向重译失败（保留失败标记）: {e}")
             self._save_structure_map(self.all_segments)
             self.checkpoint.save_checkpoint()
+        elif image_failed_count:
+            logger.warning(
+                "⚠️ 质检：{} 段非文本（image）翻译失败，仅报告不重译（见 quality_report.json）".format(
+                    image_failed_count
+                )
+            )
         elif term_violations:
             logger.info("ℹ️ 质检：{} 段术语违例（仅报告，见 quality_report.json）".format(len(term_violations)))
         else:
             logger.info("✅ 质检未发现失败或术语违例段落")
 
-        # 重译后仍失败的段落
+        # 重译后仍失败的段落（全类型如实统计，image 失败段不再从报告里消失）
         still_failed = [
             seg for seg in self.all_segments
-            if seg.content_type == "text" and contains_failed_marker(seg.translated_text or "")
+            if contains_failed_marker(seg.translated_text or "")
         ]
         self._write_quality_report(failed, term_violations, still_failed)
 
@@ -940,117 +960,106 @@ class TranslationWorkflow:
         except Exception as e:
             logger.error(f"❌ 写质检报告失败: {e}")
 
+    def _run_sync_batches(
+        self,
+        pending_segments: SegmentList,
+        on_progress: Optional[Callable[[], None]] = None,
+    ) -> int:
+        """同步翻译核心循环——rich/非 rich 共用的唯一实现。
+
+        此前两分支各持一份逐行相同的循环，失败判定/保存节奏的修复被迫双写，
+        漏一处即行为分叉；现收敛为一份，进度展示差异经 on_progress 回调注入
+        （rich 分支传进度条更新回调，非 rich 传 None）。
+
+        Returns:
+            成功翻译的片段数
+        """
+        success_count = 0
+        batch_size = self.settings.processing.batch_size
+
+        for i in range(0, len(pending_segments), batch_size):
+            batch = pending_segments[i:i+batch_size]
+            # 为当前batch的第一个segment获取上下文
+            context = ""
+            if batch:
+                context = self._get_context_from_memory(
+                    batch[0],
+                    self.settings.processing.max_context_length
+                )
+            # 传入 glossary：非 Gemini 缓存 provider（DeepSeek/OpenAI 等）只能靠参数注入术语表，
+            # engine 内部已有 `if glossary and not enable_gemini_caching` 判断，缓存模式不会重复注入
+            results = self.translator.translate_batch(batch, context=context, glossary=self.glossary)
+
+            for seg, trans in zip(batch, results):
+                if trans and not contains_failed_marker(trans):
+                    seg.translated_text = trans
+                    self.checkpoint.mark_segment_completed(seg.segment_id)
+                    success_count += 1
+                else:
+                    seg.translated_text = trans if trans else "[Failed: Empty response]"
+                    self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
+                    if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
+                        try:
+                            self._record_blocked_segments([seg], reason=trans)
+                        except Exception:
+                            logger.debug("Failed to record blocked segment")
+
+                if on_progress:
+                    on_progress()
+
+            # 定期保存检查点
+            if (i // batch_size + 1) % self.settings.processing.checkpoint_interval == 0:
+                self._save_structure_map(self.all_segments)
+                self.checkpoint.save_checkpoint()
+
+        logger.info(f"✅ 同步翻译完成: {success_count}/{len(pending_segments)} 成功")
+        return success_count
+
     def _run_sync_translation(self, pending_segments: SegmentList) -> None:
         """同步翻译模式（带进度条）"""
         logger.info("🔄 使用同步模式翻译")
         logger.info(f"📝 开始同步翻译 {len(pending_segments)} 个片段...")
-        
+
         try:
             # 尝试使用 rich 进度条，如果失败则回退到无进度条模式
             use_rich = self.settings.processing.use_rich_progress
-            
+
             if use_rich:
                 try:
                     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-                    
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn("[bold blue]{task.description}"),
-                        BarColumn(),
-                        TaskProgressColumn(),
-                        console=None,  # 使用默认console
-                    ) as progress:
-                        task = progress.add_task("[cyan]同步翻译中...", total=len(pending_segments))
-                        
-                        success_count = 0
-                        batch_size = self.settings.processing.batch_size
-                        
-                        for i in range(0, len(pending_segments), batch_size):
-                            batch = pending_segments[i:i+batch_size]
-                            # 为当前batch的第一个segment获取上下文
-                            context = ""
-                            if batch:
-                                context = self._get_context_from_memory(
-                                    batch[0],
-                                    self.settings.processing.max_context_length
-                                )
-                            results = self.translator.translate_batch(batch, context=context)
-                            
-                            for seg, trans in zip(batch, results):
-                                if trans and not contains_failed_marker(trans):
-                                    seg.translated_text = trans
-                                    self.checkpoint.mark_segment_completed(seg.segment_id)
-                                    success_count += 1
-                                else:
-                                    seg.translated_text = trans if trans else "[Failed: Empty response]"
-                                    self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
-                                    if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
-                                        try:
-                                            self._record_blocked_segments([seg], reason=trans)
-                                        except Exception:
-                                            logger.debug("Failed to record blocked segment")
-                                
-                                progress.update(task, advance=1)
-                            
-                            # 定期保存检查点
-                            if (i // batch_size + 1) % self.settings.processing.checkpoint_interval == 0:
-                                self._save_structure_map(self.all_segments)
-                                self.checkpoint.save_checkpoint()
-                        
-                        logger.info(f"✅ 同步翻译完成: {success_count}/{len(pending_segments)} 成功")
-                        
                 except ImportError:
                     logger.warning("⚠️ Rich 库未安装，使用简单模式（无进度条）")
                     use_rich = False
-            
-            # 回退到简单模式（无进度条）
-            if not use_rich:
-                translation_mode_config = self._build_translation_mode_config()
-                # 为每个batch分别处理上下文
-                success_count = 0
-                batch_size = self.settings.processing.batch_size
 
-                for i in range(0, len(pending_segments), batch_size):
-                    batch = pending_segments[i:i+batch_size]
-                    # 为当前batch的第一个segment获取上下文
-                    context = ""
-                    if batch:
-                        context = self._get_context_from_memory(
-                            batch[0],
-                            self.settings.processing.max_context_length
-                        )
-                    results = self.translator.translate_batch(batch, context=context)
+            if use_rich:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=None,  # 使用默认console
+                ) as progress:
+                    task = progress.add_task("[cyan]同步翻译中...", total=len(pending_segments))
+                    self._run_sync_batches(
+                        pending_segments,
+                        on_progress=lambda: progress.update(task, advance=1),
+                    )
+            else:
+                # 简单模式（无进度条）：同一实现，仅不传进度回调
+                self._run_sync_batches(pending_segments, on_progress=None)
 
-                    for seg, trans in zip(batch, results):
-                        if trans and not contains_failed_marker(trans):
-                            seg.translated_text = trans
-                            self.checkpoint.mark_segment_completed(seg.segment_id)
-                            success_count += 1
-                        else:
-                            seg.translated_text = trans if trans else "[Failed: Empty response]"
-                            self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
-                            if isinstance(trans, str) and trans.startswith("[Failed: Blocked"):
-                                try:
-                                    self._record_blocked_segments([seg], reason=trans)
-                                except Exception:
-                                    logger.debug("Failed to record blocked segment")
-
-                    # 定期保存检查点
-                    if (i // batch_size + 1) % self.settings.processing.checkpoint_interval == 0:
-                        self._save_structure_map(self.all_segments)
-                        self.checkpoint.save_checkpoint()
-                
-                logger.info(f"✅ 同步翻译完成: {success_count}/{len(pending_segments)} 成功")
-            
             # 最终保存
             self._save_structure_map(self.all_segments)
             self.checkpoint.save_checkpoint()
-            
+
         except Exception as e:
             logger.error(f"❌ 同步翻译失败: {e}")
+            # 只把尚未成功的段标记失败，不覆写本轮已成功的译文
+            # （否则中途抛异常会把已完成批次的译文销毁并落盘，下次运行全部重新付费翻译）
             for seg in pending_segments:
-                seg.translated_text = f"[Failed: {str(e)}]"
-                self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
+                if not seg.translated_text or contains_failed_marker(seg.translated_text):
+                    seg.translated_text = f"[Failed: {str(e)}]"
+                    self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
             self._save_structure_map(self.all_segments)
             self.checkpoint.save_checkpoint()
             raise
@@ -1067,7 +1076,8 @@ class TranslationWorkflow:
           └── asyncio.run(_run_concurrent_batches)  [单次调用]
                 └── asyncio.gather(*batch_tasks)  [真正的并发]
                       └── _process_single_batch (每个 batch)
-                            └── async_t.translate_text_batch_async
+                            └── async_t.translate_vision_batch_async (批内含 image 段)
+                                / async_t.translate_text_batch_async (纯文本批)
         """
         logger.info("⚡ 使用异步模式翻译（多批次并发+即时保存）")
         
@@ -1094,6 +1104,13 @@ class TranslationWorkflow:
         # 用于线程安全的计数和保存
         lock = threading.Lock()
         stats = {"success": 0, "processed": 0, "completed_batches": 0}
+
+        # provider 致命错误（欠费/认证/模型下线）的全书级短路点：
+        # _process_single_batch 内部为了落盘失败状态会捕获所有异常，若不在此
+        # 记录 fatal，gather 路径会继续把后续几十个批次逐一打成失败并静默收尾。
+        # 这里只暂存，待 as_completed 循环收尾后统一 raise，保证已保存的
+        # checkpoint/结构图不丢，同时让调用方（execute）感知 provider 已不可用。
+        fatal_holder = {"exc": None}
         
         async def _process_single_batch(batch_idx: int, batch: SegmentList, semaphore: asyncio.Semaphore):
             """处理单个 batch（在 semaphore 控制下）"""
@@ -1107,17 +1124,28 @@ class TranslationWorkflow:
                             self.settings.processing.max_context_length
                         )
                     
-                    # 执行翻译
+                    # 执行翻译：整批路由视觉/文本通路（判定与同步 translate_batch 一致，
+                    # 见 engine.py translate_batch 的 has_image 分流）。不拆批不合并——
+                    # 混合批内文本段的降级由各 translate_vision_batch_async 实现内置，
+                    # 否则 vision 模式下 image 段（original_text=""）会被当空文本送翻译。
                     async_t = self.translator.async_translator
-                    batch_results = await async_t.translate_text_batch_async(
-                        batch, context, self.glossary
-                    )
+                    has_image = any(seg.content_type == "image" for seg in batch)
+                    if has_image:
+                        batch_results = await async_t.translate_vision_batch_async(
+                            batch, context, self.glossary
+                        )
+                    else:
+                        batch_results = await async_t.translate_text_batch_async(
+                            batch, context, self.glossary
+                        )
                     
                     # 处理结果（线程安全）
                     batch_success = 0
                     with lock:
                         for seg, trans in zip(batch, batch_results):
-                            if trans and not (isinstance(trans, str) and (trans.startswith("[Failed") or trans.endswith("Failed]"))):
+                            # 与同步路径同源判定：手写 startswith/endswith 会漏检
+                            # "[...翻译被截断]"，把截断段记成功后 checkpoint 就不再重译
+                            if trans and not contains_failed_marker(trans):
                                 seg.translated_text = trans
                                 self.checkpoint.mark_segment_completed(seg.segment_id)
                                 stats["success"] += 1
@@ -1143,7 +1171,14 @@ class TranslationWorkflow:
                     
                 except Exception as e:
                     logger.error(f"❌ 批次 {batch_idx} 失败: {e}")
-                    
+
+                    # 硬性致命错误（classify_fatal=='hard'：402 欠费/401 认证/404 模型下线）
+                    # 记入 fatal_holder：本批仍按现逻辑标记失败并保存（保住已有进度），
+                    # 但收尾时必须整体短路，不能让后续批次继续空转烧配额。
+                    from src.translator.fallback import classify_fatal
+                    if classify_fatal(e) == 'hard':
+                        fatal_holder["exc"] = e
+
                     # 标记失败（线程安全）
                     with lock:
                         for seg in batch:
@@ -1162,25 +1197,41 @@ class TranslationWorkflow:
                     
                     return batch_idx, False
         
-        async def _run_concurrent_batches():
-            """并发执行所有 batch"""
+        async def _run_concurrent_batches(on_batch_done: Optional[Callable[[], None]] = None):
+            """并发执行所有 batch——rich/非 rich 共用的唯一驱动循环。
+
+            此前 rich 分支另维护一份带进度条的驱动副本，fatal 短路等收尾语义
+            靠注释手工"对齐"两处；现收敛为一份，进度条更新经 on_batch_done
+            回调注入（rich 分支传回调，非 rich 传 None）。
+            """
             semaphore = asyncio.Semaphore(max_concurrent)
-            
+
             # 创建所有任务
             tasks = [
                 _process_single_batch(idx, batch, semaphore)
                 for idx, batch in enumerate(batches, 1)
             ]
-            
+
             # 并发执行（使用 as_completed 获取实时进度）
             results = []
             for coro in asyncio.as_completed(tasks):
                 try:
                     batch_idx, success = await coro
                     results.append((batch_idx, success))
+                    if on_batch_done:
+                        on_batch_done()
                 except Exception as e:
+                    # 仅记录非致命的批次任务异常；fatal 已在 _process_single_batch
+                    # 内部捕获并写入 fatal_holder，不会传导到这里，
+                    # 故此 except 不会吞掉致命错误。
                     logger.error(f"批次任务异常: {e}")
-            
+
+            # 全书级短路：循环放到最后才 raise，是为了让已在飞的批次先落盘
+            # （fatal 在 _process_single_batch 内部已捕获并置位，不会被上面的
+            # except 拦掉），避免半途 raise 丢掉其他批次已保存的进度。
+            if fatal_holder["exc"]:
+                raise fatal_holder["exc"]
+
             return results
         
         # 使用 Rich 进度条（如果可用）
@@ -1203,27 +1254,14 @@ class TranslationWorkflow:
             ) as progress:
                 batch_task = progress.add_task(f"[cyan]批次进度 (并发:{max_concurrent})", total=total_batches)
                 segment_task = progress.add_task("[green]片段进度", total=total_segments)
-                
-                # 启动后台任务更新进度条
-                async def _run_with_progress():
-                    semaphore = asyncio.Semaphore(max_concurrent)
-                    tasks = [
-                        _process_single_batch(idx, batch, semaphore)
-                        for idx, batch in enumerate(batches, 1)
-                    ]
-                    
-                    for coro in asyncio.as_completed(tasks):
-                        try:
-                            await coro
-                            # 更新进度条
-                            progress.update(batch_task, completed=stats["completed_batches"])
-                            progress.update(segment_task, completed=stats["processed"])
-                        except Exception as e:
-                            logger.error(f"批次任务异常: {e}")
-                
-                # 执行并发翻译
-                asyncio.run(_run_with_progress())
-                
+
+                def _update_progress():
+                    progress.update(batch_task, completed=stats["completed_batches"])
+                    progress.update(segment_task, completed=stats["processed"])
+
+                # 执行并发翻译（与非 rich 路径同一驱动，仅注入进度条回调）
+                asyncio.run(_run_concurrent_batches(on_batch_done=_update_progress))
+
                 # 最终更新
                 progress.update(batch_task, completed=total_batches)
                 progress.update(segment_task, completed=stats["processed"])
@@ -1398,11 +1436,15 @@ class TranslationWorkflow:
             # 序列化为字典列表
             data = [seg.model_dump() for seg in segments]
             
-            # 强制写入并刷新
-            with open(self.structure_path, 'w', encoding='utf-8') as f:
+            # tmp+replace 原子写（与 merge_final.py 一致）：structure_map 是全部译文的
+            # 唯一载体，写入中途被杀会留下截断 JSON、下次运行静默重解析丢弃译文。
+            # tmp 放同目录，保证 os.replace 不跨设备。
+            tmp_path = self.structure_path.with_suffix(self.structure_path.suffix + '.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush()  # 强制刷新缓冲区
                 os.fsync(f.fileno())  # 强制同步到磁盘
+            os.replace(tmp_path, self.structure_path)
             
             # 统计已翻译数量（用于进度显示）
             translated_count = sum(1 for seg in segments if seg.is_translated)

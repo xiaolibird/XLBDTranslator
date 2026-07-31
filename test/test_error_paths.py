@@ -76,3 +76,232 @@ def test_backendadapter_missing_token_or_file_shows_none(monkeypatch):
     adapter = BackendAdapter()
     result = adapter.build_settings_from_ui()
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# FIX-1: provider 致命错误（402 欠费等）必须从异步 gather 路径向上传导。
+# 修复前 _process_single_batch 把所有异常吞成 [Failed:] 字符串并静默收尾，
+# 全书几十个批次会逐一空转打成失败，调用方（execute/回退链）毫无感知。
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from src.core.exceptions import APIError
+from src.core.schema import ContentSegment, SegmentList
+from src.translator.fallback import classify_fatal
+from src.workflow.workflow import TranslationWorkflow
+
+
+class _FatalCheckpoint:
+    """最小 checkpoint stub：记录成功/失败标记，验证 fatal 后没有批次被写成成功"""
+
+    def __init__(self):
+        self.completed = set()
+        self.failed = {}
+
+    def mark_segment_completed(self, segment_id):
+        self.completed.add(segment_id)
+
+    def mark_segment_failed(self, segment_id, reason):
+        self.failed[segment_id] = reason
+
+    def save_checkpoint(self):
+        pass
+
+
+def _make_async_workflow(segments, batch_size=1):
+    """绕过 __init__ 搭最小 workflow，只挂 _run_async_translation 依赖的属性"""
+    wf = TranslationWorkflow.__new__(TranslationWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(
+            batch_size=batch_size,
+            async_max_workers=2,
+            max_context_length=0,
+        )
+    )
+    wf.glossary = {}
+    wf.all_segments = SegmentList(segments)
+    wf.checkpoint = _FatalCheckpoint()
+    wf._save_structure_map = lambda segs: None
+    wf._get_context_from_memory = lambda seg, max_len: ""
+    return wf
+
+
+def test_async_402_fatal_propagates_and_no_batch_marked_success(monkeypatch):
+    """非 rich 路径：mock 异步翻译器抛 402（classify_fatal=='hard'）→
+    _run_async_translation 必须向上 raise，且没有任何批次被写成成功"""
+    # 强制走非 rich 的 _run_concurrent_batches 路径
+    monkeypatch.setattr("src.workflow.workflow.RICH_AVAILABLE", False)
+
+    fatal_exc = APIError("402 Payment Required: insufficient balance")
+    # 前置校验：确保测试用的异常确实被分类为硬性致命，避免测试空转
+    assert classify_fatal(fatal_exc) == "hard"
+
+    class _InsolventAsyncTranslator:
+        """欠费 provider：所有调用一律抛 402"""
+
+        def __init__(self):
+            self.calls = 0
+
+        async def translate_text_batch_async(self, segments, context="", glossary=None):
+            self.calls += 1
+            raise fatal_exc
+
+        async def translate_vision_batch_async(self, segments, context="", glossary=None):
+            self.calls += 1
+            raise fatal_exc
+
+    segments = [
+        ContentSegment(segment_id=i, original_text=f"原文{i}", content_type="text")
+        for i in range(3)
+    ]
+    wf = _make_async_workflow(segments, batch_size=1)  # 3 个批次
+    fake = _InsolventAsyncTranslator()
+    wf.translator = SimpleNamespace(async_translator=fake)
+
+    # 致命错误必须传导到调用方（execute/回退链），而非静默收尾
+    with pytest.raises(APIError):
+        wf._run_async_translation(SegmentList(segments))
+
+    # 没有任何批次被写成成功：checkpoint 无 completed，各段均为失败标记
+    assert wf.checkpoint.completed == set()
+    assert set(wf.checkpoint.failed) == {0, 1, 2}
+    assert all(
+        (s.translated_text or "").startswith("[Failed:") for s in segments
+    ), "fatal 后不允许把任何段写成成功译文"
+
+
+def test_async_nonfatal_error_does_not_raise(monkeypatch):
+    """守护测试：非致命异常仍走原降级语义（标失败但不上抛），防止短路过度扩大"""
+    monkeypatch.setattr("src.workflow.workflow.RICH_AVAILABLE", False)
+
+    nonfatal_exc = ValueError("transient parse hiccup")
+    assert classify_fatal(nonfatal_exc) is None
+
+    class _FlakyAsyncTranslator:
+        async def translate_text_batch_async(self, segments, context="", glossary=None):
+            raise nonfatal_exc
+
+        async def translate_vision_batch_async(self, segments, context="", glossary=None):
+            raise nonfatal_exc
+
+    segments = [
+        ContentSegment(segment_id=0, original_text="原文0", content_type="text"),
+    ]
+    wf = _make_async_workflow(segments, batch_size=1)
+    wf.translator = SimpleNamespace(async_translator=_FlakyAsyncTranslator())
+
+    # 不应 raise：非致命错误维持"标失败、继续收尾"的既有行为
+    wf._run_async_translation(SegmentList(segments))
+
+    assert wf.checkpoint.completed == set()
+    assert 0 in wf.checkpoint.failed
+
+
+# ---------------------------------------------------------------------------
+# FIX-2: Gemini 重试谓词直测。
+# 新版 google-genai SDK 抛 genai.errors.APIError 体系（不再是 google.api_core），
+# 谓词必须让瞬态错误（429/5xx/项目内 APIError 包装）进重试、
+# 致命 4xx（401/402/403/404）与无关异常直接上抛，否则要么限流得不到重试、
+# 要么欠费/认证错误被空转 3 轮才暴露。
+# ---------------------------------------------------------------------------
+
+from google.genai import errors as genai_errors
+
+from src.translator.engine import _is_retryable_gemini_error
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        # 429 限流：瞬态，必须重试
+        (genai_errors.ClientError(429, {"error": {"message": "rate limited"}}), True),
+        # 402 欠费：致命，重试只会空转，必须立即上抛给回退链
+        (genai_errors.ClientError(402, {"error": {"message": "payment required"}}), False),
+        # 5xx 服务端瞬态故障：必须重试
+        (genai_errors.ServerError(503, {"error": {"message": "unavailable"}}), True),
+        # 项目内 APIError（空响应/安全拦截包装）：保持既有重试行为
+        (APIError("empty response"), True),
+        # 无关异常（解析 bug 等）：不属于网络瞬态，不重试
+        (ValueError("boom"), False),
+    ],
+    ids=["genai-429", "genai-402", "genai-503", "core-apierror", "valueerror"],
+)
+def test_is_retryable_gemini_error(exc, expected):
+    assert _is_retryable_gemini_error(exc) is expected
+
+
+# ---------------------------------------------------------------------------
+# R1(fallback-book-r2-1): 同步翻译 catch-all 只标未成功段。
+# 此前中途抛异常会把 pending_segments 里已成功批次的译文整体覆写为 [Failed:]
+# 并随 structure_map 落盘销毁，下次运行 get_pending_segments 按失败标记
+# 重新入队，等于成功批次全部重付费。与 scholar 链 944f0ab 的修法对齐。
+# ---------------------------------------------------------------------------
+
+
+def _make_sync_workflow(segments, batch_size=3, use_rich=False):
+    """绕过 __init__ 搭最小 workflow，只挂 _run_sync_translation 依赖的属性"""
+    wf = TranslationWorkflow.__new__(TranslationWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(
+            use_rich_progress=use_rich,
+            batch_size=batch_size,
+            checkpoint_interval=1000,  # 避免周期性落盘干扰断言
+            max_context_length=0,
+        )
+    )
+    wf.glossary = {}
+    wf.all_segments = SegmentList(segments)
+    wf.checkpoint = _FatalCheckpoint()
+    wf._save_structure_map = lambda segs: None
+    wf._get_context_from_memory = lambda seg, max_len: ""
+    return wf
+
+
+def test_sync_catchall_preserves_completed_segments_on_midway_failure():
+    """10 段、batch_size=3：前 2 批成功后第 3 批抛 APIError →
+    前 6 段译文与 completed 状态保留，仅未成功段带 [Failed:]，异常仍上抛"""
+    segments = [
+        ContentSegment(segment_id=i, original_text=f"原文{i}", content_type="text")
+        for i in range(10)
+    ]
+    wf = _make_sync_workflow(segments, batch_size=3, use_rich=False)
+
+    call_count = {"n": 0}
+
+    def fake_translate_batch(batch, context="", glossary=None):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:
+            raise APIError("boom on batch 3")
+        return [f"译文{s.segment_id}" for s in batch]
+
+    wf.translator = SimpleNamespace(translate_batch=fake_translate_batch)
+
+    # 捕获 structure_map 落盘内容，验证磁盘视图与内存断言一致
+    structure_snapshots = []
+    wf._save_structure_map = lambda segs: structure_snapshots.append(
+        {s.segment_id: s.translated_text for s in segs}
+    )
+
+    # 异常必须向上 raise（保留原有传导语义）
+    with pytest.raises(APIError):
+        wf._run_sync_translation(SegmentList(segments))
+
+    # 前 2 批（seg 0-5）：译文保留、checkpoint 仍 completed、未被标失败
+    for i in range(6):
+        assert segments[i].translated_text == f"译文{i}", "已成功译文不许被覆写"
+        assert i in wf.checkpoint.completed
+        assert i not in wf.checkpoint.failed
+    # 第 3 批抛异常的 seg 6-8 与从未尝试的 seg 9：带 [Failed:] 标记并标失败
+    for i in range(6, 10):
+        assert (segments[i].translated_text or "").startswith("[Failed:")
+        assert i in wf.checkpoint.failed
+        assert i not in wf.checkpoint.completed
+
+    # catch-all 落盘的 structure_map 与上述内存状态一致
+    assert structure_snapshots, "catch-all 应落盘 structure_map"
+    final = structure_snapshots[-1]
+    for i in range(6):
+        assert final[i] == f"译文{i}", "落盘内容不许销毁已付费译文"
+    for i in range(6, 10):
+        assert (final[i] or "").startswith("[Failed:")

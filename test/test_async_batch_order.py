@@ -131,6 +131,178 @@ async def _run_as_completed_problem():
     )
 
 
+# ---------------------------------------------------------------------------
+# FIX-6: 异步模式整批路由视觉批次（与同步 translate_batch 的 has_image 分流同构），
+# 以及质检报告如实覆盖 image 失败段
+# ---------------------------------------------------------------------------
+
+import json
+from types import SimpleNamespace
+
+from src.workflow.workflow import TranslationWorkflow
+
+
+class _RecordingAsyncTranslator:
+    """fake 异步翻译器：记录被调方法与入参，返回可区分来源的译文"""
+
+    def __init__(self):
+        self.vision_calls: List[List[ContentSegment]] = []
+        self.text_calls: List[List[ContentSegment]] = []
+
+    async def translate_text_batch_async(self, segments, context="", glossary=None):
+        self.text_calls.append(list(segments))
+        return [f"文本译-{seg.segment_id}" for seg in segments]
+
+    async def translate_vision_batch_async(self, segments, context="", glossary=None):
+        self.vision_calls.append(list(segments))
+        return [f"视觉译-{seg.segment_id}" for seg in segments]
+
+
+class _FakeCheckpoint:
+    def __init__(self):
+        self.completed = set()
+        self.failed = {}
+
+    def mark_segment_completed(self, segment_id):
+        self.completed.add(segment_id)
+
+    def mark_segment_failed(self, segment_id, reason):
+        self.failed[segment_id] = reason
+
+    def remove_from_completed(self, segment_id):
+        self.completed.discard(segment_id)
+
+    def save_checkpoint(self):
+        pass
+
+
+def _make_workflow(segments, batch_size=10):
+    """绕过 __init__ 搭最小 workflow：只挂 _run_async_translation/_quality_check 需要的属性"""
+    wf = TranslationWorkflow.__new__(TranslationWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(
+            batch_size=batch_size,
+            async_max_workers=2,
+            max_context_length=0,
+            enable_quality_check=True,
+        )
+    )
+    wf.glossary = {}
+    wf.all_segments = SegmentList(segments)
+    wf.checkpoint = _FakeCheckpoint()
+    wf._save_structure_map = lambda segs: None
+    wf._get_context_from_memory = lambda seg, max_len: ""
+    return wf
+
+
+def test_async_mixed_batch_routes_whole_batch_to_vision():
+    """混合批（2 text + 1 image）→ 整批走 translate_vision_batch_async，
+    恰一次、入参为整批 3 段且顺序与输入一致，text 通路零调用，结果按序写回"""
+    segments = [
+        ContentSegment(segment_id=0, original_text="hello", content_type="text"),
+        ContentSegment(
+            segment_id=1, original_text="", content_type="image",
+            image_path="/nonexistent/page1.png",
+        ),
+        ContentSegment(segment_id=2, original_text="world", content_type="text"),
+    ]
+    wf = _make_workflow(segments)
+    fake = _RecordingAsyncTranslator()
+    wf.translator = SimpleNamespace(async_translator=fake)
+
+    wf._run_async_translation(SegmentList(segments))
+
+    assert len(fake.vision_calls) == 1, "混合批应恰好调用一次 translate_vision_batch_async"
+    assert len(fake.text_calls) == 0, "混合批不应调用 translate_text_batch_async"
+    assert [s.segment_id for s in fake.vision_calls[0]] == [0, 1, 2], (
+        "整批入参应为全部 3 段且顺序与输入一致（不拆分不重排）"
+    )
+    assert [s.translated_text for s in segments] == ["视觉译-0", "视觉译-1", "视觉译-2"], (
+        "翻译结果应按输入顺序写回各 segment"
+    )
+
+
+def test_async_pure_text_batch_routes_to_text():
+    """纯文本批 → 只调 translate_text_batch_async，vision 通路零调用"""
+    segments = [
+        ContentSegment(segment_id=0, original_text="foo", content_type="text"),
+        ContentSegment(segment_id=1, original_text="bar", content_type="text"),
+    ]
+    wf = _make_workflow(segments)
+    fake = _RecordingAsyncTranslator()
+    wf.translator = SimpleNamespace(async_translator=fake)
+
+    wf._run_async_translation(SegmentList(segments))
+
+    assert len(fake.text_calls) == 1
+    assert len(fake.vision_calls) == 0
+    assert [s.translated_text for s in segments] == ["文本译-0", "文本译-1"]
+
+
+def test_quality_report_covers_failed_image_segment(tmp_path):
+    """含 [Failed:] 的 image 段 → still_failed 如实计入；重译队列不含 image 段"""
+    text_failed = ContentSegment(
+        segment_id=0, original_text="broken", content_type="text",
+        translated_text="[Failed: timeout]",
+    )
+    image_failed = ContentSegment(
+        segment_id=1, original_text="", content_type="image",
+        image_path="/nonexistent/page2.png",
+        translated_text="[Failed: vision error]",
+    )
+    text_ok = ContentSegment(
+        segment_id=2, original_text="fine", content_type="text",
+        translated_text="好的译文",
+    )
+    wf = _make_workflow([text_failed, image_failed, text_ok])
+    wf.project_dir = tmp_path
+    wf.file_path = tmp_path / "book.pdf"
+
+    retry_calls = []
+
+    def _fake_retry(segs):
+        retry_calls.append(list(segs))
+        for seg in segs:
+            seg.translated_text = "重译成功"
+
+    wf._run_sync_translation = _fake_retry
+
+    wf._quality_check()
+
+    # 重译队列只含 text 失败段，不含 image 段（不新增 image 重译行为）
+    assert len(retry_calls) == 1
+    assert [s.segment_id for s in retry_calls[0]] == [0]
+
+    report = json.loads((tmp_path / "quality_report.json").read_text(encoding="utf-8"))
+    # 全类型如实统计：image 失败段进 failed_before_retry 与 still_failed
+    assert 1 in report["failed_before_retry"]
+    still_failed_ids = [item["segment_id"] for item in report["still_failed_after_retry"]]
+    assert 1 in still_failed_ids, "image 失败段必须计入 still_failed"
+    assert 0 not in still_failed_ids, "text 段重译成功后不应留在 still_failed"
+
+
+def test_quality_report_image_only_failure_no_retry(tmp_path):
+    """只有 image 失败时：不触发重译，但报告仍如实覆盖（不打 ✅ 全干净）"""
+    image_failed = ContentSegment(
+        segment_id=0, original_text="", content_type="image",
+        image_path="/nonexistent/page3.png",
+        translated_text="[Failed: vision error]",
+    )
+    wf = _make_workflow([image_failed])
+    wf.project_dir = tmp_path
+    wf.file_path = tmp_path / "book.pdf"
+
+    retry_calls = []
+    wf._run_sync_translation = lambda segs: retry_calls.append(list(segs))
+
+    wf._quality_check()
+
+    assert retry_calls == [], "image 失败段不应进入重译队列"
+    report = json.loads((tmp_path / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["failed_before_retry"] == [0]
+    assert [item["segment_id"] for item in report["still_failed_after_retry"]] == [0]
+
+
 async def main():
     """主测试函数"""
     print("异步翻译批次顺序匹配测试\n")

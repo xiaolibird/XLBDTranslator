@@ -15,10 +15,9 @@ from urllib import request, error
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
-from google.api_core.exceptions import GoogleAPICallError, ResourceExhausted, ServiceUnavailable, ClientError, DeadlineExceeded
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 
-from ..core.schema import Settings, ContentSegment, TranslationMap, SegmentList
+from ..core.schema import Settings, ContentSegment, TranslationMap, SegmentList, contains_failed_marker
 from ..core.exceptions import (
     APIError, APIRateLimitError, APITimeoutError, APIAuthenticationError,
     JSONParseError, TranslationError
@@ -31,12 +30,57 @@ logger = get_logger(__name__)
 
 
 def _reraise_if_provider_fatal(exc: Exception) -> None:
-    """欠费/认证失败/模型下线级错误不能吞成 [Failed:] 字符串：
-    必须上抛，让上层重试与回退链（FallbackTranslator）感知到 provider 已不可用，
-    否则视觉段落会被永久写成失败译文而回退链永不触发。"""
+    """provider 级错误不能吞成 [Failed:] 字符串，必须上抛让回退链（FallbackTranslator）感知：
+    - hard（欠费/认证失败/模型下线）：一次即切 provider；
+    - soft（429/quota 配额限流）：交给回退链计数——未达阈值原样上抛由上层处理，
+      连续达阈值切 provider 重放，与文本路径的传导语义完全对齐。
+    若在这里吞掉 soft，不仅回退链收不到计数，"正常返回"还会把 _soft_failures
+    清零，配额耗尽时视觉段会整本逐段写死为 [Failed:] 而兜底 provider 永不触发。"""
     from .fallback import classify_fatal
-    if classify_fatal(exc) == 'hard':
+    if classify_fatal(exc) in ('hard', 'soft'):
         raise exc
+
+
+def _is_retryable_gemini_error(e: BaseException) -> bool:
+    """Gemini 重试谓词：新版 google-genai SDK 抛的是 genai.errors.APIError 体系，
+    而非旧 google.api_core.exceptions——按旧类型匹配会让真实 429/5xx 完全得不到重试。
+    规则：
+    - 项目内 core.APIError（空响应/安全拦截等包装）→ 重试，但排除 hard：
+      APIAuthenticationError 等子类被 classify_fatal 判为 hard，重试只会空转；
+    - genai ServerError（5xx，服务端瞬态故障）→ 重试；
+    - genai ClientError 仅 429（限流是瞬态的）→ 重试；
+    - 其余 ClientError（401/402/403/404 等致命 4xx）与任意其他异常 → 不重试，
+      立刻上抛让回退链/致命短路机制接手，避免对欠费/认证错误空转 3 轮。"""
+    if isinstance(e, APIError):
+        from .fallback import classify_fatal
+        return classify_fatal(e) != 'hard'
+    if isinstance(e, genai_errors.ServerError):
+        return True
+    if isinstance(e, genai_errors.ClientError):
+        return getattr(e, "code", None) == 429
+    return False
+
+
+def _is_retryable_openai_error(e: BaseException) -> bool:
+    """OpenAI 兼容路径重试谓词：_chat_completions 把 402/401/404 HTTPError 一律
+    包装成 APIError，按类型匹配（retry_if_exception_type）会让欠费/认证失败/模型下线
+    也空转 3 轮（每轮指数等待）才交给回退链；只有 classify_fatal != 'hard' 的
+    APIError（超时/5xx/429/解析失败等包装）才值得重试。"""
+    from .fallback import classify_fatal
+    return isinstance(e, APIError) and classify_fatal(e) != 'hard'
+
+
+# 视觉调用的瞬态异常内层重试次数：质检回路对 image 段"只报告不重译"，
+# 这里的有限重试是该页图片在本轮运行中唯一的自愈机会——一次网络抖动
+# 不应让整页永久定格为 [Failed:]。
+_VISION_TRANSIENT_RETRIES = 2
+
+
+# 本地 Ollama 注入的推理参数（16GB 内存压力下从 8192/10 逐步压到当前值）。
+# 启动日志、debug 日志与 docstring 一律引用这两个常量：此前宣称值（8192/10）
+# 与实际注入值（1024/1）相差 8 倍，排查上下文截断问题会被直接误导。
+OLLAMA_NUM_CTX = 1024
+OLLAMA_NUM_THREAD = 1
 
 
 # 文本翻译的结构化输出 schema：强制模型返回 [{"id": int, "translation": str}] 数组。
@@ -429,10 +473,9 @@ class GeminiTranslator(BaseTranslator):
                 purpose="Title Translation"
             )
             raw_text = response.candidates[0].content.parts[0].text
-            # 解析响应，并处理自我修正
+            # 解析响应（含正则兜底）
             parsed_data = self._handle_json_response_with_correction(
                 raw_text,
-                original_prompt,
                 is_title_translation=True
             )
 
@@ -451,6 +494,10 @@ class GeminiTranslator(BaseTranslator):
             return {}
 
         except Exception as e:
+            # provider 级错误（hard：欠费/认证/模型下线；soft：配额限流）必须上抛
+            # 而非降级为空 {}：标题翻译若静默返回空表，回退链无从触发/计数，
+            # 标题会整批留原文。瞬态错误维持原语义——降级返回 {} 由调用方兜底。
+            _reraise_if_provider_fatal(e)
             logger.error(f"Title translation failed even after correction attempts: {e}")
             return {}
 
@@ -545,7 +592,6 @@ class GeminiTranslator(BaseTranslator):
         raw_text = response.candidates[0].content.parts[0].text
         parsed_glossary = self._handle_json_response_with_correction(
             raw_text,
-            original_prompt,
             is_glossary_extraction=True
         )
 
@@ -573,7 +619,9 @@ class GeminiTranslator(BaseTranslator):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception_type((APIError, GoogleAPICallError)),
+        # 谓词式重试而非类型匹配：genai ClientError 里混着可重试的 429 和致命的 401/402/404，
+        # 只有按 code 区分才能既覆盖真实限流又不对欠费空转。
+        retry=retry_if_exception(_is_retryable_gemini_error),
         reraise=True
     )
     def _translate_text_batch(
@@ -627,7 +675,6 @@ class GeminiTranslator(BaseTranslator):
         input_ids = [s.segment_id for s in segments]
         output_list = self._handle_json_response_with_correction(
             raw_text,
-            original_prompt,
             is_text_translation=True,
             expected_ids=input_ids
         )
@@ -687,76 +734,90 @@ class GeminiTranslator(BaseTranslator):
         return results
 
     def _call_vision_api(self, img_path: str, context: str, glossary: Optional[Dict[str, str]] = None) -> str:
-        """调用视觉 API（支持 Gemini Caching）"""
-        try:
-            # 格式化术语表（非缓存模式下在 prompt 中注入；缓存模式下已在 system instruction）
-            glossary_text = ""
-            if glossary and not self.settings.processing.enable_gemini_caching:
-                glossary_text = "\n".join(
-                    [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
+        """调用视觉 API（支持 Gemini Caching；瞬态异常有限内层重试）"""
+        # 文本批有 @retry 装饰而视觉此前零重试：一次瞬态抖动即让该页
+        # 本轮定格失败，这里补上与文本路径对等的有限重试。
+        last_error: Optional[Exception] = None
+        for attempt in range(_VISION_TRANSIENT_RETRIES + 1):
+            try:
+                # 格式化术语表（非缓存模式下在 prompt 中注入；缓存模式下已在 system instruction）
+                glossary_text = ""
+                if glossary and not self.settings.processing.enable_gemini_caching:
+                    glossary_text = "\n".join(
+                        [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
+                    )
+
+                # 使用 prompt_manager 格式化提示
+                original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
+
+                mime_type, _ = mimetypes.guess_type(img_path)
+                mime_type = mime_type or "image/png"
+                with open(img_path, "rb") as f:
+                    image_bytes = f.read()
+
+                image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+
+                vision_config = {
+                    "temperature": self.generation_config["temperature"],
+                    "top_p": self.generation_config["top_p"],
+                    "max_output_tokens": self.generation_config["max_output_tokens"],
+                    "response_mime_type": "application/json",
+                }
+
+                response = self._generate_content(
+                    contents=[original_prompt, image_part],
+                    generation_config=vision_config,
+                    use_cache=True,
+                    purpose="Vision Translation"
                 )
 
-            # 使用 prompt_manager 格式化提示
-            original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
+                raw_text = (response.text or "").strip()
 
-            mime_type, _ = mimetypes.guess_type(img_path)
-            mime_type = mime_type or "image/png"
-            with open(img_path, "rb") as f:
-                image_bytes = f.read()
+                # 解析 JSON 并提取 "translation" 字段（含正则兜底）
+                parsed_json = self._handle_json_response_with_correction(
+                    raw_text,
+                    is_vision_translation=True,
+                )
 
-            image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+                if isinstance(parsed_json, dict) and "translation" in parsed_json:
+                    return parsed_json["translation"]
 
-            vision_config = {
-                "temperature": self.generation_config["temperature"],
-                "top_p": self.generation_config["top_p"],
-                "max_output_tokens": self.generation_config["max_output_tokens"],
-                "response_mime_type": "application/json",
-            }
+                logger.error(
+                    "❌ Vision API did not return valid JSON with a 'translation' key even after correction. "
+                    f"Got: {raw_text[:200]}"
+                )
+                return "[Failed: Invalid JSON Response]"
 
-            response = self._generate_content(
-                contents=[original_prompt, image_part],
-                generation_config=vision_config,
-                use_cache=True,
-                purpose="Vision Translation"
-            )
+            except Exception as e:
+                # hard/soft 的 provider 级错误立即上抛给回退链（hard 必然复现、
+                # soft 需要回退链计数切换），只有瞬态异常才值得原地重试
+                _reraise_if_provider_fatal(e)
+                last_error = e
+                if attempt < _VISION_TRANSIENT_RETRIES:
+                    wait_time = min(8, 2 ** (attempt + 1))  # 2s → 4s，指数等待
+                    logger.warning(
+                        f"⚠️ Vision API 瞬态失败（尝试 {attempt + 1}/{_VISION_TRANSIENT_RETRIES + 1}），"
+                        f"{wait_time}s 后重试 {img_path}: {e}"
+                    )
+                    time.sleep(wait_time)
 
-            raw_text = (response.text or "").strip()
-
-            # 解析 JSON 并提取 "translation" 字段，处理自我修正
-            parsed_json = self._handle_json_response_with_correction(
-                raw_text,
-                original_prompt,
-                is_vision_translation=True,
-                image_part=image_part,
-            )
-
-            if isinstance(parsed_json, dict) and "translation" in parsed_json:
-                return parsed_json["translation"]
-
-            logger.error(
-                "❌ Vision API did not return valid JSON with a 'translation' key even after correction. "
-                f"Got: {raw_text[:200]}"
-            )
-            return "[Failed: Invalid JSON Response]"
-
-        except Exception as e:
-            _reraise_if_provider_fatal(e)
-            logger.error(f"❌ Vision API调用失败 for {img_path}: {e}")
-            return f"[Failed: {str(e)}]"
+        logger.error(f"❌ Vision API调用失败 for {img_path}: {last_error}")
+        return f"[Failed: {str(last_error)}]"
 
     def _handle_json_response_with_correction(
         self,
         raw_text: str,
-        original_prompt: str,
         is_title_translation: bool = False,
         is_glossary_extraction: bool = False,
         is_text_translation: bool = False,
         is_vision_translation: bool = False,
-        image_part: Optional[Any] = None,
         expected_ids: Optional[List[int]] = None
     ) -> Any:
         """
         处理 JSON 响应（简化版，废除 LLM 自我修正，优先保存成功部分）
+
+        注：original_prompt/image_part 参数随 LLM 自我修正机制一并废除
+        （函数体从未引用，仅让读者误以为会拿原 prompt 重问模型）。
         
         纠错流程：
         1. 标准 JSON 解析
@@ -984,7 +1045,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         │ 同步/异步模式统一流程:                                           │
         │                                                                 │
         │ 1. 整个 batch 的 segments 打包成 JSON 数组                       │
-        │    [{"id": 1, "original": "..."}, {"id": 2, "original": "..."}] │
+        │    [{"id": 1, "text": "..."}, {"id": 2, "text": "..."}]         │
         │                                                                 │
         │ 2. 一次 API 调用翻译整个 batch                                   │
         │                                                                 │
@@ -1012,9 +1073,11 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         # 截取上下文
         safe_context = context[-self.settings.processing.max_context_length:] if context else ""
         
-        # 准备输入数据（与同步模式完全一致）
+        # 准备输入数据：键名 "text" 对齐同步版 _translate_text_batch 与
+        # config/prompts/text_translation_prompt.md 的输入契约
+        # （此前用 "original"，是复制后漂移；模型能容忍但会误导改 prompt 的人）
         input_data = [
-            {"id": seg.segment_id, "original": seg.original_text}
+            {"id": seg.segment_id, "text": seg.original_text}
             for seg in segments
         ]
         input_json = json.dumps(input_data, ensure_ascii=False)
@@ -1068,7 +1131,6 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 # 解析响应（复用同步方法，传递期望的 ID 列表）
                 output_list = self.base._handle_json_response_with_correction(
                     raw_text,
-                    original_prompt,
                     is_text_translation=True,
                     expected_ids=input_ids
                 )
@@ -1095,6 +1157,10 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 break  # 超时不重试
             
             except Exception as e:
+                # 与视觉路径四处调用点对齐：欠费/认证/模型下线级错误必须上抛，
+                # 不能在重试循环里耗尽后吞成 [Failed:] 字符串——否则上层回退链
+                # 永远感知不到 provider 已不可用，文本批会被批量写死为失败。
+                _reraise_if_provider_fatal(e)
                 last_error = e
                 if attempt < retry_count:
                     wait_time = 2 ** attempt
@@ -1102,7 +1168,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"❌ 翻译失败，已用尽所有重试: {e}")
-        
+
         # 所有重试都失败，返回失败标记
         return [f"[Failed: {str(last_error)}]"] * len(segments)
 
@@ -1180,20 +1246,39 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 return self.base._call_vision_api(img_path, context, glossary)
             
             # 重试逻辑
-            last_error = None
+            last_error: Any = None
             for attempt in range(retry_count + 1):
                 try:
                     result = await loop.run_in_executor(self.executor, _process_vision)
-                    
+
                     # 添加延迟避免速率限制
                     await asyncio.sleep(self.settings.processing.vision_rate_limit_delay)
-                    
+
+                    # base._call_vision_api 把瞬态失败吞成 "[Failed: ...]" 字符串正常返回：
+                    # 不检查返回值的话第一次失败就被当成功 return，except 分支的重试
+                    # 永不可达（死代码）。把失败标记也算一次失败才能真正用上重试预算。
+                    if contains_failed_marker(result):
+                        last_error = result
+                        if attempt < retry_count:
+                            wait_time = 2 ** attempt
+                            logger.warning(f"⚠️ 视觉 API 返回失败标记（尝试 {attempt + 1}/{retry_count + 1}），{wait_time}s 后重试: {img_path}")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logger.error(f"❌ 视觉 API 失败，已用尽所有重试: {img_path}")
+                        continue
+
                     if attempt > 0:
                         logger.info(f"✅ 视觉 API 重试成功（第 {attempt + 1} 次尝试）: {img_path}")
-                    
+
                     return result
-                
+
                 except Exception as e:
+                    # hard/soft 的 provider 级错误已由 base 层 _reraise_if_provider_fatal
+                    # 上抛至此：hard 重试必然复现，soft 必须交回退链计数切换，
+                    # 都不该在这里空转重试，立即传导给上层。
+                    from .fallback import classify_fatal
+                    if classify_fatal(e) is not None:
+                        raise
                     last_error = e
                     if attempt < retry_count:
                         wait_time = 2 ** attempt
@@ -1201,7 +1286,10 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                         await asyncio.sleep(wait_time)
                     else:
                         logger.error(f"❌ 视觉 API 失败，已用尽所有重试: {img_path}")
-            
+
+            # 失败标记字符串直接透传（保留底层错误细节），异常则统一包一层
+            if isinstance(last_error, str):
+                return last_error
             return f"[Failed: {str(last_error)}]"
 
     async def _translate_text_fallback_async(
@@ -1281,7 +1369,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
             logger.info("🏠 检测到本地模式（Ollama）")
             logger.info(f"   - 服务地址: {self.base_url}")
             logger.info(f"   - 模型: {self.model}")
-            logger.info("   - 已启用 M2 Pro 优化：num_ctx=8192, num_thread=10")
+            logger.info(f"   - 已启用本地推理参数：num_ctx={OLLAMA_NUM_CTX}, num_thread={OLLAMA_NUM_THREAD}")
         elif self.is_deepseek:
             logger.info("🚀 检测到 DeepSeek API")
             logger.info(f"   - API 地址: {self.base_url}")
@@ -1396,30 +1484,39 @@ class OpenAICompatibleTranslator(BaseTranslator):
         input_json_str = json.dumps(titles, ensure_ascii=False)
         original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
 
-        raw_text = self._chat_completions(
-            system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
-            user_content=original_prompt,
-        )
+        try:
+            raw_text = self._chat_completions(
+                system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
+                user_content=original_prompt,
+            )
 
-        parsed_data = self._handle_json_response_with_repair(
-            raw_text=raw_text,
-            original_prompt=original_prompt,
-            is_dict_like=True,
-        )
+            parsed_data = self._handle_json_response_with_repair(
+                raw_text=raw_text,
+                original_prompt=original_prompt,
+                is_dict_like=True,
+            )
 
-        if isinstance(parsed_data, dict):
-            return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
+            if isinstance(parsed_data, dict):
+                return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
 
-        if isinstance(parsed_data, list) and parsed_data:
-            result: Dict[str, str] = {}
-            for item in parsed_data:
-                if isinstance(item, dict):
-                    for k, v in item.items():
-                        if k != 'id':
-                            result[str(k)] = str(v)
-            return result
+            if isinstance(parsed_data, list) and parsed_data:
+                result: Dict[str, str] = {}
+                for item in parsed_data:
+                    if isinstance(item, dict):
+                        for k, v in item.items():
+                            if k != 'id':
+                                result[str(k)] = str(v)
+                return result
 
-        return {}
+            return {}
+        except Exception as e:
+            # 对齐 Gemini 版降级语义：标题阶段位于全部译文落盘之后、渲染之前，
+            # 一次瞬态错误若上抛会让 100% 完成的翻译产不出任何成品。
+            # provider 级致命错误仍上抛给回退链；其余降级返回 {}，
+            # 标题保用原文，渲染继续。
+            _reraise_if_provider_fatal(e)
+            logger.warning(f"Title translation failed; keeping original titles: {e}")
+            return {}
 
     def extract_glossary(self, segments: SegmentList) -> Dict[str, str]:
         if not segments:
@@ -1486,7 +1583,9 @@ Return ONLY the JSON object.
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=20),
-        retry=retry_if_exception_type((APIError,)),
+        # 谓词式重试而非类型匹配：APIError 里混着 402/401/404 的 hard 包装，
+        # 对欠费/模型下线重试只会空转 3 轮才交给回退链
+        retry=retry_if_exception(_is_retryable_openai_error),
         reraise=True,
     )
     def _translate_text_batch(
@@ -1557,15 +1656,26 @@ Return ONLY the JSON object.
         current_context = context[-self.settings.processing.max_context_length:] if context else ""
 
         for seg in segments:
-            if seg.content_type == "image" and seg.image_path:
-                results.append(self._call_vision_api(seg.image_path, current_context, glossary))
-            else:
-                fallback = self._translate_text_batch([seg], current_context, glossary=glossary)
-                results.append(fallback[0] if fallback else "[Fallback Failed]")
+            try:
+                if seg.content_type == "image" and seg.image_path:
+                    translation = self._call_vision_api(seg.image_path, current_context, glossary)
+                else:
+                    fallback = self._translate_text_batch([seg], current_context, glossary=glossary)
+                    translation = fallback[0] if fallback else "[Fallback Failed]"
 
-            current_context += f"\n{results[-1]}"
-            if len(current_context) > self.settings.processing.max_context_length:
-                current_context = current_context[-self.settings.processing.max_context_length:]
+                results.append(translation)
+
+                current_context += f"\n{translation}"
+                if len(current_context) > self.settings.processing.max_context_length:
+                    current_context = current_context[-self.settings.processing.max_context_length:]
+            except Exception as e:
+                # 与 Gemini 版对齐的逐段隔离：文本段降级调用带 @retry(reraise=True)，
+                # 耗尽后异常若不在此捕获会丢弃整批已算出的 results（含已成功的视觉段）。
+                # provider 级致命错误仍上抛给回退链，其余单段打标继续。
+                _reraise_if_provider_fatal(e)
+                logger.error(f"❌ Vision翻译失败 (segment {seg.segment_id}): {e}")
+                results.append(f"[Failed: {str(e)}]")
+                continue
 
         return results
 
@@ -1578,63 +1688,62 @@ Return ONLY the JSON object.
             )
         original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
 
-        try:
-            with open(img_path, 'rb') as f:
-                b64 = base64.b64encode(f.read()).decode('ascii')
-            image_url = f"data:image/png;base64,{b64}"
+        # 文本批有 @retry 装饰而视觉此前零重试（与 Gemini 版同样的缺口）：
+        # 瞬态异常有限重试，耗尽后才落 [Failed:]。
+        last_error: Optional[Exception] = None
+        for attempt in range(_VISION_TRANSIENT_RETRIES + 1):
+            try:
+                with open(img_path, 'rb') as f:
+                    b64 = base64.b64encode(f.read()).decode('ascii')
+                image_url = f"data:image/png;base64,{b64}"
 
-            raw_text = self._chat_completions(
-                system_instruction=self.prompt_manager.get_system_instruction(use_vision=True),
-                user_content=[
-                    {"type": "text", "text": original_prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            )
+                raw_text = self._chat_completions(
+                    system_instruction=self.prompt_manager.get_system_instruction(use_vision=True),
+                    user_content=[
+                        {"type": "text", "text": original_prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                )
 
-            parsed = self._handle_json_response_with_repair(
-                raw_text=raw_text,
-                original_prompt=original_prompt,
-                is_dict_like=True,
-            )
-            if isinstance(parsed, dict) and 'translation' in parsed:
-                return str(parsed['translation'])
-            return "[Failed: Invalid JSON Response]"
-        except Exception as e:
-            _reraise_if_provider_fatal(e)
-            logger.error(f"❌ OpenAI-compatible Vision API 调用失败 for {img_path}: {e}")
-            return f"[Failed: {str(e)}]"
+                parsed = self._handle_json_response_with_repair(
+                    raw_text=raw_text,
+                    original_prompt=original_prompt,
+                    is_dict_like=True,
+                )
+                if isinstance(parsed, dict) and 'translation' in parsed:
+                    return str(parsed['translation'])
+                return "[Failed: Invalid JSON Response]"
+            except Exception as e:
+                # hard/soft 的 provider 级错误立即上抛给回退链，瞬态异常才原地重试
+                _reraise_if_provider_fatal(e)
+                last_error = e
+                if attempt < _VISION_TRANSIENT_RETRIES:
+                    wait_time = min(8, 2 ** (attempt + 1))  # 2s → 4s，指数等待
+                    logger.warning(
+                        f"⚠️ OpenAI-compatible Vision API 瞬态失败"
+                        f"（尝试 {attempt + 1}/{_VISION_TRANSIENT_RETRIES + 1}），"
+                        f"{wait_time}s 后重试 {img_path}: {e}"
+                    )
+                    time.sleep(wait_time)
+
+        logger.error(f"❌ OpenAI-compatible Vision API 调用失败 for {img_path}: {last_error}")
+        return f"[Failed: {str(last_error)}]"
 
     def _build_chat_completions_url(self) -> str:
         """构建 Chat Completions API URL
-        
-        针对本地 Ollama 服务的路径修复逻辑：
+
         - 本地模式：强制使用 http://127.0.0.1:11434/v1/chat/completions
-        - 云端模式（DeepSeek）：保持原逻辑
+        - 云端模式：base_url 的 http(s):// 前缀已由 __init__ 的
+          _validate_and_fix_base_url 唯一入口保证（否则抛 ValueError），
+          这里只负责拼 /chat/completions——DeepSeek 对带/不带 /v1 的
+          base 两种拼法都支持，无需归一化
         """
-        base = (self.base_url or '').rstrip('/')
-        
         # 本地模式：强制使用 127.0.0.1:11434/v1/chat/completions（Ollama 标准接口）
         if self.is_local:
             # 统一使用 127.0.0.1 而非 localhost，避免 DNS 解析问题
             return 'http://127.0.0.1:11434/v1/chat/completions'
-        
-        # 云端模式：确保 base_url 是完整的 URL
-        if not base.startswith(('http://', 'https://')):
-            # 如果不是完整的 URL，尝试修复常见的错误配置
-            if 'deepseek' in base.lower():
-                # DeepSeek 常见错误配置修复
-                logger.warning(f"⚠️ 检测到不完整的 DeepSeek URL 配置: '{base}'，自动修复为标准 URL")
-                return 'https://api.deepseek.com/v1/chat/completions'
-            else:
-                # 其他服务，尝试添加 https:// 前缀
-                logger.warning(f"⚠️ 检测到不完整的 URL 配置: '{base}'，尝试添加 https:// 前缀")
-                base = f'https://{base}'
-        
-        # 云端模式：DeepSeek 支持两种格式
-        # https://api.deepseek.com/chat/completions 或
-        # https://api.deepseek.com/v1/chat/completions
-        if base.endswith('/v1'):
-            return base + '/chat/completions'
+
+        base = (self.base_url or '').rstrip('/')
         return base + '/chat/completions'
 
     def _chat_completions(self, system_instruction: str, user_content: Any) -> str:
@@ -1642,7 +1751,8 @@ Return ONLY the JSON object.
         
         本地模式优化（M2 Pro 16GB）：
         - 强制 120s 超时（本地推理较慢）
-        - 注入 options 字段：num_ctx=8192（长文本记忆），num_thread=10（适配 M2 Pro 核心数）
+        - 注入 options 字段：num_ctx/num_thread 取模块常量
+          OLLAMA_NUM_CTX / OLLAMA_NUM_THREAD（低值适配 16GB 内存压力）
         
         DeepSeek 长文本模式：
         - 所有内容已预先合并到 user_content 中，system_instruction 为空
@@ -1698,12 +1808,16 @@ Return ONLY the JSON object.
             logger.debug("   📊 标准模式: System Instruction + User Content")
         
         # 本地模式：注入 Ollama 专用参数，针对 M2 Pro 16GB 优化
+        # （数值统一取模块常量，宣称与实际注入不再各写一份）
         if self.is_local:
             payload["options"] = {
-                "num_ctx": 1024,      # 进一步降低：从 2048 到 1024（适应超长上下文）
-                "num_thread": 1,      # 进一步降低：从 2 到 1（单线程，极低内存压力）
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_thread": OLLAMA_NUM_THREAD,
             }
-            logger.debug("🔧 本地模式 payload 已注入 options: num_ctx=1024, num_thread=1")
+            logger.debug(
+                f"🔧 本地模式 payload 已注入 options: "
+                f"num_ctx={OLLAMA_NUM_CTX}, num_thread={OLLAMA_NUM_THREAD}"
+            )
 
         url = self._build_chat_completions_url()
         data = json.dumps(payload).encode('utf-8')
@@ -1717,9 +1831,8 @@ Return ONLY the JSON object.
             timeout = 120  # DeepSeek响应较慢，增加到120秒
             logger.debug(f"⏱️  DeepSeek模式超时设置: {timeout}s")
         elif self.is_local:
-            timeout = 120 if self.is_local else self.settings.processing.request_timeout
-            if self.is_local:
-                logger.debug(f"⏱️  本地模式超时设置: {timeout}s")
+            timeout = 120  # 本地推理较慢，强制120秒
+            logger.debug(f"⏱️  本地模式超时设置: {timeout}s")
         else:
             timeout = self.settings.processing.request_timeout
 

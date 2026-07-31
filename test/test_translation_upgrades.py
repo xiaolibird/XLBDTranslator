@@ -96,3 +96,59 @@ def test_vision_prompt_injects_glossary():
     # 不传 glossary 时不出现该段
     prompt2 = pm.format_vision_prompt("ctx")
     assert "MANDATORY GLOSSARY" not in prompt2
+
+
+# ==================== 同步翻译循环透传 glossary（R1/fallback-book-r2-4） ====================
+# 此前 _run_sync_translation 两处 translate_batch 均不传 glossary，
+# 非 Gemini 缓存 provider（DeepSeek/OpenAI 等，prompt 里术语表退化为 "N/A"）
+# 在花钱生成术语表后整本不用；质检重译也走同函数，术语违例永远修不掉。
+
+import pytest
+
+
+@pytest.mark.parametrize("use_rich", [True, False], ids=["rich", "plain"])
+def test_sync_translate_batch_receives_glossary(use_rich):
+    """rich 与非 rich 两条同步路径都必须把 self.glossary 透传给 translate_batch"""
+    from types import SimpleNamespace
+
+    from src.core.schema import SegmentList
+    from src.workflow.workflow import TranslationWorkflow
+
+    segments = [
+        ContentSegment(segment_id=i, original_text=f"原文{i}", content_type="text")
+        for i in range(4)
+    ]
+    wf = TranslationWorkflow.__new__(TranslationWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(
+            use_rich_progress=use_rich,
+            batch_size=2,
+            checkpoint_interval=1000,
+            max_context_length=0,
+        )
+    )
+    wf.glossary = {"MNAR": "非随机缺失"}
+    wf.all_segments = SegmentList(segments)
+    wf.checkpoint = SimpleNamespace(
+        mark_segment_completed=lambda sid: None,
+        mark_segment_failed=lambda sid, reason: None,
+        save_checkpoint=lambda: None,
+    )
+    wf._save_structure_map = lambda segs: None
+    wf._get_context_from_memory = lambda seg, max_len: ""
+
+    received = []
+
+    def fake_translate_batch(batch, context="", glossary=None):
+        received.append(glossary)
+        return [f"译{s.segment_id}" for s in batch]
+
+    wf.translator = SimpleNamespace(translate_batch=fake_translate_batch)
+
+    wf._run_sync_translation(SegmentList(segments))
+
+    assert received, "translate_batch 应被调用"
+    # 每一批都必须收到同一个 glossary 对象（is 校验防止传了空 dict 冒充）
+    assert all(g is wf.glossary for g in received), (
+        "同步路径必须透传 self.glossary，收到: {}".format(received)
+    )

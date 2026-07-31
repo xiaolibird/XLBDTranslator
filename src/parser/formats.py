@@ -441,6 +441,9 @@ class EPUBParser(BaseDocPipeline):
         """按照 EPUB Spine 遍历，并解析 HTML 块级元素"""
         BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre']
 
+        # 统计解析失败的 spine item，迭代结束后汇总告警一条，避免逐条日志被淹没
+        failed_item_count = 0
+
         for item_id, linear in self.book.spine:
             item = self.book.get_item_with_id(item_id)
 
@@ -450,6 +453,10 @@ class EPUBParser(BaseDocPipeline):
             try:
                 # 1. 解析 HTML
                 raw_content = item.get_content()
+                # 防御：部分 EPUB 中 item 存在但 content 为 None（EPUBRenderer 侧已证实），
+                # 显式抛出以走下方统一的占位通道，而不是让 BeautifulSoup 行为不定
+                if raw_content is None:
+                    raise ValueError(f"{item_id} content is None")
                 soup = BeautifulSoup(raw_content, 'html.parser')
 
                 # 获取文件名作为 Key
@@ -483,4 +490,18 @@ class EPUBParser(BaseDocPipeline):
 
             except Exception as e:
                 logger.error(f"Failed to parse HTML structure for {item_id}: {e}")
-                continue
+                failed_item_count += 1
+                # 不再静默丢章：注入一个显式占位段，让失败在 structure_map 及
+                # markdown/PDF 成品的对应章节位置可见（EPUB 渲染器是原文替换式，
+                # 占位文本不会出现在 EPUB 成品里，可见性靠 structure_map/日志/质检层）。
+                # unit_key 必须用真实键 item.get_name()（文件名）而非 item_id：
+                # BaseDocPipeline.run() 用 unit_key 查 chapter_map，其键正是
+                # get_name()——用合成键必然 miss，章节切换与 _flush_buffer 不触发，
+                # 占位文本会被错误并入前一章的 rolling buffer。
+                # 失败标记只放在文本内容里，不污染 key。
+                yield item.get_name(), (
+                    f"[EPUB 章节解析失败 {item_id}: {e}] 本章原文未能提取，请检查源文件。"
+                ), "text"
+
+        if failed_item_count > 0:
+            logger.error(f"⚠️ {failed_item_count} 个章节解析失败，占位段已注入")
