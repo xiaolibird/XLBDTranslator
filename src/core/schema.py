@@ -307,10 +307,44 @@ class Settings(BaseSettings):
         return self
 
     @classmethod
+    def _known_env_keys(cls) -> set:
+        """枚举全部合法的 env 键（SECTION__FIELD 大写 + 各字段 validation_alias）。"""
+        keys = set()
+        sections = {
+            'API': APISettings, 'FILES': FileSettings, 'PROCESSING': ProcessingSettings,
+            'LOGGING': LoggingSettings, 'DOCUMENT': DocumentConfig,
+        }
+        for prefix, model in sections.items():
+            for name, field in model.model_fields.items():
+                keys.add(f"{prefix}__{name}".upper())
+                alias = getattr(field, 'validation_alias', None)
+                if isinstance(alias, str):
+                    keys.add(f"{prefix}__{alias}".upper())
+        return keys
+
+    @classmethod
     def from_env_file(cls, env_file_path: Path = Path('config/config.env')) -> 'Settings':
         """
         从指定的 .env 文件路径加载设置。
+
+        pydantic-settings 对未知键静默忽略——键名手滑（如曾经的
+        PROCESSING__MAX_CONTEXT_LENGT）会让配置无声失效。这里对照已声明
+        字段做一次校验，未识别的键 warning 出来。
         """
+        try:
+            known = cls._known_env_keys()
+            for line in env_file_path.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key = line.split('=', 1)[0].strip().upper()
+                if key not in known:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"⚠️ 配置文件中的未知键将被忽略: {key}（检查拼写，格式为 SECTION__FIELD 双下划线）"
+                    )
+        except OSError:
+            pass  # 文件读不到时交给下面的 pydantic 正常报错路径
         return cls(_env_file=env_file_path)
 
 

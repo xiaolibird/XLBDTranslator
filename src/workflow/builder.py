@@ -707,17 +707,24 @@ class SettingsBuilder:
     def build(self) -> Settings:
         """
         构建最终的 Settings 对象
-        
+
         Returns:
             Settings: 配置完成的设置对象
         """
         # 应用所有修改到设置对象
         for key, value in self._modifications.items():
             self._apply_setting(key, value)
-        
+
+        # 应用后清空修改集：build() 返回的是同一个 _settings 对象，调用方
+        # （main.py）会在两次 build() 之间直接改它（CLI flag / 交互式选择）。
+        # 此前第二次 build() 把 preset 的默认值全量重放，静默覆盖掉用户显式
+        # 传入的 --vision-mode/--retain-original——与 main.py 宣称的
+        # "CLI 参数最后生效"正好相反。清空后每个修改只应用一次，分层成立。
+        self._modifications.clear()
+
         # 验证设置
         self._validate_settings()
-        
+
         return self._settings
     
     def _apply_setting(self, key: str, value: Any) -> None:

@@ -60,15 +60,15 @@ class PDFRenderer:
 
         return None
 
-    def render_to_file(self, segments: SegmentList, output_path: Path, 
-                       title: str = "Document", translated_title: str = "", 
-                       version: str = "desktop", generate_both: bool = False) -> None:
+    def render_to_file(self, segments: SegmentList, output_path: Path,
+                       title: str = "Document", translated_title: str = "",
+                       version: str = "desktop", generate_both: bool = False) -> List[Path]:
         """
         将片段列表渲染到 PDF 文件 (优化版，支持高阶 CSS 渲染)
-        
+
         直接从 SegmentList 获取 page_index, toc_level 等信息，
         不再完全依赖 markdown 生成的内容
-        
+
         Args:
             segments: 片段列表
             output_path: 输出路径（桌面版）
@@ -76,24 +76,33 @@ class PDFRenderer:
             translated_title: 翻译后的标题
             version: 'desktop' 或 'mobile'
             generate_both: 是否同时生成桌面版和移动版
+
+        Returns:
+            实际成功生成的 PDF 路径列表（渲染失败的版本不在其中——调用方
+            必须按此判断成败，内部异常已降级为日志不再上抛）
         """
+        produced: List[Path] = []
         if generate_both:
             # 生成桌面版
-            self._render_single_version(segments, output_path, title, translated_title, "desktop")
+            if self._render_single_version(segments, output_path, title, translated_title, "desktop"):
+                produced.append(output_path)
             # 生成移动版
             mobile_path = output_path.parent / f"{output_path.stem}_mobile{output_path.suffix}"
-            self._render_single_version(segments, mobile_path, title, translated_title, "mobile")
+            if self._render_single_version(segments, mobile_path, title, translated_title, "mobile"):
+                produced.append(mobile_path)
         else:
             # 只生成指定版本
-            self._render_single_version(segments, output_path, title, translated_title, version)
-    
-    def _render_single_version(self, segments: SegmentList, output_path: Path, 
-                              title: str, translated_title: str, version: str) -> None:
+            if self._render_single_version(segments, output_path, title, translated_title, version):
+                produced.append(output_path)
+        return produced
+
+    def _render_single_version(self, segments: SegmentList, output_path: Path,
+                              title: str, translated_title: str, version: str) -> bool:
         """
         渲染单个版本的 PDF
-        
-        Args:
-            version: 'desktop' 或 'mobile'
+
+        Returns:
+            是否成功生成（失败已内部记录日志并降级，不上抛）
         """
         # 动态加载指定版本的 CSS
         css_path = self._locate_css_file(version)
@@ -178,12 +187,14 @@ class PDFRenderer:
             )
 
             self.logger.info(f"✅ [{version_label}] PDF 已成功生成: {output_path}")
+            return True
 
         except ImportError as e:
             lib_name = str(e).split("'")[-2] if "'" in str(e) else "weasyprint/markdown2"
             self.logger.error(f"⚠️ PDF 导出跳过: 缺少 Python 依赖库 - {lib_name}")
             self.logger.error("💡 请运行: pip install weasyprint markdown2")
             self.logger.error("📄 降级处理: 仅生成 Markdown 文件")
+            return False
 
         except Exception as e:
             error_msg = str(e)
@@ -191,10 +202,12 @@ class PDFRenderer:
             if any(lib in error_msg for lib in ["libgobject", "cairo", "pango", "gdk-pixbuf"]):
                 self.logger.error("⚠️ PDF 导出跳过: 缺少必要的系统底层库 (Pango/Cairo)")
                 self.logger.error("💡 macOS 请运行: brew install cairo pango gdk-pixbuf libffi")
+                self.logger.error("💡 提示: conda 环境需带 DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib 运行")
                 self.logger.error("💡 Ubuntu 请运行: apt-get install libpango1.0-dev libcairo2-dev")
             else:
                 self.logger.error(f"⚠️ PDF 导出失败: {error_msg}")
             self.logger.error("📄 降级处理: 仅生成 Markdown 文件")
+            return False
 
     def _build_segment_metadata(self, segments: SegmentList) -> Dict[int, Dict]:
         """

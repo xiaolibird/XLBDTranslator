@@ -108,9 +108,14 @@ class CheckpointManager:
                 self.checkpoint_data['completed_segments'].remove(segment_id)
 
     def mark_segment_failed(self, segment_id: int, error_msg: str = ""):
-        """标记一个段落为失败"""
+        """标记一个段落为失败（同段去重，保留最新错误——否则跨轮次重试会让
+        checkpoint.json 的 failed_segments 无界增长）"""
         if 'failed_segments' not in self.checkpoint_data:
             self.checkpoint_data['failed_segments'] = []
+        self.checkpoint_data['failed_segments'] = [
+            rec for rec in self.checkpoint_data['failed_segments']
+            if rec.get('segment_id') != segment_id
+        ]
         self.checkpoint_data['failed_segments'].append({
             'segment_id': segment_id,
             'error': error_msg,

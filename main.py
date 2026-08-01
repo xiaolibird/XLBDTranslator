@@ -162,6 +162,9 @@ def main():
             raise ConfigError(f"无法加载翻译模式: {e}")
 
         # --- 2. 应用命令行参数到 settings ---
+        if not settings.files.document_path:
+            logger.error("❌ 未指定要翻译的文档：命令行传入文件路径，或在 config.env 设置 FILES__DOCUMENT_PATH")
+            sys.exit(1)
         ext = settings.files.document_path.suffix.lower()
         
         # 2.1 处理 Vision 模式参数（仅 PDF）

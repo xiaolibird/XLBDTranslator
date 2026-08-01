@@ -61,7 +61,12 @@ def _emergency_save_handler(signum, frame):
         except Exception as e:
             logger.error(f"❌ 紧急保存失败: {e}")
     
-    # 重新抛出信号，允许进程正常终止
+    if signum == signal.SIGINT:
+        # Ctrl-C 走 Python 语义：抛 KeyboardInterrupt 让上层（如批量脚本
+        # translate_books.py 的中断分支/汇总）有机会执行。此前 SIG_DFL+kill
+        # 直接终结进程，那些分支永不可达。
+        raise KeyboardInterrupt("用户中断（已紧急保存）")
+    # SIGTERM：恢复默认行为并正常终止
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
 
@@ -218,12 +223,13 @@ class TranslationWorkflow:
             # 0. 参数优化：根据translator provider调整batch_size
             self._optimize_batch_size_for_provider()
 
-            # 1. 加载文档结构
+            # 1. 初始化翻译器（preflight：provider 拼错/缺 API key 在此立刻报错，
+            #    不必等整本书解析完；此时不创建缓存，等术语表生成后再创建）
+            self._initialize_translator()
+
+            # 2. 加载文档结构
             self._load_document()
             segment_count = len(self.all_segments) if self.all_segments else 0
-
-            # 2. 初始化翻译器（此时不创建缓存，等术语表生成后再创建）
-            self._initialize_translator()
 
             # 3. 生成术语表（通过预翻译，强制同步模式）
             self._generate_glossary()
@@ -788,18 +794,28 @@ class TranslationWorkflow:
         reprocess_pretranslated = getattr(self.settings.processing, 'reprocess_pretranslated', True)
         
         if reprocess_pretranslated:
-            # 标记预翻译部分为未翻译，以便重新处理
+            # 标记预翻译部分为未翻译，以便重新处理。
+            # 关键守卫：已进 checkpoint completed 的段说明是正式阶段（带完整
+            # mode+glossary）翻出来的，不再清空——此前无条件清空导致每次重跑
+            # （包括上轮 100% 完成后的纯补渲染）都白烧前 ~10% 段落的 API 费用。
+            # 预翻译产物恰好不在 completed（预翻译时 checkpoint 尚未初始化），
+            # 因此该守卫不影响首轮"预翻译段用完整术语表重译"的原设计。
             try:
                 ratio = getattr(self.settings.processing, 'glossary_preamble_ratio', 0.1)
                 pre_count = max(1, int(len(self.all_segments) * float(ratio)))
             except Exception:
                 pre_count = max(1, int(len(self.all_segments) * 0.1))
-            
+
+            cleared = 0
             for seg in self.all_segments[:pre_count]:
-                if seg.is_translated:
+                if seg.is_translated and not self.checkpoint.is_segment_completed(seg.segment_id):
                     seg.translated_text = ""  # 清除预翻译结果
-            
-            logger.info(f"🔄 将重新翻译前 {pre_count} 个预翻译片段（使用完整缓存）")
+                    cleared += 1
+
+            if cleared:
+                logger.info(f"🔄 将重新翻译 {cleared} 个预翻译片段（使用完整术语表）")
+            else:
+                logger.info("✅ 预翻译片段均已由正式阶段翻译，无需重译")
         
         pending_segments = self.checkpoint.get_pending_segments(self.all_segments)
         
@@ -891,8 +907,10 @@ class TranslationWorkflow:
                 seg.translated_text = ""
                 try:
                     self.checkpoint.remove_from_completed(seg.segment_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # 不静默：移除失败时该段短暂处于"已完成但无译文"状态，
+                    # get_pending_segments 的空译文判定会兜住它，但要留痕
+                    logger.warning(f"⚠️ 段 {seg.segment_id} 移出 completed 失败（将由待翻译判定兜底）: {e}")
             try:
                 self._run_sync_translation(list(retry_queue))
             except Exception as e:
@@ -1183,11 +1201,14 @@ class TranslationWorkflow:
                     if classify_fatal(e) == 'hard':
                         fatal_holder["exc"] = e
 
-                    # 标记失败（线程安全）
+                    # 标记失败（线程安全）。与同步路径同款守卫：只把尚未成功的段
+                    # 标记失败，不覆写本批已算出的译文（否则视觉批一段 429 会把
+                    # 同批其余已付费译文销毁并落盘）
                     with lock:
                         for seg in batch:
-                            seg.translated_text = f"[Failed: {str(e)}]"
-                            self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
+                            if not seg.translated_text or contains_failed_marker(seg.translated_text):
+                                seg.translated_text = f"[Failed: {str(e)}]"
+                                self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
                             stats["processed"] += 1
                         
                         stats["completed_batches"] += 1
@@ -1411,16 +1432,19 @@ class TranslationWorkflow:
             # 使用 generate_both=True 同时生成桌面版和移动版
             # 桌面版：{filename}_Translated.pdf
             # 移动版：{filename}_Translated_mobile.pdf
-            pdf_renderer.render_to_file(
-                self.all_segments, 
+            produced = pdf_renderer.render_to_file(
+                self.all_segments,
                 pdf_path,
                 title=self.doc_title,
                 translated_title=self.translated_doc_title or self.doc_title,
                 generate_both=True  # 生成两个版本
             )
-            logger.info(f"✅ PDF 已保存到: {pdf_path}")
-            mobile_pdf_path = final_dir / f"{Path(self.file_path.name).stem}_Translated_mobile.pdf"
-            logger.info(f"✅ 移动版 PDF 已保存到: {mobile_pdf_path}")
+            # 只对真正生成的文件打 ✅（渲染器内部失败会降级为日志、不上抛，
+            # 此前这里无条件宣布成功，WeasyPrint 缺库时是假日志）
+            for p in produced:
+                logger.info(f"✅ PDF 已保存到: {p}")
+            if not produced:
+                logger.warning("⚠️  本次未生成任何 PDF（详见上方渲染器日志），Markdown/EPUB 不受影响")
         except ImportError:
             logger.info("ℹ️  跳过 PDF 生成（未安装相关依赖）")
         except Exception as e:

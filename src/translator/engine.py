@@ -112,6 +112,14 @@ _TRANSLATION_RESPONSE_SCHEMA = types.Schema(
 GLOSSARY_WINDOW_SIZE = 8000
 
 
+class _ResponseValidationError(APIError):
+    """API 请求成功但响应内容不可用（安全过滤 block、空响应、无 candidates）。
+
+    与缓存/网络故障区分开：这类错误不应触发 _generate_content 的缓存失效
+    降级重发（内容级错误重发同样会失败，且会误删健康的 context cache）。
+    """
+
+
 def _glossary_extraction_prompt(content_sample: str) -> str:
     """术语抽取 prompt 的唯一出处（Gemini 与 OpenAI 兼容路径共用）。
 
@@ -432,9 +440,13 @@ class GeminiTranslator(BaseTranslator):
             if cache_name:
                 logger.debug(f"🔄 {purpose} 使用 Gemini Cache: {cache_name[:30]}...")
             # Validate response structure to avoid downstream NoneType subscripts
+            # 注意：以下三类是「请求成功但响应内容不可用」（内容级错误），用
+            # _ResponseValidationError 标记——它们与缓存无关，绝不能触发下面的
+            # 缓存失效降级（否则一次安全过滤 block 会误删整本书的 context cache
+            # 并再全价重发一次注定同样被拦的请求）
             if not response:
                 logger.error(f"❌ {purpose} returned empty response object")
-                raise APIError(f"Empty response from model for {purpose}", context={"response": repr(response)})
+                raise _ResponseValidationError(f"Empty response from model for {purpose}", context={"response": repr(response)})
 
             candidates = getattr(response, 'candidates', None)
             # Check for prompt_feedback block reasons (e.g., prohibited content)
@@ -442,21 +454,27 @@ class GeminiTranslator(BaseTranslator):
             if prompt_fb is not None and getattr(prompt_fb, 'block_reason', None):
                 block_reason = getattr(prompt_fb, 'block_reason')
                 logger.error(f"❌ {purpose} blocked by model: {block_reason}")
-                raise APIError(f"Model blocked content for {purpose}", context={"block_reason": str(block_reason), "response": repr(response)})
+                raise _ResponseValidationError(f"Model blocked content for {purpose}", context={"block_reason": str(block_reason), "response": repr(response)})
 
             if not candidates or candidates[0] is None:
                 logger.error(f"❌ {purpose} response has no candidates: {repr(response)}")
-                raise APIError(f"Model response missing candidates for {purpose}", context={"response": repr(response)})
+                raise _ResponseValidationError(f"Model response missing candidates for {purpose}", context={"response": repr(response)})
 
             return response
+        except _ResponseValidationError:
+            # 内容级错误：缓存是好的，直接上抛给调用方按内容失败处理
+            raise
         except Exception as e:
             # 缓存失败时降级
             if cache_name:
                 logger.warning(f"⚠️  {purpose} 缓存使用失败，降级为普通调用: {e}")
                 
-                # P1修复：清理失效的缓存引用
-                if 'system' in self.cache_refs and self.cache_refs['system'] == cache_name:
-                    del self.cache_refs['system']
+                # P1修复：清理失效的缓存引用。
+                # 用原子 pop 而非 check-then-del：异步线程池共享同一 cache_refs，
+                # TTL 到期瞬间多个在飞请求同时进此分支，check-then-del 会二次
+                # KeyError 掩盖原始错误
+                if self.cache_refs.get('system') == cache_name:
+                    self.cache_refs.pop('system', None)
                     logger.info("🗑️  已清理内存中的失效缓存引用")
                 
                 # P1修复：从元数据中删除失效缓存
@@ -1372,10 +1390,10 @@ class OpenAICompatibleTranslator(BaseTranslator):
       - base_url: https://api.deepseek.com (or https://api.deepseek.com/v1)
       - endpoint: POST /chat/completions
 
-    Env vars are provided via Settings.api:
-      - API_OPENAI_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY
-      - OPENAI_BASE_URL / DEEPSEEK_BASE_URL
-      - OPENAI_MODEL / DEEPSEEK_MODEL
+    Env vars are provided via Settings.api（SECTION__KEY 双下划线格式）:
+      - API__OPENAI_API_KEY
+      - API__OPENAI_BASE_URL
+      - API__OPENAI_MODEL
     """
 
     def __init__(self, settings: Settings):
@@ -1417,8 +1435,8 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
         if not self.api_key:
             raise APIAuthenticationError(
-                "OpenAI-compatible API key is missing. Set API_OPENAI_API_KEY (or OPENAI_API_KEY/DEEPSEEK_API_KEY).",
-                context={"setting": "API_OPENAI_API_KEY"},
+                "OpenAI-compatible API key is missing. 在 config/config.env 中设置 API__OPENAI_API_KEY（双下划线）。",
+                context={"setting": "API__OPENAI_API_KEY"},
             )
     
     def _validate_and_fix_base_url(self, base_url: str) -> str:
