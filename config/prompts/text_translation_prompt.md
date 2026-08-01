@@ -28,7 +28,7 @@ Translate the JSON array into Chinese. Connect with `<previous_context>`. Follow
 
 # Output
 ```json
-[{"id": 1, "translation": "译文"}]
+{"translations": [{"id": 1, "translation": "译文"}]}
 ```
 
 Follow system_instruction JSON rules strictly.

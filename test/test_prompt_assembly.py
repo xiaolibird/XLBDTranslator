@@ -188,6 +188,27 @@ def run_fallback_tests():
         print(f"  ⚠️ 第二 provider 初始化失败，跳过: {e}")
 
 
+def run_parser_tests():
+    print("\n== JSON 契约解析器 ==")
+    from src.translator.engine import _normalize_translation_list
+    obj = {"translations": [{"id": 1, "translation": "甲"}]}
+    check("对象格式解包", _normalize_translation_list(obj) == obj["translations"])
+    arr = [{"id": 1, "translation": "甲"}]
+    check("旧数组格式直通", _normalize_translation_list(arr) == arr)
+    degen = {"1": "甲", "2": "乙"}
+    check("退化 map 兼容", len(_normalize_translation_list(degen)) == 2)
+
+    s = make_settings()
+    t = OpenAICompatibleTranslator(s)
+    complete_obj = '{"translations": [{"id": 1, "translation": "完整句子。"}, {"id": 2, "translation": "第二句"}]}'
+    out = t._regex_fallback_for_list(complete_obj)
+    check("对象响应不误判截断", out and "翻译被截断" not in out[-1]["translation"],
+          str(out[-1] if out else None))
+    truncated = '{"translations": [{"id": 1, "translation": "断在半'
+    out2 = t._regex_fallback_for_list(truncated)
+    check("真截断仍被标记", out2 and "翻译被截断" in out2[-1]["translation"])
+
+
 def run_template_hygiene_tests():
     print("\n== 模板卫生 ==")
     prompts_dir = project_root / 'config' / 'prompts'
@@ -202,6 +223,7 @@ if __name__ == '__main__':
     run_openai_tests()
     run_gemini_tests()
     run_fallback_tests()
+    run_parser_tests()
     run_template_hygiene_tests()
     print(f"\n{'=' * 50}\n通过 {PASS} / 失败 {FAIL}")
     sys.exit(1 if FAIL else 0)

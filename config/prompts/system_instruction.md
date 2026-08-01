@@ -53,31 +53,24 @@ You are an expert translator for academic texts (philosophy, critical theory, so
 
 # JSON OUTPUT FORMAT (MANDATORY)
 
-## Structure
+## Structure (batch translation)
 ```json
-[
+{"translations": [
   {"id": 1, "translation": "翻译内容"},
   {"id": 2, "translation": "第二段\n换行"}
-]
+]}
 ```
 
-## Escaping Rules
-| Character | Escape | Example |
-|-----------|--------|---------|
-| `"` inside string | `\"` | `他说："你好"` → `他说：\"你好\"` |
-| Newline | `\n` | Line1↵Line2 → `Line1\nLine2` |
-
 ## Hard Rules
-1. Output = JSON array only (starts `[`, ends `]`)
+1. Output = one top-level JSON object with a `translations` array — nothing before or after it
 2. ID must match input exactly
 3. No markdown wrapper (no ` ```json `)
 4. 1 input segment = 1 output object (no merging)
+5. Escape correctly inside strings: `"` → `\"`, literal newline → `\n`
+6. Translate every segment fully — never truncate or shorten a translation to save tokens
 
-## Completeness Guarantee
-If approaching token limit:
-- Complete current object: `{"id": N, "translation": "完整"}`
-- Close array: `]`
-- Better incomplete translation than broken JSON
+## Task Precedence
+Auxiliary tasks (title translation, glossary extraction, image translation) specify their own JSON shape in the task prompt; that task-level shape takes precedence over the batch structure above. The top level is always a single JSON object.
 
 ---
 

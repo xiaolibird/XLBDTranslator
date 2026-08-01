@@ -83,18 +83,28 @@ OLLAMA_NUM_CTX = 1024
 OLLAMA_NUM_THREAD = 1
 
 
-# 文本翻译的结构化输出 schema：强制模型返回 [{"id": int, "translation": str}] 数组。
-# 仅用于文本批量翻译（字段固定）；术语表/标题翻译是动态键字典，无法用固定 schema 约束，故不设。
-_TRANSLATION_LIST_SCHEMA = types.Schema(
-    type=types.Type.ARRAY,
-    items=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "id": types.Schema(type=types.Type.INTEGER),
-            "translation": types.Schema(type=types.Type.STRING),
-        },
-        required=["id", "translation"],
-    ),
+# 文本翻译的结构化输出 schema：强制模型返回
+# {"translations": [{"id": int, "translation": str}]} 顶层对象。
+# 顶层用对象而非数组：与 DeepSeek response_format=json_object 的「顶层必须为
+# 对象」语义、以及全部 prompt 的输出契约统一（_normalize_translation_list 兼容
+# 解包旧数组格式）。仅用于文本批量翻译；术语表/标题翻译是动态键字典，无法用
+# 固定 schema 约束，故不设。
+_TRANSLATION_RESPONSE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "translations": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "id": types.Schema(type=types.Type.INTEGER),
+                    "translation": types.Schema(type=types.Type.STRING),
+                },
+                required=["id", "translation"],
+            ),
+        ),
+    },
+    required=["translations"],
 )
 
 # 术语抽取的分窗大小（字符）。此前对全文只取前 8000 字符导致大文档后半段术语系统性缺失；
@@ -671,7 +681,7 @@ class GeminiTranslator(BaseTranslator):
         )
 
         # 结构化输出：强制模型返回符合 schema 的 JSON 数组，几乎消除畸形输出。
-        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_LIST_SCHEMA}
+        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_RESPONSE_SCHEMA}
 
         response = self._generate_content(
             contents=original_prompt,
@@ -919,7 +929,7 @@ class GeminiTranslator(BaseTranslator):
         logger.info("🔄 Using regex fallback for JSON parsing...")
 
         # 检测是否被截断（末尾没有 ] 或最后一个对象不完整）
-        is_truncated = not text.rstrip().endswith(']')
+        is_truncated = not text.rstrip().endswith((']', '}'))
         if is_truncated:
             logger.warning("⚠️ Detected incomplete JSON (missing closing bracket or truncated content)")
 
@@ -1117,7 +1127,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
             loop = asyncio.get_event_loop()
         
         # 结构化输出：与同步文本翻译一致，强制返回符合 schema 的 JSON 数组
-        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_LIST_SCHEMA}
+        text_generation_config = {**self.generation_config, "response_schema": _TRANSLATION_RESPONSE_SCHEMA}
 
         def _call_with_cache():
             return self.base._generate_content(
@@ -1961,7 +1971,7 @@ Return ONLY the JSON object.
         logger.info("🔄 Using regex fallback for JSON parsing...")
         
         # 检测是否被截断
-        is_truncated = not text.rstrip().endswith(']')
+        is_truncated = not text.rstrip().endswith((']', '}'))
         if is_truncated:
             logger.warning("⚠️ Detected incomplete JSON (missing closing bracket)")
         
