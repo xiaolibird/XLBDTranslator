@@ -841,7 +841,13 @@ class PromptManager:
                 return f.read()
         except FileNotFoundError:
             logger.warning(f"⚠️ Prompt template not found: {path}, using fallback")
-            return "Translate the following text: {input_json}"
+            # 中性兜底指令：不带花括号占位符（模板从不做 .format()，占位符会以
+            # 字面量进 prompt 并与 user message 里的真实输入自相矛盾）
+            return (
+                "You are a professional translator. Translate the JSON segments "
+                "provided in the user message into Chinese and return a JSON object "
+                'of the form {"translations": [{"id": ..., "translation": ...}]}.'
+            )
     
     def get_system_instruction(
         self, 

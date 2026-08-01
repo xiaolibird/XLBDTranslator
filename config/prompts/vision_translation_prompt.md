@@ -1,9 +1,6 @@
 # Vision Translation Task
 
-## Context
-<previous_context>
-{context}
-</previous_context>
+The user message provides the page context (`<previous_context>`, the source text of the preceding page — reference only) and the image to translate.
 
 ---
 
@@ -20,10 +17,9 @@
 3. **Preserve Lists** - Keep bullet/numbered format
 
 ## Open Quote Handling
-If text cuts mid-quote:
-- Source: `He said, "Truth is not`
-- ✅ Output: `他说："真理并非` (open quote)
-- ❌ NOT: `他说："真理并非……"` (wrongly closed)
+If the source text cuts off mid-quote, keep the quote open in the translation.
+Correct: `He said, "Truth is not` → `他说："真理并非` (quote left open).
+Wrong: closing it artificially as `他说："真理并非……"`.
 
 ---
 

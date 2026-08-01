@@ -51,9 +51,11 @@ class ClaudeAgentTranslator(OpenAICompatibleTranslator):
                 context={"hint": "npm install -g @anthropic-ai/claude-code"},
             )
 
-        # 强制简化版 prompt：完整版 system instruction 的 ❌/✅ 对照表会触发
-        # Claude API 输出内容过滤器的误报（Output blocked by content filtering policy）
-        self.prompt_manager = PromptManager(settings, force_simple=True)
+        # 完整版 prompt：❌/✅ markdown 表格（曾触发输出过滤器误报的格式特征）
+        # 已在 system_instruction.md 中改写为等信息量纯文字，claude-agent 不必再
+        # 降级到丢失全部反翻译腔规则的 simple 版。若误报复现，把 force_simple
+        # 改回 True 即可回退（逃生舱保留）。
+        self.prompt_manager = PromptManager(settings, force_simple=False)
         self._async_translator = None
         self.model: str = getattr(settings.api, 'agent_model', 'sonnet') or 'sonnet'
         # 复用父类的长文本模式：system instruction 合并进单个 prompt

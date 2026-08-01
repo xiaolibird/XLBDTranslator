@@ -2,7 +2,7 @@
 
 ## Input Structure
 ```
-<previous_context>前文翻译</previous_context>
+<previous_context>上一段落的英文原文（仅供衔接参考，勿翻译、勿输出）</previous_context>
 <glossary>
 - **term**: translation
 </glossary>
@@ -10,10 +10,12 @@
 [{"id": 1, "text": "..."}]
 ```
 
+Note: `<previous_context>` contains the SOURCE text (English) of the preceding segment — use it only for continuity (pronouns, terminology, tone); do NOT translate it or include it in the output.
+
 ---
 
 # Task
-Translate the JSON array into Chinese. Connect with `<previous_context>`. Follow `<glossary>` strictly.
+Translate the JSON array into Chinese. Connect naturally with the preceding text. Follow `<glossary>` strictly.
 
 ---
 
