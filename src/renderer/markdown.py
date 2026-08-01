@@ -291,11 +291,12 @@ class MarkdownRenderer:
 
     def _render_bilingual_content(self, segment: ContentSegment) -> str:
         """渲染双语对照内容（纯 Markdown 语法）
-        
-        格式：每对译文-原文后都有分割线
-        - 译文：正文（普通段落）
-        - 原文：引用块（> 开头）
-        - 分割线
+
+        格式：段内每对为 译文正文 + 原文引用块；分割线只在**整个 segment
+        末尾**加一条。此前每对都加 `---`，导致 PDF 侧按 <hr> 切出的
+        content-block 数量多于 segment 数，页码/页眉从文档开头就系统性
+        漂移（页码列表是按 segment 建的）。对内的视觉分隔由引用块转换出的
+        bilingual-separator 承担。
         """
         parts = []
 
@@ -321,11 +322,11 @@ class MarkdownRenderer:
                 orig_lines = orig_paras[i].strip().split('\n')
                 quoted_lines = ['> ' + line if line.strip() else '>' for line in orig_lines]
                 parts.append('\n'.join(quoted_lines))
-                parts.append("\n")
-            
-            # 3. 每对译文-原文后添加分割线
-            parts.append(self.templates['section_separator'])
-            parts.append("\n")
+                parts.append("\n\n")
+
+        # 分割线：每个 segment 恰好一条（与纯译文模式的语义对齐）
+        parts.append(self.templates['section_separator'])
+        parts.append("\n")
 
         return "".join(parts)
 

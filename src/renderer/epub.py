@@ -359,9 +359,8 @@ class EPUBRenderer:
                         original_title = section.title
                         normalized = self._normalize_text(original_title)
                         translated = translation_map.get(normalized)
-
-                        if not translated:
-                            translated = self._fuzzy_match(normalized, translation_map)
+                        # TOC 标题只做精确匹配：translation_map 的 key 是正文
+                        # 原文，标题走模糊匹配大概率被替换成某段正文整段译文
 
                         if translated:
                             section.title = translated
@@ -390,9 +389,8 @@ class EPUBRenderer:
                         original_title = item.title
                         normalized = self._normalize_text(original_title)
                         translated = translation_map.get(normalized)
-
-                        if not translated:
-                            translated = self._fuzzy_match(normalized, translation_map)
+                        # TOC 标题只做精确匹配：translation_map 的 key 是正文
+                        # 原文，标题走模糊匹配大概率被替换成某段正文整段译文
 
                         if translated:
                             item.title = translated
@@ -510,31 +508,18 @@ class EPUBRenderer:
         # 记录替换次数
         replacement_count = 0
 
-        # 遍历所有块级标签（从内到外，避免重复处理）
-        processed_tags: Set[int] = set()
-
+        # 只处理"叶子块"：自身不再包含任何块级子标签。
+        # find_all 是文档序（父先于子），此前包裹整章的容器 <div> 先于其
+        # <p> 被处理——模糊匹配一旦命中会 clear 掉整个 div 只塞一段译文，
+        # 该章其余段落在成品里直接消失；原 has_processed_child 守卫在
+        # 父先序下恒为 False，形同虚设。
         for tag in body.find_all(self.BLOCK_TAGS):
-            tag_id = id(tag)
+            if tag.find(self.BLOCK_TAGS):
+                continue  # 容器标签：交给其内部叶子块处理
 
-            # 检查是否已被父标签处理过
-            if tag_id in processed_tags:
-                continue
-
-            # 检查是否有已处理的子标签（跳过容器标签）
-            has_processed_child = False
-            for child in tag.find_all(self.BLOCK_TAGS):
-                if id(child) in processed_tags:
-                    has_processed_child = True
-                    break
-
-            if has_processed_child:
-                continue
-
-            # 处理该标签，传入 soup 用于创建新标签
             result = self._process_tag(tag, translation_map, soup)
             if result:
                 replacement_count += 1
-                processed_tags.add(tag_id)
 
         # 返回修改后的 HTML（添加防护）
         try:
@@ -646,27 +631,75 @@ class EPUBRenderer:
 
     def _fuzzy_match(self, text: str, translation_map: Dict[str, str]) -> Optional[str]:
         """
-        模糊匹配翻译
+        模糊匹配翻译（处理空白/软连字符等差异导致的精确匹配失败）
 
-        处理由于空白字符差异导致的匹配失败
+        约束（防错配）：
+        - 候选集合按 translation_map 预计算一次（此前每个未命中标签 × 每条
+          译文现建两个 set，全书 ≈ 数百万次 set 构造）
+        - 长度守卫：len 比超出 [0.6, 1.67] 的候选直接跳过（防止单段译文
+          吞掉整章长文本，或反向）
+        - 一次性消费：命中过的候选不再参与后续模糊匹配（同一条译文此前
+          可被填进多个不同标签）
         """
         if len(text) < 10:
             return None
 
-        # 尝试找到最相似的匹配
+        cache_key = id(translation_map)
+        cache = self.__dict__.setdefault('_fuzzy_index_cache', {})
+        if cache_key not in cache:
+            index = []
+            for orig, trans in translation_map.items():
+                if len(orig) >= 10:
+                    index.append((orig, trans, self._sim_profile(orig)))
+            cache[cache_key] = index
+        index = cache[cache_key]
+        consumed: Set[str] = self.__dict__.setdefault('_fuzzy_consumed', set())
+
+        text_profile = self._sim_profile(text)
+        text_len = len(text)
+
         best_match = None
+        best_orig = None
         best_score = 0.0
 
-        for orig, trans in translation_map.items():
-            if len(orig) < 10:
+        for orig, trans, orig_profile in index:
+            if orig in consumed:
+                continue
+            ratio = text_len / len(orig)
+            if ratio < 0.6 or ratio > 1.67:
                 continue
 
-            score = self._similarity(text, orig)
+            score = self._similarity_profiled(text, text_profile, orig, orig_profile)
             if score > best_score and score > 0.85:  # 相似度阈值
                 best_score = score
                 best_match = trans
+                best_orig = orig
 
+        if best_orig is not None:
+            consumed.add(best_orig)
         return best_match
+
+    def _sim_profile(self, s: str) -> set:
+        """预计算 _similarity 用的集合表示（中文字符集 / 英文词集）。"""
+        if self._contains_cjk(s):
+            return set(s.replace(" ", ""))
+        return set(s.lower().split())
+
+    def _similarity_profiled(self, s1: str, set1: set, s2: str, set2: set) -> float:
+        """带预计算集合的相似度（与 _similarity 语义一致）。"""
+        if not s1 or not s2:
+            return 0.0
+        # 短文本仍用子串匹配
+        if len(s1) < 50 or len(s2) < 50:
+            shorter = min(s1, s2, key=len)
+            longer = max(s1, s2, key=len)
+            if shorter in longer:
+                return len(shorter) / len(longer)
+        if not set1 or not set2:
+            return 0.0
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        return intersection / union if union > 0 else 0.0
 
     def _similarity(self, s1: str, s2: str) -> float:
         """计算两个字符串的相似度"""
