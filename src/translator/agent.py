@@ -164,9 +164,8 @@ class ClaudeAgentTranslator(OpenAICompatibleTranslator):
         )
         try:
             raw_text = self._run_cli(prompt, extra_args=['--allowedTools', 'Read'])
-            parsed = self._handle_json_response_with_repair(
+            parsed = self._parse_json_response(
                 raw_text=raw_text,
-                original_prompt=prompt,
                 is_dict_like=True,
             )
             if isinstance(parsed, dict) and 'translation' in parsed:

@@ -87,7 +87,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": False,            # 不保留原文
         
         # --- 其他 ---
-        "json_repair_retries": 1,            # 少量 JSON 修复
         "use_rich_progress": True,           # 使用 rich 进度
         "log_level": "INFO",                 # 标准日志级别
     },
@@ -149,7 +148,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": False,            # 不保留原文
         
         # --- 其他 ---
-        "json_repair_retries": 3,            # 更多 JSON 修复
         "use_rich_progress": True,           # 使用 rich 进度
         "log_level": "INFO",                 # 标准日志级别
     },
@@ -211,7 +209,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": False,            # 不保留原文
         
         # --- 其他 ---
-        "json_repair_retries": 2,            # 标准 JSON 修复
         "use_rich_progress": True,           # 使用 rich 进度
         "log_level": "INFO",                 # 标准日志级别
     },
@@ -273,7 +270,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": True,             # 保留原文（调试对照）
         
         # --- 其他 ---
-        "json_repair_retries": 5,            # 更多 JSON 修复
         "use_rich_progress": False,          # 关闭 rich（避免干扰日志）
         "log_level": "DEBUG",                # 详细日志
     },
@@ -335,7 +331,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": False,            # 不保留原文
         
         # --- 其他 ---
-        "json_repair_retries": 1,            # 少量 JSON 修复
         "use_rich_progress": True,           # 使用 rich 进度
         "log_level": "WARNING",              # 减少日志输出
     },
@@ -397,7 +392,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retain_original": True,             # ★ 保留原文（核心）
         
         # --- 其他 ---
-        "json_repair_retries": 2,            # 标准 JSON 修复
         "use_rich_progress": True,           # 使用 rich 进度
         "log_level": "INFO",                 # 标准日志级别
     },
@@ -448,7 +442,6 @@ _SETTING_ROUTES: Dict[str, tuple] = {
     "render_page_markers": ("processing", "render_page_markers"),
     "use_vision_mode": ("processing", "use_vision_mode"),
     "retain_original": ("processing", "retain_original"),
-    "json_repair_retries": ("processing", "json_repair_retries"),
     "use_rich_progress": ("processing", "use_rich_progress"),
     "enable_quality_check": ("processing", "enable_quality_check"),
     "qc_semantic": ("processing", "qc_semantic"),

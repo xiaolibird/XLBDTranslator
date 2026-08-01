@@ -934,9 +934,13 @@ class TranslationWorkflow:
                 "document": self.file_path.name,
                 "total_segments": len(self.all_segments) if self.all_segments else 0,
                 "failed_before_retry": [seg.segment_id for seg in failed_before],
+                # advisory：子串启发式检测，存在误报，按设计只报告不重译
+                # （与 prompt 的 MANDATORY 措辞对齐说明，避免读报告的人误以为已强制执行）
                 "term_violations_before_retry": [
                     {
                         "segment_id": seg.segment_id,
+                        "type": "advisory",
+                        "note": "substring heuristic; may contain false positives; not re-translated by design",
                         "missing_terms": [{"term": en, "expected": zh} for en, zh in vs],
                     }
                     for seg, vs in term_violations_before

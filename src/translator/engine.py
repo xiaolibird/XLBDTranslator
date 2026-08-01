@@ -112,6 +112,39 @@ _TRANSLATION_RESPONSE_SCHEMA = types.Schema(
 GLOSSARY_WINDOW_SIZE = 8000
 
 
+def _glossary_extraction_prompt(content_sample: str) -> str:
+    """术语抽取 prompt 的唯一出处（Gemini 与 OpenAI 兼容路径共用）。
+
+    此前两个 Translator 各持一份拷贝且已漂移（OpenAI 版丢了示例输出块），
+    改一处不同步另一处。以带示例的版本为准。
+    """
+    return f"""
+You are an expert linguist and terminologist.
+Analyze the following pairs of original and translated text. Identify all key, recurring, or specialized terms (like names, places, philosophical concepts, technical jargon) and create a definitive glossary.
+
+RULES:
+1. The output MUST be a flat JSON object.
+2. Keys are the original English terms.
+3. Values are their corresponding Chinese translations found in the text.
+4. Focus on nouns and proper nouns.
+5. Be precise. The goal is to enforce consistency.
+
+Example Output Format:
+{{
+    "Slavoj Žižek": "斯拉沃热·齐泽克",
+    "the Real": "实在界",
+    "Objet petit a": "客体小 a"
+}}
+
+Text to Analyze:
+<text>
+{content_sample}
+</text>
+
+Return ONLY the JSON object.
+""".strip()
+
+
 def _normalize_translation_list(parsed: Any) -> List[Dict[str, Any]]:
     """把翻译解析结果规整成 [{"id":..,"translation":..}] 列表。
 
@@ -500,7 +533,7 @@ class GeminiTranslator(BaseTranslator):
             )
             raw_text = response.candidates[0].content.parts[0].text
             # 解析响应（含正则兜底）
-            parsed_data = self._handle_json_response_with_correction(
+            parsed_data = self._parse_json_response(
                 raw_text,
                 is_title_translation=True
             )
@@ -567,31 +600,7 @@ class GeminiTranslator(BaseTranslator):
 
     def _extract_glossary_window(self, content_sample: str) -> Dict[str, str]:
         """对单个内容窗口做一次术语抽取，返回归一化后的 {原文: 译文} 字典。"""
-        original_prompt = f"""
-        You are an expert linguist and terminologist.
-        Analyze the following pairs of original and translated text. Identify all key, recurring, or specialized terms (like names, places, philosophical concepts, technical jargon) and create a definitive glossary.
-
-        RULES:
-        1. The output MUST be a flat JSON object.
-        2. Keys are the original English terms.
-        3. Values are their corresponding Chinese translations found in the text.
-        4. Focus on nouns and proper nouns.
-        5. Be precise. The goal is to enforce consistency.
-
-        Example Output Format:
-        {{
-            "Slavoj Žižek": "斯拉沃热·齐泽克",
-            "the Real": "实在界",
-            "Objet petit a": "客体小 a"
-        }}
-
-        Text to Analyze:
-        <text>
-        {content_sample}
-        </text>
-
-        Return ONLY the JSON object.
-        """
+        original_prompt = _glossary_extraction_prompt(content_sample)
 
         if self._client is None:
             raise APIAuthenticationError("Gemini client is not configured")
@@ -616,7 +625,7 @@ class GeminiTranslator(BaseTranslator):
             raise
 
         raw_text = response.candidates[0].content.parts[0].text
-        parsed_glossary = self._handle_json_response_with_correction(
+        parsed_glossary = self._parse_json_response(
             raw_text,
             is_glossary_extraction=True
         )
@@ -698,7 +707,7 @@ class GeminiTranslator(BaseTranslator):
         
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]
-        output_list = self._handle_json_response_with_correction(
+        output_list = self._parse_json_response(
             raw_text,
             is_text_translation=True,
             expected_ids=input_ids
@@ -797,7 +806,7 @@ class GeminiTranslator(BaseTranslator):
                 raw_text = (response.text or "").strip()
 
                 # 解析 JSON 并提取 "translation" 字段（含正则兜底）
-                parsed_json = self._handle_json_response_with_correction(
+                parsed_json = self._parse_json_response(
                     raw_text,
                     is_vision_translation=True,
                 )
@@ -827,7 +836,7 @@ class GeminiTranslator(BaseTranslator):
         logger.error(f"❌ Vision API调用失败 for {img_path}: {last_error}")
         return f"[Failed: {str(last_error)}]"
 
-    def _handle_json_response_with_correction(
+    def _parse_json_response(
         self,
         raw_text: str,
         is_title_translation: bool = False,
@@ -912,9 +921,10 @@ class GeminiTranslator(BaseTranslator):
 
     def _repair_json_content(self, text: str) -> Any:
         """修复 JSON 字符串 (只进行代码块去除，不进行高级字符串修复)"""
-        # 去除 Markdown 代码块
-        pattern = r'^```(?:json)?\s*(.*)\s*```$'
-        match = re.search(pattern, text, re.DOTALL)
+        # 去除 Markdown 代码块：先整串包裹匹配，不中再宽松搜索首个代码块
+        # （与 OpenAI 版 _strip_code_fences 同款修复）
+        match = re.search(r'^```(?:json)?\s*(.*)\s*```$', text.strip(), re.DOTALL) \
+            or re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
         if match:
             text = match.group(1)
 
@@ -1153,7 +1163,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
                 raw_text = response.candidates[0].content.parts[0].text
                 
                 # 解析响应（复用同步方法，传递期望的 ID 列表）
-                output_list = self.base._handle_json_response_with_correction(
+                output_list = self.base._parse_json_response(
                     raw_text,
                     is_text_translation=True,
                     expected_ids=input_ids
@@ -1538,9 +1548,8 @@ class OpenAICompatibleTranslator(BaseTranslator):
                 user_content=original_prompt,
             )
 
-            parsed_data = self._handle_json_response_with_repair(
+            parsed_data = self._parse_json_response(
                 raw_text=raw_text,
-                original_prompt=original_prompt,
                 is_dict_like=True,
             )
 
@@ -1591,33 +1600,15 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
     def _extract_glossary_window(self, content_sample: str) -> Dict[str, str]:
         """对单个内容窗口做一次术语抽取，返回归一化后的 {原文: 译文} 字典。"""
-        original_prompt = f"""
-You are an expert linguist and terminologist.
-Analyze the following pairs of original and translated text. Identify all key, recurring, or specialized terms (like names, places, philosophical concepts, technical jargon) and create a definitive glossary.
-
-RULES:
-1. The output MUST be a flat JSON object.
-2. Keys are the original English terms.
-3. Values are their corresponding Chinese translations found in the text.
-4. Focus on nouns and proper nouns.
-5. Be precise. The goal is to enforce consistency.
-
-Text to Analyze:
-<text>
-{content_sample}
-</text>
-
-Return ONLY the JSON object.
-""".strip()
+        original_prompt = _glossary_extraction_prompt(content_sample)
 
         raw_text = self._chat_completions(
             system_instruction="You output JSON only.",
             user_content=original_prompt,
         )
 
-        parsed = self._handle_json_response_with_repair(
+        parsed = self._parse_json_response(
             raw_text=raw_text,
-            original_prompt=original_prompt,
             is_dict_like=True,
         )
 
@@ -1668,9 +1659,8 @@ Return ONLY the JSON object.
 
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]
-        output_list = self._handle_json_response_with_repair(
+        output_list = self._parse_json_response(
             raw_text=raw_text,
-            original_prompt=original_prompt,
             is_text_translation=True,
             expected_ids=input_ids,
         )
@@ -1737,9 +1727,8 @@ Return ONLY the JSON object.
                     ],
                 )
 
-                parsed = self._handle_json_response_with_repair(
+                parsed = self._parse_json_response(
                     raw_text=raw_text,
-                    original_prompt=original_prompt,
                     is_dict_like=True,
                 )
                 if isinstance(parsed, dict) and 'translation' in parsed:
@@ -1890,6 +1879,13 @@ Return ONLY the JSON object.
 
         try:
             parsed = json.loads(resp_text)
+            # DeepSeek 前缀缓存命中监测：prompt 拼装顺序（system+glossary 稳定
+            # 前缀在先）是否真的命中缓存，唯一的量化证据就是这两个字段
+            usage = parsed.get('usage') or {}
+            hit = usage.get('prompt_cache_hit_tokens')
+            miss = usage.get('prompt_cache_miss_tokens')
+            if hit is not None or miss is not None:
+                logger.debug(f"💾 DeepSeek 前缀缓存: hit={hit} miss={miss} tokens")
             content = parsed['choices'][0]['message']['content']
             if not isinstance(content, str):
                 return json.dumps(content, ensure_ascii=False)
@@ -1898,14 +1894,20 @@ Return ONLY the JSON object.
             raise APIError(f"OpenAI-compatible response parse failed: {e}")
 
     def _strip_code_fences(self, text: str) -> str:
-        pattern = r'^```(?:json)?\s*(.*)\s*```$'
-        match = re.search(pattern, text, re.DOTALL)
-        return match.group(1) if match else text
+        # 先按整串包裹匹配（贪婪，内容含内嵌 ``` 也安全）；不中再宽松搜索首个
+        # 代码块——模型在代码块外带说明文字时（claude-agent 无 JSON mode 最常见）
+        # 此前直接掉进正则兜底
+        strict = re.search(r'^```(?:json)?\s*(.*)\s*```$', text.strip(), re.DOTALL)
+        if strict:
+            return strict.group(1)
+        loose = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+        if loose:
+            return loose.group(1)
+        return text
 
-    def _handle_json_response_with_repair(
+    def _parse_json_response(
         self,
         raw_text: str,
-        original_prompt: str,
         *,
         is_text_translation: bool = False,
         is_dict_like: bool = False,

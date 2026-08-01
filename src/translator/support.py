@@ -1039,16 +1039,15 @@ Your Style & Approach:
         Returns:
             格式化的标题翻译提示
         """
-        style = self.mode_entity.style if self.mode_entity else "Professional and accurate"
-        
-        return f"""You are a professional translator. Translate the following list of document headers/titles into Chinese.
+        # 不再自建第二个角色人设、不再整段重复注入 mode.style——角色与模式已在
+        # system instruction 中（正式阶段含 mode），这里只给任务契约
+        return f"""# Task: Title Translation
 
-Your style: {style}
+Translate the following list of document headers/titles into Chinese, following the active translation mode and terminology conventions from the system instruction. Titles should be concise and consistent.
 
 Input JSON: {text_list}
 
-**You MUST OBEY THE FOLLOWING RULE!!!!!!**
-Output JSON format: A flat JSON Dictionary where keys are the source text and values are the translation.
+Output JSON shape (task-level, takes precedence per Task Precedence): a flat JSON object where keys are the source titles and values are the translations.
 Example: {{"Chapter 1": "第一章", "Index": "索引"}}
 
 Return ONLY the JSON object."""

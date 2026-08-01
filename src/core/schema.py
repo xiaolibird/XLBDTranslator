@@ -244,7 +244,7 @@ class ProcessingSettings(BaseModel):
     use_vision_mode: Optional[bool] = Field(None, validation_alias="USE_VISION_MODE", description="是否默认启用视觉模式")
     retain_original: Optional[bool] = Field(None, validation_alias="RETAIN_ORIGINAL", description="是否保留原文")
     # 其他可选设置
-    json_repair_retries: int = Field(0, description="JSON 修复重试次数")
+    json_repair_retries: int = Field(0, description="(deprecated, unused) JSON 修复已由结构化输出+正则兜底取代；字段保留仅防旧 env 配置炸启动")
     use_rich_progress: bool = Field(False, description="是否使用 rich 进度显示")
 
     # 质检回路：翻译完成后扫描失败/术语违例段落并定向重译（上限 1 轮），生成 quality_report.json

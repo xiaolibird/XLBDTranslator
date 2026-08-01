@@ -61,6 +61,13 @@ def main():
             type=str,
             help='翻译模式 ID（如 1, 2, 3 等）'
         )
+
+        # 翻译供应商参数（覆盖 config.env 中的 API__TRANSLATOR_PROVIDER）
+        parser.add_argument(
+            '--provider',
+            type=str,
+            help='翻译供应商（deepseek/gemini/claude-agent 等，覆盖配置文件默认值）'
+        )
         
         # Vision 模式参数（仅 PDF）
         parser.add_argument(
@@ -113,6 +120,10 @@ def main():
         # 直接作用于 settings 对象，最后生效、覆盖预设）
         if args.preset:
             builder.use_preset(args.preset)
+
+        # 命令行覆盖翻译供应商
+        if args.provider:
+            builder.translation_provider(args.provider)
 
         # 命令行参数覆盖文档路径
         if args.file_path:
