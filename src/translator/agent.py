@@ -149,13 +149,12 @@ class ClaudeAgentTranslator(OpenAICompatibleTranslator):
     def _call_vision_api(self, img_path: str, context: str,
                          glossary: Optional[dict] = None) -> str:
         """视觉翻译：让 agent 用 Read 工具亲自读图片文件。"""
+        # 正式阶段 glossary 已在 system instruction；旁路调用才走兜底
         glossary_text = ""
-        if glossary:
-            glossary_text = "\n".join(
-                [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
-            )
+        if glossary and not self._formal_phase:
+            glossary_text = self.prompt_manager.format_glossary(glossary)
         original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
-        system_instruction = self.prompt_manager.get_system_instruction(use_vision=True)
+        system_instruction = self._build_system_instruction(use_vision=True)
         prompt = (
             f"{system_instruction}\n\n{'=' * 80}\n\n"
             f"First, use the Read tool to view the image file at: {img_path}\n\n"

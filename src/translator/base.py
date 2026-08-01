@@ -65,6 +65,12 @@ class BaseTranslator(ABC):
         
         self.settings = settings
         self.doc_hash: Optional[str] = None
+
+        # 翻译阶段状态：预翻译（术语表提取）阶段为 False；workflow 在术语表
+        # 就绪后调用 begin_formal_translation() 切入正式阶段，此后 prompt 拼装
+        # 应包含 mode 与 glossary（见 PromptManager.get_system_instruction）
+        self._formal_phase: bool = False
+        self._formal_glossary: Dict[str, str] = {}
         
         # 从 settings 自动计算 doc_hash（用于缓存/断点等特性）
         try:
@@ -181,10 +187,19 @@ class BaseTranslator(ABC):
         """
         pass
     
+    def begin_formal_translation(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        """进入正式翻译阶段：此后 prompt 拼装应包含翻译模式（mode）与术语表。
+
+        默认实现只记录状态；子类（如 GeminiTranslator）可覆写以额外完成
+        缓存创建/system instruction 重建等工作。覆写时必须先调 super()。
+        """
+        self._formal_phase = True
+        self._formal_glossary = dict(glossary or {})
+
     def cleanup(self):
         """
         清理资源（可选实现）
-        
+
         子类可以重写此方法以清理特定资源
         """
         pass

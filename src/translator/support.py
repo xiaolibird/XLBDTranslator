@@ -912,6 +912,18 @@ The following terms MUST be translated exactly as specified. These are non-negot
         
         return "".join(parts)
 
+    @staticmethod
+    def format_glossary(glossary: Optional[Dict[str, str]]) -> str:
+        """术语表的唯一权威文本格式。
+
+        统一为 `- **term**: translation`（与 text_translation_prompt.md 的输入契约
+        一致）；强制语义由 MANDATORY GLOSSARY 段头承担，逐行重复 "Must be
+        translated as" 是纯 token 浪费。空/None 返回空串。
+        """
+        if not glossary:
+            return ""
+        return "\n".join(f"- **{k}**: {v}" for k, v in glossary.items())
+
     def get_mode_prefix(self) -> str:
         """获取 Mode 配置作为 User message 的前缀（文本路径已并入 system instruction，
         视觉路径仍在 user message 中拼接此前缀）。"""
@@ -979,24 +991,22 @@ Your Style & Approach:
     
     def format_vision_prompt(self, context: str, glossary: str = "") -> str:
         """
-        格式化视觉翻译的完整提示
+        格式化视觉翻译的完整提示（user message 部分）
+
+        正式翻译阶段的 mode 与 glossary 已并入 system instruction
+        （见 get_system_instruction / 各 Translator 的 _build_system_instruction），
+        这里只装动态内容。
 
         Args:
             context: 上下文文本
-            glossary: 术语表文本（已格式化为「- **原文**: Must be translated as **译文**」行），
-                      为空时不注入。修复此前视觉路径不带术语表、与文本路径术语不一致的问题。
+            glossary: 旁路兜底用术语表文本（正式阶段调用方应传空串）
 
         Returns:
             格式化的完整提示
         """
         parts = []
 
-        # 添加模式前缀
-        mode_prefix = self.get_mode_prefix()
-        if mode_prefix:
-            parts.append(mode_prefix)
-
-        # 添加术语表（与文本路径一致，强制术语统一）
+        # 旁路兜底：仅当调用方未走正式阶段钩子却直接传术语表时注入
         if glossary and glossary.strip() and glossary.strip() != "N/A":
             parts.append(
                 "# MANDATORY GLOSSARY\n<glossary>\n"

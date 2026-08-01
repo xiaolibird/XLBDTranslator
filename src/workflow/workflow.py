@@ -773,11 +773,11 @@ class TranslationWorkflow:
     
     def _run_translation_loop(self) -> None:
         """执行翻译循环（支持同步/异步模式）"""
-        # ========== 第二阶段：创建完整缓存（正式翻译用） ==========
-        # 包含 glossary 和 mode
-        if hasattr(self.translator, 'create_full_cache'):
-            self.translator.create_full_cache(glossary=self.glossary)
-            logger.info("📦 正式翻译阶段：使用完整缓存（含 mode 和 glossary）")
+        # ========== 第二阶段：进入正式翻译阶段 ==========
+        # 统一阶段钩子：所有 provider 从此在 system instruction 中携带
+        # mode + glossary（Gemini 在钩子内自行创建完整缓存并重建 base config）
+        self.translator.begin_formal_translation(self.glossary)
+        logger.info("📦 正式翻译阶段：mode + glossary 已注入 system prompt")
         
         # 获取待翻译片段（所有片段，因为正式翻译需要重新翻译预翻译部分以保证一致性）
         # 注意：预翻译的片段也需要重新翻译，因为：

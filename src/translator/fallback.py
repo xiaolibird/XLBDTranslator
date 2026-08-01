@@ -151,6 +151,8 @@ class FallbackTranslator(BaseTranslator):
         self._soft_failures: Dict[int, int] = {}
         self._lock = threading.RLock()
         self._async_translator: Optional['AsyncFallbackTranslator'] = None
+        # 正式翻译阶段快照（glossary），用于向懒实例化的新 provider 重放阶段状态
+        self._formal_snapshot: Optional[Dict[str, str]] = None
 
         logger.info(f"🛟 回退翻译器已启用: {' → '.join(self.providers)}")
         # 立即解析首个可用 provider（缺 key 等构建失败会自动跳过）
@@ -173,6 +175,10 @@ class FallbackTranslator(BaseTranslator):
                 provider = self.providers[idx]
                 try:
                     instance = _create_translator(provider, self.settings)
+                    # 阶段状态重放：中途 fallback 切换出来的新 provider 必须
+                    # 继承正式翻译阶段（否则退回无 mode/无 glossary 状态）
+                    if self._formal_snapshot is not None:
+                        instance.begin_formal_translation(self._formal_snapshot)
                     self._instances[idx] = instance
                     logger.info(f"🛟 当前翻译 provider: {provider} ({idx + 1}/{len(self.providers)})")
                     return idx, instance
@@ -261,6 +267,14 @@ class FallbackTranslator(BaseTranslator):
     # ------------------------------------------------------------------
     # Gemini 缓存接口透传（provider 不支持时静默降级）
     # ------------------------------------------------------------------
+
+    def begin_formal_translation(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        """存快照并转发给当前 provider；此后懒实例化的 provider 由 _get_current 重放。"""
+        super().begin_formal_translation(glossary)
+        with self._lock:
+            self._formal_snapshot = dict(glossary or {})
+            _, t = self._get_current()
+            t.begin_formal_translation(self._formal_snapshot)
 
     def create_base_cache(self) -> Optional[str]:
         _, t = self._get_current()

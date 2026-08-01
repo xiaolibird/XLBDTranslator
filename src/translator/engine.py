@@ -240,20 +240,12 @@ class GeminiTranslator(BaseTranslator):
             logger.info("ℹ️ Gemini 缓存未启用，跳过完整缓存创建")
             return None
         
-        # 格式化术语表
-        glossary_text = ""
-        if glossary:
-            glossary_text = "\n".join([
-                f"- **{k}**: {v}" 
-                for k, v in glossary.items()
-            ])
-        
         # 生成完整 system instruction（含 mode 和 glossary）
         system_instruction = self.prompt_manager.get_system_instruction(
             use_vision=self.settings.processing.use_vision_mode,
             include_mode=True,
             include_glossary=bool(glossary),
-            glossary_text=glossary_text
+            glossary_text=self.prompt_manager.format_glossary(glossary)
         )
         
         mode_name = getattr(self.settings.processing.translation_mode_entity, 'name', 'Default')
@@ -279,6 +271,30 @@ class GeminiTranslator(BaseTranslator):
             self.cache_refs['system'] = self.cache_refs['base']
             return True
         return False
+
+    def begin_formal_translation(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        """进入正式翻译阶段：建完整缓存 + 重建 base config。
+
+        重建 _base_generation_config 让非缓存路径与缓存失效降级路径
+        （_generate_content 回填 system_instruction 处）同样带上
+        mode + glossary——此前这两条路径会静默丢失翻译模式。
+        """
+        super().begin_formal_translation(glossary)
+        self.create_full_cache(glossary=glossary)  # 内部有 caching 开关守卫
+
+        full_si = self.prompt_manager.get_system_instruction(
+            use_vision=self.settings.processing.use_vision_mode,
+            include_mode=True,
+            include_glossary=bool(glossary),
+            glossary_text=self.prompt_manager.format_glossary(glossary),
+        )
+        self._base_generation_config = self._base_generation_config.model_copy(
+            update={"system_instruction": full_si}
+        )
+        logger.info(
+            "🧭 正式翻译阶段：base config 已重建（mode + glossary 进入 system instruction，"
+            f"术语 {len(self._formal_glossary)} 条）"
+        )
     
     @property
     def async_translator(self):
@@ -641,12 +657,11 @@ class GeminiTranslator(BaseTranslator):
         # 截取上下文
         safe_context = context[-self.settings.processing.max_context_length:] if context else ""
 
-        # 格式化术语表（仅在非缓存模式下才在 user message 中包含）
-        # 正式翻译阶段 glossary 已在 system instruction 缓存中，这里不需要再传
+        # 正式阶段 glossary 已在 system instruction（缓存与非缓存路径均由
+        # begin_formal_translation 保证）；仅旁路调用才走 user message 兜底
         glossary_text = ""
-        if glossary and not self.settings.processing.enable_gemini_caching:
-            # 非缓存模式：在 user message 中包含 glossary
-            glossary_text = "\n".join([f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()])
+        if glossary and not self._formal_phase:
+            glossary_text = self.prompt_manager.format_glossary(glossary)
 
         # 格式化提示（固定部分已在system instruction，仅填充动态变量）
         original_prompt = self.prompt_manager.format_text_prompt(
@@ -740,12 +755,10 @@ class GeminiTranslator(BaseTranslator):
         last_error: Optional[Exception] = None
         for attempt in range(_VISION_TRANSIENT_RETRIES + 1):
             try:
-                # 格式化术语表（非缓存模式下在 prompt 中注入；缓存模式下已在 system instruction）
+                # 正式阶段 glossary 已在 system instruction；旁路调用才走兜底
                 glossary_text = ""
-                if glossary and not self.settings.processing.enable_gemini_caching:
-                    glossary_text = "\n".join(
-                        [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
-                    )
+                if glossary and not self._formal_phase:
+                    glossary_text = self.prompt_manager.format_glossary(glossary)
 
                 # 使用 prompt_manager 格式化提示
                 original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
@@ -1082,10 +1095,11 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         ]
         input_json = json.dumps(input_data, ensure_ascii=False)
         
-        # 格式化术语表（仅在非缓存模式下使用）
+        # 正式阶段 glossary 已在 system instruction（base config 已由
+        # begin_formal_translation 重建）；旁路调用才走 user message 兜底
         glossary_text = ""
-        if glossary and not self.settings.processing.enable_gemini_caching:
-            glossary_text = "\n".join([f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()])
+        if glossary and not self.base._formal_phase:
+            glossary_text = self.base.prompt_manager.format_glossary(glossary)
         
         # 格式化 Prompt（与同步模式完全一致）
         original_prompt = self.prompt_manager.format_text_prompt(
@@ -1361,7 +1375,8 @@ class OpenAICompatibleTranslator(BaseTranslator):
         self.is_local: bool = self._detect_local_service(self.base_url)
         self.is_deepseek: bool = self._detect_deepseek_api(self.base_url)
         
-        # DeepSeek 长文本模式：自动切换为单 message 模式（system + instruction + mode + context + prompt）
+        # DeepSeek 长文本模式：_chat_completions 会把 system instruction（正式
+        # 阶段含 mode+glossary）并入单条 user message
         # 原因：DeepSeek 对长上下文支持更好，且 system message 可能影响性能
         self.use_long_text_mode: bool = self.is_deepseek
         
@@ -1463,6 +1478,29 @@ class OpenAICompatibleTranslator(BaseTranslator):
             self._async_translator = AsyncOpenAICompatibleTranslator(self)
         return self._async_translator
 
+    def _build_system_instruction(self, use_vision: bool = False) -> str:
+        """按当前翻译阶段构建 system instruction。
+
+        正式阶段（begin_formal_translation 之后）包含 mode 与 glossary；
+        get_system_instruction 对相同输入是确定性的，因此正式阶段逐请求
+        字节级相同——DeepSeek 前缀缓存按稳定前缀命中。
+        """
+        if self._formal_phase:
+            return self.prompt_manager.get_system_instruction(
+                use_vision=use_vision,
+                include_mode=True,
+                include_glossary=bool(self._formal_glossary),
+                glossary_text=self.prompt_manager.format_glossary(self._formal_glossary),
+            )
+        return self.prompt_manager.get_system_instruction(use_vision=use_vision)
+
+    def begin_formal_translation(self, glossary: Optional[Dict[str, str]] = None) -> None:
+        super().begin_formal_translation(glossary)
+        logger.info(
+            "🧭 正式翻译阶段：mode + glossary 已并入 system instruction "
+            f"(术语 {len(self._formal_glossary)} 条)"
+        )
+
     def translate_batch(
         self,
         segments: SegmentList,
@@ -1486,7 +1524,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
         try:
             raw_text = self._chat_completions(
-                system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
+                system_instruction=self._build_system_instruction(use_vision=False),
                 user_content=original_prompt,
             )
 
@@ -1597,47 +1635,32 @@ Return ONLY the JSON object.
         input_data = [{"id": seg.segment_id, "text": seg.original_text} for seg in segments]
         input_json = json.dumps(input_data, ensure_ascii=False)
 
-        safe_context = context[-self.settings.processing.max_context_length:] if context else "No Context"
+        safe_context = context[-self.settings.processing.max_context_length:] if context else ""
 
-        glossary_text = "N/A"
-        if glossary:
-            glossary_text = "\n".join(
-                [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
-            )
+        # 正式阶段 glossary 已在 system instruction（稳定前缀，DeepSeek 可命中
+        # 前缀缓存）；仅当旁路调用方未走 begin_formal_translation 却直接传了
+        # 术语表时，才退回 user message 注入
+        user_glossary = ""
+        if glossary and not self._formal_phase:
+            user_glossary = self.prompt_manager.format_glossary(glossary)
 
-        # DeepSeek 长文本模式：将 system instruction 嵌入到 user content 中
-        if self.use_long_text_mode:
-            system_instruction = self.prompt_manager.get_system_instruction(use_vision=False)
-            user_prompt = self.prompt_manager.format_text_prompt(
-                context=safe_context,
-                input_json=input_json,
-                glossary=glossary_text,
-            )
-            # 将 system instruction 和 user prompt 合并为完整的长文本 prompt
-            combined_prompt = f"{system_instruction}\n\n{'='*80}\n\n{user_prompt}"
-            
-            raw_text = self._chat_completions(
-                system_instruction="",  # 长文本模式下 system_instruction 为空
-                user_content=combined_prompt,
-            )
-        else:
-            # 标准模式：system 和 user 分离
-            original_prompt = self.prompt_manager.format_text_prompt(
-                context=safe_context,
-                input_json=input_json,
-                glossary=glossary_text,
-            )
-
-            raw_text = self._chat_completions(
-                system_instruction=self.prompt_manager.get_system_instruction(use_vision=False),
-                user_content=original_prompt,
-            )
+        original_prompt = self.prompt_manager.format_text_prompt(
+            context=safe_context,
+            input_json=input_json,
+            glossary=user_glossary,
+        )
+        # 长文本模式（DeepSeek）的 system 并入单条 user message 的合并职责
+        # 统一在 _chat_completions，这里不再预拼接
+        raw_text = self._chat_completions(
+            system_instruction=self._build_system_instruction(use_vision=False),
+            user_content=original_prompt,
+        )
 
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]
         output_list = self._handle_json_response_with_repair(
             raw_text=raw_text,
-            original_prompt=combined_prompt if self.use_long_text_mode else original_prompt,
+            original_prompt=original_prompt,
             is_text_translation=True,
             expected_ids=input_ids,
         )
@@ -1681,12 +1704,11 @@ Return ONLY the JSON object.
 
     def _call_vision_api(self, img_path: str, context: str,
                          glossary: Optional[Dict[str, str]] = None) -> str:
-        glossary_text = ""
-        if glossary:
-            glossary_text = "\n".join(
-                [f"- **{k}**: Must be translated as **{v}**" for k, v in glossary.items()]
-            )
-        original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=glossary_text)
+        # 正式阶段 glossary 已在 system instruction；旁路调用才走 user message 兜底
+        user_glossary = ""
+        if glossary and not self._formal_phase:
+            user_glossary = self.prompt_manager.format_glossary(glossary)
+        original_prompt = self.prompt_manager.format_vision_prompt(context, glossary=user_glossary)
 
         # 文本批有 @retry 装饰而视觉此前零重试（与 Gemini 版同样的缺口）：
         # 瞬态异常有限重试，耗尽后才落 [Failed:]。
@@ -1698,7 +1720,7 @@ Return ONLY the JSON object.
                 image_url = f"data:image/png;base64,{b64}"
 
                 raw_text = self._chat_completions(
-                    system_instruction=self.prompt_manager.get_system_instruction(use_vision=True),
+                    system_instruction=self._build_system_instruction(use_vision=True),
                     user_content=[
                         {"type": "text", "text": original_prompt},
                         {"type": "image_url", "image_url": {"url": image_url}},
@@ -1755,12 +1777,20 @@ Return ONLY the JSON object.
           OLLAMA_NUM_CTX / OLLAMA_NUM_THREAD（低值适配 16GB 内存压力）
         
         DeepSeek 长文本模式：
-        - 所有内容已预先合并到 user_content 中，system_instruction 为空
-        - 格式：完整的长文本 prompt 包含 system instruction + mode + context + input
+        - system_instruction 在此处（唯一位置）并入单条 user message，
+          调用方一律正常传 system_instruction，不做预拼接
         - 原因：DeepSeek 对长上下文支持更好，且避免 system message 限制
         """
-        # DeepSeek 长文本模式：所有内容已预先合并，无需额外处理
+        # DeepSeek 长文本模式：把 system instruction 并入唯一的 user message
         if self.use_long_text_mode:
+            if system_instruction:
+                if isinstance(user_content, str):
+                    user_content = f"{system_instruction}\n\n{'=' * 80}\n\n{user_content}"
+                elif isinstance(user_content, list):
+                    # 多模态内容：system 作为首个 text part 注入
+                    user_content = [
+                        {"type": "text", "text": f"{system_instruction}\n\n{'=' * 80}"}
+                    ] + list(user_content)
             payload = {
                 "model": self.model,
                 "messages": [
@@ -1769,7 +1799,7 @@ Return ONLY the JSON object.
                 "temperature": self.settings.processing.temperature,
                 "stream": False,
             }
-            logger.debug("📝 使用长文本模式（所有内容预先合并）")
+            logger.debug("📝 使用长文本模式（system instruction 已并入单条 user message）")
         else:
             # 标准模式：system + user 分离
             payload = {
@@ -1803,7 +1833,7 @@ Return ONLY the JSON object.
         
         logger.info(f"📤 发送API请求 - 文本总长度: {total_text_length} 字符")
         if self.use_long_text_mode:
-            logger.debug("   📊 长文本模式: System Instruction + 分隔符 + Mode + Glossary + Context + Input JSON")
+            logger.debug("   📊 长文本模式: [System Instruction(正式阶段含 Mode+Glossary)] + 分隔符 + Context + Input JSON（单条 user message）")
         else:
             logger.debug("   📊 标准模式: System Instruction + User Content")
         
