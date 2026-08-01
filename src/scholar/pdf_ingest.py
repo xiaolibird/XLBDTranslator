@@ -26,6 +26,7 @@ from .schema import (
 )
 from .closereading import pdf_to_text, parse_closeread
 from ..utils.logger import get_logger
+from ..utils.json_tools import strip_code_fences as _strip_json
 
 logger = get_logger(__name__)
 
@@ -286,13 +287,6 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
 def path_hint(ids: Dict[str, Optional[str]]) -> str:
     return ids.get("doi") or ids.get("arxiv_id") or ids.get("title") or "unknown"
 
-
-def _strip_json(text: str) -> str:
-    s = (text or "").strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    return s.strip()
 
 
 def _close_suffix(head: str) -> Optional[str]:

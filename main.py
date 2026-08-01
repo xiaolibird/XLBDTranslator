@@ -309,7 +309,11 @@ def main():
         workflow = TranslationWorkflow(final_settings)
         workflow.execute()
         logger.info("=" * 60)
-        logger.info("🎉 翻译任务成功完成！")
+        failed_n = getattr(workflow, 'still_failed_count', 0)
+        if failed_n:
+            logger.warning(f"⚠️ 翻译任务完成，但有 {failed_n} 段失败（详见产物清单中的 quality_report.json）")
+        else:
+            logger.info("🎉 翻译任务成功完成！")
         logger.info("=" * 60)
 
     # loguru 会对 message.format(*args, **kwargs) 二次格式化：错误信息里带花括号

@@ -63,7 +63,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 1.0,      # 短 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 300,               # 较大最小块
         "max_chunk_size": 2500,              # 较大最大块
         
         # --- 异步/并发 ---
@@ -124,7 +123,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 3.0,      # 长 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 150,               # 较小最小块
         "max_chunk_size": 1500,              # 较小最大块（精细）
         
         # --- 异步/并发 ---
@@ -185,7 +183,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 2.0,      # 标准 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 200,               # 标准最小块
         "max_chunk_size": 2000,              # 标准最大块
         
         # --- 异步/并发 ---
@@ -246,7 +243,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 1.0,      # 短 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 100,               # 极小最小块
         "max_chunk_size": 1000,              # 极小最大块
         
         # --- 异步/并发 ---
@@ -307,7 +303,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 2.5,      # 略长 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 300,               # 较大最小块
         "max_chunk_size": 3000,              # 大最大块
         
         # --- 异步/并发 ---
@@ -368,7 +363,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "vision_rate_limit_delay": 2.0,      # 标准 Vision 间隔
         
         # --- 分块 ---
-        "min_chunk_size": 200,               # 标准最小块
         "max_chunk_size": 1800,              # 略小最大块
         
         # --- 异步/并发 ---
@@ -428,7 +422,6 @@ _SETTING_ROUTES: Dict[str, tuple] = {
     "request_timeout": ("processing", "request_timeout"),
     "rate_limit_delay": ("processing", "rate_limit_delay"),
     "vision_rate_limit_delay": ("processing", "vision_rate_limit_delay"),
-    "min_chunk_size": ("processing", "min_chunk_size"),
     "max_chunk_size": ("processing", "max_chunk_size"),
     "enable_async": ("processing", "enable_async"),
     "async_threshold": ("processing", "async_threshold"),

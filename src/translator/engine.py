@@ -116,6 +116,20 @@ _TRANSLATION_RESPONSE_SCHEMA = types.Schema(
 GLOSSARY_WINDOW_SIZE = 8000
 
 
+def _stop_by_settings(retry_state) -> bool:
+    """tenacity stop 回调：读实例 settings.processing.max_retries。
+
+    此前两处 @retry 硬编码 stop_after_attempt(3)，quality 预设声称的
+    max_retries=5 从未生效。
+    """
+    try:
+        self_obj = retry_state.args[0]
+        limit = int(getattr(self_obj.settings.processing, 'max_retries', 3))
+    except Exception:
+        limit = 3
+    return retry_state.attempt_number >= max(1, limit)
+
+
 class _ResponseValidationError(APIError):
     """API 请求成功但响应内容不可用（安全过滤 block、空响应、无 candidates）。
 
@@ -357,6 +371,14 @@ class GeminiTranslator(BaseTranslator):
         if self._async_translator is None:
             self._async_translator = AsyncGeminiTranslator(self)
         return self._async_translator
+
+    def cleanup(self):
+        """清理异步线程池（直连模式下由 workflow._cleanup_resources 调用）。"""
+        if self._async_translator is not None:
+            try:
+                self._async_translator.cleanup()
+            except Exception:
+                pass
     
 
     def _configure_api(self):
@@ -640,8 +662,11 @@ class GeminiTranslator(BaseTranslator):
                 purpose="Glossary Extraction"
             )
         except APIError as e:
-            # 被安全过滤器拦截时跳过该窗口，允许翻译继续
-            if "blocked" in str(e).lower() or "PROHIBITED_CONTENT" in str(e):
+            # 被安全过滤器拦截时跳过该窗口，允许翻译继续。
+            # 用 .message 而非 str(e)：__str__ 拼接 context（含 repr(response)
+            # 回显），书籍正文里出现 'blocked' 一词会误判（与 fallback.classify_fatal 同理）
+            _msg = (getattr(e, 'message', None) or str(e))
+            if "blocked" in _msg.lower() or "PROHIBITED_CONTENT" in _msg:
                 logger.warning(f"⚠️  Glossary Extraction was blocked by safety filters. Skipping window. Error: {e}")
                 return {}
             raise
@@ -674,7 +699,7 @@ class GeminiTranslator(BaseTranslator):
         return window_glossary
 
     @retry(
-        stop=stop_after_attempt(3),
+        stop=_stop_by_settings,
         wait=wait_exponential(multiplier=1, min=1, max=30),
         # 谓词式重试而非类型匹配：genai ClientError 里混着可重试的 429 和致命的 401/402/404，
         # 只有按 code 区分才能既覆盖真实限流又不对欠费空转。
@@ -1170,7 +1195,7 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
             )
         
         # 重试逻辑（与同步模式的 @retry 装饰器效果一致）
-        retry_count = 2
+        retry_count = max(0, int(getattr(self.settings.processing, 'max_retries', 3)) - 1)
         last_error = None
         input_ids = [s.segment_id for s in segments]
         
@@ -1520,6 +1545,22 @@ class OpenAICompatibleTranslator(BaseTranslator):
             self._async_translator = AsyncOpenAICompatibleTranslator(self)
         return self._async_translator
 
+    def cleanup(self):
+        """清理异步线程池与持久连接（直连模式下由 workflow._cleanup_resources 调用；
+        fallback 模式下由 FallbackTranslator.cleanup 逐实例调用）。"""
+        if self._async_translator is not None:
+            try:
+                self._async_translator.cleanup()
+            except Exception:
+                pass
+        local = self.__dict__.get('_conn_local')
+        conn = getattr(local, 'conn', None) if local is not None else None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _build_system_instruction(self, use_vision: bool = False) -> str:
         """按当前翻译阶段构建 system instruction。
 
@@ -1648,10 +1689,22 @@ class OpenAICompatibleTranslator(BaseTranslator):
             for k, v in parsed.items():
                 if k and v:
                     window_glossary[str(k).strip()] = str(v).strip()
+        elif isinstance(parsed, list):
+            # 与 Gemini 版对齐：模型偶尔返回 [{en: zh}, ...] 或 [[en, zh], ...]
+            # 数组，此前 OpenAI 版静默返回 0 条术语
+            for item in parsed:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        if k and v:
+                            window_glossary[str(k).strip()] = str(v).strip()
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    k, v = item
+                    if k and v:
+                        window_glossary[str(k).strip()] = str(v).strip()
         return window_glossary
 
     @retry(
-        stop=stop_after_attempt(3),
+        stop=_stop_by_settings,
         wait=wait_exponential(multiplier=1, min=1, max=20),
         # 谓词式重试而非类型匹配：APIError 里混着 402/401/404 的 hard 包装，
         # 对欠费/模型下线重试只会空转 3 轮才交给回退链
@@ -1713,6 +1766,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
             try:
                 if seg.content_type == "image" and seg.image_path:
                     translation = self._call_vision_api(seg.image_path, current_context, glossary)
+                    time.sleep(self.settings.processing.vision_rate_limit_delay)
                 else:
                     fallback = self._translate_text_batch([seg], current_context, glossary=glossary)
                     translation = fallback[0] if fallback else "[Fallback Failed]"

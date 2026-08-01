@@ -18,6 +18,7 @@ from .fulltext import (
     ipv4_client, resolve_oa_pdf, europepmc_fulltext, europepmc_pmcid,
 )
 from ..utils.logger import get_logger
+from ..utils.json_tools import strip_code_fences as _strip_json
 
 logger = get_logger(__name__)
 
@@ -149,13 +150,6 @@ _CLOSEREAD_PROMPT = """你是一名方法学审稿助手，为一位研究者做
   ]
 }}"""
 
-
-def _strip_json(text: str) -> str:
-    s = (text or "").strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
-        s = re.sub(r"\s*```$", "", s)
-    return s.strip()
 
 
 def parse_closeread(response: str) -> Optional[CloseReading]:

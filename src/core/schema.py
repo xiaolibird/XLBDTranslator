@@ -134,25 +134,6 @@ class ContentSegment(BaseModel):
             return False
         return not contains_failed_marker(self.translated_text)
 
-    def get_context_window(self, all_segments: list['ContentSegment'], window_size: int = 3) -> str:
-        """获取上下文窗口"""
-        if not all_segments:
-            return ""
-
-        # 找到当前片段在列表中的位置
-        current_idx = next((i for i, seg in enumerate(all_segments) if seg.segment_id == self.segment_id), -1)
-        if current_idx == -1:
-            return ""
-
-        # 获取前几个已翻译的片段
-        context_parts = []
-        for i in range(max(0, current_idx - window_size), current_idx):
-            if i < len(all_segments) and all_segments[i].is_translated:
-                context_parts.append(all_segments[i].translated_text)
-
-        return " ".join(context_parts).strip()
-
-
 class APISettings(BaseModel):
     """API 配置"""
     translator_provider: str = Field("gemini", validation_alias="TRANSLATOR_PROVIDER", description="翻译器提供商 (gemini, openai-compatible, ollama)")
@@ -220,7 +201,6 @@ class ProcessingSettings(BaseModel):
     vision_rate_limit_delay: float = Field(2.0, validation_alias="VISION_RATE_LIMIT_DELAY", description="Vision模式请求间隔 (秒)")
 
     # 分块
-    min_chunk_size: int = Field(200, validation_alias="MIN_CHUNK_SIZE", description="最小分块大小")
     max_chunk_size: int = Field(2000, validation_alias="MAX_CHUNK_SIZE", description="最大分块大小")
 
     # 异步/并发与缓存相关（Builder 会设置这些）

@@ -91,41 +91,6 @@ def process_unified_toc(
     return chapter_map
 
 
-def parse_csv_toc(csv_path: Path) -> List[Dict[str, Any]]:
-    """解析 CSV 格式的目录文件"""
-    import csv
-
-    standardized_items = []
-
-    try:
-        with open(csv_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-
-            for row in reader:
-                # 健壮性读取：处理 CSV 列名大小写或空格
-                row_lower = {k.lower().strip(): v for k, v in row.items()}
-
-                page_str = row_lower.get('page') or row_lower.get('页码')
-                if not page_str:
-                    continue
-
-                p_idx = int(page_str) - 1  # 用户习惯 1-based, 内部逻辑 0-based
-
-                title = row_lower.get('title') or row_lower.get('标题') or f"Page {p_idx+1}"
-                level_str = row_lower.get('level') or row_lower.get('层级') or "1"
-
-                if p_idx >= 0:
-                    standardized_items.append({
-                        'level': int(level_str),
-                        'title': title.strip(),
-                        'key': p_idx
-                    })
-    except Exception as e:
-        raise ValueError(f"Failed to parse CSV TOC: {e}")
-
-    return standardized_items
-
-
 def parse_epub_toc(toc, level: int = 1) -> List[Dict[str, Any]]:
     """解析 EPUB 目录结构"""
     items = []

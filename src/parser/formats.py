@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 
 from ..core.schema import ContentSegment, Settings
 from ..core.exceptions import DocumentParseError
-from .helpers import process_unified_toc, extract_text_from_html, parse_epub_toc
+from .helpers import process_unified_toc, parse_epub_toc
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)

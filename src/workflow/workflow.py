@@ -112,6 +112,9 @@ class TranslationWorkflow:
         self.translator: Optional[GeminiTranslator] = None
         self.cache_manager = None
         self.checkpoint: Optional[CheckpointManager] = None
+        # 收尾汇总用：实际产出文件与质检残留失败数
+        self.produced_outputs: List[Path] = []
+        self.still_failed_count: int = 0
         self.glossary: Optional[Dict[str, str]] = None
         
         # 文档标题（原文和译文）
@@ -197,21 +200,6 @@ class TranslationWorkflow:
         
         return optimized, original_batch_size, optimized_batch_size, reason
 
-    def _build_translation_mode_config(self) -> Dict[str, str]:
-        """构建用于调用翻译器的 translation_mode_config 字典"""
-        mode_entity = getattr(self.settings.processing, 'translation_mode_entity', None)
-        if mode_entity:
-            return {
-                'name': getattr(mode_entity, 'name', 'Auto'),
-                'style': getattr(mode_entity, 'style', 'Fluent and precise'),
-                'role_desc': getattr(mode_entity, 'role_desc', 'Expert translator')
-            }
-        return {
-            'name': str(getattr(self.settings.processing, 'translation_mode', 'Default')),
-            'style': 'Fluent and precise',
-            'role_desc': 'Expert translator'
-        }
-        
     def execute(self) -> None:
         """执行完整的翻译工作流"""
         logger.info(f"🚀 开始处理文档: {self.file_path.name}")
@@ -256,6 +244,20 @@ class TranslationWorkflow:
 
             # 9. 渲染最终文档
             self._render_output()
+
+            # 10. 收尾汇总：产物清单 + 按质检结果如实收尾（不再无条件庆祝）
+            logger.info("=" * 60)
+            failed_n = getattr(self, 'still_failed_count', 0)
+            if failed_n:
+                logger.warning(f"⚠️ 翻译完成，但有 {failed_n} 段失败（已如实标记在输出中）")
+            else:
+                logger.info("✅ 全部段落翻译成功")
+            logger.info("📦 产物清单:")
+            for out_path in self.produced_outputs:
+                logger.info(f"   - {out_path}")
+            if not self.produced_outputs:
+                logger.warning("   - （无成品产出，请检查上方渲染日志）")
+            logger.info(f"   - 质检报告: {self.project_dir / 'quality_report.json'}")
 
         except Exception as e:
             logger.error(f"❌ 翻译工作流执行失败: {e}")
@@ -376,7 +378,7 @@ class TranslationWorkflow:
         
         raise TranslationError(
             f"未知 translator_provider: {provider}。"
-            f"支持的provider: gemini, deepseek, openai, openai-compatible。"
+            f"支持的provider: gemini, deepseek, openai, openai-compatible, claude-agent。"
             f"注意：Ollama现已集成到openai-compatible中，请使用OPENAI_BASE_URL=http://localhost:11434"
         )
     
@@ -934,6 +936,7 @@ class TranslationWorkflow:
             seg for seg in self.all_segments
             if contains_failed_marker(seg.translated_text or "")
         ]
+        self.still_failed_count = len(still_failed)
         self._write_quality_report(failed, term_violations, still_failed)
 
         if still_failed:
@@ -1009,8 +1012,12 @@ class TranslationWorkflow:
                     batch[0],
                     self.settings.processing.max_context_length
                 )
-            # 传入 glossary：非 Gemini 缓存 provider（DeepSeek/OpenAI 等）只能靠参数注入术语表，
-            # engine 内部已有 `if glossary and not enable_gemini_caching` 判断，缓存模式不会重复注入
+            # 传入 glossary：正式阶段已在 system instruction（begin_formal_translation），
+            # engine 内部的旁路兜底判定保证不会重复注入
+            if i > 0 and self.settings.processing.rate_limit_delay > 0:
+                # 批间限速（PROCESSING__RATE_LIMIT_DELAY，此前无任何消费者）；
+                # 异步路径由 semaphore 控并发，不做逐批 sleep
+                time.sleep(self.settings.processing.rate_limit_delay)
             results = self.translator.translate_batch(batch, context=context, glossary=self.glossary)
 
             for seg, trans in zip(batch, results):
@@ -1308,15 +1315,20 @@ class TranslationWorkflow:
         logger.info(f"📊 并发效率: {max_concurrent} batches 同时运行")
     
     def _cleanup_resources(self) -> None:
-        """清理资源"""
+        """清理资源
+
+        统一走 translator.cleanup()：FallbackTranslator 会逐 provider 清理各自的
+        异步线程池。此前这里引用不存在的 cache_manager.cleanup_all_caches()
+        （属性名/方法名双错，hasattr 恒 False，整段死代码），且只清顶层
+        _async_translator、漏掉 fallback 链内各实例的线程池。
+        Gemini context cache 不在此清理：按内容 hash 跨轮次复用，交给 TTL 过期。
+        """
         try:
-            if hasattr(self.translator, '_async_translator') and self.translator._async_translator:
-                self.translator._async_translator.cleanup()
-            if hasattr(self.translator, 'cache_manager') and self.translator.cache_manager:
-                self.translator.cache_manager.cleanup_all_caches()
+            if hasattr(self.translator, 'cleanup'):
+                self.translator.cleanup()
             logger.info("✅ 资源清理完成")
         except Exception as e:
-            logger.debug(f"清理资源时出现警告: {e}")
+            logger.warning(f"⚠️ 清理资源时出现警告: {e}")
     
     def _render_output(self) -> None:
         """Render: 生成最终文档（Markdown + PDF + EPUB）"""
@@ -1349,6 +1361,7 @@ class TranslationWorkflow:
             translated_title=self.translated_doc_title or self.doc_title
         )
         logger.info(f"✅ Markdown 已保存到: {md_output_path}")
+        self.produced_outputs.append(md_output_path)
         
         # 2. 生成 EPUB（默认）- 根据源文件类型选择不同策略
         epub_output_path = final_dir / f"{Path(self.file_path.name).stem}_Translated.epub"
@@ -1366,6 +1379,7 @@ class TranslationWorkflow:
                     translated_title=self.translated_doc_title or self.doc_title
                 )
                 logger.info(f"✅ EPUB 已保存到: {epub_output_path}")
+                self.produced_outputs.append(epub_output_path)
             except ImportError:
                 logger.info("ℹ️  跳过 EPUB 生成（未安装 ebooklib）")
             except Exception as e:
@@ -1421,6 +1435,7 @@ class TranslationWorkflow:
                     translated_title=self.translated_doc_title or self.doc_title
                 )
                 logger.info(f"✅ EPUB 已保存到: {epub_output_path}")
+                self.produced_outputs.append(epub_output_path)
                 
             except ImportError as e:
                 logger.info(f"ℹ️  跳过 EPUB 生成（缺少依赖: {e}）")
@@ -1449,6 +1464,7 @@ class TranslationWorkflow:
             # 此前这里无条件宣布成功，WeasyPrint 缺库时是假日志）
             for p in produced:
                 logger.info(f"✅ PDF 已保存到: {p}")
+                self.produced_outputs.append(p)
             if not produced:
                 logger.warning("⚠️  本次未生成任何 PDF（详见上方渲染器日志），Markdown/EPUB 不受影响")
         except ImportError:

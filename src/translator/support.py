@@ -44,6 +44,11 @@ class CheckpointManager:
         self.checkpoint_file = self.project_dir / "checkpoint.json"
         self.checkpoint_data: Dict = {}
         
+        # enable_checkpoint=False 时整体降级为 no-op（此前该配置无任何消费者）
+        self.enabled = bool(getattr(settings.processing, 'enable_checkpoint', True))
+        if not self.enabled:
+            logger.warning("⚠️ 断点续传已禁用（PROCESSING__ENABLE_CHECKPOINT=False）：中断即需重头翻译")
+
         # 记录checkpoint文件路径，便于排查
         logger.info(f"📍 Checkpoint文件路径: {self.checkpoint_file.absolute()}")
         
@@ -51,7 +56,7 @@ class CheckpointManager:
     
     def _load_checkpoint(self):
         """加载现有的检查点文件"""
-        if self.checkpoint_file.exists():
+        if self.enabled and self.checkpoint_file.exists():
             try:
                 with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                     self.checkpoint_data = json.load(f)
@@ -78,6 +83,8 @@ class CheckpointManager:
     
     def save_checkpoint(self):
         """保存当前检查点到文件"""
+        if not self.enabled:
+            return
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True)
             self.checkpoint_data['last_update'] = datetime.now().isoformat()
@@ -140,13 +147,6 @@ class CheckpointManager:
             self.checkpoint_data['title_translations'] = {}
         self.checkpoint_data['title_translations'][original_title] = translated_title
     
-    def get_filenames(self) -> Tuple[Optional[str], Optional[str]]:
-        """获取原文件名和翻译后文件名"""
-        return (
-            self.checkpoint_data.get('original_filename'),
-            self.checkpoint_data.get('translated_filename')
-        )
-    
     def save_filenames(self, original_filename: str, translated_filename: str = None):
         """保存文件名信息"""
         self.checkpoint_data['original_filename'] = original_filename
@@ -198,41 +198,6 @@ class CheckpointManager:
         """更新总段落数"""
         self.checkpoint_data['total_segments'] = total
     
-    def get_progress_stats(self) -> Dict:
-        """获取进度统计信息"""
-        completed = len(self.checkpoint_data.get('completed_segments', []))
-        failed = len(self.checkpoint_data.get('failed_segments', []))
-        total = self.checkpoint_data.get('total_segments', 0)
-        progress_pct = (completed / total * 100) if total > 0 else 0
-        
-        return {
-            'completed': completed,
-            'failed': failed,
-            'total': total,
-            'pending': total - completed,
-            'progress_percentage': progress_pct,
-            'start_time': self.checkpoint_data.get('start_time'),
-            'last_update': self.checkpoint_data.get('last_update')
-        }
-    
-    def reset_checkpoint(self):
-        """重置检查点（重新开始翻译）"""
-        logger.warning("🗑️  重置检查点，将从头开始翻译")
-        self.checkpoint_data = {
-            'start_time': datetime.now().isoformat(),
-            'completed_segments': [],
-            'failed_segments': [],
-            'total_segments': 0,
-            'last_update': None
-        }
-        if self.checkpoint_file.exists():
-            self.checkpoint_file.unlink()
-
-
-# ========================================================================
-# 2. 缓存持久化管理
-# ========================================================================
-
 class CachePersistenceManager:
     """缓存持久化管理器 - 管理Gemini缓存与本地文件的映射关系"""
     
@@ -344,87 +309,6 @@ class CachePersistenceManager:
             logger.error(f"❌ 注册System缓存失败: {e}")
             return False
     
-    def register_glossary_cache(
-        self,
-        cache_name: str,
-        glossary_hash: str,
-        term_count: int,
-        ttl_hours: float = 2.0
-    ) -> bool:
-        """注册术语表缓存"""
-        try:
-            # 使用日期+doc_hash+术语表hash生成缓存键
-            date_str = datetime.now().strftime("%Y%m%d")
-            doc_hash_short = self.doc_hash[:8] if self.doc_hash else "nodoc"
-            cache_key = f"glo_{date_str}_{doc_hash_short}_{glossary_hash[:8]}"
-            
-            self.cache_metadata["glossary"][cache_key] = {
-                "cache_name": cache_name,
-                "glossary_hash": glossary_hash,
-                "term_count": term_count,
-                "created_at": time.time(),
-                "expiry_time": time.time() + (ttl_hours * 3600),
-                "ttl_hours": ttl_hours,
-                "type": "glossary"
-            }
-            self._save_metadata()
-            logger.info(f"📌 已注册术语表缓存: {cache_key} ({term_count}项)")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 注册术语表缓存失败: {e}")
-            return False
-    
-    def register_context_cache(
-        self,
-        cache_name: str,
-        context_hash: str,
-        segment_range: str,
-        ttl_hours: float = 1.0
-    ) -> bool:
-        """注册上下文缓存"""
-        try:
-            cache_key = f"context_{segment_range}_{context_hash[:8]}"
-            self.cache_metadata["context"][cache_key] = {
-                "cache_name": cache_name,
-                "context_hash": context_hash,
-                "segment_range": segment_range,
-                "created_at": time.time(),
-                "expiry_time": time.time() + (ttl_hours * 3600),
-                "ttl_hours": ttl_hours,
-                "type": "context"
-            }
-            self._save_metadata()
-            logger.info(f"📌 已注册上下文缓存: {cache_key}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 注册上下文缓存失败: {e}")
-            return False
-    
-    def register_uploaded_file(
-        self,
-        file_path: str,
-        file_uri: str,
-        file_hash: str,
-        mime_type: str = "image/jpeg"
-    ) -> bool:
-        """注册已上传文件（Gemini Developer API专用）"""
-        try:
-            cache_key = f"file_{file_hash[:12]}"
-            self.cache_metadata["uploaded_files"][cache_key] = {
-                "file_path": file_path,
-                "file_uri": file_uri,
-                "file_hash": file_hash,
-                "mime_type": mime_type,
-                "uploaded_at": time.time(),
-                "type": "uploaded_file"
-            }
-            self._save_metadata()
-            logger.debug(f"📌 已注册上传文件: {Path(file_path).name}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ 注册上传文件失败: {e}")
-            return False
-    
     def get_system_cache(self, content_hash: str) -> Optional[str]:
         """获取System Instruction缓存名称（通过内容hash查找）
         
@@ -456,110 +340,6 @@ class CachePersistenceManager:
         
         return None
     
-    def get_glossary_cache(self, glossary_hash: str) -> Optional[str]:
-        """获取术语表缓存名称（增强版：提前过期检查）"""
-        cache_key = f"glossary_{glossary_hash[:8]}"
-        cache_info = self.cache_metadata["glossary"].get(cache_key)
-        
-        if cache_info:
-            current_time = time.time()
-            expiry_time = cache_info.get('expiry_time', 0)
-            buffer_seconds = 600  # 10分钟缓冲
-            
-            # 检查是否已过期或即将过期
-            if current_time > (expiry_time - buffer_seconds):
-                logger.warning(f"⏰ 术语表缓存 {cache_key} 已过期，删除记录")
-                del self.cache_metadata["glossary"][cache_key]
-                self._save_metadata()
-                return None
-            
-            logger.debug(f"♻️  复用术语表缓存: {cache_key}")
-            return cache_info.get('cache_name')
-        return None
-    
-    def get_context_cache(self, context_hash: str) -> Optional[str]:
-        """获取上下文缓存名称（增强版：提前过期检查）"""
-        current_time = time.time()
-        buffer_seconds = 600  # 10分钟缓冲
-        expired_keys = []
-        
-        for cache_key, cache_info in self.cache_metadata["context"].items():
-            expiry_time = cache_info.get('expiry_time', 0)
-            
-            if cache_info.get('context_hash') == context_hash:
-                # 检查是否已过期或即将过期
-                if current_time > (expiry_time - buffer_seconds):
-                    logger.warning(f"⏰ 上下文缓存 {cache_key} 已过期，删除记录")
-                    expired_keys.append(cache_key)
-                    continue
-                
-                logger.debug(f"♻️  复用上下文缓存: {cache_key}")
-                return cache_info.get('cache_name')
-        
-        # 清理过期记录
-        if expired_keys:
-            for key in expired_keys:
-                del self.cache_metadata["context"][key]
-            self._save_metadata()
-        
-        return None
-    
-    def get_uploaded_file_uri(self, file_hash: str) -> Optional[str]:
-        """获取已上传文件的URI"""
-        cache_key = f"file_{file_hash[:12]}"
-        cache_info = self.cache_metadata["uploaded_files"].get(cache_key)
-        if cache_info:
-            logger.debug(f"♻️  复用上传文件: {cache_key}")
-            return cache_info.get('file_uri')
-        return None
-    
-    def list_all_caches(self) -> Dict[str, List[Dict[str, Any]]]:
-        """列出所有缓存"""
-        result = {}
-        current_time = time.time()
-        
-        for cache_type, caches in self.cache_metadata.items():
-            if not isinstance(caches, dict):
-                continue
-            active_caches = []
-            for cache_key, cache_info in caches.items():
-                expiry_time = cache_info.get('expiry_time', 0)
-                is_expired = current_time > expiry_time
-                cache_info_copy = cache_info.copy()
-                cache_info_copy['key'] = cache_key
-                cache_info_copy['is_expired'] = is_expired
-                if not is_expired or cache_type == "uploaded_files":
-                    active_caches.append(cache_info_copy)
-            result[cache_type] = active_caches
-        return result
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """获取缓存统计信息"""
-        stats = {
-            "total_caches": 0,
-            "active_caches": 0,
-            "expired_caches": 0,
-            "by_type": {}
-        }
-        current_time = time.time()
-        
-        for cache_type, caches in self.cache_metadata.items():
-            if not isinstance(caches, dict):
-                continue
-            total = len(caches)
-            active = sum(1 for c in caches.values() 
-                        if time.time() < c.get('expiry_time', float('inf')))
-            expired = total - active
-            stats["by_type"][cache_type] = {
-                "total": total,
-                "active": active,
-                "expired": expired
-            }
-            stats["total_caches"] += total
-            stats["active_caches"] += active
-            stats["expired_caches"] += expired
-        return stats
-    
     def remove_invalid_cache(self, cache_name: str) -> bool:
         """删除失效的缓存记录（用于降级处理）
         
@@ -583,17 +363,6 @@ class CachePersistenceManager:
         if removed:
             self._save_metadata()
         return removed
-    
-    def clear_all_caches(self):
-        """清除所有缓存记录"""
-        self.cache_metadata = {
-            "system_instruction": {},
-            "glossary": {},
-            "context": {},
-            "uploaded_files": {}
-        }
-        self._save_metadata()
-        logger.info("🧹 已清除所有缓存记录")
     
     def get_or_create_system_cache(
         self,
@@ -712,82 +481,6 @@ class CachePersistenceManager:
                 # 通知所有等待的线程
                 self._cache_created_condition.notify_all()
                 logger.debug(f"🔓 缓存创建流程结束，已通知等待线程")
-    
-    def get_or_create_glossary_cache(
-        self,
-        glossary: Dict[str, str],
-        model_name: str
-    ) -> Optional[str]:
-        """
-        统一的术语表缓存获取或创建方法
-        
-        Args:
-            glossary: 术语表字典
-            model_name: 模型名称
-            
-        Returns:
-            缓存名称（cache_name），如果创建失败则返回None
-        """
-        if not glossary:
-            return None
-        
-        # 计算术语表哈希
-        glossary_text = json.dumps(glossary, ensure_ascii=False, sort_keys=True)
-        glossary_hash = self.compute_content_hash(glossary_text)
-        
-        # 检查是否已有可复用的缓存
-        existing_cache = self.get_glossary_cache(glossary_hash)
-        if existing_cache:
-            logger.info(f"♻️  复用已有术语表缓存: {existing_cache[:50]}...")
-            return existing_cache
-        
-        # 创建新缓存
-        try:
-            from google import genai
-            from google.genai import types
-
-            client = genai.Client(api_key=self.settings.api.gemini_api_key)
-            ttl_seconds = int(self.settings.processing.cache_ttl_hours * 2 * 3600)
-            
-            # 格式化术语表内容
-            glossary_content = "\n".join([
-                f"- **{k}**: Must be translated as **{v}**" 
-                for k, v in glossary.items()
-            ])
-
-            cache = client.caches.create(
-                model=model_name,
-                config=types.CreateCachedContentConfig(
-                    display_name=f"glossary_{glossary_hash[:8]}",
-                    contents=[
-                        types.Content(
-                            role="user",
-                            parts=[types.Part.from_text(text=glossary_content)],
-                        )
-                    ],
-                    ttl=f"{ttl_seconds}s",
-                ),
-            )
-
-            cache_name = cache.name
-            logger.info(f"✅ 术语表缓存已创建: {cache_name[:50]}... ({len(glossary)}项)")
-            
-            # 注册到持久化管理器
-            self.register_glossary_cache(
-                cache_name=cache_name,
-                glossary_hash=glossary_hash,
-                term_count=len(glossary),
-                ttl_hours=self.settings.processing.cache_ttl_hours * 2
-            )
-            
-            return cache_name
-            
-        except ImportError:
-            logger.warning("⚠️  google.genai 模块不可用，跳过术语表缓存创建")
-            return None
-        except Exception as e:
-            logger.warning(f"⚠️  创建术语表缓存失败: {e}")
-            return None
     
     @staticmethod
     def compute_content_hash(content: str) -> str:
@@ -934,31 +627,6 @@ The following terms MUST be translated exactly as specified. These are non-negot
         if not glossary:
             return ""
         return "\n".join(f"- **{k}**: {v}" for k, v in glossary.items())
-
-    def get_mode_prefix(self) -> str:
-        """获取 Mode 配置作为 User message 的前缀（文本路径已并入 system instruction，
-        视觉路径仍在 user message 中拼接此前缀）。"""
-        if not self.mode_entity:
-            return ""
-
-        role_desc = self.mode_entity.role_desc
-        style = self.mode_entity.style
-        mode_name = self.mode_entity.name
-
-        return f"""{'='*80}
-⚠️ ACTIVE TRANSLATION MODE: {mode_name}
-{'='*80}
-
-Your Role:
-{role_desc}
-
-Your Style & Approach:
-{style}
-
-**CRITICAL**: Follow THIS mode's philosophy for the translation below.
-{'='*80}
-
-"""
 
     def format_text_prompt(
         self,

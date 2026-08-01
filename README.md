@@ -33,15 +33,18 @@
 
 ### 🎭 专业翻译人格 (Persona)
 - **高度可定制**：通过编辑 `config/modes.json`，您可以轻松修改或创建新的专家角色。
-- **内置专家模式**：
-    - **齐泽克专家**：擅长黑格尔哲学、拉康精神分析的学术翻译。
-    - **社会学研究员**：精通批判理论、欧洲大陆哲学。
-    - **传记记者**：文学性传记和历史非虚构作品专家。
-    - **人工智能专家**： 精通 AI 和科技前沿领域。
-    - **小说翻译家**：世情耽美言情小说翻译专家。
-    - **尼采阐释者**：哲学隐喻的诗意翻译。
-    - **摘要模式**：快速提炼与归纳文档要点。
-    - **逻辑分析师**：论证结构与逻辑链条的精确翻译。
+- **内置专家模式**（与 `config/modes.json` 同步，`--mode <ID>` 选择）：
+
+    | ID | 模式 | 适用场景 |
+    |----|------|----------|
+    | 1 | Continental Philosophy | 黑格尔/海德格尔/萨特/拉康/德里达/德勒兹，按流派定译 |
+    | 2 | Biography & History | 传记与历史非虚构，专名一致+历史语域 |
+    | 3 | Critical Theory | 意识形态批判/电影理论/法兰克福学派/齐泽克，含译注规范 |
+    | 4 | AI & Data Science | AI 论文与技术文档，大模型时代词汇+符号代码保真 |
+    | 5 | Novel & Fiction | 小说翻译，情感细腻+角色语域一致 |
+    | 6 | Nietzsche Specialist | 查拉图斯特拉风格，隐喻解构+韵律散文 |
+    | 7 | Digest Mode | 压缩摘要，把书读薄 |
+    | 8 | Logic Analyst | 方括号显化隐含逻辑（默认） |
 
 ### ⚙️ 高度可配置
 - **`.env` 驱动**：所有核心配置均通过 `config/config.env` 文件管理，支持非交互式运行。
@@ -151,11 +154,13 @@ cp config/config.env.template config/config.env
     FILES__DOCUMENT_PATH="/path/to/your/document.pdf"
     ```
 
-3.  **Gemini 模型 (可选)**:
-    - 运行 `python check_models.py` 查看您可用的模型列表。
+3.  **模型选择 (可选)**:
+    - 运行 `python check_models.py` 查看当前可用的模型列表（README 不维护硬编码清单，以脚本输出为准）。
     ```dotenv
-    # 默认为 gemini-2.5-flash
-    API__GEMINI_MODEL="gemini-2.5-flash"
+    # 主力 DeepSeek（当前在用）
+    API__OPENAI_MODEL="deepseek-v4-flash"
+    # 回退 Gemini（当前在用）
+    API__GEMINI_MODEL="gemini-3.5-flash"
     ```
 
 4.  **其他常用配置 (可选, 用于非交互式运行)**:
@@ -206,7 +211,9 @@ python main.py --config /path/to/custom.env document.epub
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `--mode` | 翻译模式 ID（对应 modes.json 中的 key）| `--mode 1` |
+| `--mode` | 翻译模式 ID（对应 modes.json 中的 key）| `--mode 3` |
+| `--provider` | 翻译供应商（覆盖 config.env）：`deepseek`/`gemini`/`claude-agent` 等 | `--provider claude-agent` |
+| `--preset` | 配置预设：`fast`/`quality`/`balanced`/`debug`/`economy`/`bilingual` | `--preset quality` |
 
 ##### PDF 专用参数
 
@@ -222,6 +229,16 @@ python main.py --config /path/to/custom.env document.epub
 |------|------|------|
 | `--retain-original` | 在输出中保留原文（双语对照） | `--retain-original` |
 | `--no-retain-original` | 在输出中不保留原文 | `--no-retain-original` |
+
+##### 批量翻译（多本书/整个目录）
+
+```bash
+# 目录递归收集 .epub/.pdf，顺序翻译；每本独立日志与断点，单本失败不中断队列
+python scripts/translate_books.py ~/Downloads/wanna-read --mode 3 --retain-original
+
+# 先看清单不执行
+python scripts/translate_books.py ~/Downloads/wanna-read --dry-run
+```
 
 #### 4.3 使用示例
 
@@ -447,17 +464,18 @@ XLBDTranslator/
 │   │   ├── formats.py    # 格式处理
 │   │   └── helpers.py    # 辅助函数
 │   ├── translator/       # 翻译引擎（同步/异步）
-│   │   ├── base.py       # 基础翻译器
-│   │   ├── engine.py     # 翻译引擎
-│   │   └── support.py    # 支持模块
+│   │   ├── base.py       # 抽象基类与阶段钩子
+│   │   ├── engine.py     # Gemini / OpenAI 兼容(DeepSeek) 引擎
+│   │   ├── agent.py      # claude-agent（本机 claude CLI 订阅通路）
+│   │   ├── fallback.py   # 多供应商回退链
+│   │   └── support.py    # 断点续传 / 缓存持久化 / Prompt 管理
 │   ├── renderer/         # 渲染器（Markdown、PDF、EPUB）
 │   │   ├── markdown.py   # Markdown 渲染
 │   │   ├── pdf.py        # PDF 渲染
 │   │   └── epub.py       # EPUB 渲染
 │   ├── workflow/         # 工作流
 │   │   ├── workflow.py   # 主工作流
-│   │   ├── builder.py    # 配置构建器
-│   │   └── tester.py     # 测试工具
+│   │   └── builder.py    # 配置构建器（预设）
 │   ├── scholar/          # Scholar Digest（Gmail 邮件 + PubMed/arXiv 检索）
 │   │   ├── academic_search.py # PubMed/arXiv 检索客户端
 │   │   ├── fulltext.py   # OA 全文解析（arXiv 直链 / Unpaywall）
@@ -479,7 +497,14 @@ XLBDTranslator/
     - `structure_map.json`: 核心状态文件，记录了每个片段的原文、译文和元数据，是实现断点续传的关键。
     - `checkpoint.json`: 恢复检查点数据
     - `glossary.json`: 提取的术语表，确保一致性
-- **最终文件**: 默认情况下，翻译完成的 `_Translated.md` 和 `_Translated.pdf` 文件会保存在与**源文件相同的目录**中。
+    - `quality_report.json`: 译后质检报告（失败段/术语违例）——判断"这本书翻得能不能用"看它
+    - `blocked_segments.json`: 被安全过滤器拦截的段落记录（如有）
+- **最终文件**: 默认保存在与**源文件相同的目录**（或 `FILES__FINAL_OUTPUT_DIR`）：
+    - `_Translated.md`（Markdown）
+    - `_Translated.epub`（EPUB 源会回填出双语 EPUB）
+    - `_Translated.pdf` + `_Translated_mobile.pdf`（桌面版与移动版，需 WeasyPrint 系统库；
+      macOS + conda 环境需带 `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` 运行）
+    - 运行结束时日志会打印「📦 产物清单」列出实际生成的文件
 
 ## 🎨 高级定制
 
