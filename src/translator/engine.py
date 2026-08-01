@@ -4,13 +4,17 @@ Gemini 翻译客户端
 """
 import asyncio
 import base64
+import http.client
 import json
+import socket
+import threading
 import time
 import re
 import mimetypes
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 from urllib import request, error
+from urllib.parse import urlparse
 
 from google import genai
 from google.genai import types
@@ -1520,20 +1524,29 @@ class OpenAICompatibleTranslator(BaseTranslator):
         """按当前翻译阶段构建 system instruction。
 
         正式阶段（begin_formal_translation 之后）包含 mode 与 glossary；
-        get_system_instruction 对相同输入是确定性的，因此正式阶段逐请求
-        字节级相同——DeepSeek 前缀缓存按稳定前缀命中。
+        结果按 use_vision 预算缓存——阶段内输入不变，逐请求重拼 ~7KB 大
+        字符串（含全表 glossary join）是纯浪费，且缓存保证字节级恒定，
+        DeepSeek 前缀缓存按稳定前缀命中。
         """
+        # agent.py 跳过本类 __init__，缓存字典懒初始化
+        cache: Dict[bool, str] = self.__dict__.setdefault('_si_cache', {})
+        key = bool(use_vision) if self._formal_phase else None  # 预翻译阶段不缓存（量小且 mode 可能后置变化）
+        if key is not None and key in cache:
+            return cache[key]
         if self._formal_phase:
-            return self.prompt_manager.get_system_instruction(
+            si = self.prompt_manager.get_system_instruction(
                 use_vision=use_vision,
                 include_mode=True,
                 include_glossary=bool(self._formal_glossary),
                 glossary_text=self.prompt_manager.format_glossary(self._formal_glossary),
             )
+            cache[key] = si
+            return si
         return self.prompt_manager.get_system_instruction(use_vision=use_vision)
 
     def begin_formal_translation(self, glossary: Optional[Dict[str, str]] = None) -> None:
         super().begin_formal_translation(glossary)
+        self.__dict__['_si_cache'] = {}  # 阶段切换时使旧预算失效
         logger.info(
             "🧭 正式翻译阶段：mode + glossary 已并入 system instruction "
             f"(术语 {len(self._formal_glossary)} 条)"
@@ -1768,6 +1781,65 @@ class OpenAICompatibleTranslator(BaseTranslator):
         logger.error(f"❌ OpenAI-compatible Vision API 调用失败 for {img_path}: {last_error}")
         return f"[Failed: {str(last_error)}]"
 
+    def _http_post_json(self, url: str, data: bytes, headers: Dict[str, str], timeout: int) -> str:
+        """POST 并返回响应体，按线程复用持久连接（keep-alive）。
+
+        此前每次请求用 urllib.request.urlopen 新建 TCP+TLS 连接——一本书
+        150-200 次 TLS 握手、跨境 RTT 下累计 25-60s 纯握手开销。改为
+        http.client 线程本地长连接（异步线程池下每线程各持一条），陈旧
+        连接（服务端已断开）自动重建一次。
+        """
+        parsed = urlparse(url)
+        key = (parsed.scheme, parsed.netloc)
+        # agent.py 跳过本类 __init__，线程本地存储懒初始化
+        local = self.__dict__.setdefault('_conn_local', threading.local())
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            conn = getattr(local, 'conn', None)
+            if conn is None or getattr(local, 'conn_key', None) != key:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn_cls = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
+                conn = conn_cls(parsed.netloc, timeout=timeout)
+                local.conn, local.conn_key = conn, key
+            elif conn.sock is not None:
+                # 复用连接时按本次请求更新超时
+                conn.sock.settimeout(timeout)
+
+            try:
+                path = parsed.path or '/'
+                conn.request('POST', path, body=data, headers=headers)
+                resp = conn.getresponse()
+                body = resp.read().decode('utf-8', errors='replace')
+                if resp.status >= 400:
+                    raise APIError(f"OpenAI-compatible HTTPError: {resp.status} {resp.reason} {body[:200]}")
+                return body
+            except APIError:
+                raise  # 应用层错误：响应已读完，连接可继续复用
+            except socket.timeout as e:
+                # 超时不重试（语义与旧 urlopen 一致，重试交给上层 tenacity）
+                local.conn = None
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise APITimeoutError(f"OpenAI-compatible request timeout: {e}")
+            except (http.client.HTTPException, ConnectionError, BrokenPipeError, OSError) as e:
+                # 陈旧连接（keep-alive 被服务端关闭）最常见：重建一次再试
+                local.conn = None
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                last_exc = e
+                if attempt == 0:
+                    continue
+        raise APITimeoutError(f"OpenAI-compatible request failed: {last_exc}")
+
     def _build_chat_completions_url(self) -> str:
         """构建 Chat Completions API URL
 
@@ -1883,17 +1955,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
         else:
             timeout = self.settings.processing.request_timeout
 
-        req = request.Request(url, data=data, headers=headers, method='POST')
-        try:
-            with request.urlopen(req, timeout=timeout) as resp:
-                resp_text = resp.read().decode('utf-8')
-        except error.HTTPError as e:
-            body = e.read().decode('utf-8', errors='replace') if hasattr(e, 'read') else ''
-            raise APIError(f"OpenAI-compatible HTTPError: {e.code} {e.reason} {body[:200]}")
-        except error.URLError as e:
-            raise APITimeoutError(f"OpenAI-compatible request failed: {e}")
-        except TimeoutError as e:
-            raise APITimeoutError(f"OpenAI-compatible request timeout: {e}")
+        resp_text = self._http_post_json(url, data, headers, timeout)
 
         try:
             parsed = json.loads(resp_text)
@@ -2030,33 +2092,24 @@ class AsyncOpenAICompatibleTranslator(BaseAsyncTranslator):
     def __init__(self, base_translator: OpenAICompatibleTranslator):
         super().__init__(base_translator)
         
-        # 动态并发控制：根据服务类型调整并发数
+        # 并发控制：尊重 settings.async_max_workers（此前云端硬编码 3/10，
+        # 配置被静默忽略——workflow 的 semaphore 放行 N 个批次而线程池只有 3
+        # 个线程，有效并发被压到 1/5）。本地模式仍强制 2（16GB 内存保护）。
+        configured = getattr(base_translator.settings.processing, 'async_max_workers', 10)
         if base_translator.is_local:
-            # 本地模式：2 并发（M2 Pro 16GB 限制，避免显存溢出）
             max_workers = 2
-        elif base_translator.is_deepseek:
-            # DeepSeek：3 并发（避免触发速率限制，DeepSeek响应较慢）
-            max_workers = 3
         else:
-            # 其他云端模式：10 并发（网络 I/O 密集，可以高并发）
-            max_workers = 10
+            max_workers = max(1, int(configured))
             
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self._max_workers = max_workers  # 保存用于日志
         
         # 日志输出当前并发模式
-        if base_translator.is_local:
-            logger.info("🔒 异步翻译器已初始化（本地模式）")
-            logger.info("   - 并发数: 2（M2 Pro 16GB 内存保护）")
-            logger.info("   - 原因: 防止本地模型并发导致统一内存溢出")
-        elif base_translator.is_deepseek:
-            logger.info("🚀 异步翻译器已初始化（DeepSeek模式）")
-            logger.info("   - 并发数: 3（速率限制保护）")
-            logger.info("   - 原因: DeepSeek响应较慢，避免触发API限流")
-        else:
-            logger.info("🚀 异步翻译器已初始化（云端模式）")
-            logger.info("   - 并发数: 10（网络 I/O 优化）")
-            logger.info("   - 适用于: OpenAI 等云端服务")
+        mode_label = "本地模式" if base_translator.is_local else (
+            "DeepSeek模式" if base_translator.is_deepseek else "云端模式")
+        source = "本地强制 2，内存保护" if base_translator.is_local else "来自 PROCESSING__ASYNC_MAX_WORKERS"
+        logger.info(f"🚀 异步翻译器已初始化（{mode_label}）")
+        logger.info(f"   - 并发数: {max_workers}（{source}）")
     
     async def __aenter__(self):
         """异步上下文管理器入口"""

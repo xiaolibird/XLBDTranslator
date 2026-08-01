@@ -52,11 +52,10 @@ class DocumentLoader:
         else:
             raise DocumentFormatError(f"Unsupported file format: {ext}")
 
-        # 解析文档
+        # 解析文档（pipeline.run() 结束时已自行保存缓存到同一路径，
+        # 此处不再重复写盘——大书的 structure JSON 有 MB 级，写一次就够）
         segments = parser.run()
-
-        # 保存缓存
-        self._save_cache(cache_path, segments)
+        logger.info(f"💾 Cache saved by pipeline: {len(segments)} segments.")
 
         return segments
 

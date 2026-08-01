@@ -83,12 +83,20 @@ class PDFRenderer:
         """
         produced: List[Path] = []
         if generate_both:
+            # 两个版本只有 CSS 不同：markdown 渲染 + markdown2 + 后处理正则
+            # 预计算一次共享（此前每版本各跑一遍，全书 markdown 生成翻倍）。
+            # 预计算失败则传 None，桌面版按原诊断路径重算并报告。
+            shared_html: Optional[str] = None
+            try:
+                shared_html = self._build_html_body(segments, title, translated_title)
+            except Exception:
+                pass
             # 生成桌面版
-            if self._render_single_version(segments, output_path, title, translated_title, "desktop"):
+            if self._render_single_version(segments, output_path, title, translated_title, "desktop", html_body=shared_html):
                 produced.append(output_path)
             # 生成移动版
             mobile_path = output_path.parent / f"{output_path.stem}_mobile{output_path.suffix}"
-            if self._render_single_version(segments, mobile_path, title, translated_title, "mobile"):
+            if self._render_single_version(segments, mobile_path, title, translated_title, "mobile", html_body=shared_html):
                 produced.append(mobile_path)
         else:
             # 只生成指定版本
@@ -96,10 +104,41 @@ class PDFRenderer:
                 produced.append(output_path)
         return produced
 
+    def _build_html_body(self, segments: SegmentList, title: str, translated_title: str) -> str:
+        """把 SegmentList 渲染为 PDF 用的 html_body（版本无关的共享前半段）。"""
+        import markdown2
+        from .markdown import MarkdownRenderer
+
+        segment_metadata = self._build_segment_metadata(segments)
+        md_renderer = MarkdownRenderer(self.settings)
+        markdown_content = md_renderer.render_to_string(segments, title, translated_title)
+        clean_markdown, _page_map = self._extract_page_numbers_and_clean(markdown_content)
+        html_body = markdown2.markdown(
+            clean_markdown,
+            extras=[
+                "fenced-code-blocks",
+                "tables",
+                "footnotes",
+                "break-on-newline",
+                "header-ids",
+                "code-friendly",
+                "cuddled-lists"
+            ]
+        )
+        html_body = self._convert_blockquote_to_original(html_body)
+        html_body = self._enhance_blockquotes_with_metadata(html_body, segment_metadata)
+        html_body = self._add_heading_spacing(html_body, segment_metadata)
+        return html_body
+
     def _render_single_version(self, segments: SegmentList, output_path: Path,
-                              title: str, translated_title: str, version: str) -> bool:
+                              title: str, translated_title: str, version: str,
+                              html_body: Optional[str] = None) -> bool:
         """
         渲染单个版本的 PDF
+
+        Args:
+            html_body: 预计算的共享 HTML 正文（generate_both 时由 render_to_file
+                       传入，避免每版本重跑 markdown 全链路）；None 则自行构建
 
         Returns:
             是否成功生成（失败已内部记录日志并降级，不上抛）
@@ -107,47 +146,15 @@ class PDFRenderer:
         # 动态加载指定版本的 CSS
         css_path = self._locate_css_file(version)
         version_label = "桌面版" if version == "desktop" else "移动版(iPhone)"
-        
+
         try:
             # 1. 延迟导入依赖，确保环境缺失时不会直接崩溃
-            import markdown2
             from weasyprint import HTML, CSS
             from weasyprint.text.fonts import FontConfiguration
 
-            # 2. 从 SegmentList 构建增强的元数据映射
-            segment_metadata = self._build_segment_metadata(segments)
-            
-            # 3. 生成 Markdown 内容
-            from .markdown import MarkdownRenderer
-            md_renderer = MarkdownRenderer(self.settings)
-            markdown_content = md_renderer.render_to_string(segments, title, translated_title)
-
-            # 4. 提取页码信息并清理 Segment 标记
-            clean_markdown, page_map = self._extract_page_numbers_and_clean(markdown_content)
-
-            # 5. 转换为 HTML (增强扩展支持)
-            # code-friendly 防止下划线误伤样式，header-ids 支持 string-set 抓取标题
-            html_body = markdown2.markdown(
-                clean_markdown,
-                extras=[
-                    "fenced-code-blocks", 
-                    "tables", 
-                    "footnotes", 
-                    "break-on-newline", 
-                    "header-ids",
-                    "code-friendly",
-                    "cuddled-lists"
-                ]
-            )
-
-            # 5.4. 转换 blockquote 为 .original 样式
-            html_body = self._convert_blockquote_to_original(html_body)
-
-            # 5.5. 后处理：为 blockquote 添加页码属性和层级间距
-            html_body = self._enhance_blockquotes_with_metadata(html_body, segment_metadata)
-            
-            # 5.6. 处理层级标题间距（基于 toc_level）
-            html_body = self._add_heading_spacing(html_body, segment_metadata)
+            # 2-5. 构建版本无关的 HTML 正文（可复用预计算结果）
+            if html_body is None:
+                html_body = self._build_html_body(segments, title, translated_title)
 
             # 6. 生成 HTML 模板（使用动态CSS路径）
             display_title = translated_title if translated_title else title

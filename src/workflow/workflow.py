@@ -306,7 +306,8 @@ class TranslationWorkflow:
         
         if segments:
             logger.info(f"✅ 解析完成，生成 {len(segments)} 个片段")
-            self._save_structure_map(segments)
+            # parse_document 内部的 pipeline 已把同一份数据写到 structure_path，
+            # 此处不再第三次全量落盘
             self.all_segments = segments
             self._build_segment_index()  # 构建快速索引
         else:
@@ -1183,11 +1184,16 @@ class TranslationWorkflow:
                             stats["processed"] += 1
                         
                         stats["completed_batches"] += 1
-                        
-                        # 每完成一个 batch 就保存
-                        self._save_structure_map(self.all_segments)
-                        self.checkpoint.save_checkpoint()
-                    
+
+                        # 按 checkpoint_interval 节流（与同步路径对齐）。
+                        # 此前每批全量落盘 2.7MB structure_map + fsync 且在锁内、
+                        # 在事件循环线程上——一本书 ≈300MB 写入 + 224 次 fsync，
+                        # 写盘期间整个并发调度停摆。结尾处仍有一次最终保存兜底。
+                        interval = max(1, getattr(self.settings.processing, 'checkpoint_interval', 1))
+                        if stats["completed_batches"] % interval == 0:
+                            self._save_structure_map(self.all_segments)
+                            self.checkpoint.save_checkpoint()
+
                     logger.info(f"✅ 批次 {batch_idx}/{total_batches} 完成 (本批成功: {batch_success}/{len(batch)}, 总进度: {stats['completed_batches']}/{total_batches})")
                     return batch_idx, True
                     

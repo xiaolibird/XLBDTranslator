@@ -55,8 +55,10 @@ class CheckpointManager:
             try:
                 with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                     self.checkpoint_data = json.load(f)
-                completed_count = len(self.checkpoint_data.get('completed_segments', []))
-                logger.info(f"📂 加载检查点: 已完成 {completed_count} 个段落")
+                # 内部用 set（O(1) 成员判断；此前 list 上 in/append 是 O(n)，
+                # 全书标记完成合计 O(n²)），仅在落盘时转有序 list
+                self._completed = set(self.checkpoint_data.get('completed_segments', []))
+                logger.info(f"📂 加载检查点: 已完成 {len(self._completed)} 个段落")
             except Exception as e:
                 logger.warning(f"⚠️ 加载检查点失败: {e}")
                 self.checkpoint_data = {}
@@ -72,12 +74,15 @@ class CheckpointManager:
                 'translated_filename': None,
                 'title_translations': {}  # {原标题: 译标题}
             }
+        self._completed = set(self.checkpoint_data.get('completed_segments', []))
     
     def save_checkpoint(self):
         """保存当前检查点到文件"""
         try:
             self.project_dir.mkdir(parents=True, exist_ok=True)
             self.checkpoint_data['last_update'] = datetime.now().isoformat()
+            # 落盘前把内部 set 序列化为有序 list
+            self.checkpoint_data['completed_segments'] = sorted(self._completed)
             
             # tmp+replace 原子写：checkpoint 被截断会让续传状态整体作废，
             # tmp 与目标同目录规避 os.replace 跨设备问题
@@ -88,7 +93,7 @@ class CheckpointManager:
                 os.fsync(f.fileno())
             os.replace(tmp_file, self.checkpoint_file)
             
-            completed = len(self.checkpoint_data.get('completed_segments', []))
+            completed = len(self._completed)
             total = self.checkpoint_data.get('total_segments', 0)
             logger.debug(f"💾 检查点已保存: {completed}/{total}")
         except Exception as e:
@@ -96,16 +101,11 @@ class CheckpointManager:
     
     def mark_segment_completed(self, segment_id: int):
         """标记一个段落为已完成"""
-        if 'completed_segments' not in self.checkpoint_data:
-            self.checkpoint_data['completed_segments'] = []
-        if segment_id not in self.checkpoint_data['completed_segments']:
-            self.checkpoint_data['completed_segments'].append(segment_id)
-    
+        self._completed.add(segment_id)
+
     def remove_from_completed(self, segment_id: int):
         """从已完成列表中移除一个段落（用于重新翻译）"""
-        if 'completed_segments' in self.checkpoint_data:
-            if segment_id in self.checkpoint_data['completed_segments']:
-                self.checkpoint_data['completed_segments'].remove(segment_id)
+        self._completed.discard(segment_id)
 
     def mark_segment_failed(self, segment_id: int, error_msg: str = ""):
         """标记一个段落为失败（同段去重，保留最新错误——否则跨轮次重试会让
@@ -124,11 +124,11 @@ class CheckpointManager:
     
     def is_segment_completed(self, segment_id: int) -> bool:
         """检查段落是否已完成"""
-        return segment_id in self.checkpoint_data.get('completed_segments', [])
-    
+        return segment_id in self._completed
+
     def get_completed_segment_ids(self) -> Set[int]:
         """获取所有已完成的段落ID"""
-        return set(self.checkpoint_data.get('completed_segments', []))
+        return set(self._completed)
     
     def get_title_translation(self, original_title: str) -> Optional[str]:
         """获取已缓存的标题翻译"""

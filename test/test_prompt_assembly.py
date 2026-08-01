@@ -53,24 +53,6 @@ def make_segments():
     ]
 
 
-class _FakeResp:
-    def __init__(self, payload_bytes):
-        self._body = json.dumps({
-            "choices": [{"message": {"content": json.dumps(
-                {"translations": [{"id": 1, "translation": "译一"}, {"id": 2, "translation": "译二"}]}
-            )}}]
-        }).encode()
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-
 def run_openai_tests():
     print("\n== OpenAI 兼容路径（DeepSeek 长文本模式） ==")
     s = make_settings()
@@ -79,13 +61,17 @@ def run_openai_tests():
 
     captured = []
 
-    def fake_urlopen(req, timeout=None):
-        captured.append(req.data.decode('utf-8'))
-        return _FakeResp(req.data)
+    def fake_post(self, url, data, headers, timeout):
+        captured.append(data.decode('utf-8'))
+        return json.dumps({
+            "choices": [{"message": {"content": json.dumps(
+                {"translations": [{"id": 1, "translation": "译一"}, {"id": 2, "translation": "译二"}]}
+            )}}]
+        })
 
     glossary = {"the Real": "实在界", "interpellation": "询唤"}
 
-    with mock.patch.object(engine_mod.request, 'urlopen', fake_urlopen):
+    with mock.patch.object(OpenAICompatibleTranslator, '_http_post_json', fake_post):
         # --- 预翻译阶段（未调钩子）---
         t._translate_text_batch(make_segments(), context="prev source text")
         pre_payload = json.loads(captured[-1])
