@@ -439,7 +439,10 @@ class EPUBParser(BaseDocPipeline):
 
     def _iter_content_units(self):
         """按照 EPUB Spine 遍历，并解析 HTML 块级元素"""
-        BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre']
+        # div 必须在列（与 renderer/epub.py 的 BLOCK_TAGS 对齐）：Calibre 转制书
+        # 常把全部正文放 <div class="...">、<p> 只是空锚点——缺 div 时整本书
+        # 会被解析成 0 个正文段（实例：Girard 法语版仅剩封面图 alt 一个片段）
+        BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'pre', 'div']
 
         # 统计解析失败的 spine item，迭代结束后汇总告警一条，避免逐条日志被淹没
         failed_item_count = 0
@@ -482,6 +485,11 @@ class EPUBParser(BaseDocPipeline):
                         else:
                             yield unit_key, "", "text"
                     else:
+                        # 只提取"叶子块"：含任何块级/img 子标签的都是布局容器，
+                        # 直接 get_text 会把子块文本重复提取一遍（与 renderer
+                        # epub.py 的叶子守卫同一逻辑）
+                        if tag.find(BLOCK_TAGS + ['img']):
+                            continue
                         # 4. 提取纯文本
                         text = tag.get_text(separator=' ', strip=True)
                         # 注意：BaseDocPipeline 会过滤掉纯空格/空字符串
