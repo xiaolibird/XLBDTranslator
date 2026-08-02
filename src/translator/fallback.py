@@ -30,6 +30,11 @@ _HARD_PATTERNS = (
     'no longer available', 'model_not_found', 'not_found',
     'model not exist', 'model not found', 'model does not exist',
     'is not found',  # Gemini: "models/xxx is not found for API version ..."
+    # Claude API 输出版权过滤器（claude-agent 翻译书籍实测 6/6 必拦，重试无意义）：
+    # 一次即切换下一个 provider——这是尊重过滤器的裁决把工作交给别家，不是绕过。
+    # 用完整短语精确匹配，不会误伤 Gemini 的 SAFETY block（措辞不同，且后者
+    # 走 _ResponseValidationError 内容级通道）
+    'output blocked by content filtering',
 )
 # 软性致命：配额/限流，可能是瞬时的，连续达到阈值才切换
 _SOFT_PATTERNS = (
@@ -81,14 +86,17 @@ def classify_fatal(exc: Exception) -> Optional[str]:
 def canonical_provider(provider: str) -> str:
     """把 provider 名归一化到实际后端：别名与同配置的同类 provider 视为同一个。
 
-    deepseek/openai/ollama 等都由 OpenAICompatibleTranslator + 同一组 openai_*
-    配置驱动，同链中出现两个只会得到完全相同的实例（假回退）。
+    deepseek/openai 等由 OpenAICompatibleTranslator + 同一组 openai_* 配置驱动，
+    同链中出现两个只会得到完全相同的实例（假回退）。ollama 虽同类实现，但有
+    独立的 ollama_* 配置组，是真正不同的后端，可与 deepseek 同链共存。
     """
     p = (provider or '').strip().lower()
     if p in _AGENT_PROVIDERS:
         return 'claude-agent'
     if p == 'gemini':
         return 'gemini'
+    if p == 'ollama':
+        return 'ollama'
     if p in SUPPORTED_PROVIDERS:
         return 'openai-compatible'
     return p
@@ -104,6 +112,8 @@ def _create_translator(provider: str, settings: Settings) -> BaseTranslator:
     if p in _AGENT_PROVIDERS:
         from .agent import ClaudeAgentTranslator
         return ClaudeAgentTranslator(settings)
+    if p == 'ollama':
+        return OpenAICompatibleTranslator(settings, provider='ollama')
     if p in SUPPORTED_PROVIDERS:
         if p == 'deepseek':
             base_url = getattr(settings.api, 'openai_base_url', '') or ''

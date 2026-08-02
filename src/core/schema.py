@@ -145,9 +145,10 @@ class APISettings(BaseModel):
     openai_api_key: Optional[str] = Field(None, validation_alias="OPENAI_API_KEY", description="OpenAI兼容API密钥")
     fallback_providers: str = Field("", validation_alias="FALLBACK_PROVIDERS", description="回退供应商链，逗号分隔（如 'claude-agent' 或 'gemini,claude-agent'）。主 provider 欠费/认证失败/配额耗尽时自动切换")
     agent_model: str = Field("sonnet", validation_alias="AGENT_MODEL", description="claude-agent provider 使用的模型别名（sonnet/opus/haiku）")
-    # Ollama配置
-    # ollama_base_url: str = Field("http://localhost:11434", validation_alias="OLLAMA_BASE_URL", description="Ollama服务器地址")
-    # ollama_model: str = Field("qwen2.5:14b", validation_alias="OLLAMA_MODEL", description="Ollama模型名称")
+    # Ollama 独立配置组：让 'ollama' 能与 deepseek 同链共存（二者都走
+    # OpenAICompatibleTranslator，但 provider='ollama' 时读这组而非 openai_*）
+    ollama_base_url: str = Field("http://localhost:11434/v1", validation_alias="OLLAMA_BASE_URL", description="Ollama服务器地址（OpenAI兼容端点）")
+    ollama_model: str = Field("qwen3.5:35b", validation_alias="OLLAMA_MODEL", description="Ollama模型名称")
 
 
 

@@ -1418,14 +1418,22 @@ class OpenAICompatibleTranslator(BaseTranslator):
       - API__OPENAI_MODEL
     """
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, provider: str = 'openai-compatible'):
         super().__init__(settings)
         self.prompt_manager = PromptManager(settings)
         self._async_translator: Optional[AsyncOpenAICompatibleTranslator] = None
 
-        self.api_key: Optional[str] = settings.api.openai_api_key
-        self.base_url: str = settings.api.openai_base_url
-        self.model: str = settings.api.openai_model
+        # provider='ollama' 读独立的 ollama_* 配置组：deepseek 与本地 ollama
+        # 因此可以同链共存（此前共享 openai_* 一组配置，同链只会得到两个
+        # 指向同一后端的实例）
+        if provider == 'ollama':
+            self.api_key = 'ollama'  # 本地服务无鉴权，占位即可
+            self.base_url = settings.api.ollama_base_url
+            self.model = settings.api.ollama_model
+        else:
+            self.api_key: Optional[str] = settings.api.openai_api_key
+            self.base_url: str = settings.api.openai_base_url
+            self.model: str = settings.api.openai_model
         
         # 验证和修复 base_url 配置
         self.base_url = self._validate_and_fix_base_url(self.base_url)
@@ -1989,13 +1997,17 @@ class OpenAICompatibleTranslator(BaseTranslator):
             'Authorization': f'Bearer {self.api_key}',
         }
         
-        # 动态超时：DeepSeek/本地推理较慢，在用户配置之上保证 120s 下限；
-        # 不得低于配置值——本地大模型（如 qwen3:32b ~7 tok/s）一批可达十几分钟，
-        # 硬编码上限会让客户端超时后服务端仍在算旧请求，重试排队必然雪崩
+        # 动态超时：在用户配置之上保证下限，不得低于配置值。
+        # 本地下限 1800s——大模型一批实测 2-10 分钟（qwen3.5 thinking 随输入膨胀），
+        # 回退链切到 ollama 时若沿用云端的 120s 配置，客户端超时后服务端仍在算
+        # 旧请求、重试排队必然雪崩；DeepSeek 下限 120s（云端响应慢的老经验值）
         timeout = self.settings.processing.request_timeout
-        if self.is_deepseek or self.is_local:
+        if self.is_local:
+            timeout = max(1800, timeout)
+            logger.debug(f"⏱️  本地模式超时设置: {timeout}s")
+        elif self.is_deepseek:
             timeout = max(120, timeout)
-            logger.debug(f"⏱️  {'DeepSeek' if self.is_deepseek else '本地'}模式超时设置: {timeout}s")
+            logger.debug(f"⏱️  DeepSeek模式超时设置: {timeout}s")
 
         resp_text = self._http_post_json(url, data, headers, timeout)
 

@@ -543,9 +543,15 @@ class GmailAPISettings(BaseModel):
 
 class LLMSettings(BaseModel):
     """LLM 配置（用于论文摘要）"""
-    provider: str = Field("deepseek", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, openai-compatible)")
+    provider: str = Field("deepseek", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, ollama, claude-agent, openai-compatible)")
     api_key: Optional[str] = Field(None, validation_alias=AliasChoices("api_key", "GEMINI_API_KEY"), description="Gemini API密钥")
     model: str = Field("deepseek-v4-flash", validation_alias=AliasChoices("model", "LLM_MODEL"), description="模型名称")
+    # 回退链（逗号分隔）：主 provider 欠费/认证失败/CLI 缺失/内容拦截时依序切换。
+    # 与 translator 侧对齐的推荐链：deepseek → ollama → claude-agent → gemini
+    fallback_providers: str = Field("", validation_alias=AliasChoices("fallback_providers", "FALLBACK_PROVIDERS"), description="回退提供商链，逗号分隔（如 'ollama,claude-agent,gemini'）")
+    # 本地 Ollama 独立配置（与 openai 兼容组分离，可同链共存）
+    ollama_base_url: str = Field("http://localhost:11434/v1", validation_alias=AliasChoices("ollama_base_url", "OLLAMA_BASE_URL"), description="Ollama 服务地址（OpenAI 兼容端点）")
+    ollama_model: str = Field("qwen3.5:35b", validation_alias=AliasChoices("ollama_model", "OLLAMA_MODEL"), description="Ollama 模型名称")
 
     # OpenAI 兼容提供商（DeepSeek 等）。未设置时回退复用主配置
     # config/config.env 中的 API__OPENAI_API_KEY / API__OPENAI_BASE_URL

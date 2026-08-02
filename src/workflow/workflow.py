@@ -372,10 +372,16 @@ class TranslationWorkflow:
             self.translator = ClaudeAgentTranslator(self.settings)
             logger.info("✅ Claude Agent 翻译器已初始化 (headless CLI)")
             return
-        
-        # Ollama已集成到OpenAI-compatible provider中
-        # 配置示例：TRANSLATOR_PROVIDER=openai-compatible, OPENAI_BASE_URL=http://localhost:11434
-        
+
+        if provider == 'ollama':
+            # 本地 Ollama：独立 ollama_* 配置组（API__OLLAMA_BASE_URL/OLLAMA_MODEL），
+            # 可与 deepseek 同链共存
+            self.cache_manager = None
+            self.translator = OpenAICompatibleTranslator(self.settings, provider='ollama')
+            logger.info("✅ Ollama 翻译器已初始化 (本地)")
+            return
+
+
         raise TranslationError(
             f"未知 translator_provider: {provider}。"
             f"支持的provider: gemini, deepseek, openai, openai-compatible, claude-agent。"

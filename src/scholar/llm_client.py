@@ -39,7 +39,20 @@ _AGENT_CWD = Path.home() / '.claude-pipeline-cwd'
 
 
 class LLMClient:
-    """封装 LLM 连接与调用。只依赖 LLMSettings，无 workflow 状态。"""
+    """封装 LLM 连接与调用。只依赖 LLMSettings，无 workflow 状态。
+
+    支持回退链（settings.fallback_providers，逗号分隔）：当前 provider 出现
+    致命错误（凭据缺失/401/402/403/404/CLI 不可用/内容拦截/重试耗尽）时依序
+    切换到下一个，链尽才抛。无 fallback 配置时行为与单 provider 完全一致。
+    """
+
+    # 非主 provider 的缺省模型：链上切换后，settings.model（主 provider 的
+    # 模型名）对别家无效（如 sonnet 发给 deepseek 会 404），按此表取各家缺省
+    _DEFAULT_MODELS = {
+        'deepseek': 'deepseek-v4-flash',
+        'claude-agent': 'sonnet',
+        'gemini': 'gemini-3.5-flash',
+    }
 
     def __init__(self, llm_settings):
         self.settings = llm_settings  # scholar.schema.LLMSettings
@@ -47,17 +60,80 @@ class LLMClient:
         # 手动精读并发化后，多线程可能同时首访 conn；无锁的懒加载会竞态双建连接
         # （openai-compatible 分支还会泄漏一个 httpx.Client）。单线程调用方零感知。
         self._conn_lock = threading.Lock()
+        # provider 链：主 provider + fallback（去空白、去与主重复项）
+        primary = (llm_settings.provider or 'deepseek').strip().lower()
+        fallback_raw = getattr(llm_settings, 'fallback_providers', '') or ''
+        chain = [primary]
+        for p in fallback_raw.split(','):
+            p = p.strip().lower()
+            if p and p not in chain:
+                chain.append(p)
+        self._chain = chain
+        self._chain_idx = 0
+
+    @property
+    def current_provider(self) -> str:
+        return self._chain[self._chain_idx]
 
     @property
     def conn(self) -> dict:
         if self._conn is None:
             with self._conn_lock:
                 if self._conn is None:
-                    self._conn = self._create()
+                    self._conn = self._create_from_chain()
         return self._conn
 
-    def _create(self) -> dict:
-        provider = self.settings.provider.lower()
+    def _create_from_chain(self) -> dict:
+        """从当前链位起建连接；构造失败（缺凭据/缺 CLI）自动跳到下一个。"""
+        while self._chain_idx < len(self._chain):
+            name = self._chain[self._chain_idx]
+            try:
+                conn = self._create(name)
+                conn['name'] = name
+                if self._chain_idx > 0:
+                    logger.warning("🛟 LLM 回退链：当前 provider = {} ({}/{})".format(
+                        name, self._chain_idx + 1, len(self._chain)))
+                return conn
+            except Exception as e:
+                logger.warning("⚠️ LLM provider '{}' 初始化失败，跳过: {}".format(name, e))
+                self._chain_idx += 1
+        raise RuntimeError("所有 LLM provider 均不可用（回退链已耗尽: {}）".format(self._chain))
+
+    def _advance_chain(self, reason: str) -> bool:
+        """切到下一个 provider。返回是否成功切换（False=链已耗尽）。"""
+        with self._conn_lock:
+            if self._chain_idx + 1 >= len(self._chain):
+                return False
+            old = self._chain[self._chain_idx]
+            self._chain_idx += 1
+            self._conn = None
+            logger.warning("🛟 LLM provider '{}' 判定不可用（{}），切换到 '{}'".format(
+                old, reason[:160], self._chain[self._chain_idx]))
+            return True
+
+    def _model_for(self, conn: dict, override: Optional[str]) -> str:
+        """解析本次调用的模型名。
+
+        主 provider（链首）：尊重 caller 的 override（filter_model/closeread_model）。
+        切换后的 provider：override 是主 provider 的模型名，对当前家无效，忽略并
+        改用该 provider 的缺省模型。
+        """
+        name = conn.get('name') or ''
+        if self._chain_idx == 0:
+            return override or conn['model']
+        if override and override != conn['model']:
+            logger.debug("已切换 provider，忽略主链模型覆写 '{}'，使用 {}".format(override, conn['model']))
+        return conn['model']
+
+    def _base_model(self, provider: str) -> str:
+        """provider 的基础模型：主 provider 用 settings.model，其余用各家缺省。"""
+        if provider == self._chain[0]:
+            return self.settings.model
+        if provider == 'ollama':
+            return self.settings.ollama_model
+        return self._DEFAULT_MODELS.get(provider, self.settings.model)
+
+    def _create(self, provider: str) -> dict:
 
         if provider in _AGENT_PROVIDERS:
             import shutil
@@ -66,12 +142,24 @@ class LLMClient:
                 raise ValueError(
                     "claude CLI 未安装或不在 PATH，无法使用 claude-agent provider"
                     "（npm install -g @anthropic-ai/claude-code）")
-            return {'cli_path': cli, 'model': self.settings.model, 'provider': 'claude-agent'}
+            return {'cli_path': cli, 'model': self._base_model(provider), 'provider': 'claude-agent'}
 
         if provider == 'gemini':
             from google import genai
             client = genai.Client(api_key=self.settings.api_key)
-            return {'client': client, 'model': self.settings.model, 'provider': 'gemini'}
+            return {'client': client, 'model': self._base_model(provider), 'provider': 'gemini'}
+
+        if provider == 'ollama':
+            # 本地 Ollama：独立配置组、无鉴权占位 key；本地大模型单次调用可达
+            # 数分钟（thinking 型），超时须远大于云端的 120s
+            import httpx as _httpx
+            return {
+                'client': _httpx.Client(timeout=1800.0),
+                'base_url': self.settings.ollama_base_url.rstrip('/'),
+                'api_key': 'ollama',
+                'model': self.settings.ollama_model,
+                'provider': 'openai-compatible',
+            }
 
         # OpenAI 兼容（deepseek / openai-compatible）
         import httpx
@@ -100,9 +188,26 @@ class LLMClient:
             'client': httpx.Client(timeout=120.0),
             'base_url': base_url.rstrip('/'),
             'api_key': api_key,
-            'model': self.settings.model,
+            'model': self._base_model(provider),
             'provider': 'openai-compatible',
         }
+
+    def _is_switchable(self, e: Exception) -> bool:
+        """该异常是否意味着「当前 provider 不可用，应切换」（而非单次瞬时失败）。"""
+        # 重试循环耗尽后抛出的瞬时类错误：该 provider 当前不可用
+        if isinstance(e, (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
+                          subprocess.TimeoutExpired)):
+            return True
+        if isinstance(e, httpx.HTTPStatusError):
+            return e.response.status_code in (401, 402, 403, 404)
+        # claude CLI 的非重试类失败（含内容拦截「Output blocked」——切下家接手，
+        # 这是尊重过滤器裁决而非绕过）
+        if isinstance(e, RuntimeError) and 'claude cli' in str(e).lower():
+            return True
+        text = str(e).lower()
+        return any(k in text for k in ('401', '402', '403', 'quota', 'resource_exhausted',
+                                       'resource exhausted', 'api key', 'permission denied',
+                                       'payment required', 'insufficient balance'))
 
     def call(self, prompt: str, model: Optional[str] = None,
              max_tokens: Optional[int] = None, temperature: Optional[float] = None,
@@ -110,10 +215,29 @@ class LLMClient:
         """调用 LLM，返回文本。
 
         model/max_tokens/temperature 缺省时用 settings；json_mode=True 请求结构化 JSON。
-        对限流(429)/服务端(5xx)/超时/连接错误做指数退避重试（并发多月回填时保证稳健）。
+        对限流(429)/服务端(5xx)/超时/连接错误做指数退避重试（并发多月回填时保证稳健）；
+        致命错误（欠费/认证/CLI 缺失/内容拦截/重试耗尽）沿 fallback 链切换 provider。
         """
-        conn = self.conn
+        while True:
+            conn = self.conn  # 懒建；构造失败会自动沿链推进
+            try:
+                return self._call_once(conn, prompt, model, max_tokens, temperature,
+                                       json_mode, max_retries)
+            except Exception as e:
+                if not self._is_switchable(e):
+                    raise
+                if not self._advance_chain(str(e)):
+                    raise
+
+    def _call_once(self, conn: dict, prompt: str, model: Optional[str],
+                   max_tokens: Optional[int], temperature: Optional[float],
+                   json_mode: bool, max_retries: int) -> str:
         provider = conn.get('provider')
+        model = self._model_for(conn, model)
+        # ollama 的 thinking 型模型（qwen3.5）思考过程同样消耗生成预算，
+        # 8K 会被 thinking 烧光导致 content 为空（实测），下限抬到 24K
+        if conn.get('name') == 'ollama' and (max_tokens is None or max_tokens < 24576):
+            max_tokens = 24576
         temp = self.settings.temperature if temperature is None else temperature
         mtok = self.settings.max_output_tokens if max_tokens is None else max_tokens
 
@@ -121,7 +245,7 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 if provider == 'claude-agent':
-                    return self._call_agent(prompt, model or conn['model'], json_mode)
+                    return self._call_agent(prompt, model, json_mode)
 
                 if provider == 'gemini':
                     from google.genai import types
@@ -129,7 +253,7 @@ class LLMClient:
                     if json_mode:
                         cfg['response_mime_type'] = 'application/json'
                     response = conn['client'].models.generate_content(
-                        model=model or conn['model'],
+                        model=model,
                         contents=prompt,
                         config=types.GenerateContentConfig(**cfg),
                     )
@@ -137,7 +261,7 @@ class LLMClient:
 
                 # OpenAI 兼容
                 payload = {
-                    "model": model or conn['model'],
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": temp,
                     "max_tokens": mtok,
