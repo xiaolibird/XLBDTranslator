@@ -2,7 +2,7 @@
 翻译工作流模块
 """
 import asyncio
-import json, os, traceback, signal, threading
+import json, os, time, traceback, signal, threading
 from pathlib import Path
 from typing import Callable, Dict, Optional, List
 

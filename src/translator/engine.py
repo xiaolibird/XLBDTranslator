@@ -80,13 +80,6 @@ def _is_retryable_openai_error(e: BaseException) -> bool:
 _VISION_TRANSIENT_RETRIES = 2
 
 
-# 本地 Ollama 注入的推理参数（16GB 内存压力下从 8192/10 逐步压到当前值）。
-# 启动日志、debug 日志与 docstring 一律引用这两个常量：此前宣称值（8192/10）
-# 与实际注入值（1024/1）相差 8 倍，排查上下文截断问题会被直接误导。
-OLLAMA_NUM_CTX = 1024
-OLLAMA_NUM_THREAD = 1
-
-
 # 文本翻译的结构化输出 schema：强制模型返回
 # {"translations": [{"id": int, "translation": str}]} 顶层对象。
 # 顶层用对象而非数组：与 DeepSeek response_format=json_object 的「顶层必须为
@@ -1451,7 +1444,7 @@ class OpenAICompatibleTranslator(BaseTranslator):
             logger.info("🏠 检测到本地模式（Ollama）")
             logger.info(f"   - 服务地址: {self.base_url}")
             logger.info(f"   - 模型: {self.model}")
-            logger.info(f"   - 已启用本地推理参数：num_ctx={OLLAMA_NUM_CTX}, num_thread={OLLAMA_NUM_THREAD}")
+            logger.info("   - 推理参数交由 Ollama/模型默认值（不注入 num_ctx/num_thread）")
         elif self.is_deepseek:
             logger.info("🚀 检测到 DeepSeek API")
             logger.info(f"   - API 地址: {self.base_url}")
@@ -1913,12 +1906,11 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
     def _chat_completions(self, system_instruction: str, user_content: Any) -> str:
         """调用 Chat Completions API
-        
-        本地模式优化（M2 Pro 16GB）：
-        - 强制 120s 超时（本地推理较慢）
-        - 注入 options 字段：num_ctx/num_thread 取模块常量
-          OLLAMA_NUM_CTX / OLLAMA_NUM_THREAD（低值适配 16GB 内存压力）
-        
+
+        本地模式（Ollama）：
+        - 超时取 max(120, request_timeout)——本地大模型一批可达十几分钟
+        - 不注入 num_ctx/num_thread，推理参数交由 Ollama/模型默认值
+
         DeepSeek 长文本模式：
         - system_instruction 在此处（唯一位置）并入单条 user message，
           调用方一律正常传 system_instruction，不做预拼接
@@ -1980,17 +1972,15 @@ class OpenAICompatibleTranslator(BaseTranslator):
         else:
             logger.debug("   📊 标准模式: System Instruction + User Content")
         
-        # 本地模式：注入 Ollama 专用参数，针对 M2 Pro 16GB 优化
-        # （数值统一取模块常量，宣称与实际注入不再各写一份）
+        # 本地模式不再注入 num_ctx/num_thread：旧值（1024/1，为 16GB 内存设）
+        # 一旦被 Ollama 严格执行会静默截断输入毁掉译文；上下文交给模型默认值。
+        # 但 max_tokens 必须显式解锁：Ollama 无此字段时按默认 num_predict 截断
+        # 生成（实测 qwen3.5:35b 被限 ~3.9K），思考型模型的 thinking 先烧掉大半
+        # 预算、译文被拦腰截断；云端仍不设（各服务上限不一，设过高会 400）。
+        # 24576 而非 16384：20K 字符的大批下 thinking 可膨胀至 1 万+ token，
+        # 16384 会被整个烧完导致 content 为空（实测连续空响应）
         if self.is_local:
-            payload["options"] = {
-                "num_ctx": OLLAMA_NUM_CTX,
-                "num_thread": OLLAMA_NUM_THREAD,
-            }
-            logger.debug(
-                f"🔧 本地模式 payload 已注入 options: "
-                f"num_ctx={OLLAMA_NUM_CTX}, num_thread={OLLAMA_NUM_THREAD}"
-            )
+            payload["max_tokens"] = 24576
 
         url = self._build_chat_completions_url()
         data = json.dumps(payload).encode('utf-8')
@@ -1999,15 +1989,13 @@ class OpenAICompatibleTranslator(BaseTranslator):
             'Authorization': f'Bearer {self.api_key}',
         }
         
-        # 动态超时：本地模式强制 120s，云端模式根据服务调整
-        if self.is_deepseek:
-            timeout = 120  # DeepSeek响应较慢，增加到120秒
-            logger.debug(f"⏱️  DeepSeek模式超时设置: {timeout}s")
-        elif self.is_local:
-            timeout = 120  # 本地推理较慢，强制120秒
-            logger.debug(f"⏱️  本地模式超时设置: {timeout}s")
-        else:
-            timeout = self.settings.processing.request_timeout
+        # 动态超时：DeepSeek/本地推理较慢，在用户配置之上保证 120s 下限；
+        # 不得低于配置值——本地大模型（如 qwen3:32b ~7 tok/s）一批可达十几分钟，
+        # 硬编码上限会让客户端超时后服务端仍在算旧请求，重试排队必然雪崩
+        timeout = self.settings.processing.request_timeout
+        if self.is_deepseek or self.is_local:
+            timeout = max(120, timeout)
+            logger.debug(f"⏱️  {'DeepSeek' if self.is_deepseek else '本地'}模式超时设置: {timeout}s")
 
         resp_text = self._http_post_json(url, data, headers, timeout)
 
