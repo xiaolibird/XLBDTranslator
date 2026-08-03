@@ -509,15 +509,24 @@ def merge_note(entry: Dict[str, Any], gen_block: str, existing: Optional[str]
 
 # ---------------- 语义相似边（图谱主力） ----------------
 
-def _tokens(e: Dict[str, Any]) -> List[str]:
-    """英文词（≥3 字母、去停用词）+ 中文字符级 2-gram（大量 one_line/highlights 是中文）。"""
-    parts = [e.get("title") or "", e.get("one_line") or ""]
-    parts += [(h.get("text") or "") for h in (e.get("highlights") or []) if isinstance(h, dict)]
-    text = " ".join(parts).lower()
+def tokenize(text: str) -> List[str]:
+    """英文词（≥3 字母、去停用词）+ 中文字符级 2-gram（大量 one_line/highlights 是中文）。
+
+    vault 近邻图与语义检索 sparse 分支共用（`scripts/notes_search.py` BM25 分词）。
+    """
+    text = text.lower()
     toks = [w for w in _EN_WORD.findall(text) if w not in _STOP]
     cn = _CN_CHAR.findall(text)
     toks += ["".join(cn[i:i + 2]) for i in range(len(cn) - 1)]
     return toks
+
+
+def _tokens(e: Dict[str, Any]) -> List[str]:
+    """英文词（≥3 字母、去停用词）+ 中文字符级 2-gram（大量 one_line/highlights 是中文）。"""
+    parts = [e.get("title") or "", e.get("one_line") or ""]
+    parts += [(h.get("text") or "") for h in (e.get("highlights") or []) if isinstance(h, dict)]
+    text = " ".join(parts)
+    return tokenize(text)
 
 
 def compute_neighbors(entries: List[Dict[str, Any]], k: int = 5

@@ -277,6 +277,7 @@ def write_notes(
     fallback_citekeys: bool = False,
     emit_index_sidecar: bool = True,
     index_series: str = "auto",
+    existing_citekeys: Optional[set] = None,
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
@@ -298,7 +299,9 @@ def write_notes(
     # headless 回填：为无 Zotero key 的论文补人读临时键（去重防撞），令札记不出现 MISSING-KEY
     if fallback_citekeys:
         citekeys = dict(citekeys)
-        used = {v for v in citekeys.values() if v}
+        # used 初始化为"本批已用键 + 索引已有 citekey 全集"：确保新生成的 fallback 键
+        # 不与库内任何条目重名，杜绝"同一论文 auto/manual 各收一次生成同名 citekey"
+        used = {v for v in citekeys.values() if v} | (existing_citekeys or set())
         for seg in segments:
             if citekeys.get(seg.paper_id):
                 continue

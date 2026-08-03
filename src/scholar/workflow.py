@@ -42,6 +42,10 @@ FILTER_PROMPT_FALLBACK = """<!-- version: filter-v2-embedded -->
 # TASK
 对下面每条记录（title + abstract）输出筛选判定，只依据给定文本，不得脑补。
 
+部分记录带 library_neighbors 字段：本地文献库中与该论文语义最相近的已收文献（含相似度 sim，
+citekey/year/one_line）。高相似 ≠ 排除——可能是同方向的新进展，正该收；但若与已收文献纯重复、
+增量微小，降为 MAYBE，并在 one_line 中点名重复的 citekey。无该字段的记录按无近邻处理。
+
 # 纳入维度（命中任一 → 进入候选池）
 A 缺失机制方法学；B 缺失感知建模；C 缺失×因果；D 跨域/跨中心迁移；
 E 对抗性证据（结论与本文相反也**必须捕获**）；F 多库 ICU 基准；G 临床落地场景。
@@ -115,6 +119,13 @@ class ScholarWorkflow:
         self._filter_prompt_template: Optional[str] = None
         self._filter_prompt_version: Optional[str] = None
         self._filter_fallback_count = 0
+
+        # RAG phase 3：札记库语义近邻（懒加载缓存，同一次 run 内 filter 与落盘复用）。
+        # segment_id -> [{citekey, year, one_line, sim}, ...]；向量库/Ollama 不可用时值为 []。
+        self._library_neighbors_cache: Dict[int, List[dict]] = {}
+        self._vector_store = None  # 懒加载的 embed_store.VectorStore，失败后不重试
+        self._embedding_client = None  # 懒加载的 embeddings.EmbeddingClient
+        self._library_neighbors_unavailable = False  # 一次失败后本次 run 内不再重试，避免刷屏
 
         # 跨来源去重（邮件路径与外部检索共用，保证 Gmail/PubMed/arXiv 不重复入库）
         self._seen_paper_ids: set = set()
@@ -419,7 +430,12 @@ class ScholarWorkflow:
         ))
 
     def _filter_by_whitelist(self, papers: List[PaperSegment], stage: str) -> List[PaperSegment]:
-        """关键词白名单过滤，为每篇论文产出裁决记录"""
+        """关键词白名单过滤，为每篇论文产出裁决记录。
+
+        注意：keyword 模式是纯本地离线兜底路径（LLM 挂了才走它），刻意不注入 RAG 近邻——
+        `_library_neighbors` 的消费方是 LLM 裁决 prompt，keyword 模式没有消费方，只会引入
+        Ollama 依赖与延迟，违背离线兜底定位。
+        """
         whitelist = self.settings.processing.whitelist
         kept = []
         for paper in papers:
@@ -471,6 +487,7 @@ class ScholarWorkflow:
                     stage="keyword_fallback",
                     reason="白名单命中: {}".format(hit),
                     one_line="白名单命中: {}".format(hit),
+                    library_neighbors=self._library_neighbors_cache.get(paper.segment_id) or [],
                 )
                 paper.filter_decision = decision
                 self.included_decisions.append(decision)
@@ -482,6 +499,7 @@ class ScholarWorkflow:
                     verdict="undecided",
                     stage="keyword_fallback",
                     reason="LLM 裁决失败且未命中白名单，待人工复核",
+                    library_neighbors=self._library_neighbors_cache.get(paper.segment_id) or [],
                 )
                 paper.filter_decision = decision
                 self.undecided_segments.append(paper)
@@ -594,6 +612,7 @@ class ScholarWorkflow:
             confidence=self._coerce_confidence(verdict.get('confidence')),
             model=model,
             prompt_version=prompt_version,
+            library_neighbors=self._library_neighbors_cache.get(paper.segment_id) or [],
         )
 
     def _record_exclusion(self, paper: PaperSegment, decision: FilterDecision):
@@ -628,16 +647,116 @@ class ScholarWorkflow:
             self._filter_prompt_version = "{}@{}".format(label, digest)
         return self._filter_prompt_version
 
+    def _library_neighbors(self, papers: List[PaperSegment], k: int = 3,
+                            min_sim: float = 0.65) -> Dict[int, List[dict]]:
+        """查札记库（本地已收文献）语义近邻：segment_id -> [{citekey, year, one_line, sim}, ...]。
+
+        查询文本口径与 _build_filter_prompt 送审文本一致：title + "\\n" + abstract[:800]（截断
+        长度对齐现有裁决 prompt，避免两条截断口径打架）。一次性批量 embed 所有候选论文（不是
+        逐篇请求 Ollama），查 paper 级向量（level=='paper' 掩码）取 top-k，sim < min_sim 丢弃。
+        min_sim=0.65 是实测分界：bge-m3 短文本相似度分布窄，库内真实近邻落在 0.63-0.74，
+        完全离题论文（含共享 ML 词汇者）最高 0.61——0.5 挡不住离题项，勿轻易调低。
+
+        结果按 segment_id 缓存在 self._library_neighbors_cache，同一次 run 内 filter 阶段
+        （_build_filter_prompt 注入）与裁决落盘（_build_filter_decision/_fallback_partition
+        写入 FilterDecision.library_neighbors）复用，不重复查询同一篇论文。
+
+        整个函数 try/except 包死：向量库缺失、Ollama 不可达、embedding 维度异常等任何失败都只
+        log warning 并返回 {}（本次 run 内后续调用直接跳过不再重试）——RAG 近邻是审稿辅助信息，
+        digest 主流程绝不因它不可用而中断或改变行为。
+        """
+        result: Dict[int, List[dict]] = {}
+        to_query: List[PaperSegment] = []
+        for paper in papers:
+            cached = self._library_neighbors_cache.get(paper.segment_id)
+            if cached is not None:
+                result[paper.segment_id] = cached
+            else:
+                to_query.append(paper)
+        if not to_query:
+            return result
+
+        if self._library_neighbors_unavailable:
+            for paper in to_query:
+                self._library_neighbors_cache[paper.segment_id] = []
+                result[paper.segment_id] = []
+            return result
+
+        try:
+            import numpy as np
+
+            from .embed_store import VectorStore
+            from .embeddings import EmbeddingClient, EmbeddingError, resolve_embedding_base_url
+
+            if self._vector_store is None:
+                db_path = self.settings.processing.notes_dir / "embeddings.sqlite3"
+                self._vector_store = VectorStore.load(db_path)
+                want_model = getattr(self.settings.llm, "embedding_model", None) or "bge-m3"
+                # 只比基础名：`bge-m3:latest` 与 `bge-m3` 是同一模型
+                if (self._vector_store.model or "").split(":")[0] != want_model.split(":")[0]:
+                    raise EmbeddingError(
+                        "向量库 embedding 模型 {} 与配置 {} 不一致，先跑 notes_embed.py --full 重建"
+                        .format(self._vector_store.model, want_model))
+            store = self._vector_store
+            mask = np.array([rec.get("level") == "paper" for rec in store.records], dtype=bool)
+
+            if self._embedding_client is None:
+                base_url = resolve_embedding_base_url(self.settings.llm)
+                model = getattr(self.settings.llm, "embedding_model", None) or "bge-m3"
+                self._embedding_client = EmbeddingClient(base_url=base_url, model=model)
+            client = self._embedding_client
+            # probe 本地毫秒级（GET /api/tags），Ollama 起着但挂起时快速失败而非等 120s 超时×3
+            client.probe()
+
+            texts = [
+                "{}\n{}".format(p.metadata.title or "", (p.original_abstract or "")[:800])
+                for p in to_query
+            ]
+            vecs = client.embed(texts)
+
+            for paper, vec in zip(to_query, vecs):
+                hits = store.search(vec, mask=mask, top_k=k)
+                neighbors = []
+                for idx, sim in hits:
+                    if sim < min_sim:
+                        continue
+                    rec = store.records[idx]
+                    # paper chunk 文本 = title + "\n" + one_line（one_line 为空则只有 title）
+                    text_parts = (rec.get("text") or "").split("\n", 1)
+                    one_line = text_parts[1] if len(text_parts) > 1 else ""
+                    neighbors.append({
+                        "citekey": rec.get("citekey"),
+                        "year": rec.get("year"),
+                        "one_line": one_line,
+                        "sim": round(float(sim), 3),
+                    })
+                self._library_neighbors_cache[paper.segment_id] = neighbors
+                result[paper.segment_id] = neighbors
+        except Exception as e:
+            logger.warning(
+                "  ⚠️ 札记库语义近邻检索不可用（本次 run 降级为无 RAG 近邻，不影响裁决主流程）: {}".format(e))
+            self._library_neighbors_unavailable = True
+            for paper in to_query:
+                self._library_neighbors_cache[paper.segment_id] = []
+                result[paper.segment_id] = []
+
+        return result
+
     def _build_filter_prompt(self, batch: List[PaperSegment]) -> str:
         """构建批量裁决 prompt"""
+        neighbors_map = self._library_neighbors(batch)
         papers_data = []
         for seg in batch:
-            papers_data.append({
+            item = {
                 "id": seg.segment_id,
                 "title": seg.metadata.title,
                 "abstract": (seg.original_abstract or "")[:800],
                 "journal": seg.metadata.journal,
-            })
+            }
+            neighbors = neighbors_map.get(seg.segment_id) or []
+            if neighbors:
+                item["library_neighbors"] = neighbors
+            papers_data.append(item)
 
         template = self._get_filter_prompt_template()
         prompt = template.replace("{{RESEARCH_INTERESTS}}", self.settings.processing.research_interests)

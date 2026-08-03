@@ -206,8 +206,28 @@ def main() -> int:
     if not args.no_index:
         from src.scholar.notes_index import update_index, write_outputs
         nd = Path(settings.processing.notes_dir)
-        write_outputs(update_index(nd), nd)      # 增量：只重解析新增的周文件
+        index_data = update_index(nd)
+        write_outputs(index_data, nd)      # 增量：只重解析新增的周文件
         logger.info("文献索引已刷新")
+
+        # best-effort 向量同步：周一 09:30 launchd 自动入库绝不能因 Ollama 没起而失败。
+        # 任何异常（Ollama 不可达/模型未 pull/网络问题）只 log warning，不改变退出码，
+        # 不中断脚本——向量库是索引的纯派生物，缺一次同步不影响本次入库结果。
+        try:
+            from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
+            from src.scholar.embed_store import sync_store
+            client = EmbeddingClient(
+                base_url=resolve_embedding_base_url(settings.llm),
+                model=settings.llm.embedding_model,
+            )
+            try:
+                stats = sync_store(nd / "embeddings.sqlite3", index_data, client)
+            finally:
+                client.close()
+            logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+                stats.embedded, stats.deleted, stats.meta_refreshed))
+        except Exception as e:
+            logger.warning("向量库同步跳过（不影响入库）：{}".format(e))
 
     print("\n{}".format("=" * 66))
     print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))

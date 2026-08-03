@@ -570,8 +570,10 @@ def write_if_changed(path: Path, content: str) -> bool:
         pass
     path.parent.mkdir(parents=True, exist_ok=True)
     # tmp+replace 原子写（同 merge_final.py）：all_references.json 等经此落盘，
-    # 半写 JSON 会直接毒害 pandoc/vault 消费方；tmp 同目录避免跨设备 replace
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # 半写 JSON 会直接毒害 pandoc/vault 消费方；tmp 同目录避免跨设备 replace。
+    # tmp 名掺 pid：双写者并发（如 weekly-ingest 与手动 backfill 重叠）各写各的 tmp，
+    # 避免互相截断同一 tmp 导致 os.replace 落成半截文件。
+    tmp = path.with_suffix(path.suffix + ".tmp-{}".format(os.getpid()))
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
     return True
@@ -751,8 +753,9 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
     else:
         wrote["index_json"] = True
     if wrote["index_json"]:
-        # 索引是跨运行去重的真理源，截断即触发 load_seen_keys fail-fast——原子写掉
-        tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+        # 索引是跨运行去重的真理源，截断即触发 load_seen_keys fail-fast——原子写掉。
+        # tmp 名掺 pid（同 write_if_changed），防双写者互相截断。
+        tmp = index_path.with_suffix(index_path.suffix + ".tmp-{}".format(os.getpid()))
         tmp.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, index_path)
 

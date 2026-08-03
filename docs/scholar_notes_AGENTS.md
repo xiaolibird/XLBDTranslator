@@ -19,6 +19,13 @@
 | `科研札记_YYYY-MM_{全文,手动}精读.docx` | 样式化 Word 版(人读,agent 勿解析) |
 | `manual/YYYY-MM/*.paper.json` | 手动精读的中间 bundle(内部用,勿检索) |
 
+## 语义检索(中文找英文表述、换述同义词用)
+
+`jq`/`notes_query.py` 是精确子串匹配；查不到换述表达（如中文"缺失机制不可忽略"查不到英文
+"informative missingness"）时改用 `PYTHONPATH=. python scripts/notes_search.py <查询...>
+[--role ...] [--json]`(默认 `--mode hybrid`=向量+BM25 关键词融合)。句级证据同样只覆盖库内
+480 篇精读文献,语义命中若标注"该篇无精读句级证据"是真的没有,不是没搜到。
+
 ## 检索流程(四步法)
 
 1. **先查索引**:`jq` 过滤 `literature_index.json` 的 `papers[]`,拿到 citekey / note_file / note_line;

@@ -27,7 +27,7 @@ INDEX_PATH = REPO / "output" / "scholar_notes" / "literature_index.json"
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
 TIER_EMOJI = {"high": "🔴", "mid": "🟠", "low": "🟢"}
-MONTH_RE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+MONTH_RE = re.compile(r"^\d{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$")  # YYYY[-MM[-DD]]，月份/日语义校验
 MAX_SHOWN_HITS = 4          # 人读模式每条最多展示几句（--json 不截断）
 
 

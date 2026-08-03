@@ -349,13 +349,22 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
         full_text = sum(1 for s in segs if s.close_reading and s.close_reading.from_full_text)
 
     from .notes import write_notes
+    existing_ckeys = set()
+    idx_path = Path(proc.notes_dir) / "literature_index.json"
+    if idx_path.exists():
+        try:
+            existing_ckeys = {p.get("citekey") for p in
+                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
+                              if p.get("citekey")}
+        except Exception:
+            pass
     res = write_notes(
         list(segs), citekeys, out_dir=Path(proc.notes_dir),
         instruction=proc.notes_instruction,
         digest_title="科研札记 · {}{}".format(label, title_suffix),
         filename="科研札记_{}_全文精读".format(label),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True)
+        fallback_citekeys=True, existing_citekeys=existing_ckeys)
 
     hit_ck = sum(1 for v in citekeys.values() if v)
     logger.info("  ✅ {} → {} 篇 | citekey {}/{} | 全文精读 {} | 增强 CR{}/AX{}/TS{}".format(

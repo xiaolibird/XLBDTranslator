@@ -190,11 +190,44 @@ def _print_attention(outs, failed):
         print("  · ingest 失败：{} —— {}".format(name, err[:80]))
 
 
+def _sync_embedding_best_effort(notes_dir: Path, index: dict, settings) -> None:
+    """best-effort 向量库同步：手动精读重建索引后跟进向量库。
+
+    与 ingest_notes.py 的挂钩一致——任何异常只 log warning，绝不打断手动精读主流程。
+    """
+    try:
+        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
+        from src.scholar.embed_store import sync_store
+        client = EmbeddingClient(
+            base_url=resolve_embedding_base_url(settings.llm),
+            model=settings.llm.embedding_model,
+        )
+        try:
+            stats = sync_store(notes_dir / "embeddings.sqlite3", index, client)
+        finally:
+            client.close()
+        logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+            stats.embedded, stats.deleted, stats.meta_refreshed))
+    except Exception as e:
+        logger.warning("向量库同步跳过（不影响手动精读结果）：{}".format(e))
+
+
 def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     """从当月全部 final bundle 重建手动精读四件套 + 刷索引。"""
     from src.scholar.pdf_ingest import load_bundle, segment_from_bundle, BUNDLE_SUFFIX
     from src.scholar.notes import write_notes
     from src.scholar.notes_index import update_index, write_outputs
+
+    # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名
+    existing_ckeys = set()
+    idx_path = notes_dir / "literature_index.json"
+    if idx_path.exists():
+        try:
+            existing_ckeys = {p.get("citekey") for p in
+                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
+                              if p.get("citekey")}
+        except Exception:
+            pass  # 索引损坏时退化为只查本批，仍安全
 
     mdir = notes_dir / "manual" / month
     bundles = sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))) if mdir.exists() else []
@@ -219,6 +252,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         # 仍刷一次索引（若该月手动 md 曾存在但现无 final，索引以磁盘为准）
         idx = update_index(notes_dir)
         write_outputs(idx, notes_dir)
+        _sync_embedding_best_effort(notes_dir, idx, settings)
         return {"month": month, "papers": 0, "skipped_drafts": skipped, "index": idx}
 
     citekeys = {seg.paper_id: None for seg in segments}
@@ -228,10 +262,12 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         digest_title="科研札记 · {}（手动深度精读）".format(month),
         filename="科研札记_{}_手动精读".format(month),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True, index_series="manual")
+        fallback_citekeys=True, index_series="manual",
+        existing_citekeys=existing_ckeys)
     # 这份索引直接带给 _report_final 复用：全量重建要扫全部札记 md，跑两遍纯属白等
     idx = update_index(notes_dir)
     write_outputs(idx, notes_dir)
+    _sync_embedding_best_effort(notes_dir, idx, settings)
     return {"month": month, "papers": len(segments), "skipped_drafts": skipped,
             "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
 

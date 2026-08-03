@@ -152,13 +152,22 @@ def run_month(y, m, settings, seen: set, args) -> dict:
         full_text = sum(1 for s in fresh if s.close_reading and s.close_reading.from_full_text)
 
     from src.scholar.notes import write_notes
+    existing_ckeys = set()
+    idx_path = Path(proc.notes_dir) / "literature_index.json"
+    if idx_path.exists():
+        try:
+            existing_ckeys = {p.get("citekey") for p in
+                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
+                              if p.get("citekey")}
+        except Exception:
+            pass
     res = write_notes(
         fresh, citekeys, out_dir=Path(proc.notes_dir),
         instruction=proc.notes_instruction,
         digest_title="科研札记 · {}（全文精读）".format(label),
         filename="科研札记_{}_全文精读".format(label),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True)  # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
+        fallback_citekeys=True, existing_citekeys=existing_ckeys)  # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
     seen |= month_keys           # 落盘成功，本月键此刻才算真正「已收录」
 
     hit_ck = sum(1 for v in citekeys.values() if v)
@@ -259,7 +268,24 @@ def main():
         try:
             from src.scholar.notes_index import update_index, write_outputs
             notes_dir = Path(settings.processing.notes_dir)
-            write_outputs(update_index(notes_dir), notes_dir)
+            index_data = update_index(notes_dir)
+            write_outputs(index_data, notes_dir)
+            # best-effort 向量同步：batch 回填后跟进向量库（失败只 warning，不影响回填结果）
+            try:
+                from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
+                from src.scholar.embed_store import sync_store
+                client = EmbeddingClient(
+                    base_url=resolve_embedding_base_url(settings.llm),
+                    model=settings.llm.embedding_model,
+                )
+                try:
+                    stats = sync_store(notes_dir / "embeddings.sqlite3", index_data, client)
+                finally:
+                    client.close()
+                logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+                    stats.embedded, stats.deleted, stats.meta_refreshed))
+            except Exception as e2:
+                logger.warning("向量库同步跳过（不影响回填结果）：{}".format(e2))
         except Exception as e:
             index_err = e
             logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))
