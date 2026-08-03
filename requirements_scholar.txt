@@ -26,3 +26,6 @@ PyMuPDF>=1.23.0
 
 # 其他工具
 python-dateutil>=2.8.2
+
+# 札记库语义检索（embedding 向量运算）
+numpy

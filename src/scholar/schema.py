@@ -234,6 +234,11 @@ class FilterDecision(BaseModel):
     model: Optional[str] = Field(None, description="做出裁决的 LLM 模型（确定性阶段为 None）")
     prompt_version: Optional[str] = Field(None, description="裁决 prompt 版本标签+模板哈希（如 filter-v2@a1b2c3d4）")
     decided_at: datetime = Field(default_factory=datetime.now, description="裁决时间")
+    # RAG phase 3：札记库语义近邻（{citekey, year, one_line, sim}），随裁决固化供复盘；
+    # 向量库/Ollama 不可用时上游返回空列表，此处默认 [] 且不影响旧 digest JSON 反序列化。
+    library_neighbors: List[dict] = Field(
+        default_factory=list, description="裁决时参考的札记库语义近邻（本地已收文献）"
+    )
 
 
 # ==================== 全文精读结果 ====================
@@ -552,6 +557,9 @@ class LLMSettings(BaseModel):
     # 本地 Ollama 独立配置（与 openai 兼容组分离，可同链共存）
     ollama_base_url: str = Field("http://localhost:11434/v1", validation_alias=AliasChoices("ollama_base_url", "OLLAMA_BASE_URL"), description="Ollama 服务地址（OpenAI 兼容端点）")
     ollama_model: str = Field("qwen3.5:35b", validation_alias=AliasChoices("ollama_model", "OLLAMA_MODEL"), description="Ollama 模型名称")
+    # 札记库语义检索用（scripts/notes_embed.py / notes_search.py），与翻译/摘要模型完全独立
+    embedding_model: str = Field("bge-m3", validation_alias=AliasChoices("embedding_model", "EMBEDDING_MODEL"), description="本地 embedding 模型（札记库语义检索）")
+    embedding_base_url: Optional[str] = Field(None, validation_alias=AliasChoices("embedding_base_url", "EMBEDDING_BASE_URL"), description="Embedding 服务地址；None 时从 ollama_base_url 去掉尾部 /v1 派生")
 
     # OpenAI 兼容提供商（DeepSeek 等）。未设置时回退复用主配置
     # config/config.env 中的 API__OPENAI_API_KEY / API__OPENAI_BASE_URL
