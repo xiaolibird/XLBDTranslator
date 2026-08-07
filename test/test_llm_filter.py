@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from src.scholar.schema import ScholarSettings, PaperMetadata, PaperSegment
+from src.scholar.schema import DigestStatus, ScholarSettings, PaperMetadata, PaperSegment
 from src.scholar.workflow import ScholarWorkflow
 
 MINIMAL_ENV = """
@@ -101,7 +101,7 @@ def test_filter_by_whitelist_records_decisions(tmp_path):
 # ==================== llm 模式裁决 ====================
 
 def test_filter_by_llm_records_full_audit(tmp_path, monkeypatch):
-    """LLM 裁决：判定+理由+模型+prompt 版本全部入记录"""
+    """LLM 裁决：判定+理由+模型+prompt 版本全部入记录（filter-v3 顶层对象格式）"""
     settings = _make_settings(tmp_path, filter_mode="llm")
     wf = ScholarWorkflow(settings)
     papers = [
@@ -110,14 +110,14 @@ def test_filter_by_llm_records_full_audit(tmp_path, monkeypatch):
     ]
 
     response = """```json
-[
+{"verdicts": [
   {"id": 1, "decision": "INCLUDE", "bucket": ["B"], "flags": [], "role": "CITE_SUPPORT",
    "one_line": "图方法可迁移到 EHR", "confidence": 0.8},
   {"id": 2, "decision": "EXCLUDE", "exclude_reason": "X1", "flags": [], "role": "NONE",
    "one_line": "天文学研究，与医疗无关", "confidence": 0.9}
-]
+]}
 ```"""
-    monkeypatch.setattr(wf, "_call_llm", lambda prompt, model=None: response)
+    monkeypatch.setattr(wf, "_call_llm", lambda prompt, model=None, json_mode=None: response)
 
     kept = wf._filter_by_llm(papers)
 
@@ -139,21 +139,24 @@ def test_filter_by_llm_records_full_audit(tmp_path, monkeypatch):
 
 
 def test_filter_by_llm_uses_filter_model_override(tmp_path, monkeypatch):
-    """LLM__FILTER_MODEL 设置时裁决使用该模型而非主模型"""
+    """LLM__FILTER_MODEL 设置时裁决使用该模型而非主模型（响应用旧顶层数组格式，验证宽容兼容）"""
     settings = _make_settings(tmp_path, filter_mode="llm")
     settings.llm.filter_model = "fake-flash"
     wf = ScholarWorkflow(settings)
 
     seen_models = []
+    seen_json_mode = []
 
-    def fake_call(prompt, model=None):
+    def fake_call(prompt, model=None, json_mode=None):
         seen_models.append(model)
+        seen_json_mode.append(json_mode)
         return '[{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.7}]'
 
     monkeypatch.setattr(wf, "_call_llm", fake_call)
     wf._filter_by_llm([_make_paper(1, "EHR study")])
 
     assert seen_models == ["fake-flash"]
+    assert seen_json_mode == [True]
     assert wf.included_decisions[0].model == "fake-flash"
 
 
@@ -165,10 +168,10 @@ def test_filter_by_llm_missing_id_falls_back(tmp_path, monkeypatch):
         _make_paper(1, "Graph learning for EHR"),
         _make_paper(2, "EHR phenotyping study"),
     ]
-    # 只返回 id=1 的裁决
+    # 只返回 id=1 的裁决（旧顶层数组格式，验证宽容兼容）
     monkeypatch.setattr(
         wf, "_call_llm",
-        lambda prompt, model=None: '[{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.7}]'
+        lambda prompt, model=None, json_mode=None: '[{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.7}]'
     )
 
     kept = wf._filter_by_llm(papers)
@@ -189,7 +192,7 @@ def test_filter_by_llm_batch_failure_falls_back(tmp_path, monkeypatch):
         _make_paper(2, "Quasar spectroscopy"),
     ]
 
-    def boom(prompt, model=None):
+    def boom(prompt, model=None, json_mode=None):
         raise RuntimeError("API down")
 
     monkeypatch.setattr(wf, "_call_llm", boom)
@@ -210,7 +213,7 @@ def test_filter_by_llm_batch_failure_undecided_not_excluded(tmp_path, monkeypatc
         _make_paper(2, "Quasar spectroscopy"),
     ]
 
-    def boom(prompt, model=None):
+    def boom(prompt, model=None, json_mode=None):
         raise RuntimeError("API down")
 
     monkeypatch.setattr(wf, "_call_llm", boom)
@@ -253,13 +256,17 @@ def test_filter_by_llm_batch_failure_undecided_not_excluded(tmp_path, monkeypatc
 # ==================== 响应解析 ====================
 
 def test_parse_filter_response_variants(tmp_path):
-    """裁决响应解析：裸 JSON / ```json 围栏 / {papers: [...]} 包装"""
+    """裁决响应解析：{verdicts:[...]} 新契约 / 裸 JSON 数组 / ```json 围栏 / {papers:[...]} 旧包装"""
     wf = ScholarWorkflow(_make_settings(tmp_path))
     item = {"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "r", "confidence": 0.6}
 
+    verdicts_obj = json.dumps({"verdicts": [item]})
+    assert wf._parse_filter_response(verdicts_obj)[1]["decision"] == "INCLUDE"
+    # 旧顶层数组格式（宽容回退）
     assert wf._parse_filter_response(json.dumps([item]))[1]["decision"] == "INCLUDE"
     fenced = "```json\n{}\n```".format(json.dumps([item]))
     assert 1 in wf._parse_filter_response(fenced)
+    # 旧 {papers: [...]} 包装格式（宽容回退）
     wrapped = json.dumps({"papers": [item]})
     assert 1 in wf._parse_filter_response(wrapped)
 
@@ -271,6 +278,69 @@ def test_parse_filter_response_invalid_raises(tmp_path):
         wf._parse_filter_response("sorry, I cannot help")
     with pytest.raises(ValueError):
         wf._parse_filter_response('{"not": "a list"}')
+
+
+def test_parse_filter_response_drops_ids_outside_valid_set(tmp_path):
+    """valid_ids 传入时，集合外的 id（示例小节回显 900001 / 幻觉 id）必须被丢弃，
+    不进入返回映射；合法 id 正常保留。"""
+    wf = ScholarWorkflow(_make_settings(tmp_path))
+    payload = json.dumps({"verdicts": [
+        {"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.7},
+        {"id": 900001, "decision": "EXCLUDE", "bucket": [], "one_line": "示例回显", "confidence": 0.5},
+    ]})
+    result = wf._parse_filter_response(payload, valid_ids={1})
+    assert 1 in result
+    assert 900001 not in result
+
+    # 不传 valid_ids（None）时不做过滤，兼容未指定批次上下文的调用方
+    result_unfiltered = wf._parse_filter_response(payload)
+    assert {1, 900001} == set(result_unfiltered.keys())
+
+
+def test_parse_filter_response_skips_non_numeric_id_without_crashing(tmp_path):
+    """单条 id 非数字（模型吐出字符串 "N/A"）只丢弃该条，其余条目正常解析，不拖垮整批"""
+    wf = ScholarWorkflow(_make_settings(tmp_path))
+    payload = json.dumps({"verdicts": [
+        {"id": "N/A", "decision": "INCLUDE", "bucket": ["A"], "one_line": "脏 id", "confidence": 0.5},
+        {"id": 2, "decision": "INCLUDE", "bucket": ["B"], "one_line": "正常", "confidence": 0.8},
+    ]})
+    result = wf._parse_filter_response(payload)
+    assert 2 in result
+    assert result[2]["one_line"] == "正常"
+    assert len(result) == 1
+
+
+def test_parse_llm_response_drops_ids_outside_valid_set(tmp_path):
+    """digest 侧 _parse_llm_response 同款防护：valid_ids 传入时，集合外的 id（示例小节
+    回显 900001 / 幻觉 id）必须被丢弃，不覆盖批次内真实论文；合法 id 正常写入译文。"""
+    wf = ScholarWorkflow(_make_settings(tmp_path))
+    batch = [_make_paper(1, "Real Paper Title")]
+    payload = json.dumps({"papers": [
+        {"id": 1, "translated_title": "真实译文", "translated_abstract": "真实摘要"},
+        {"id": 900001, "translated_title": "示例回显标题", "translated_abstract": "示例回显摘要"},
+    ]})
+    wf._parse_llm_response(payload, batch, valid_ids={1})
+    assert batch[0].metadata.translated_title == "真实译文"
+    assert batch[0].translated_abstract == "真实摘要"
+
+    # 不传 valid_ids（None）时不做过滤，兼容未指定批次上下文的调用方（如既有单测）
+    batch2 = [_make_paper(1, "Real Paper Title")]
+    wf._parse_llm_response(payload, batch2)
+    assert batch2[0].metadata.translated_title == "真实译文"
+
+
+def test_parse_llm_response_skips_non_numeric_id_without_crashing(tmp_path):
+    """单条 id 非数字（模型吐出字符串 "N/A"）只丢弃该条，同批其余合法 id 正常解析，
+    不拖垮整批（与 filter 侧 _parse_filter_response 同款容错）"""
+    wf = ScholarWorkflow(_make_settings(tmp_path))
+    batch = [_make_paper(2, "Paper Two")]
+    payload = json.dumps({"papers": [
+        {"id": "N/A", "translated_title": "脏 id 标题", "translated_abstract": "脏 id 摘要"},
+        {"id": "2", "translated_title": "正常译文", "translated_abstract": "正常摘要"},
+    ]})
+    wf._parse_llm_response(payload, batch)
+    assert batch[0].metadata.translated_title == "正常译文"
+    assert batch[0].status == DigestStatus.COMPLETED
 
 
 # ==================== sidecar 固化 ====================
@@ -285,10 +355,10 @@ def test_excluded_sidecar_written_with_audit_fields(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(
         wf, "_call_llm",
-        lambda prompt, model=None: json.dumps([
+        lambda prompt, model=None, json_mode=None: json.dumps({"verdicts": [
             {"id": 1, "decision": "INCLUDE", "bucket": ["B"], "one_line": "相关", "confidence": 0.8},
             {"id": 2, "decision": "EXCLUDE", "exclude_reason": "X1", "one_line": "无关", "confidence": 0.9},
-        ])
+        ]})
     )
     wf.segments = papers
     wf._step_filter_papers()
@@ -353,8 +423,13 @@ def test_blacklist_prefilter_records_exclusion(tmp_path, monkeypatch):
 # ==================== scholar_main 不再硬编码词表 ====================
 
 def test_scholar_main_no_hardcoded_wordlists():
-    """env 配置的黑白名单不得再被 scholar_main 硬编码覆盖"""
+    """env 配置的黑白名单不得再被 scholar_main/cli 硬编码覆盖
+
+    scholar_main.py 下沉为薄壳后，真正的配置构建逻辑在 src/scholar/cli.py，
+    两份都要检查，避免闸门被下沉打断。
+    """
     source = Path("scholar_main.py").read_text(encoding="utf-8")
+    source += Path("src/scholar/cli.py").read_text(encoding="utf-8")
     assert "settings.processing.whitelist = [" not in source
     assert "settings.processing.blacklist = [" not in source
 
@@ -383,7 +458,7 @@ def test_filter_by_llm_survives_dirty_fields(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(
         wf, "_call_llm",
-        lambda prompt, model=None: json.dumps([
+        lambda prompt, model=None, json_mode=None: json.dumps([
             {"id": 1, "decision": "INCLUDE", "bucket": "B", "flags": None,
              "role": ["MUST_ENGAGE"], "one_line": "ok", "confidence": "high"},
             {"id": 2, "decision": "MAYBE", "bucket": ["C"], "one_line": "m", "confidence": "0.9"},
@@ -411,7 +486,7 @@ def test_filter_by_llm_maybe_is_included(tmp_path, monkeypatch):
     papers = [_make_paper(1, "Missingness-aware model, ambiguous scope")]
     monkeypatch.setattr(
         wf, "_call_llm",
-        lambda prompt, model=None: json.dumps([
+        lambda prompt, model=None, json_mode=None: json.dumps([
             {"id": 1, "decision": "MAYBE", "bucket": ["C"], "flags": ["THREAT"],
              "role": "MUST_ENGAGE", "one_line": "可能反例", "confidence": 0.3},
         ])

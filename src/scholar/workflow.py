@@ -8,7 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 from .schema import (
     ScholarSettings,
@@ -23,6 +23,7 @@ from .schema import (
 from .gmail_client import GmailClient
 from .paths import repo_path
 from .paper_extractor import ScholarEmailParser
+from .research_profile import get_exclusion_dims, get_inclusion_dims
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -33,7 +34,7 @@ FILTER_BATCH_SIZE = 20
 # 裁决 prompt 模板文件；缺失时使用内嵌兜底模板（保证 cron 无人值守可跑）
 FILTER_PROMPT_FILE = repo_path("config/prompts/whitelist_filter_prompt.md")
 
-FILTER_PROMPT_FALLBACK = """<!-- version: filter-v2-embedded -->
+FILTER_PROMPT_FALLBACK = """<!-- version: filter-v3-embedded -->
 # ROLE
 你是一名方法学审稿助手，为一篇投稿的论文做文献筛选。
 
@@ -47,26 +48,31 @@ FILTER_PROMPT_FALLBACK = """<!-- version: filter-v2-embedded -->
 citekey/year/one_line）。高相似 ≠ 排除——可能是同方向的新进展，正该收；但若与已收文献纯重复、
 增量微小，降为 MAYBE，并在 one_line 中点名重复的 citekey。无该字段的记录按无近邻处理。
 
-# 纳入维度（命中任一 → 进入候选池）
-A 缺失机制方法学；B 缺失感知建模；C 缺失×因果；D 跨域/跨中心迁移；
-E 对抗性证据（结论与本文相反也**必须捕获**）；F 多库 ICU 基准；G 临床落地场景。
+{{INCLUSION_DIMS}}
 
-# 排除维度（命中 → drop，除非同时强命中 A/C/E）
-X1 纯影像/基因组无表格EHR；X2 纯填补增量无机制；X3 无定量证据的综述；
-X4 通用LLM未涉缺失/迁移；X5 无方法贡献的RCT/流调；X6 纯因果理论无实证；X7 无实验短文。
+{{EXCLUSION_DIMS}}
 
 # RULES
 - 宁可 MAYBE 不可 EXCLUDE：与 C 或 E 沾边的一律不低于 MAYBE。
 - 结论与本文相左 ≠ 排除理由；THREAT 类 role 设为 MUST_ENGAGE。
 - 摘要不足以判定则 decision=MAYBE 且 confidence≤0.4。
 
-# OUTPUT（严格 JSON 数组，无 markdown，无前后缀）
+# OUTPUT（严格 JSON 对象，顶层不得是数组，无 markdown，无前后缀）
 ```json
-[
-  {"id": 1, "decision": "INCLUDE|MAYBE|EXCLUDE", "bucket": ["A"], "exclude_reason": null,
-   "flags": [], "role": "BACKGROUND", "one_line": "≤30字用处", "confidence": 0.8}
-]
+{
+  "verdicts": [
+    {"id": 900001, "decision": "INCLUDE|MAYBE|EXCLUDE", "bucket": ["A"], "exclude_reason": null,
+     "flags": [], "role": "BACKGROUND", "one_line": "≤30字用处", "confidence": 0.8}
+  ]
+}
 ```
+示例 id（900001）仅供格式参考，不得出现在你的输出中。
+
+# 示例（精简版，完整版见 config/prompts/whitelist_filter_prompt.md）
+- 纯填补 RMSE 增量、无下游/机制分析 → EXCLUDE，exclude_reason="X2"。
+- 缺失掩码嵌入模型且掩码本身带预后信号 → INCLUDE，bucket=["B"]。
+- 摘要未披露缺失处理方式、证据不足 → MAYBE，confidence≤0.4。
+- 实证结论与本文相反（如推翻 attention=因果的主张）→ INCLUDE，flags=["THREAT"]，role="MUST_ENGAGE"。
 
 ## 待裁决论文
 ```json
@@ -526,8 +532,9 @@ class ScholarWorkflow:
 
             try:
                 prompt = self._build_filter_prompt(batch)
-                response = self._call_llm(prompt, model=model)
-                verdicts = self._parse_filter_response(response)
+                response = self._call_llm(prompt, model=model, json_mode=True)
+                batch_ids = {p.segment_id for p in batch}
+                verdicts = self._parse_filter_response(response, valid_ids=batch_ids)
             except Exception as e:
                 logger.warning("  批次 {} LLM 裁决失败，回退关键词白名单: {}".format(batch_num, e))
                 self._filter_fallback_count += len(batch)
@@ -642,12 +649,24 @@ class ScholarWorkflow:
         return self._filter_prompt_template
 
     def _get_filter_prompt_version(self) -> str:
-        """裁决 prompt 版本标识：模板声明的版本标签 + 模板内容 md5 前 8 位"""
+        """裁决 prompt 版本标识：模板声明的版本标签 + (模板内容 + 纳入/排除维度 + 研究方向) md5 前 8 位。
+
+        A-G/X1-X7 与 research_interests 已从模板正文移出，改成 {{INCLUSION_DIMS}}/
+        {{EXCLUSION_DIMS}}/{{RESEARCH_INTERESTS}} 占位符，单独对模板取 md5 会导致换研究方向
+        （只改 config/research_profile.yaml）后指纹不变——审计记录里区分不出换方向前后的裁决。
+        故把三者一并拼进 md5 输入，指纹随 profile 变化。
+        """
         if self._filter_prompt_version is None:
             template = self._get_filter_prompt_template()
             m = re.search(r'<!--\s*version:\s*(.+?)\s*-->', template)
             label = m.group(1) if m else "unversioned"
-            digest = hashlib.md5(template.encode('utf-8')).hexdigest()[:8]
+            fingerprint_input = "\x00".join([
+                template,
+                get_inclusion_dims(),
+                get_exclusion_dims(),
+                self.settings.processing.research_interests,
+            ])
+            digest = hashlib.md5(fingerprint_input.encode('utf-8')).hexdigest()[:8]
             self._filter_prompt_version = "{}@{}".format(label, digest)
         return self._filter_prompt_version
 
@@ -779,12 +798,22 @@ class ScholarWorkflow:
 
         template = self._get_filter_prompt_template()
         prompt = template.replace("{{RESEARCH_INTERESTS}}", self.settings.processing.research_interests)
+        # 纳入/排除维度单点化：内容来自 config/research_profile.yaml，换研究方向改那一处即可
+        prompt = prompt.replace("{{INCLUSION_DIMS}}", get_inclusion_dims())
+        prompt = prompt.replace("{{EXCLUSION_DIMS}}", get_exclusion_dims())
         prompt = prompt.replace("{{PAPERS_JSON}}", json.dumps(papers_data, ensure_ascii=False, indent=2))
         return prompt
 
-    def _parse_filter_response(self, response: str) -> Dict[int, Dict[str, Any]]:
+    def _parse_filter_response(self, response: str,
+                                valid_ids: Optional[Set[int]] = None) -> Dict[int, Dict[str, Any]]:
         """解析方法学审稿裁决响应为 {id: item} 映射（item 含 decision/bucket/flags/role/one_line/confidence）；
-        解析失败抛异常由调用方回退。"""
+        解析失败抛异常由调用方回退。
+
+        valid_ids: 当前批次的合法 id 集合。prompt 里已用软约束要求模型不得输出示例 id 或幻觉 id，
+        但 flash 级模型仍会回显示例小节的 id（900001-900004 等）或编造不存在的 id——这里把软约束
+        变成代码强制：不在集合内的 id 直接丢弃该条，不让脏 id 污染 verdict 映射（调用方按 segment_id
+        查不到时会走单篇回退，行为等价于"这条没被裁决"，安全）。留空（None/未传）时不做过滤，
+        兼容测试与其它未传批次上下文的调用方。"""
         json_text = response
         if '```json' in response:
             json_text = response.split('```json')[1].split('```')[0]
@@ -792,15 +821,30 @@ class ScholarWorkflow:
             json_text = response.split('```')[1].split('```')[0]
 
         verdicts = json.loads(json_text.strip())
-        if isinstance(verdicts, dict) and 'papers' in verdicts:
-            verdicts = verdicts['papers']
+        if isinstance(verdicts, dict):
+            # verdicts: filter-v3 契约（DeepSeek json_object 要求顶层对象）；
+            # papers: 旧顶层数组格式的历史包装，宽容兼容
+            if 'verdicts' in verdicts:
+                verdicts = verdicts['verdicts']
+            elif 'papers' in verdicts:
+                verdicts = verdicts['papers']
         if not isinstance(verdicts, list):
-            raise ValueError("裁决响应不是 JSON 数组")
+            raise ValueError("裁决响应不是 JSON 数组，也非 {verdicts:[...]} 对象")
 
         result = {}
         for item in verdicts:
-            if isinstance(item, dict) and 'id' in item and 'decision' in item:
-                result[int(item['id'])] = item
+            if not (isinstance(item, dict) and 'id' in item and 'decision' in item):
+                continue
+            # 单条 id 非数字（如模型吐出字符串 "N/A"）只丢弃这一条，不能让 int() 抛异常拖垮整批
+            try:
+                item_id = int(item['id'])
+            except (TypeError, ValueError):
+                logger.warning("  裁决响应含非数字 id，丢弃该条: {!r}".format(item.get('id')))
+                continue
+            if valid_ids is not None and item_id not in valid_ids:
+                logger.warning("  裁决响应 id={} 不在本批合法 id 集合内，丢弃该条（示例回显/幻觉 id）".format(item_id))
+                continue
+            result[item_id] = item
         return result
     
     def _step_process_papers(self):
@@ -817,25 +861,37 @@ class ScholarWorkflow:
         
         batch_size = self.settings.processing.batch_size
         total = len(self.segments)
-        
-        # 分批处理
+        total_batches = (total + batch_size - 1) // batch_size
+
+        # 分批处理；逐批 catch 只为了让个别批次的偶发故障（单批 JSON 解析失败等）
+        # 不拖垮整轮，但必须统计成功批次数——LLM 回退链耗尽（欠费/限流/CLI 缺失
+        # 全部命中）时每一批都会同样失败，逐批 catch+continue 会把「通路级故障」
+        # 悄悄吞成「处理完成 0/N」，随后 Step 4 照常产出 status=COMPLETED 的 digest、
+        # 进程退出码 0。对齐 ingest.run_ingest 对全文精读 0/N 的同款守卫：全部批次
+        # 失败时直接 raise，让 execute() 的外层 except 捕获、非零退出、不写终稿。
+        failed_batches = 0
         for i in range(0, total, batch_size):
             batch_segments = self.segments[i:i + batch_size]
             batch_num = i // batch_size + 1
-            total_batches = (total + batch_size - 1) // batch_size
-            
+
             logger.info("  处理批次 {}/{} ({} 篇)".format(batch_num, total_batches, len(batch_segments)))
-            
+
             try:
                 self._process_batch(batch_segments)
             except Exception as e:
                 logger.error("  批次 {} 处理失败: {}".format(batch_num, e))
+                failed_batches += 1
                 # 继续处理下一批
                 continue
-        
+
+        if total_batches > 0 and failed_batches == total_batches:
+            raise RuntimeError(
+                "LLM 处理 {}/{} 批全部失败，视为 LLM 通路级故障（回退链耗尽/欠费/限流），"
+                "不产出降级 digest".format(failed_batches, total_batches))
+
         # 按优先级排序
         self._sort_by_priority()
-        
+
         # 统计
         processed = sum(1 for s in self.segments if s.is_processed)
         logger.info("处理完成: {}/{} 篇论文".format(processed, total))
@@ -1022,12 +1078,13 @@ class ScholarWorkflow:
         
         # 构建 prompt
         prompt = self._build_batch_prompt(batch)
-        
-        # 调用 LLM
-        response = self._call_llm(prompt)
-        
-        # 解析响应并更新段落
-        self._parse_llm_response(response, batch)
+
+        # 调用 LLM（顶层对象输出，DeepSeek response_format=json_object 硬性要求）
+        response = self._call_llm(prompt, json_mode=True)
+
+        # 解析响应并更新段落（valid_ids 挡示例 id 回显/幻觉 id，与 filter 侧同款防护）
+        batch_ids = {seg.segment_id for seg in batch}
+        self._parse_llm_response(response, batch, valid_ids=batch_ids)
     
     def _build_batch_prompt(self, batch: List[PaperSegment]) -> str:
         """构建批量处理的 prompt（参考 scholar_digest_prompt.md）"""
@@ -1051,10 +1108,10 @@ class ScholarWorkflow:
                 "email_received_at": email_received
             })
         
-        prompt = """你是一位医学人工智能领域的博士生导师，正在帮助学生筛选和分析论文。
+        prompt = """你是一位相关方法学领域的博士生导师，正在帮助学生筛选和分析论文。
 
 ## 研究背景
-学生研究方向：电子健康记录(EHR)数据挖掘、临床预测模型、图神经网络(GNN)、半监督学习、大语言模型(LLM)在医学中的应用
+__RESEARCH_INTERESTS__
 
 ## 任务
 对以下论文进行：
@@ -1065,29 +1122,32 @@ class ScholarWorkflow:
 
 ## 评分规则
 - source_score: 顶级期刊(Lancet/NEJM/Nature)=1.0, 专业期刊(JAMIA/JBI)=0.9, 一般期刊=0.7, 会议=0.6, 预印本=0.4
-- field_score: 医学信息学/EHR/临床预测=1.0, 医学AI=0.9, 通用ML=0.6, 其他=0.3
+- field_score: 与上述研究方向高度相关领域=1.0, 相邻方法学领域=0.9, 通用ML=0.6, 其他=0.3
 - recency_score: 当前年份=1.0, 每早一年扣 0.2（如去年=0.8, 两年前=0.6, 五年以上=0.0）
 - type_score: 综述/Meta分析=1.0, 方法论=0.9, 原创研究=0.7, 应用研究=0.5
 - citation_score: 引用量 > 1000 = 1.0, > 100 = 0.7, > 10 = 0.4, 0 = 0.0
 - priority_score = 0.25*source + 0.25*field + 0.15*recency + 0.15*type + 0.2*citation
 
-## 输出格式（严格JSON数组）
+## 输出格式（严格 JSON 对象，顶层不得是数组）
 ```json
-[
-  {
-    "id": 1,
-    "translated_title": "中文标题",
-    "translated_abstract": "中文摘要（术语标注英文）",
-    "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
-    "relevance_score": 0.85,
-    "relevance_reason": "相关度评估理由",
-    "source_type": "journal/conference/arxiv",
-    "paper_type": "review/research/method",
-    "priority_score": 0.82,
-    "priority_breakdown": {"source_score": 0.9, "field_score": 0.8, "recency_score": 0.7, "type_score": 0.6}
-  }
-]
+{
+  "papers": [
+    {
+      "id": 900001,
+      "translated_title": "中文标题",
+      "translated_abstract": "中文摘要（术语标注英文）",
+      "keywords": ["关键词1", "关键词2", "关键词3", "关键词4", "关键词5"],
+      "relevance_score": 0.85,
+      "relevance_reason": "相关度评估理由",
+      "source_type": "journal/conference/arxiv",
+      "paper_type": "review/research/method",
+      "priority_score": 0.82,
+      "priority_breakdown": {"source_score": 0.9, "field_score": 0.8, "recency_score": 0.7, "type_score": 0.6}
+    }
+  ]
+}
 ```
+示例 id（900001）仅供格式参考，不得出现在你的输出中。
 
 ## 输入论文
 ```json
@@ -1096,21 +1156,30 @@ __PAPERS_JSON__
 
 请严格按照JSON格式输出，ID必须与输入一一对应。"""
         # 不能用 str.format()：模板中的 JSON 示例花括号会被当成格式占位符（KeyError）
+        prompt = prompt.replace("__RESEARCH_INTERESTS__", self.settings.processing.research_interests)
         prompt = prompt.replace("__PAPERS_JSON__", json.dumps(papers_data, ensure_ascii=False, indent=2))
-        
+
         return prompt
     
-    def _call_llm(self, prompt: str, model: Optional[str] = None) -> str:
+    def _call_llm(self, prompt: str, model: Optional[str] = None, json_mode: bool = False) -> str:
         """调用 LLM API（委托 LLMClient）
 
         Args:
             prompt: 提示词
             model: 覆盖默认模型（用于过滤裁决等使用不同档位模型的场景）
+            json_mode: 请求结构化 JSON 输出（DeepSeek response_format=json_object 等）
         """
-        return self.llm_client.call(prompt, model=model)
+        return self.llm_client.call(prompt, model=model, json_mode=json_mode)
     
-    def _parse_llm_response(self, response: str, batch: List[PaperSegment]):
-        """解析 LLM 响应并更新段落（新JSON格式）"""
+    def _parse_llm_response(self, response: str, batch: List[PaperSegment],
+                             valid_ids: Optional[Set[int]] = None):
+        """解析 LLM 响应并更新段落（新JSON格式）。
+
+        valid_ids: 本批合法 id 集合（segment_id）。与 filter 侧 _parse_filter_response 同款
+        防护：flash 级模型会把 prompt 里输出示例的 id 原样回显——若示例 id 落在真实 segment_id
+        空间内，回显内容（示例的"中文标题"/"中文摘要"等占位文本）会静默覆盖同 id 的真实论文。
+        传入本批 valid_ids 后不在集合内的条目直接丢弃，不让示例回显或幻觉 id 污染结果。
+        留空（None/未传）时不做过滤，兼容测试与未传批次上下文的调用方。"""
         try:
             # 尝试提取 JSON
             json_match = response
@@ -1120,58 +1189,98 @@ __PAPERS_JSON__
                 json_match = response.split('```')[1].split('```')[0]
             
             papers = json.loads(json_match.strip())
-            
+
             # 支持两种格式：直接数组或 {papers: [...]}
-            if isinstance(papers, dict) and 'papers' in papers:
-                papers = papers['papers']
-            
-            # 创建 ID 到结果的映射
-            results_map = {p['id']: p for p in papers}
-            
+            if isinstance(papers, dict):
+                if 'papers' in papers:
+                    papers = papers['papers']
+                else:
+                    # 包装键容错：顶层是对象但不含 'papers' 键（模型自造了别的包装键名，
+                    # 如 {"results": [...]}），若恰好只有一个 list 型 value 就取它——
+                    # 与 filter 侧 _parse_filter_response 的 verdicts/papers 双重兼容口径对齐。
+                    list_values = [v for v in papers.values() if isinstance(v, list)]
+                    if len(list_values) == 1:
+                        papers = list_values[0]
+
+            # 创建 ID 到结果的映射（与 filter 侧 _parse_filter_response 同款双保险：
+            # 单条 id 非数字容错 + 本批合法 id 集合过滤，挡示例回显/幻觉 id）
+            results_map: Dict[int, Dict[str, Any]] = {}
+            for p in papers:
+                if not (isinstance(p, dict) and 'id' in p):
+                    continue
+                try:
+                    p_id = int(p['id'])
+                except (TypeError, ValueError):
+                    logger.warning("  响应含非数字 id，丢弃该条: {!r}".format(p.get('id')))
+                    continue
+                if valid_ids is not None and p_id not in valid_ids:
+                    logger.warning("  响应 id={} 不在本批合法 id 集合内，丢弃该条（示例回显/幻觉 id）".format(p_id))
+                    continue
+                results_map[p_id] = p
+
             # 更新段落
             for seg in batch:
-                if seg.segment_id in results_map:
-                    result = results_map[seg.segment_id]
-                    
-                    # 更新翻译内容
-                    seg.translated_abstract = result.get('translated_abstract', '')
-                    seg.summary = result.get('summary', seg.translated_abstract[:200])
-                    
-                    # 更新元数据
+                if seg.segment_id not in results_map:
+                    seg.status = DigestStatus.FAILED
+                    seg.error_message = "Not found in LLM response"
+                    logger.warning("    [MISS] ID {} not in response".format(seg.segment_id))
+                    continue
+                result = results_map[seg.segment_id]
+                try:
+                    # 更新翻译内容。
+                    # translated_abstract 先落地再算默认值（而非把 [:200] 塞进 .get 的默认实参）——
+                    # Python 无条件先求值默认实参，LLM 返回 translated_abstract=null 时
+                    # None[:200] 会当场 TypeError。
+                    # summary：_build_batch_prompt 的输出契约里没有这个字段（prompt 从未
+                    # 要求模型产出），LLM 恒不返回 —— 不再拿摘要前 200 字冒充「AI 归纳」，
+                    # 留空则 notes.py/schema.py/docx_builder.py 的 AI 归纳/AI总结块按现有
+                    # `if seg.summary` 判断自然不渲染，不再产出与摘要逐字重复的假总结。
+                    abstract = result.get('translated_abstract') or ''
+                    seg.translated_abstract = abstract
+                    seg.summary = result.get('summary') or ''
+
+                    # 更新元数据。以下每个字段都用 `or 默认值` 兜 LLM 返回 null 的情形——
+                    # 同一批里一篇 relevance_score/priority_score/keywords=null 曾经在
+                    # float(None)/None 上直接 TypeError，被本 try 外层的批级 except 吞掉后，
+                    # 连带把「排在它之后、已解析正常」的论文也错杀成 FAILED；keywords=None
+                    # 不兜底还会静默写进 metadata，让下游 ", ".join(keywords) 二次爆炸。
                     if 'translated_title' in result:
-                        seg.metadata.translated_title = result['translated_title']
+                        seg.metadata.translated_title = result['translated_title'] or seg.metadata.translated_title
                     if 'keywords' in result:
-                        seg.metadata.keywords = result['keywords']
+                        seg.metadata.keywords = result['keywords'] or []
                     if 'relevance_score' in result:
-                        seg.metadata.relevance_score = float(result['relevance_score'])
+                        seg.metadata.relevance_score = float(result['relevance_score'] or 0)
                     if 'source_type' in result:
-                        seg.metadata.source_type = result['source_type']
+                        seg.metadata.source_type = result['source_type'] or seg.metadata.source_type
                     if 'paper_type' in result:
-                        seg.metadata.paper_type = result['paper_type']
+                        seg.metadata.paper_type = result['paper_type'] or seg.metadata.paper_type
                     if 'priority_score' in result:
                         # 使用 LLM 返回的优先级覆盖规则计算的值
-                        seg.priority_score = float(result['priority_score'])
+                        seg.priority_score = float(result['priority_score'] or 0)
                     if 'priority_breakdown' in result:
-                        breakdown = result['priority_breakdown']
+                        breakdown = result['priority_breakdown'] or {}
                         seg.metadata.priority_reason = "source={:.1f}, field={:.1f}, recency={:.1f}, type={:.1f}".format(
-                            breakdown.get('source_score', 0),
-                            breakdown.get('field_score', 0),
-                            breakdown.get('recency_score', 0),
-                            breakdown.get('type_score', 0)
+                            breakdown.get('source_score', 0) or 0,
+                            breakdown.get('field_score', 0) or 0,
+                            breakdown.get('recency_score', 0) or 0,
+                            breakdown.get('type_score', 0) or 0
                         )
-                    if 'relevance_reason' in result:
+                    if result.get('relevance_reason'):
                         seg.metadata.priority_reason = (seg.metadata.priority_reason or "") + " | " + result['relevance_reason']
-                    
+
                     seg.status = DigestStatus.COMPLETED
                     seg.processed_at = datetime.now()
                     logger.info("    [OK] {} (priority={:.2f}, relevance={:.2f})".format(
                         seg.metadata.title[:40], seg.priority_score, seg.metadata.relevance_score or 0
                     ))
-                else:
+                except Exception as exc:
+                    # 单篇脏数据（某字段被 LLM 返回了意外类型）只废这一篇——绝不能让
+                    # 异常冒出这层 for 循环，否则外层的批级 except 会把本批「排在它
+                    # 之后」的所有论文（包括已经解析正常的）全部错杀成 FAILED。
                     seg.status = DigestStatus.FAILED
-                    seg.error_message = "Not found in LLM response"
-                    logger.warning("    [MISS] ID {} not in response".format(seg.segment_id))
-                    
+                    seg.error_message = "Field update failed: {}".format(exc)
+                    logger.warning("    [FIELD-ERROR] {}: {}".format(seg.segment_id, exc))
+
         except json.JSONDecodeError as e:
             logger.error("  [ERROR] JSON parse failed: {}".format(str(e)))
             # 只把尚未成功的论文标记失败，不回写已 COMPLETED 的

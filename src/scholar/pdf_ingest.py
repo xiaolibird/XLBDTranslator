@@ -25,6 +25,7 @@ from .schema import (
     FilterDecision, CloseReading,
 )
 from .closereading import pdf_to_text, parse_closeread
+from .research_profile import get_contamination_example_terms
 from ..utils.logger import get_logger
 from ..utils.json_tools import strip_code_fences as _strip_json
 
@@ -480,7 +481,7 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
 
 ⚠️ 画像的使用边界（违反会让札记库长期失真，务必遵守）：
 1. 除「对我研究的联想」外，**其余各节只能复述块笔记里确有的内容**，不得引入画像里的术语、
-   框架或方法构想。原文没出现的词（如 MNAR、缺失指纹、跨中心迁移等）就不许出现在
+   框架或方法构想。原文没出现的词（如 {contamination_examples}等）就不许出现在
    研究问题/方法与数据/结果与效应量/图表要点/局限各节里。
 2. **不要把原文措辞升格**：原文写 "non-random"、"违反 MAR 假设"、"非完全随机缺失"，
    就照原样写，不要替它归类成 MNAR 或别的理论框架。
@@ -520,6 +521,7 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
         return None, "", False
     prompt = _SYNTH_PROMPT.format(
         research_interests=research_interests or "（未提供）",
+        contamination_examples="、".join(get_contamination_example_terms()),
         chunk_notes=json.dumps(usable, ensure_ascii=False)[:60000])
     try:
         resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)

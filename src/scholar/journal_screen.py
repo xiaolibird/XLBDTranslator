@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""期刊全量筛选：PubMed 检索 → 标题级黑名单预筛 → filter-v2 LLM 裁决 → 候选导出。
+"""期刊全量筛选：PubMed 检索 → 标题级黑名单预筛 → filter-v3 LLM 裁决 → 候选导出。
 
 与 ScholarWorkflow 的三点关键区别：
 1. 无 Gmail 依赖——纯 PubMed 检索，按期刊名 + 日期区间捞全量
@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .academic_search import AcademicSearchClient, item_to_segment
+from .research_profile import (
+    get_covid_safeguard_keywords,
+    get_journal_blacklist_categories,
+    get_omics_ehr_signal_keywords,
+)
 from .schema import DigestStatus, FilterDecision, PaperMetadata, PaperSegment, ScholarSettings
 from ..utils.logger import get_logger
 
@@ -29,55 +34,25 @@ IN_LIBRARY_SIM_THRESHOLD = 0.85
 # ---------------------------------------------------------------- 黑名单词表
 # 分类组织，每类有一个前缀注释说明口径。
 # 匹配时大小写不敏感，按整词边界 + 复数容忍（复用 _match_title_only 的规则）。
-
-JOURNAL_BLACKLIST_CATEGORIES = {
-    "A-医学影像视觉": [
-        # 大板块：npj DM 近半是医疗影像/AI 读片，与表格 EHR/缺失/因果基本无关
-        "image", "imaging", "neuroimaging",  # neuroimaging 是复合词，整词匹配不命中→显式加
-        "vision", "visual", "segmentation",
-        "radiolog", "radiograph", "radiomic",
-        "CT scan", "X-ray", "mammograph", "ultrasound", "ultrasonograph",
-        "echocardiograph", "fundus", "retinal", "retinopath", "ophthalm",
-        "dermatoscop", "dermoscop", "dermatolog",
-        "histolog", "histopatholog", "pathology image",
-        "endoscop", "colonoscop", "angiograph", "tomograph",
-        "MRI", "magnetic resonance", "PET/CT", "SPECT",
-        "photoacoustic", "hyperspectral",
-    ],
-    "B-可穿戴传感器移动健康": [
-        "wearable", "accelerometer", "smartwatch",
-        "photoplethysmograph", "PPG",
-        "motion sensor", "activity track", "gait",
-        "step count", "sleep track",
-        "digital biomarker", "digital phenotyp",
-        "smartphone sensor", "mobile health app",
-        "consumer wearable",
-    ],
-    "C-纯NLP_LLM无临床深度": [
-        "chatbot", "conversational agent", "question answering",
-        "medical dialogue", "sentiment analysis",
-        "social media", "tweet", "clinical note generation",
-        "note generation", "clinical text summariz",
-    ],
-    "D-纯组学测序": [
-        # 用词干而非完整词：genom 可命中 genomic/genomics/genome/radiogenomic/pharmacogenomic
-        "genom", "proteom", "single-cell", "single cell RNA",
-        "scRNA-seq", "microbio", "metagenom", "metabolom",
-        "transcriptom", "epigenom",
-    ],
-    "E-明显不相关": [
-        "blockchain", "3D print",
-    ],
-}
+# 词表来自 config/research_profile.yaml（journal_blacklist_categories）：
+# A 类 neuroimaging 是复合词，整词匹配不命中→显式加；D 类用词干而非完整词，
+# genom 可命中 genomic/genomics/genome/radiogenomic/pharmacogenomic。
+JOURNAL_BLACKLIST_CATEGORIES = get_journal_blacklist_categories()
 
 # COVID 专项：标题含 COVID/COVID-19/SARS-CoV-2 且不含以下任一词 → 排除
-COVID_SAFEGUARD_KEYWORDS = [
-    "EHR", "electronic health record", "missingness", "MNAR",
-    "causal", "multi-site", "multi-center", "external validation",
-    "transportability", "missing data", "imputation",
-]
+# 词表来自 config/research_profile.yaml（journal_screen.covid_safeguard_keywords）
+COVID_SAFEGUARD_KEYWORDS = get_covid_safeguard_keywords()
 
 # ---------------------------------------------------------------- 匹配逻辑
+
+
+def _esc_cell(text: Any) -> str:
+    """候选列表 Markdown 表格列消毒：裸 `|` 会提前闭合当前列、裸换行会把整行拆成
+    多行——原来只给 title 做了这层转义，one_line（LLM 自由文本，最容易带 `|`）/
+    bucket/role/decision/flags 这些同样拼进表格单元格的列没做，含 `|` 时会把
+    后面所有列错列漂移，实测 filter-v3 的一句话用途偶尔会写成 `A|B 两种情形`
+    这类带竖线的短语。所有拼进表格单元格的自由文本列统一走这一个函数。"""
+    return str(text or "").replace("|", "\\|").replace("\n", " ")
 
 
 def _match_title_only(title: str, keywords: List[str]) -> Optional[str]:
@@ -111,9 +86,8 @@ def _hit_blacklist(title: str) -> Optional[Tuple[str, str]]:
             # D-分类有特殊规则：如果标题同时出现 EHR/electronic health record
             # 或 clinical prediction 等临床词，不算命中（组学+EHR 可能是相关论文）
             if cat == "D-纯组学测序":
-                ehr_signal = ["EHR", "electronic health record", "clinical predict",
-                              "missing data", "missingness", "MNAR", "imputation",
-                              "multi-site", "multi-center", "external validation"]
+                # 词表来自 config/research_profile.yaml（journal_screen.omics_ehr_signal_keywords）
+                ehr_signal = get_omics_ehr_signal_keywords()
                 if any(s.lower() in title_lower for s in ehr_signal):
                     continue  # 不排除：组学 + EHR 组合可能是相关的
             return (cat, hit)
@@ -139,7 +113,7 @@ class JournalScreener:
 
     两阶段工作流：
     1. `search_and_blacklist()` — PubMed 检索 + 标题黑名单 → 落盘中间结果
-    2. `run_filter()` — 读中间结果 → classify_segments(filter-v2) → 候选 JSON/MD
+    2. `run_filter()` — 读中间结果 → classify_segments(filter-v3) → 候选 JSON/MD
     """
 
     def __init__(self, output_dir: Path, settings: ScholarSettings):
@@ -285,18 +259,45 @@ class JournalScreener:
                      len(items), len(kept), len(skipped), len(whitelist))
         return kept, skipped, len(skipped)
 
-    # ---- Stage 2: filter-v2 ----
+    # ---- Stage 2: filter-v3 ----
+
+    def _empty_result(self, search_results: Dict[str, Any], total_input: int,
+                      kw_skipped: int = 0) -> Dict[str, Any]:
+        """run_filter 两条空结果早退分支与主路径共用的字段骨架。
+
+        早退分支若只给 candidates/total_input 几个字段，export_candidates 拿
+        result.get("journal", "journal") 当 slug 落盘成 journal_candidates.json（不是
+        {真实期刊}_candidates.json），_write_candidates_md 的降量表也全兜成 0——
+        真实原因（PubMed 捞到多少篇、被黑名单/关键词砍掉多少）在产物里完全看不到。
+        """
+        total = search_results.get("total_pubmed", 0)
+        bl_excluded = search_results.get("blacklist_excluded", 0)
+        return {
+            "journal": search_results.get("journal", "journal"),
+            "date_range": search_results.get("date_range"),
+            "generated_at": datetime.now().isoformat(),
+            "total_pubmed": total,
+            "blacklist_excluded": bl_excluded,
+            "after_blacklist": total - bl_excluded,
+            "keyword_prefilter_skipped": kw_skipped,
+            "total_input": total_input,
+            "entered_filter": 0,
+            "filter_method": "none",
+            "candidates_count": 0,
+            "filter_stats": {},
+            "candidates": [],
+        }
 
     def run_filter(self, search_results: Dict[str, Any],
                    prefilter: bool = True, llm_filter: bool = True) -> Dict[str, Any]:
-        """关键词预筛 + filter-v2 LLM 裁决（llm_filter=False 时跳过 LLM）。
+        """关键词预筛 + filter-v3 LLM 裁决（llm_filter=False 时跳过 LLM）。
 
         prefilter=True（默认）：先跑白名单关键词预筛。
         llm_filter=False：只做关键词预筛，按命中词生成候选，不调 LLM。"""
         kept = search_results.get("kept", [])
         if not kept:
             logger.warning("Stage 1 无保留论文，跳过 filter")
-            return {"candidates": [], "total_input": 0}
+            return self._empty_result(search_results, total_input=0)
 
         kw_skipped = 0
         n_input = len(kept)
@@ -304,10 +305,10 @@ class JournalScreener:
             kept, _, kw_skipped = self.keyword_prefilter(kept)
             if not kept:
                 logger.warning("关键词预筛后无保留论文")
-                return {"candidates": [], "total_input": n_input,
-                        "keyword_prefilter_skipped": kw_skipped}
+                return self._empty_result(search_results, total_input=n_input,
+                                          kw_skipped=kw_skipped)
 
-        logger.info("filter-v2 裁决: {} 篇论文{}",
+        logger.info("filter-v3 裁决: {} 篇论文{}",
                      len(kept), "" if llm_filter else " (仅关键词)")
 
         if not llm_filter:
@@ -321,23 +322,32 @@ class JournalScreener:
             seg = item_to_segment(it, segment_id=i + 1)
             segments.append(seg)
 
-        # 调 classify_segments（force_include=False：信任 filter-v2 EXCLUDE）
+        # 调 classify_segments（force_include=False：信任 filter-v3 EXCLUDE）
         from .ingest import classify_segments
         classify_segments(segments, self.settings, force_include=False)
 
-        # 收集候选：INCLUDE + MAYBE + THREAT
+        # 收集候选：INCLUDE + MAYBE + UNDECIDED（THREAT 是 flags 旗标，只有真正的
+        # EXCLUDE 不进候选）。UNDECIDED 是 workflow._fallback_partition 在 LLM
+        # 批次异常/单篇 id 缺失时挂的裁决（verdict="undecided", decision=None）：
+        # 语义是「没判过」，不是「判了无关」，必须单列，不能并入 EXCLUDE 静默消失
+        # ——那样用户会以为 LLM 已经判定无关，实际上根本没跑到那篇论文的裁决。
         candidates = []
-        stats = {"INCLUDE": 0, "MAYBE": 0, "EXCLUDE": 0, "THREAT": 0, "BENCHMARK": 0,
-                 "OVERCLAIM_PRECEDENT": 0}
+        stats = {"INCLUDE": 0, "MAYBE": 0, "UNDECIDED": 0, "EXCLUDE": 0,
+                 "THREAT": 0, "BENCHMARK": 0, "OVERCLAIM_PRECEDENT": 0}
         for seg in segments:
             fd = seg.filter_decision
             if fd is None:
                 stats["EXCLUDE"] += 1
                 continue
 
-            if fd.decision == "INCLUDE":
+            if fd.verdict == "undecided" or fd.decision is None:
+                decision_label = "UNDECIDED"
+                stats["UNDECIDED"] += 1
+            elif fd.decision == "INCLUDE":
+                decision_label = "INCLUDE"
                 stats["INCLUDE"] += 1
             elif fd.decision == "MAYBE":
+                decision_label = "MAYBE"
                 stats["MAYBE"] += 1
             else:
                 stats["EXCLUDE"] += 1
@@ -357,10 +367,11 @@ class JournalScreener:
                 "doi": seg.metadata.doi,
                 "pmid": seg.metadata.pmid,
                 "abstract": (seg.original_abstract or "")[:800],
-                "decision": fd.decision,
+                "decision": decision_label,
                 "bucket": fd.bucket or [],
                 "role": fd.role,
-                "one_line": fd.one_line or "",
+                "one_line": fd.one_line or fd.reason or (
+                    "LLM 裁决失败待人工复核" if decision_label == "UNDECIDED" else ""),
                 "flags": fd.flags or [],
                 "confidence": fd.confidence or 0.0,
                 "library_neighbors": fd.library_neighbors or [],
@@ -370,12 +381,16 @@ class JournalScreener:
             })
 
         logger.info(
-            "filter-v2 完成: INCLUDE={}, MAYBE={}, EXCLUDE={}, THREAT={}, BENCHMARK={}",
-            stats["INCLUDE"], stats["MAYBE"], stats["EXCLUDE"],
+            "filter-v3 完成: INCLUDE={}, MAYBE={}, UNDECIDED={}, EXCLUDE={}, THREAT={}, BENCHMARK={}",
+            stats["INCLUDE"], stats["MAYBE"], stats["UNDECIDED"], stats["EXCLUDE"],
             stats["THREAT"], stats["BENCHMARK"])
+        if stats["UNDECIDED"]:
+            logger.warning(
+                "  ⚠️ {} 篇 LLM 裁决失败待人工复核（UNDECIDED，已计入候选而非 EXCLUDE）"
+                .format(stats["UNDECIDED"]))
 
         candidates.sort(key=lambda c: (
-            0 if c["decision"] == "INCLUDE" else 1,
+            {"INCLUDE": 0, "MAYBE": 1, "UNDECIDED": 2}.get(c["decision"], 3),
             -(c.get("confidence") or 0),
         ))
 
@@ -437,6 +452,7 @@ class JournalScreener:
             "generated_at": datetime.now().isoformat(),
             "total_pubmed": search_results["total_pubmed"],
             "blacklist_excluded": search_results["blacklist_excluded"],
+            "after_blacklist": search_results["total_pubmed"] - search_results["blacklist_excluded"],
             "keyword_prefilter_skipped": kw_skipped,
             "entered_filter": len(kept),
             "filter_method": "keyword_only",
@@ -474,11 +490,14 @@ class JournalScreener:
         after_kw = after_bl - kw_skipped
 
         filter_method = result.get("filter_method", "llm")
-        method_label = "关键词白名单" if filter_method == "keyword_only" else "filter-v2 LLM"
+        method_label = {"keyword_only": "关键词白名单", "none": "无（提前终止，见下方降量表）"}.get(
+            filter_method, "filter-v3 LLM")
 
         lines = [
             "# {} 文献筛候选列表".format(result.get("journal", "")),
             "",
+            "| 项目 | 值 |",
+            "|---|---|",
             "| 生成时间 | {} |".format(result.get("generated_at", "")),
             "| 日期范围 | {} 至 {} |".format(
                 (result.get("date_range") or ["?", "?"])[0],
@@ -514,18 +533,17 @@ class JournalScreener:
             lines.append(
                 "|---|------|------|------|------|------|------------|--------|-----|")
             for i, c in enumerate(candidates, 1):
-                title = (c.get("title") or "")[:60]
-                title = title.replace("|", "\\|").replace("\n", " ")
+                title = _esc_cell((c.get("title") or "")[:60])
                 year = c.get("year") or "?"
-                decision = c.get("decision", "?")
-                bucket = ",".join(c.get("bucket", []))
-                role = c.get("role") or "-"
-                one_line = (c.get("one_line") or "")[:40]
+                decision = _esc_cell(c.get("decision", "?"))
+                bucket = _esc_cell(",".join(c.get("bucket", [])))
+                role = _esc_cell(c.get("role") or "-")
+                one_line = _esc_cell((c.get("one_line") or "")[:40])
                 conf = c.get("confidence", 0)
                 in_lib = "📚" if c.get("in_library") else ""
                 flags = ""
                 if c.get("flags"):
-                    flags = " " + ",".join(c["flags"])
+                    flags = " " + _esc_cell(",".join(c["flags"]))
 
                 lines.append(
                     "| {} | {} | {} | {}{} | {} | {} | {} | {:.0%} | {} |".format(

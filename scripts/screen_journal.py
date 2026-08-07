@@ -3,7 +3,7 @@
 
 针对指定期刊做两阶段文献筛选：
   Stage 1 (search)：PubMed 全量检索 + 标题级黑名单预筛 → search_results.json
-  Stage 2 (filter)：filter-v2 LLM 三态裁决 → candidates.json + candidates.md
+  Stage 2 (filter)：filter-v3 LLM 三态裁决 → candidates.json + candidates.md
 
 两步可独立运行、中间介入人工审查降量效果后再续跑。也支持一步到底。
 
@@ -12,7 +12,7 @@
   PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" \\
       --from 2021-08-01 --to 2026-08-01 --stage search
 
-  # 审查降量分布后，续跑 filter-v2
+  # 审查降量分布后，续跑 filter-v3
   PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" --stage filter
 
   # 一步到底（search + filter 连跑）
@@ -90,7 +90,7 @@ def cmd_search(args, output_dir: Path):
 
 
 def cmd_filter(args, output_dir: Path):
-    """Stage 2: filter-v2 LLM 裁决（--no-llm 时仅关键词筛选）"""
+    """Stage 2: filter-v3 LLM 裁决（--no-llm 时仅关键词筛选）"""
     settings = _load_settings()
     screener = JournalScreener(output_dir, settings)
 
@@ -101,7 +101,7 @@ def cmd_filter(args, output_dir: Path):
     # 打印裁决摘要
     stats = result.get("filter_stats", {})
     print("\n" + "=" * 60)
-    print("Stage 2 完成: filter-v2 LLM 三态裁决")
+    print("Stage 2 完成: filter-v3 LLM 三态裁决")
     print("=" * 60)
     print("输入论文: {} 篇".format(result.get("after_blacklist", "?")))
     print("候选论文: {} 篇".format(result.get("candidates_count", "?")))
@@ -131,14 +131,14 @@ def cmd_filter(args, output_dir: Path):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="期刊全量筛选——PubMed 检索 + 黑名单预筛 + filter-v2 LLM 裁决",
+        description="期刊全量筛选——PubMed 检索 + 黑名单预筛 + filter-v3 LLM 裁决",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
             "  # Step 1: 检索+黑名单\n"
             '  PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" '
             "--from 2021-08-01 --to 2026-08-01 --stage search\n\n"
-            "  # Step 2: filter-v2 裁决\n"
+            "  # Step 2: filter-v3 裁决\n"
             '  PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" --stage filter\n\n'
             "  # 一步到底\n"
             '  PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" '

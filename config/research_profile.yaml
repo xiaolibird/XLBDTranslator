@@ -1,0 +1,251 @@
+# 研究方向单点配置
+# ------------------------------------------------------------------
+# 换研究方向时只改这一个文件。加载优先级：env（各调用方自己的 env 覆盖，
+# 如 PROCESSING__RESEARCH_INTERESTS）> 本文件（yaml）> 内嵌默认（本文件缺失
+# 或解析失败时，src/scholar/research_profile.py 里的 _DEFAULT_PROFILE 兜底，
+# 与本文件默认值逐字一致，保证 filter-v3 裁决行为不因误删本文件而突变）。
+#
+# 加载方 = src/scholar/research_profile.py::get_profile()，被以下五处消费：
+#   - src/scholar/settings.py         ProcessingSettings.research_interests / whitelist 默认值
+#   - config/prompts/whitelist_filter_prompt.md  {{INCLUSION_DIMS}}/{{EXCLUSION_DIMS}} 占位符
+#                                      （经 src/scholar/workflow.py 填充）
+#   - src/scholar/journal_screen.py   COVID 豁免词表 / 组学豁免词表 / 期刊标题黑名单 A-E 类目
+#   - src/scholar/pdf_ingest.py       深度精读汇总阶段的防污染例举词
+#   - src/scholar/vault.py            BUCKET_LABEL（A-G 筛选维度中文名）
+#
+# 改这个文件不会自动生效于「本文件缺失时」的兜底路径——那部分需要同步改
+# research_profile.py 的 _DEFAULT_PROFILE（正常运营不会走到，只是保险丝）。
+
+# 论文主题与定位：注入 LLM 方法学审稿 prompt 的 {{RESEARCH_INTERESTS}}，
+# 也是深度精读汇总阶段「对我研究的联想」一节的输入。
+interests: >-
+  论文主题：EHR 缺失机制（MNAR）与「缺失条件依赖结构」的跨中心可迁移性；定位为
+  causal hypothesis generation，不做 causal identification。基础工作：MA-GCT（特征专属可学习掩码嵌入 +
+  Guide/Prior 注意力约束）。
+
+# filter-v3 三态裁决的纳入维度（命中任一 → 进入候选池）。
+# 整段注入 whitelist_filter_prompt.md 的 {{INCLUSION_DIMS}}，含标题行。
+inclusion_dims: |-
+  # 纳入维度（命中任一 → 进入候选池）
+  A. 缺失机制方法学：MNAR / MAR、missingness mechanism diagnosis、
+     Little's test、informative missingness、missingness indicator、
+     missingness as signal / mask、imputation distortion。
+  B. 缺失感知建模：missingness-aware architecture、mask embedding、
+     learnable mask token、attention with missing input、
+     graph learning with attribute missing、feature propagation。
+  C. 缺失 × 因果：missingness graph (m-graph)、MNAR identifiability、
+     causal discovery under missing data、test-order / measurement confounding、
+     missingness indicators as DAG nodes。
+  D. 跨域/跨中心迁移：transportability、domain shift / dataset shift、
+     external validation across databases、LODO、site heterogeneity、
+     distribution shift in EHR。
+  E. 对抗性证据（**必须捕获，不得因“结论与本文相反”而排除**）：
+     声称因果特征集不提升泛化、causal features vs. all features、
+     attention ≠ causality、可解释性权重的可靠性质疑。
+  F. venue 基准：多库大规模 ICU 预测验证（MIMIC-IV / eICU / AmsterdamUMCdb / HiRID）。
+  G. 临床落地场景：sepsis subphenotype、AKI、CKD/透析、ICU 死亡率预测。
+
+# filter-v3 三态裁决的排除维度（命中 → drop，除非同时强命中 A/C/E）。
+# 整段注入 whitelist_filter_prompt.md 的 {{EXCLUSION_DIMS}}，含标题行。
+exclusion_dims: |-
+  # 排除维度（命中 → drop，除非同时强命中 A/C/E）
+  X1. 纯影像 / 基因组 / 单细胞 / 蛋白组，无表格型 EHR。
+  X2. 时序填补方法本身的增量改进（新 imputer + 更低 RMSE），无下游/机制分析。
+  X3. 综述/观点文，且不提供可引用的定量证据或分类框架。
+  X4. LLM/foundation model 通用能力，未涉及缺失或迁移。
+  X5. RCT / 流行病学关联研究，无方法学贡献。
+  X6. 因果推断纯理论（do-calculus、identification proofs），无缺失或无实证。
+  X7. 会议 workshop 短文、无实验的 preprint stub。
+
+# journal_screen.py 的标题级黑名单豁免词表
+journal_screen:
+  # COVID 专项：标题含 COVID/COVID-19/SARS-CoV-2 且不含以下任一词 → 排除
+  covid_safeguard_keywords:
+    - "EHR"
+    - "electronic health record"
+    - "missingness"
+    - "MNAR"
+    - "causal"
+    - "multi-site"
+    - "multi-center"
+    - "external validation"
+    - "transportability"
+    - "missing data"
+    - "imputation"
+  # 组学豁免：D-纯组学测序类命中时，若标题同时出现以下临床/方法学信号词，
+  # 不算命中黑名单（组学 + EHR 组合可能是相关论文）
+  omics_ehr_signal_keywords:
+    - "EHR"
+    - "electronic health record"
+    - "clinical predict"
+    - "missing data"
+    - "missingness"
+    - "MNAR"
+    - "imputation"
+    - "multi-site"
+    - "multi-center"
+    - "external validation"
+
+# pdf_ingest.py 深度精读汇总阶段（_SYNTH_PROMPT）的防污染例举词：
+# 提醒 LLM「原文没出现的画像术语不许出现在复述性小节里」时举的例子。
+pdf_ingest:
+  contamination_example_terms:
+    - "MNAR"
+    - "缺失指纹"
+    - "跨中心迁移"
+
+# settings.py ProcessingSettings.whitelist：keyword 过滤模式下的白名单关键词（52 词，
+# llm 模式下仅作 LLM 失败时的回退词表）。也是 journal_screen.py keyword_prefilter 的降量词表。
+whitelist_keywords:
+  # EHR / 临床预测
+  - "EHR"
+  - "Electronic Health Record"
+  - "EMR"
+  - "Electronic Medical Record"
+  - "Clinical Prediction"
+  - "Predictive Model"
+  - "Risk Prediction"
+  - "Clinical Decision Support"
+  # 缺失机制方法学
+  - "MNAR"
+  - "MAR"
+  - "missing not at random"
+  - "missingness"
+  - "informative missingness"
+  - "missing data"
+  - "imputation"
+  - "mask embedding"
+  - "missingness-aware"
+  - "missingness indicator"
+  # 缺失 × 因果
+  - "missingness graph"
+  - "m-graph"
+  - "causal discovery"
+  - "causal structure"
+  - "identifiability"
+  # 跨域 / 迁移
+  - "transportability"
+  - "domain shift"
+  - "dataset shift"
+  - "distribution shift"
+  - "external validation"
+  - "LODO"
+  - "site heterogeneity"
+  - "generalization"
+  # 建模
+  - "GNN"
+  - "Graph Neural Network"
+  - "Graph Convolutional"
+  - "attention"
+  - "feature propagation"
+  - "LLM"
+  - "Large Language Model"
+  - "foundation model"
+  - "Transformer"
+  - "Semi-supervised"
+  - "Active Learning"
+  # venue 基准 / 临床场景
+  - "MIMIC"
+  - "eICU"
+  - "AmsterdamUMCdb"
+  - "HiRID"
+  - "ICU"
+  - "sepsis"
+  - "AKI"
+  - "acute kidney injury"
+  - "CKD"
+  - "mortality prediction"
+
+# journal_screen.py JOURNAL_BLACKLIST_CATEGORIES：期刊全量筛选 Stage 1 的标题级黑名单
+# （A-E 五类词表，大小写不敏感 + 整词边界 + 复数容忍）。D 类命中时若标题同时出现
+# EHR/临床信号词，视为豁免（组学 + EHR 组合可能是相关论文），见 _hit_blacklist 的
+# omics_ehr_signal_keywords（journal_screen 键）。
+journal_blacklist_categories:
+  "A-医学影像视觉":
+    - "image"
+    - "imaging"
+    - "neuroimaging"
+    - "vision"
+    - "visual"
+    - "segmentation"
+    - "radiolog"
+    - "radiograph"
+    - "radiomic"
+    - "CT scan"
+    - "X-ray"
+    - "mammograph"
+    - "ultrasound"
+    - "ultrasonograph"
+    - "echocardiograph"
+    - "fundus"
+    - "retinal"
+    - "retinopath"
+    - "ophthalm"
+    - "dermatoscop"
+    - "dermoscop"
+    - "dermatolog"
+    - "histolog"
+    - "histopatholog"
+    - "pathology image"
+    - "endoscop"
+    - "colonoscop"
+    - "angiograph"
+    - "tomograph"
+    - "MRI"
+    - "magnetic resonance"
+    - "PET/CT"
+    - "SPECT"
+    - "photoacoustic"
+    - "hyperspectral"
+  "B-可穿戴传感器移动健康":
+    - "wearable"
+    - "accelerometer"
+    - "smartwatch"
+    - "photoplethysmograph"
+    - "PPG"
+    - "motion sensor"
+    - "activity track"
+    - "gait"
+    - "step count"
+    - "sleep track"
+    - "digital biomarker"
+    - "digital phenotyp"
+    - "smartphone sensor"
+    - "mobile health app"
+    - "consumer wearable"
+  "C-纯NLP_LLM无临床深度":
+    - "chatbot"
+    - "conversational agent"
+    - "question answering"
+    - "medical dialogue"
+    - "sentiment analysis"
+    - "social media"
+    - "tweet"
+    - "clinical note generation"
+    - "note generation"
+    - "clinical text summariz"
+  "D-纯组学测序":
+    - "genom"
+    - "proteom"
+    - "single-cell"
+    - "single cell RNA"
+    - "scRNA-seq"
+    - "microbio"
+    - "metagenom"
+    - "metabolom"
+    - "transcriptom"
+    - "epigenom"
+  "E-明显不相关":
+    - "blockchain"
+    - "3D print"
+
+# vault.py BUCKET_LABEL：A-G 七个筛选维度的中文名（tag/MOC 页标题用），
+# 语义与 inclusion_dims 里的 A-G 一一对应，改研究方向时两处要一起改。
+bucket_labels:
+  A: "缺失机制方法学"
+  B: "缺失感知建模"
+  C: "缺失与因果"
+  D: "跨域跨中心迁移"
+  E: "对抗性证据"
+  F: "多库ICU基准"
+  G: "临床落地场景"
