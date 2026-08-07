@@ -221,14 +221,19 @@ def _merge_csl(entry: Dict[str, Any], item: Dict[str, Any]) -> None:
                                           fallback=entry.get("citekey", ""))
 
 
-def _locate_headings(md_path: Path) -> Dict[str, Any]:
-    """citekey -> (行号, 标题行)，供 sidecar 条目补 note_line/note_heading。"""
-    out = {}
+def _locate_headings(md_path: Path) -> Dict[str, List[Any]]:
+    """citekey -> [(行号, 标题行), ...]（按文件内出现顺序），供 sidecar 条目按序回填
+    note_line/note_heading。
+
+    同一 citekey 在一份 md 里出现多次（近重复文献分别精读）时，各次出现都要保留——
+    dict 单值会让后写的覆盖先写的，导致所有该 citekey 的 sidecar 条目都指向最后一节。
+    """
+    out: Dict[str, List[Any]] = {}
     try:
         for i, line in enumerate(Path(md_path).read_text(encoding="utf-8").splitlines(), 1):
             m = _SECTION_RE.match(line)
             if m:
-                out[m.group(4)] = (i, line)
+                out.setdefault(m.group(4), []).append((i, line))
     except Exception:
         pass
     return out
@@ -265,8 +270,16 @@ def build_month_entries(month: str, md_path: Path,
         # 按 citekey 匹配）。新 sidecar（v3+，含 highlights）直接沿用，不触碰。
         hl_map = ({m["citekey"]: m for m in parse_note_md(md_path)}
                   if any("highlights" not in e for e in entries) else {})
+        # sidecar 条目已按 priority_rank 排好，与 build_digest_note 落盘顺序一致——
+        # 同 citekey 出现多次时（近重复文献各自精读）按出现次序逐个认领，不能整批复用
+        # 同一个 (行号, 标题)，否则第二条以后全部指向最后一节。
+        _loc_cursor: Dict[str, int] = {}
         for e in entries:
-            loc = locs.get(e.get("citekey"))
+            ck = e.get("citekey")
+            candidates = locs.get(ck) or []
+            i = _loc_cursor.get(ck, 0)
+            loc = candidates[i] if i < len(candidates) else None
+            _loc_cursor[ck] = i + 1
             e["note_line"] = loc[0] if loc else None
             e["note_heading"] = loc[1] if loc else None
             if "highlights" not in e:
@@ -673,7 +686,10 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
                             old: str, new: str) -> bool:
     """把 entry 所在札记里的 [@old] 改为 [@new]，并同步 references.json 的 id。
 
-    优先按 entry.note_line 定点替换（防同名键误伤），找不到再全文首个命中。
+    必须按 entry.note_line 定点替换——同 citekey 在同一份 md 里可以出现多次（近重复
+    文献各自精读），"全文首个命中" 回退会在这种情况下改错节：改的是另一条同 key 条目
+    的标题行，而当前 entry 真正所在的那一节反而没改。note_line 没命中就跳过并报错，
+    不瞎猜。
     """
     md = Path(notes_dir) / entry["note_file"]
     try:
@@ -683,13 +699,12 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
         return False
     tag_old, tag_new = "[@{}]".format(old), "[@{}]".format(new)
     ln = entry.get("note_line")
-    hit_line = None
     if ln and 1 <= ln <= len(lines) and tag_old in lines[ln - 1]:
         hit_line = ln - 1
     else:
-        hit_line = next((i for i, l in enumerate(lines) if tag_old in l), None)
-    if hit_line is None:
-        logger.warning("  ⚠️ 未在 {} 找到 {}，跳过".format(md.name, tag_old))
+        logger.warning(
+            "  ⚠️ {} 的 note_line={} 未命中 {}，跳过改键（同 key 多节时拒绝瞎猜首个命中）".format(
+                md.name, ln, tag_old))
         return False
     lines[hit_line] = lines[hit_line].replace(tag_old, tag_new)
     # 原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致
@@ -774,6 +789,28 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
 
 
 # ---------------- backfill 去重集 ----------------
+
+def existing_citekeys(index_path: Path,
+                      exclude_note_files: Optional[Set[str]] = None) -> Set[str]:
+    """从索引读取全部 citekey 全集，供兜底键生成时判断「库内已占用」。
+
+    exclude_note_files：本次要整篇重写的札记文件名集合（如 {"科研札记_2024-03_全文精读.md"}）。
+    这些文件里的旧条目必须剔除——否则本批重算出同样的兜底键会被判「已占用」而加消歧
+    后缀，下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
+    同一坑三处链路共用：backfill_notes.run_month（按月）、ingest.run_ingest（按周）、
+    read_pdf._rebuild_month（历史已修，现改调本函数）。
+    """
+    p = Path(index_path)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return set()   # 索引损坏时退化为空集（仅影响本次消歧判断，不影响去重正确性）
+    excl = exclude_note_files or set()
+    return {e.get("citekey") for e in data.get("papers", [])
+            if e.get("citekey") and e.get("note_file") not in excl}
+
 
 def load_seen_keys(index_path: Path,
                    exclude_months: Optional[Set[str]] = None) -> Set[str]:

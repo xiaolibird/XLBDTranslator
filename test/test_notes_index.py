@@ -121,6 +121,30 @@ def test_sidecar_preferred_over_md(tmp_path):
     assert by["public2025Deep"]["note_line"]                     # 落盘上下文仍从 md 定位
 
 
+def test_sidecar_duplicate_citekey_gets_distinct_note_lines(tmp_path):
+    """回归 notes_index.py:230 — 同一 citekey 在一份 md 里出现多次(误配撞键)时,
+    _locate_headings 若用 dict 单值会让后写的覆盖先写的,sidecar 每条条目的
+    note_line 就全指向最后一节。修复后须按出现顺序逐条认领,各自指向自己的小节。"""
+    _write_month(tmp_path, citekeys={"pa": "shared2025Key", "pb": "shared2025Key", "pc": None},
+                 sidecar=True)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    same_key = [e for e in entries if e["citekey"] == "shared2025Key"]
+    assert len(same_key) == 2
+    lines = [e["note_line"] for e in same_key]
+    assert len(set(lines)) == 2, "两条同 citekey 条目的 note_line 不能撞到同一行"
+    # 各自的 note_heading 都必须真的含 [@shared2025Key]（自证落点在正确的小节标题上）
+    for e in same_key:
+        assert e["note_heading"] and "[@shared2025Key]" in e["note_heading"]
+    # priority_score 更高的 pa 排在前面，其 note_line 应更小（更靠文件前部）
+    by_title = {e["title"]: e for e in same_key}
+    a = by_title["Deep | EHR [Models] under MNAR"]
+    b = by_title["Graph Transformers for Missingness"]
+    assert a["note_line"] < b["note_line"]
+
+
 # ---------------- 去重 / 撞键 ----------------
 
 def test_dedup_earliest_month_wins():
@@ -204,6 +228,24 @@ def test_fix_citekey_collisions_renames_later_month(tmp_path):
     # 最早月原键不动
     md1 = (tmp_path / "科研札记_2024-01_全文精读.md").read_text(encoding="utf-8")
     assert "[@wang2024Same]" in md1
+
+
+def test_rename_citekey_in_note_skips_on_note_line_mismatch(tmp_path):
+    """回归 notes_index.py:687 — note_line 没有真实命中 [@old] 时必须跳过改键,
+    不能退化成「全文首个命中」瞎猜；否则同 citekey 出现多次时会改错别的那一条。"""
+    _write_month(tmp_path, citekeys={"pa": "shared2025Key", "pb": "shared2025Key", "pc": None})
+    stem = "科研札记_2025-03_全文精读"
+    md = tmp_path / (stem + ".md")
+    entries = ni.build_month_entries("2025-03", md,
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=None)
+    b = next(e for e in entries if e["title"] == "Graph Transformers for Missingness")
+    entry_bad = dict(b)
+    entry_bad["note_line"] = 1     # 伪造一个不含 [@shared2025Key] 的行号（文件顶端 front matter）
+    ok = ni._rename_citekey_in_note(tmp_path, entry_bad, "shared2025Key", "shared2025Keyb")
+    assert ok is False
+    text = md.read_text(encoding="utf-8")
+    assert text.count("[@shared2025Key]") == 2   # 两条都原样保留，谁也没被误改
 
 
 def test_citekey_collision_detected():
@@ -662,6 +704,31 @@ def test_load_seen_keys_corrupt_index_raises(tmp_path):
         ni.load_seen_keys(p)
     # 文件不存在仍是"首次运行"语义，返回空集不抛
     assert ni.load_seen_keys(tmp_path / "nope.json") == set()
+
+
+def test_existing_citekeys_excludes_own_note_file(tmp_path):
+    """exclude_note_files 剔除本次要整篇重写的札记自己的旧条目——否则重跑时兜底键
+    重算出同样的 base 会被判「库内已占用」而加消歧后缀，来回改名（citekey 抖动）。"""
+    p = tmp_path / "literature_index.json"
+    p.write_text(json.dumps({"papers": [
+        {"citekey": "wang2024Missing", "note_file": "科研札记_2024-03_全文精读.md"},
+        {"citekey": "other2023Key", "note_file": "科研札记_2023-11_全文精读.md"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+    all_keys = ni.existing_citekeys(p)
+    assert all_keys == {"wang2024Missing", "other2023Key"}
+
+    excl = ni.existing_citekeys(p, exclude_note_files={"科研札记_2024-03_全文精读.md"})
+    assert excl == {"other2023Key"}
+
+
+def test_existing_citekeys_missing_or_corrupt_index_returns_empty(tmp_path):
+    """索引不存在或损坏时退化为空集（只影响消歧判断，不影响去重正确性——
+    与 load_seen_keys 的 fail-fast 语义不同，这里没有"重复入库"风险）。"""
+    assert ni.existing_citekeys(tmp_path / "nope.json") == set()
+    p = tmp_path / "literature_index.json"
+    p.write_text('{"papers": [{"citekey": "a2024', encoding="utf-8")   # 截断
+    assert ni.existing_citekeys(p) == set()
 
 
 def test_write_if_changed_atomic_no_tmp_residue(tmp_path):

@@ -4,7 +4,7 @@
 背景：周报（digest）判完就把结果丢在 `output/scholar_digest/*.json`，从不写札记——
 因为 `write_notes()` 埋在 `workflow._step_sync_zotero()` 里，被 `zotero_enabled`
 一起关掉了（无人值守跑不了 Zotero 桌面端）。本模块把那最后一段接回来，并且
-**直接复用 digest JSON 里已有的 filter-v2 裁决，不重跑 LLM 筛选**。
+**直接复用 digest JSON 里已有的 filter-v3 裁决，不重跑 LLM 筛选**。
 
 三条入口共用同一条管线（收集 segments → 跨库去重 → 元数据增强 → citekey →
 top-N 全文精读 → write_notes）：
@@ -275,7 +275,7 @@ def segments_from_identifiers(ids: Sequence[str], email: str = "") -> List[Paper
 
 def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
                       force_include: bool = True) -> None:
-    """就地给 segments 打 filter-v2 裁决（bucket/role/flags/one_line）。
+    """就地给 segments 打 filter-v3 裁决（bucket/role/flags/one_line）。
 
     force_include：手选的论文即便被判 EXCLUDE 也强行入库——用户已经用行动表态了。
     但**保留** LLM 给的 bucket/role/flags，否则这些论文在 vault 里全落进「未分维度」。
@@ -305,6 +305,35 @@ def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
 
 
 # ---------------------------------------------------------------- 共用管线
+
+def _existing_note_dedup_keys(out_dir: Path, filename: str) -> Optional[Set[str]]:
+    """读同名周札记的 sidecar 索引，取其已收录论文的 dedup_key 全集。
+
+    write_notes() 是 `open(path, "w")` 整篇重写：同一 label 第二次跑若 segs 里
+    不含上一批论文（跨库去重会把它们过滤掉——它们已经"在库里"），整篇覆盖会
+    把上一批已入库论文从 md/references/sidecar 里连根抹掉。这里在落盘前探一
+    次既有内容，供调用方判断本批是否会造成数据丢失。
+
+    Returns:
+        None：同名 md 不存在，可放心写。
+        非空 set：同名 md 存在，返回其已收录论文的 dedup_key 集合（理论上不会是
+                空集——run_ingest 对 0 篇 segs 提前 return，从不会写出零条目的
+                札记）。
+
+    Raises:
+        Exception：sidecar 缺失/损坏，无法确认既有内容。故意不吞掉——调用方须
+                   把"读不出既有内容"当成"可能会覆盖丢弃"同等保守处理，不能
+                   静默当作"没有既有内容"直接放行覆盖。
+    """
+    from .notes import _slug
+    slug = _slug(filename, 80) or "scholar_digest"
+    note_path = out_dir / "{}.md".format(slug)
+    if not note_path.exists():
+        return None
+    sidecar_path = out_dir / "{}.index.json".format(slug)
+    data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    return {e.get("dedup_key") for e in data.get("papers", []) if e.get("dedup_key")}
+
 
 def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: str,
                top_n: int = 5, close_read: bool = True,
@@ -375,20 +404,42 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
         full_text = sum(1 for s in segs if s.close_reading and s.close_reading.from_full_text)
 
     from .notes import write_notes
-    existing_ckeys = set()
+    from .notes_index import existing_citekeys
+    notes_out_dir = Path(proc.notes_dir)
+    note_filename = "科研札记_{}_全文精读".format(label)
+    # 排除本次要重写的周札记自己的旧条目——否则本批重算出同样的兜底键会被判「库内
+    # 已占用」而加消歧后缀，下一轮又因为后缀键才是「已占用」而改回原键，来回改名
+    # （citekey 抖动，同 backfill_notes.run_month / read_pdf._rebuild_month 同源坑）。
+    # 正常路径已被 _existing_note_dedup_keys 的整篇覆盖检查挡住，但 --no-dedup 或
+    # 本批覆盖既有全集时仍会走到这里，防御一下不额外增加成本。
     idx_path = Path(proc.notes_dir) / "literature_index.json"
-    if idx_path.exists():
-        try:
-            existing_ckeys = {p.get("citekey") for p in
-                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
-                              if p.get("citekey")}
-        except Exception as e:
-            logger.debug("literature_index.json 读取失败 [{}]: {}", idx_path, e)
+    existing_ckeys = existing_citekeys(
+        idx_path, exclude_note_files={"{}.md".format(note_filename)})
+    try:
+        existing_dk = _existing_note_dedup_keys(notes_out_dir, note_filename)
+    except Exception as e:
+        raise RuntimeError(
+            "周札记 {} 已存在但索引 sidecar 无法读取（{}），无法确认既有内容是否会被"
+            "整篇覆盖丢弃，拒绝写入。请改用不同的 --label 重跑，或先修复/补齐 sidecar 后再试。"
+            .format(note_filename, e))
+    if existing_dk is not None:
+        new_dk = {dedup_key(seg.metadata) for seg in segs}
+        missing_dk = existing_dk - new_dk
+        if missing_dk:
+            # write_notes 会用本批 segs 整篇覆盖同名 md/references/sidecar；本批不
+            # 含既有文件里的全部论文，直接写会把 missing_dk 那些论文从库里抹掉
+            # （连带它们的 citekey/向量/vault 笔记）。宁可拒绝，让调用方换个
+            # --label（或先把上一批一起传进来）。
+            raise RuntimeError(
+                "周札记 {} 已存在且含 {} 篇本批未覆盖的论文（[@key] 与索引会被整篇覆盖丢弃）："
+                "拒绝写入以避免数据丢失。请改用不同的 --label 重跑，或把上一批论文与本批"
+                "一起传入后再跑。".format(note_filename, len(missing_dk)))
+
     res = write_notes(
-        list(segs), citekeys, out_dir=Path(proc.notes_dir),
+        list(segs), citekeys, out_dir=notes_out_dir,
         instruction=proc.notes_instruction,
         digest_title="科研札记 · {}{}".format(label, title_suffix),
-        filename="科研札记_{}_全文精读".format(label),
+        filename=note_filename,
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True, existing_citekeys=existing_ckeys)
 

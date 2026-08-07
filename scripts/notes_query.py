@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from src.scholar.notes_index import is_missing_citekey  # noqa: E402
+
 INDEX_PATH = REPO / "output" / "scholar_notes" / "literature_index.json"  # 模块级常量，向后兼容
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
@@ -118,8 +121,14 @@ def main() -> int:
             len(index["citekey_collisions"])), file=sys.stderr)
 
     results = []
+    skipped_missing = 0
     for e in index["papers"]:
         if not isinstance(e, dict) or e.get("duplicate_of") or not e.get("citekey"):
+            continue
+        # MISSING-KEY 占位键不对应任何真实文献；build_all_references/vault/embed_store
+        # 三处消费方都拦截了它，这里必须一致，否则 --cite 会吐出书目里查无此人的死引用。
+        if is_missing_citekey(e):
+            skipped_missing += 1
             continue
         if args.tier and e.get("priority_tier") != args.tier:
             continue
@@ -138,6 +147,9 @@ def main() -> int:
                                 0 if r[2] == "highlight" else 1, -len(r[1])))
     shown = results if args.limit == 0 else results[:args.limit]
     truncated = len(results) - len(shown)
+    if skipped_missing:
+        print("⚠️ {} 条占位键（MISSING-KEY，无 Zotero citekey）条目已跳过——补 citekey 后"
+              "重跑 notes_index.py 重建索引".format(skipped_missing), file=sys.stderr)
 
     if args.as_json:
         print(json.dumps({

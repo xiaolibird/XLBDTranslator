@@ -83,8 +83,10 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
     proc.closeread_enabled = False       # 精读在本驱动里单独跑
     proc.external_sources_enabled = True # PubMed + arXiv
     proc.filter_mode = "llm"
-    # 过夜吞吐优化：整月 Gmail 常有数百篇，逐篇 AI 归纳太慢；
-    # 交付重点是 top-N 全文精读，非 top-N 只保留摘要即可 → 默认关摘要级归纳、加大筛选批量。
+    # 过夜吞吐优化：整月 Gmail 常有数百篇，逐篇跑 LLM 批处理步骤太慢；
+    # 交付重点是 top-N 全文精读，非 top-N 只保留摘要即可 → 默认关批处理步骤、加大筛选批量。
+    # 注：generate_summary 不产出独立总结（batch prompt 从未要求模型给 summary 字段），
+    # 只影响非 top-N 论文是否仍跑一遍关键词/相关度/优先级评分。
     proc.translate_abstracts = False
     proc.generate_summary = bool(args.summary)
     proc.batch_size = max(proc.batch_size, args.batch_size)
@@ -159,7 +161,10 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
         label, len(fresh), hit_ck, len(fresh), full_text, cr, ax, ts))
     return {"month": label, "status": "ok", "included": len(segs), "fresh": len(fresh),
             "citekey": hit_ck, "full_text": full_text,
-            "md": res["note_path"], "docx": res.get("docx_path")}
+            "md": res["note_path"], "docx": res.get("docx_path"),
+            # index_sidecar：本月 write_notes 顺手写出的 {slug}.index.json，供 main()
+            # 把本月新生成的兜底 citekey 并回 existing_ckeys（碰撞窗口修复，见 main()）。
+            "index_sidecar": res.get("index_sidecar")}
 
 
 def prev_month_label(today=None):
@@ -178,7 +183,8 @@ def main():
     ap.add_argument("--config", default="config/scholar.env")
     ap.add_argument("--top-n", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=15, help="LLM 筛选批量（过夜吞吐）")
-    ap.add_argument("--summary", action="store_true", help="为非 top-N 也生成 AI 归纳（更慢）")
+    ap.add_argument("--summary", action="store_true",
+                    help="为非 top-N 也跑一遍 LLM 批处理步骤（更慢；不产出独立总结，只影响关键词/相关度/优先级评分）")
     ap.add_argument("--no-close-read", action="store_true")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--token-path", default="", help="独立 Gmail token 副本路径（并行分片防写冲突）")
@@ -219,22 +225,20 @@ def main():
             results = []
     # 全局去重集：从文献索引恢复（跨运行持久化——跑新月份不与历史月重复）。
     # --force 重跑历史月时剔除待跑月份自己的键，否则本月论文全在 seen 里会被 dedup 成空札记。
-    from src.scholar.notes_index import load_seen_keys
+    from src.scholar.notes_index import load_seen_keys, existing_citekeys
     run_months = {"{:04d}-{:02d}".format(y, m) for y, m in months}
     seen: set = load_seen_keys(
         Path(settings.processing.notes_dir) / "literature_index.json",
         exclude_months=run_months if args.force else None)
     logger.info("跨运行去重集：从索引恢复 {} 个键".format(len(seen)))
-    # 与 seen 同源一次性计算 existing_ckeys，避免 41 个月每轮重复读 literature_index.json
-    existing_ckeys: set = set()
+    # 与 seen 同源一次性计算 existing_ckeys，避免 41 个月每轮重复读 literature_index.json。
+    # --force 重跑历史月时排除本次要重写的札记文件自己的旧 citekey——否则本月兜底键重算出
+    # 同一个 base 时会被判「库内已占用」而加消歧后缀，下一轮又因为后缀键才是「已占用」而
+    # 改回原键，来回改名（citekey 抖动，同 read_pdf._rebuild_month 已修过的坑）。
+    own_note_files = ({"科研札记_{}_全文精读.md".format(label) for label in run_months}
+                      if args.force else set())
     idx_path = Path(settings.processing.notes_dir) / "literature_index.json"
-    if idx_path.exists():
-        try:
-            existing_ckeys = {p.get("citekey") for p in
-                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
-                              if p.get("citekey")}
-        except Exception:
-            pass
+    existing_ckeys: set = existing_citekeys(idx_path, exclude_note_files=own_note_files)
 
     for i, (y, m) in enumerate(months, 1):
         label = "{:04d}-{:02d}".format(y, m)
@@ -250,6 +254,16 @@ def main():
             logger.error("❌ {} 失败：{}".format(label, e))
             logger.error(traceback.format_exc())
             r = {"month": label, "status": "error", "error": str(e)}
+        if r.get("status") == "ok" and r.get("index_sidecar"):
+            # 碰撞窗口修复：existing_ckeys 只在循环开始前从 literature_index.json 算过
+            # 一次快照，主索引要等本轮全部月份跑完才由 update_index 刷新——本月刚生成
+            # 的兜底 citekey 若不当场并回 existing_ckeys，下一个月遇到同样的 base
+            # （常客作者连续几个月都在库里投稿很常见）会看不到本月已占用这个键，算出
+            # 同一个兜底 citekey，两个月各出一篇同名 citekey 的札记。
+            try:
+                existing_ckeys |= existing_citekeys(Path(r["index_sidecar"]))
+            except Exception as e:
+                logger.warning("  ⚠️ 并回本月 sidecar citekey 失败（不影响本月已写盘的札记）: {}".format(e))
         r["elapsed_sec"] = round(time.time() - t0, 1)
         results = [x for x in results if x.get("month") != label] + [r]
         # 原子写：先写 tmp 再 os.replace，避免半写 JSON 丢失整月进度

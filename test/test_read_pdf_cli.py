@@ -7,6 +7,7 @@
     结果重读了一篇 2026-06 已精读过的论文。
 """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -118,3 +119,88 @@ def test_repo_root_is_the_repo():
     from src.scholar.paths import REPO_ROOT
     assert (REPO_ROOT / "src" / "scholar" / "pdf_ingest.py").exists()
     assert (REPO_ROOT / "scripts" / "read_pdf.py").exists()
+
+
+# ---------------- _rebuild_month citekey 抖动回归 ----------------
+
+def _manual_seg(paper_id, title, author, doi, year=2026):
+    from datetime import date as _date
+    from src.scholar.schema import (
+        PaperSegment, PaperMetadata, FilterDecision, CloseReading,
+        CloseReadSection, CloseReadSentence,
+    )
+    fd = FilterDecision(paper_id=paper_id, title=title, verdict="included",
+                        decision="INCLUDE", stage="llm_judge", one_line="手动深读文献")
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        CloseReadSection(heading="研究问题", sentences=[
+            CloseReadSentence(text="研究缺失机制。", tag=None)])])
+    return PaperSegment(
+        segment_id=1, paper_id=paper_id, priority_score=1.0,
+        metadata=PaperMetadata(paper_id=paper_id, title=title, authors=[author], doi=doi,
+                               publication_date=_date(year, 8, 1)),
+        filter_decision=fd, close_reading=cr)
+
+
+def _write_final_bundle(notes_dir, month, seg, pdf_path):
+    from src.scholar import pdf_ingest as pi
+    bf = pi.bundle_path(notes_dir, month, seg.paper_id)
+    pi.write_bundle(bf, status="final", month=month, pdf_path=pdf_path,
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+    return bf
+
+
+class _FakeProc:
+    notes_instruction = ""
+    notes_emit_docx = False
+    notes_docx_cjk_font = ""
+
+
+class _FakeSettings:
+    processing = _FakeProc()
+
+
+def _citekey_of(notes_dir, paper_title):
+    idx = json.loads((notes_dir / "literature_index.json").read_text(encoding="utf-8"))
+    for p in idx["papers"]:
+        if p.get("title") == paper_title:
+            return p.get("citekey")
+    return None
+
+
+def test_rebuild_month_keeps_existing_citekey_stable_across_reruns(tmp_path):
+    """回归 read_pdf.py:266 — 同月第二次 finalize 不能把第一篇的 citekey 抖成 xxxb 再抖回来。
+
+    第一次 finalize（仅 A）落 citekey 到索引；第二次 finalize（新增 B 后整月重建）
+    此前会把 A 自己上一轮写入索引的 citekey 误判为「库内已占用」，被迫加消歧后缀。
+    """
+    month = "2026-08"
+    segA = _manual_seg("pa", "Missing Data Structures Paper", "Zhang", "10.1/a")
+    _write_final_bundle(tmp_path, month, segA, "/a.pdf")
+
+    r1 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r1["papers"] == 1
+    key_a_first = _citekey_of(tmp_path, "Missing Data Structures Paper")
+    assert key_a_first and not key_a_first.endswith("b")
+
+    # 追加第二篇不同论文，触发整月重建
+    segB = _manual_seg("pb", "Second Independent Paper", "Wang", "10.1/b")
+    _write_final_bundle(tmp_path, month, segB, "/b.pdf")
+
+    r2 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r2["papers"] == 2
+    key_a_second = _citekey_of(tmp_path, "Missing Data Structures Paper")
+    key_b = _citekey_of(tmp_path, "Second Independent Paper")
+
+    assert key_a_second == key_a_first, (
+        "A 的 citekey 在第二次 finalize 后被抖动：{} -> {}".format(key_a_first, key_a_second))
+    assert key_b and key_b != key_a_second
+
+    # 第三次 finalize（再加一篇 C）：A、B 的键仍应保持不变
+    segC = _manual_seg("pc", "Third Independent Paper", "Li", "10.1/c")
+    _write_final_bundle(tmp_path, month, segC, "/c.pdf")
+    r3 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r3["papers"] == 3
+    assert _citekey_of(tmp_path, "Missing Data Structures Paper") == key_a_first
+    assert _citekey_of(tmp_path, "Second Independent Paper") == key_b

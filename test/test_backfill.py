@@ -272,6 +272,143 @@ def test_failed_month_keys_not_in_seen_for_later_months(tmp_path, monkeypatch):
     assert seen  # 落盘成功后键才并入
 
 
+def test_force_excludes_own_month_citekeys_from_existing_ckeys(tmp_path, monkeypatch):
+    """--force 重跑某月时，existing_ckeys 不应包含该月自己在索引里的旧 citekey——
+    否则兜底键生成会把上一轮的 base 键判成「库内已占用」而加消歧后缀，下一轮又
+    因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。"""
+    import scripts.backfill_notes as bn
+
+    monkeypatch.chdir(tmp_path)
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "literature_index.json").write_text(json.dumps({
+        "papers": [
+            {"citekey": "wang2024Missing", "note_file": "科研札记_2026-06_全文精读.md"},
+            {"citekey": "other2023Key", "note_file": "科研札记_2026-05_全文精读.md"},
+        ]
+    }, ensure_ascii=False), encoding="utf-8")
+
+    env_file = tmp_path / "scholar_test.env"
+    env_file.write_text(
+        "GMAIL__CREDENTIALS_PATH=fake/creds.json\n"
+        "GMAIL__TOKEN_PATH=fake/token.json\n"
+        "LLM__PROVIDER=gemini\n"
+        "LLM__GEMINI_API_KEY=FAKE_KEY_FOR_TEST\n"
+        "LLM__MODEL=fake-model\n"
+        "PROCESSING__NOTES_DIR={}\n".format(notes_dir),
+        encoding="utf-8",
+    )
+
+    captured = {}
+
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+        captured["existing_ckeys"] = set(existing_ckeys)
+        return {"month": "{:04d}-{:02d}".format(y, m), "status": "ok"}
+
+    monkeypatch.setattr(bn, "run_month", fake_run_month)
+    monkeypatch.setattr(sys, "argv",
+                        ["backfill_notes.py", "--since", "2026-06", "--until", "2026-06",
+                         "--no-index", "--force", "--config", str(env_file)])
+
+    bn.main()
+
+    assert "wang2024Missing" not in captured["existing_ckeys"]  # 本月自己的旧键已排除
+    assert "other2023Key" in captured["existing_ckeys"]         # 别的月份键仍算「已占用」
+
+
+def test_no_force_keeps_own_month_citekeys_in_existing_ckeys(tmp_path, monkeypatch):
+    """不带 --force 的正常跑（新月份）不该排除任何 note_file——existing_ckeys 就该是
+    索引里的全量键，这样新论文才能避开库内已有的 citekey 撞名。"""
+    import scripts.backfill_notes as bn
+
+    monkeypatch.chdir(tmp_path)
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "literature_index.json").write_text(json.dumps({
+        "papers": [
+            {"citekey": "wang2024Missing", "note_file": "科研札记_2026-06_全文精读.md"},
+        ]
+    }, ensure_ascii=False), encoding="utf-8")
+
+    env_file = tmp_path / "scholar_test.env"
+    env_file.write_text(
+        "GMAIL__CREDENTIALS_PATH=fake/creds.json\n"
+        "GMAIL__TOKEN_PATH=fake/token.json\n"
+        "LLM__PROVIDER=gemini\n"
+        "LLM__GEMINI_API_KEY=FAKE_KEY_FOR_TEST\n"
+        "LLM__MODEL=fake-model\n"
+        "PROCESSING__NOTES_DIR={}\n".format(notes_dir),
+        encoding="utf-8",
+    )
+
+    captured = {}
+
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+        captured["existing_ckeys"] = set(existing_ckeys)
+        return {"month": "{:04d}-{:02d}".format(y, m), "status": "ok"}
+
+    monkeypatch.setattr(bn, "run_month", fake_run_month)
+    monkeypatch.setattr(sys, "argv",
+                        ["backfill_notes.py", "--since", "2026-07", "--until", "2026-07",
+                         "--no-index", "--config", str(env_file)])
+
+    bn.main()
+
+    assert "wang2024Missing" in captured["existing_ckeys"]
+
+
+def test_sidecar_citekeys_merged_into_existing_ckeys_across_months(tmp_path, monkeypatch):
+    """多月同进程内跑：本月新生成的兜底 citekey（sidecar）必须在下一个月调用
+    run_month 前就并进 existing_ckeys——否则同一进程内连续两个月遇到同样的
+    作者+年份 base 会各自算出同一个兜底键（existing_ckeys 只在循环开始前从
+    literature_index.json 算过一次快照，主索引要等全部月份跑完才由 update_index
+    刷新，看不到本月刚写盘的键）。"""
+    import scripts.backfill_notes as bn
+
+    monkeypatch.chdir(tmp_path)
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "literature_index.json").write_text(
+        json.dumps({"papers": []}), encoding="utf-8")
+
+    env_file = tmp_path / "scholar_test.env"
+    env_file.write_text(
+        "GMAIL__CREDENTIALS_PATH=fake/creds.json\n"
+        "GMAIL__TOKEN_PATH=fake/token.json\n"
+        "LLM__PROVIDER=gemini\n"
+        "LLM__GEMINI_API_KEY=FAKE_KEY_FOR_TEST\n"
+        "LLM__MODEL=fake-model\n"
+        "PROCESSING__NOTES_DIR={}\n".format(notes_dir),
+        encoding="utf-8",
+    )
+
+    # 第一个月的 sidecar：write_notes 顺手写出的 {slug}.index.json，含一个新生成的兜底键
+    sidecar_1 = notes_dir / "科研札记_2026-06_全文精读.index.json"
+    sidecar_1.write_text(json.dumps({"papers": [{"citekey": "wang2026Deep"}]},
+                                    ensure_ascii=False), encoding="utf-8")
+
+    captured = []
+
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+        label = "{:04d}-{:02d}".format(y, m)
+        captured.append((label, set(existing_ckeys)))
+        if label == "2026-06":
+            return {"month": label, "status": "ok", "index_sidecar": str(sidecar_1)}
+        return {"month": label, "status": "ok"}
+
+    monkeypatch.setattr(bn, "run_month", fake_run_month)
+    monkeypatch.setattr(sys, "argv",
+                        ["backfill_notes.py", "--since", "2026-06", "--until", "2026-07",
+                         "--no-index", "--config", str(env_file)])
+
+    bn.main()
+
+    assert captured[0][0] == "2026-06"
+    assert "wang2026Deep" not in captured[0][1]    # 6 月开跑前索引里还没有这个键
+    assert captured[1][0] == "2026-07"
+    assert "wang2026Deep" in captured[1][1]         # 7 月开跑前已并回，避免撞名
+
+
 # ---------------- top-N 精读候选随 priority_score 变化（R2 回归） ----------------
 
 

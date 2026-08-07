@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+from .llm_client import LLMClient
 from .schema import PaperSegment, ScholarSettings
 from ..utils.logger import get_logger
 
@@ -33,42 +34,52 @@ class DeepResearchClient:
             settings: ScholarSettings 配置对象
         """
         self.settings = settings
-        self._client = None
-        
+        self._llm_client = None
+
         # 输出目录
         self.output_dir = settings.processing.output_dir / "deep_research"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         logger.info("DeepResearchClient initialized")
         logger.info("   Output directory: {}".format(self.output_dir))
-    
+
     @property
-    def client(self):
-        """懒加载 Gemini 客户端"""
-        if self._client is None:
-            from google import genai
-            self._client = genai.Client(api_key=self.settings.llm.api_key)
-        return self._client
-    
+    def llm_client(self) -> LLMClient:
+        """懒加载 LLMClient：走统一回退链（settings.llm.provider → fallback_providers），
+        不再钉死单一 Gemini provider/模型 ID（该实验版模型已下线）。"""
+        if self._llm_client is None:
+            self._llm_client = LLMClient(self.settings.llm)
+        return self._llm_client
+
+    def close(self):
+        """释放 LLMClient 持有的连接（openai-compatible/ollama 分支持有 httpx.Client）。"""
+        if self._llm_client is not None:
+            self._llm_client.close()
+            self._llm_client = None
+
     def generate_thesis_introduction(
         self,
         papers: List[PaperSegment],
-        research_topic: str = "EHR Data Mining and Clinical Prediction using GNN and LLM",
+        research_topic: Optional[str] = None,
         target_words: int = 15000,
         save_output: bool = True
     ) -> Dict[str, Any]:
         """
         生成博士论文绪论
-        
+
         Args:
             papers: 已处理的论文列表（按优先级排序）
-            research_topic: 研究主题
+            research_topic: 研究主题；留空（None）时从 settings.processing.research_interests
+                （单点化配置见 config/research_profile.yaml）派生，不再硬编码某个具体研究方向
             target_words: 目标字数
             save_output: 是否保存输出
-            
+
         Returns:
             生成结果字典
         """
+        if not research_topic or not research_topic.strip():
+            research_topic = self.settings.processing.research_interests or "基于本地文献库的综述"
+
         logger.info("=" * 60)
         logger.info("Starting Thesis Introduction Generation")
         logger.info("=" * 60)
@@ -79,12 +90,12 @@ class DeepResearchClient:
         # 筛选高优先级论文
         top_papers = self._select_top_papers(papers, max_papers=50)
         logger.info("   Selected top {} papers for analysis".format(len(top_papers)))
-        
+
         # 构建 prompt
         prompt = self._build_thesis_prompt(top_papers, research_topic, target_words)
-        
-        # 加载 prompt 模板（如果存在）
-        prompt_file = Path("config/prompts/thesis_introduction_prompt.md")
+
+        # 加载 prompt 模板（如果存在）；基于模块 __file__ 推导仓库根，避免 cwd 漂移时静默 fallback 到内联版
+        prompt_file = Path(__file__).resolve().parents[2] / "config" / "prompts" / "thesis_introduction_prompt.md"
         if prompt_file.exists():
             template = prompt_file.read_text(encoding='utf-8')
             prompt = self._merge_with_template(template, top_papers, research_topic)
@@ -147,27 +158,24 @@ You are helping a PhD student in Medical Informatics write the Introduction chap
 
 **Research Topic**: {topic}
 
-**Research Areas**:
-- Electronic Health Record (EHR) data mining
-- Clinical prediction models
-- Graph Neural Networks (GNN) for healthcare
-- Large Language Models (LLM) in medicine
-- Semi-supervised learning for clinical applications
+**Research Interests**:
+{interests}
 
 ## Requirements
 
 ### 1. Structure (Target: {words} words)
 1. Research Background (3000-4000 words)
-   - Development of medical informatization
-   - Value and challenges of EHR data
-   - Rise of AI in healthcare
+   - Real-world problem and data/method context in this field
+   - Why the problem matters and is worth studying now
+   - How the phenomenon translates into a concrete research question
 
 2. Literature Review (8000-10000 words)
-   - Traditional clinical prediction methods
-   - Deep learning approaches in EHR
-   - Graph-based methods for medical data
-   - LLM applications in clinical settings
-   - Research gaps and opportunities
+   - Organize by methodological lineage (not paper-by-paper): from
+     traditional/early approaches to recent mainstream methods
+   - For each lineage, synthesize the input papers along a
+     chronological/technical-evolution axis
+   - Summarize representative ideas, strengths and limitations of each lineage
+   - Research gaps and opportunities, tied to the research interests above
 
 3. Research Questions (1500-2000 words)
    - Problem statement
@@ -203,10 +211,11 @@ Please generate the thesis introduction in Markdown format with:
 Begin generation:
 """.format(
             topic=research_topic,
+            interests=self.settings.processing.research_interests,
             words=target_words,
             papers=papers_text
         )
-        
+
         return prompt
     
     def _format_papers_for_prompt(self, papers: List[PaperSegment]) -> str:
@@ -253,62 +262,47 @@ Begin generation:
         
         # 替换占位符
         result = template.replace("{{RESEARCH_TOPIC}}", research_topic)
+        result = result.replace("{{RESEARCH_INTERESTS}}", self.settings.processing.research_interests)
         result = result.replace("{{PAPERS_LIST}}", papers_text)
         result = result.replace("{{PAPER_COUNT}}", str(len(papers)))
         result = result.replace("{{GENERATION_DATE}}", datetime.now().strftime("%Y-%m-%d"))
-        
+
         return result
     
     def _call_deep_research(self, prompt: str) -> Dict[str, Any]:
         """
-        调用 Deep Research API
-        
-        Note: Gemini Deep Research 可能需要特殊的 API 调用方式
-        这里提供一个基础实现，可能需要根据实际 API 调整
+        调用 LLM 生成深度研究内容。
+
+        经由 LLMClient 走统一回退链（settings.llm.provider → fallback_providers，
+        对齐 workflow/closereading 的通路），不再钉死单个已下线的 Gemini 实验模型
+        ID，也不再绕开 fallback 链单挑 Gemini API key。模型档位复用
+        closeread_model（全文精读/长文生成用的强模型），未设置时退回主模型 model
+        （与 ingest.run_ingest 的 closeread 调用同一取值口径）。
         """
+        model = self.settings.llm.closeread_model or self.settings.llm.model
         try:
-            from google.genai import types
-            
-            # 使用更大的模型进行深度研究
-            # 如果有 Deep Research 专用 API，在这里替换
-            model = "gemini-2.5-pro-exp-03-25"  # 或 "gemini-2.0-flash-thinking-exp-01-21"
-            
             logger.info("   Using model: {}".format(model))
             logger.info("   Prompt length: {} chars".format(len(prompt)))
-            
-            # 配置生成参数
-            config = types.GenerateContentConfig(
-                temperature=0.7,  # 稍微提高创造性
-                max_output_tokens=65536,  # 最大输出
-                # 如果支持的话，启用深度研究模式
-                # thinking_config=types.ThinkingConfig(thinking_budget=24576)
-            )
-            
             logger.info("   Generating content (this may take several minutes)...")
             start_time = time.time()
-            
-            response = self.client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config
-            )
-            
+
+            text = self.llm_client.call(
+                prompt, model=model, max_tokens=65536, temperature=0.7)
+
             elapsed = time.time() - start_time
             logger.info("   Generation completed in {:.1f} seconds".format(elapsed))
-            
-            # 提取结果
-            text = response.text if hasattr(response, 'text') else str(response)
-            
+
             return {
                 'success': True,
                 'content': text,
                 'model': model,
+                'provider': self.llm_client.current_provider,
                 'elapsed_seconds': elapsed,
                 'prompt_length': len(prompt),
                 'output_length': len(text),
                 'generated_at': datetime.now().isoformat()
             }
-            
+
         except Exception as e:
             logger.error("Deep Research API call failed: {}".format(str(e)))
             return {
@@ -407,11 +401,23 @@ Begin generation:
 4. Discuss limitations and gaps
 5. Suggest future directions
 
+## Output Structure (target: 3000-5000 words)
+1. Introduction (scope and objective of the review)
+2. Thematic synthesis (organize by method/theme, not paper-by-paper)
+3. Research gaps and open questions
+4. Future directions
+
+## Citation Requirements
+- Cite every claim using the paper's list number below, e.g. [3] or (Author, Year)
+- The bracketed number must match that paper's numbering in "Papers for Review" below
+- Prefer the input papers below; do not invent papers or numbers not present in the list
+
 ## Papers for Review
 {papers}
 
 ## Output
-Generate a comprehensive literature review in academic style.
+Generate a comprehensive literature review in academic style, in Markdown
+with clear section headers and a reference list at the end.
 """.format(
             type=review_type.title(),
             area=focus_area,

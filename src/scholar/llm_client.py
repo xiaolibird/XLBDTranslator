@@ -37,6 +37,14 @@ _AGENT_SEMAPHORE = threading.Semaphore(4)
 # 一起隔离，headless 直接报 "Not logged in"。
 _AGENT_CWD = Path.home() / '.claude-pipeline-cwd'
 
+# 数字状态码须整词匹配：避免命中 request id（如 req-a402fb99）或计数
+# （如 "4021 tokens"）里恰好出现的数字子串。语义对齐 translator/fallback.py
+# 的 classify_fatal 里的 _HARD_CODE_RE（该文件独立实现，禁止跨模块 import——
+# 两边的异常类型体系不同，fallback.py 走 APIError.message，这里是裸 str(e)）。
+_FATAL_CODE_RE = re.compile(r'\b(401|402|403)\b')
+_FATAL_PHRASES = ('quota', 'resource_exhausted', 'resource exhausted', 'api key',
+                   'permission denied', 'payment required', 'insufficient balance')
+
 
 class LLMClient:
     """封装 LLM 连接与调用。只依赖 LLMSettings，无 workflow 状态。
@@ -114,9 +122,21 @@ class LLMClient:
                 self._chain_idx += 1
         raise RuntimeError("所有 LLM provider 均不可用（回退链已耗尽: {}）".format(self._chain))
 
-    def _advance_chain(self, reason: str) -> bool:
-        """切到下一个 provider。返回是否成功切换（False=链已耗尽）。"""
+    def _advance_chain(self, failed_conn: dict, reason: str) -> bool:
+        """切到下一个 provider。返回「是否应该用新 conn 重试」（False=链已耗尽）。
+
+        failed_conn 是调用方失败时实际使用的那份 conn（call() 里 self.conn 取到
+        的那份）。多线程共享同一个 LLMClient 时，几个线程可能几乎同时对同一个
+        provider 判定失败：若不核对 failed_conn 是否仍是当前 conn，会出现「线程1
+        切到 idx 1，线程2/3/4 各自再把指针往前推一格」，一次失败烧穿整条回退
+        链，健康的下家 provider 一次真实请求都没发过（对齐
+        translator/fallback.py._mark_failed 的 idx 校验）。
+        """
         with self._conn_lock:
+            if self._conn is not failed_conn:
+                # 其他线程已经切换过（self._conn 已被重建或清空）：直接告知调用方
+                # 用新 conn 重试，不再重复推进指针。
+                return True
             if self._chain_idx + 1 >= len(self._chain):
                 return False
             old = self._chain[self._chain_idx]
@@ -229,9 +249,7 @@ class LLMClient:
         if isinstance(e, RuntimeError) and 'claude cli' in str(e).lower():
             return True
         text = str(e).lower()
-        return any(k in text for k in ('401', '402', '403', 'quota', 'resource_exhausted',
-                                       'resource exhausted', 'api key', 'permission denied',
-                                       'payment required', 'insufficient balance'))
+        return bool(_FATAL_CODE_RE.search(text)) or any(k in text for k in _FATAL_PHRASES)
 
     def call(self, prompt: str, model: Optional[str] = None,
              max_tokens: Optional[int] = None, temperature: Optional[float] = None,
@@ -250,7 +268,7 @@ class LLMClient:
             except Exception as e:
                 if not self._is_switchable(e):
                     raise
-                if not self._advance_chain(str(e)):
+                if not self._advance_chain(conn, str(e)):
                     raise
 
     def _call_once(self, conn: dict, prompt: str, model: Optional[str],
@@ -271,7 +289,7 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 if provider == 'claude-agent':
-                    return self._call_agent(prompt, model, json_mode)
+                    return self._call_agent(conn, prompt, model, json_mode)
 
                 if provider == 'gemini':
                     from google.genai import types
@@ -283,6 +301,20 @@ class LLMClient:
                         contents=prompt,
                         config=types.GenerateContentConfig(**cfg),
                     )
+                    if not response.text:
+                        # response.text 在安全拦截 / MAX_TOKENS 截断时为 None，直接
+                        # 返回会违反本方法「返回 str」的契约，下游按 str 处理拿到
+                        # TypeError、错因也丢了。这里不用 switchable 的关键词（如
+                        # 401/403/quota），是有意的：安全拦截是内容层裁决，换
+                        # provider 不代表能绕过，不应触发 _is_switchable 切链。
+                        finish_reason = None
+                        try:
+                            finish_reason = response.candidates[0].finish_reason
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Gemini 响应内容为空（finish_reason={}），"
+                            "可能被安全过滤拦截或 max_output_tokens 不足".format(finish_reason))
                     return response.text
 
                 # OpenAI 兼容
@@ -303,7 +335,16 @@ class LLMClient:
                 if resp.status_code == 429 or resp.status_code >= 500:
                     raise _RetryableHTTP("HTTP {}".format(resp.status_code))
                 resp.raise_for_status()
-                return resp.json()['choices'][0]['message']['content']
+                body = resp.json()
+                content = body['choices'][0]['message']['content']
+                if not content:
+                    # 同 gemini 分支：content 在内容过滤 / 空补全时可为 None，
+                    # 直接返回违反契约，改为抛出带明确原因的异常。
+                    finish_reason = body['choices'][0].get('finish_reason')
+                    raise RuntimeError(
+                        "OpenAI 兼容响应内容为空（finish_reason={}），"
+                        "可能被内容过滤拦截或模型未生成有效输出".format(finish_reason))
+                return content
             except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
                     subprocess.TimeoutExpired) as e:
                 last_exc = e
@@ -318,8 +359,11 @@ class LLMClient:
     # claude CLI headless：用订阅额度跑，不消耗 API key
     # ------------------------------------------------------------------
 
-    def _call_agent(self, prompt: str, model: str, json_mode: bool) -> str:
-        conn = self.conn
+    def _call_agent(self, conn: dict, prompt: str, model: str, json_mode: bool) -> str:
+        # 用调用方传入的 conn（_call_once 里已解析好的那份），不重新读 self.conn——
+        # 并发场景下另一线程可能已经 _advance_chain 重建了 conn，届时 self.conn
+        # 会是别家 provider 的连接（如取到 openai-compatible 的 dict，没有
+        # cli_path，KeyError）。
         if json_mode:
             # claude CLI 没有原生 json_mode，靠指令约束 + 事后剥 ``` 围栏
             prompt = prompt + "\n\n【输出要求】只输出一个合法 JSON 对象，不要任何解释文字或 Markdown 代码围栏。"

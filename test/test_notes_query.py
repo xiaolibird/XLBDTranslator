@@ -154,6 +154,34 @@ def test_missing_index_exits_2(tmp_path, monkeypatch, capsys):
     assert code == 2 and "notes_index.py" in out.err     # 给出可操作提示
 
 
+def test_missing_key_placeholder_excluded_from_cite(fake_index, monkeypatch, capsys):
+    """回归 notes_query.py:122 — MISSING-KEY 占位条目不能被 --cite 吐出来。
+
+    build_all_references/vault.select_papers/embed_store.chunks_from_index 三处消费方
+    都用 is_missing_citekey 拦截了这类条目（未从 BBT 回查到 citekey 时的兜底），
+    notes_query 必须同一口径，否则 [@MISSING-KEY-...] 会被粘进论文正文渲染成死引用。"""
+    fake_index([
+        _paper("MISSING-KEY-10.1000/xyz", citekey_source="missing",
+               highlights=[_hl("citable", "MNAR 证据一句")]),
+        _paper("real2025Y", highlights=[_hl("citable", "MNAR 证据另一句")]),
+    ])
+    code, out = _run(monkeypatch, capsys, ["MNAR", "--cite"])
+    assert code == 0
+    assert "MISSING-KEY" not in out.out
+    assert "@real2025Y" in out.out
+    assert "占位键" in out.err and "1" in out.err
+
+
+def test_missing_key_placeholder_excluded_from_json(fake_index, monkeypatch, capsys):
+    fake_index([
+        _paper("MISSING-KEY-10.1000/abc", citekey_source="missing",
+               highlights=[_hl("citable", "MNAR 证据一句")]),
+    ])
+    code, out = _run(monkeypatch, capsys, ["MNAR", "--json"])
+    d = json.loads(out.out)
+    assert code == 1 and d["total"] == 0
+
+
 def test_role_choices_match_schema():
     """CLI 的 role 三值必须与 schema.TAG_TO_ROLE 的产出集合一致（防第二真相源漂移）。"""
     from src.scholar.schema import TAG_TO_ROLE

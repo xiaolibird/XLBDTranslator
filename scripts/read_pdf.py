@@ -216,18 +216,15 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     """从当月全部 final bundle 重建手动精读四件套 + 刷索引。"""
     from src.scholar.pdf_ingest import load_bundle, segment_from_bundle, BUNDLE_SUFFIX
     from src.scholar.notes import write_notes
-    from src.scholar.notes_index import update_index, write_outputs
+    from src.scholar.notes_index import update_index, write_outputs, existing_citekeys
 
-    # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名
-    existing_ckeys = set()
+    # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名。
+    # 但要排除本月这份手动精读 md 自己的旧条目——否则每次 finalize/regen 整篇重写
+    # 本月 md 时，本月论文的上一轮 citekey 会被当成「库内已占用」，被迫加消歧后缀，
+    # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
+    own_note_file = "科研札记_{}_手动精读.md".format(month)
     idx_path = notes_dir / "literature_index.json"
-    if idx_path.exists():
-        try:
-            existing_ckeys = {p.get("citekey") for p in
-                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
-                              if p.get("citekey")}
-        except Exception:
-            pass  # 索引损坏时退化为只查本批，仍安全
+    existing_ckeys = existing_citekeys(idx_path, exclude_note_files={own_note_file})
 
     mdir = notes_dir / "manual" / month
     bundles = sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))) if mdir.exists() else []

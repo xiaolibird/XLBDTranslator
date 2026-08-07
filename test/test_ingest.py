@@ -296,3 +296,127 @@ def test_closeread_partial_success_still_writes(tmp_path, monkeypatch):
     segs = [_seg(1, "A", doi="10.1/a"), _seg(2, "B", doi="10.1/b")]
     rep = ING.run_ingest(segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
     assert rep["status"] == "ok" and rep["count"] == 2
+
+
+# ---------------- G. 周札记覆盖保护（同 label 第二次入库不得整篇覆盖丢弃上一批） ----------------
+
+def _seed_existing_note(notes_dir: Path, label: str, dedup_keys):
+    """伪造一份"已存在"的周札记 md + sidecar（模拟上一批已入库的内容）。"""
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    stem = "科研札记_{}_全文精读".format(label)
+    (notes_dir / "{}.md".format(stem)).write_text("# 既有周札记\n", encoding="utf-8")
+    sidecar = {"schema_version": 1, "papers": [
+        {"citekey": "old{}".format(i), "dedup_key": k} for i, k in enumerate(dedup_keys)]}
+    (notes_dir / "{}.index.json".format(stem)).write_text(
+        json.dumps(sidecar, ensure_ascii=False), encoding="utf-8")
+
+
+def test_second_batch_dropping_existing_paper_is_rejected(tmp_path, monkeypatch):
+    """回归：本批不含既有周札记里的全部论文时，拒绝整篇覆盖（否则上一批论文
+    连同其 citekey/索引条目一起被抹掉），且不得实际调用 write_notes。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    notes_dir = tmp_path / "notes"
+    old_seg = _seg(1, "上批论文", doi="10.1/old")
+    _seed_existing_note(notes_dir, "2026-07-27", [ING.dedup_key(old_seg.metadata)])
+
+    import src.scholar.notes as notes
+    written = []
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: written.append(1))
+
+    new_segs = [_seg(2, "本批论文", doi="10.1/new")]  # 不含上批那篇
+    with pytest.raises(RuntimeError, match="拒绝写入"):
+        ING.run_ingest(new_segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert not written
+    # 既有文件必须原样保留，不能被本次调用动过
+    assert (notes_dir / "科研札记_2026-07-27_全文精读.md").read_text(encoding="utf-8") == "# 既有周札记\n"
+
+
+def test_second_batch_covering_existing_paper_still_writes(tmp_path, monkeypatch):
+    """本批（含新论文）完整覆盖既有周札记里的全部论文时，允许照常写入。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    notes_dir = tmp_path / "notes"
+    kept_seg = _seg(1, "上批论文", doi="10.1/old")
+    _seed_existing_note(notes_dir, "2026-07-27", [ING.dedup_key(kept_seg.metadata)])
+
+    import src.scholar.notes as notes
+    monkeypatch.setattr(
+        notes, "write_notes",
+        lambda *a, **k: {"note_path": str(notes_dir / "n.md"), "docx_path": None})
+
+    new_segs = [_seg(1, "上批论文", doi="10.1/old"), _seg(2, "本批论文", doi="10.1/new")]
+    rep = ING.run_ingest(new_segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert rep["status"] == "ok" and rep["count"] == 2
+
+
+def test_no_existing_note_writes_without_guard_interference(tmp_path, monkeypatch):
+    """同名周札记不存在时，守卫不应误挡首次入库。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    notes_dir = tmp_path / "notes"
+
+    import src.scholar.notes as notes
+    monkeypatch.setattr(
+        notes, "write_notes",
+        lambda *a, **k: {"note_path": str(notes_dir / "n.md"), "docx_path": None})
+
+    segs = [_seg(1, "首批论文", doi="10.1/first")]
+    rep = ING.run_ingest(segs, settings, "2026-08-03", top_n=5, close_read=True, seen=set())
+    assert rep["status"] == "ok" and rep["count"] == 1
+
+
+def test_existing_note_with_unreadable_sidecar_is_rejected(tmp_path, monkeypatch):
+    """既有 md 存在但 sidecar 缺失/损坏：无法确认既有内容，必须保守拒绝而非
+    静默当作"无既有内容"直接覆盖。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    stem = "科研札记_2026-07-27_全文精读"
+    (notes_dir / "{}.md".format(stem)).write_text("# 既有周札记\n", encoding="utf-8")
+    (notes_dir / "{}.index.json".format(stem)).write_text("{ 坏 json", encoding="utf-8")
+
+    import src.scholar.notes as notes
+    written = []
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: written.append(1))
+
+    segs = [_seg(2, "本批论文", doi="10.1/new")]
+    with pytest.raises(RuntimeError, match="无法读取"):
+        ING.run_ingest(segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert not written
+
+
+def test_run_ingest_excludes_own_week_note_citekeys_from_existing_ckeys(tmp_path, monkeypatch):
+    """回归 FIX-1（ingest 侧同源坑）：本批完整覆盖既有周札记（正常改写路径）时，
+    existing_ckeys 不该包含这份周札记自己的旧 citekey——否则兜底键生成会把上一轮的
+    base 键判成「库内已占用」而加消歧后缀，来回改名（citekey 抖动）。守卫链路虽已
+    挡住大多数场景，这里防御式验证 write_notes 收到的 existing_citekeys 确实排除了
+    本周文件、但仍含别的周文件的键。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    notes_dir = tmp_path / "notes"
+    kept_seg = _seg(1, "上批论文", doi="10.1/old")
+    _seed_existing_note(notes_dir, "2026-07-27", [ING.dedup_key(kept_seg.metadata)])
+
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    (notes_dir / "literature_index.json").write_text(json.dumps({"papers": [
+        {"citekey": "wang2024Missing", "note_file": "科研札记_2026-07-27_全文精读.md"},
+        {"citekey": "other2023Key", "note_file": "科研札记_2026-06-01_全文精读.md"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+    import src.scholar.notes as notes
+    captured = {}
+
+    def fake_write_notes(segs, citekeys, **k):
+        captured["existing_citekeys"] = set(k.get("existing_citekeys") or set())
+        return {"note_path": str(notes_dir / "n.md"), "docx_path": None}
+
+    monkeypatch.setattr(notes, "write_notes", fake_write_notes)
+
+    new_segs = [_seg(1, "上批论文", doi="10.1/old"), _seg(2, "本批论文", doi="10.1/new")]
+    rep = ING.run_ingest(new_segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+
+    assert rep["status"] == "ok"
+    assert "wang2024Missing" not in captured["existing_citekeys"]
+    assert "other2023Key" in captured["existing_citekeys"]

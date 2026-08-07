@@ -679,6 +679,61 @@ def test_conflict_file_is_never_pruned(notes_dir, index, tmp_path):
     assert c.exists()
 
 
+# ---------------- L. --limit 不得驱动落选/MOC 清理（调试抽样语义 ≠ 落选口径）----------------
+#
+# write_vault(limit=N) 是「只处理前 N 篇」的调试语义。此前的清理逻辑只认
+# 「当前这轮 entries 有没有覆盖到」，limit 截断后的 entries 只是全集的一个前缀，
+# 会把「本轮没处理但仍在全集里」的其余笔记与 MOC 页当成落选一并删掉。
+
+def test_limit_does_not_delete_papers_outside_truncated_set(notes_dir, index, tmp_path):
+    """先无 limit 全量生成 3 篇；再以 limit=1 重跑：另外 2 篇的笔记不得被当成
+    orphan 删除（它们仍在索引全集里，只是这一轮没被处理到）。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2, include_maybe=True, include_abstract_only=True)
+    other_papers = [vd / V.PAPERS_DIR / "{}.md".format(ck)
+                    for ck in ("lee2025Graph", "min2025Paper")]
+    assert all(p.exists() for p in other_papers)
+
+    rep = V.write_vault(index, notes_dir, vd, k=2, include_maybe=True,
+                        include_abstract_only=True, limit=1)
+
+    assert all(p.exists() for p in other_papers), "limit 截断外的论文笔记被误删"
+    assert rep["orphan_papers"] == []
+    assert rep["pruned"] == []
+    assert rep["cleanup_skipped_due_to_limit"] is True
+
+
+def test_limit_does_not_prune_stale_moc_pages(notes_dir, index, tmp_path):
+    """limit 生效时连本该清理的过期 MOC 页也不清（宁可漏清，不能误删未覆盖的）。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2, include_maybe=True, include_abstract_only=True)
+    ghost = vd / V.MOC_DIR / "年份" / "2099-2099-01.md"
+    ghost.parent.mkdir(parents=True, exist_ok=True)
+    ghost.write_text("# 过期分片\n", encoding="utf-8")
+
+    rep = V.write_vault(index, notes_dir, vd, k=2, include_maybe=True,
+                        include_abstract_only=True, limit=1)
+
+    assert ghost.exists(), "limit 生效时不该清理 MOC 过期页"
+    assert rep["pruned"] == []
+
+
+def test_no_limit_cleanup_flag_is_false(notes_dir, index, tmp_path):
+    """不传 limit（或 limit=0）时清理照常进行，report 里的标记位为假。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert not rep.get("cleanup_skipped_due_to_limit")
+
+
+def test_limit_still_writes_the_truncated_entries(notes_dir, index, tmp_path):
+    """limit 只影响清理，不影响本轮该写的那几篇——它们必须照常落盘。"""
+    vd = tmp_path / "v"
+    rep = V.write_vault(index, notes_dir, vd, k=2, limit=1)
+    assert rep["selected"] == 1
+    assert (vd / V.PAPERS_DIR / "public2025Deep.md").exists()  # priority 最高的 pa
+
+
 # ---------------- K. 第二轮审查修复的回归 ----------------
 
 def test_preserved_key_with_colon_stays_valid_yaml(index):
@@ -749,6 +804,102 @@ def test_untampered_rebuild_is_not_conflict(notes_dir, index, tmp_path):
     V.write_vault(index, notes_dir, vd, k=2)
     rep = V.write_vault(index, notes_dir, vd, k=2)
     assert rep["conflicts"] == [] and rep["written"] == 0
+
+
+def test_force_regen_overwrites_tampered_conflict_and_keeps_user_zone(notes_dir, index, tmp_path):
+    """回归 FIX-4：--force-regen 此前是完全空操作——force 分支与常规分支写的是同一份
+    merge_note 结果，真正需要强制覆盖的 conflict 条目反而在 merge_note 早退时就 continue
+    掉了，force 检查根本轮不到。现在 force_regen=True 必须把 conflict 条目也覆盖掉
+    （不再产出 .conflict.md 旁路），且用户在哨兵之后写的手写区要保留。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    note = vd / V.PAPERS_DIR / "public2025Deep.md"
+    t = note.read_text(encoding="utf-8")
+    t = t.replace("## 句级证据", "我在生成块里写了一句批注\n\n## 句级证据")
+    t += "\n我在用户区手写的一段 ✍️\n"
+    note.write_text(t, encoding="utf-8")
+
+    # 不带 --force-regen：仍按现有语义判 conflict，原文件不动
+    rep = V.write_vault(index, notes_dir, vd, k=2)
+    assert "public2025Deep" in rep["conflicts"]
+    assert rep["force_overwritten"] == []
+
+    # 带 --force-regen：conflict 条目被直接覆盖，不再落 .conflict.md 旁路，
+    # 且原先写在哨兵之后的用户区内容仍保留在覆盖后的文件里。
+    rep2 = V.write_vault(index, notes_dir, vd, k=2, force_regen=True)
+    assert "public2025Deep" in rep2["force_overwritten"]
+    assert "public2025Deep" not in rep2["conflicts"]
+    after = note.read_text(encoding="utf-8")
+    assert "我在生成块里写了一句批注" not in after   # 生成块已被新内容覆盖
+    assert "我在用户区手写的一段 ✍️" in after         # 用户区仍保留
+    assert not (vd / V.PAPERS_DIR / "public2025Deep.conflict.md").exists()
+
+
+def test_force_regen_is_noop_when_no_conflicts(notes_dir, index, tmp_path):
+    """没有冲突条目时，--force-regen 不该改变任何输出——与不加该开关逐字节一致。"""
+    vd_a = tmp_path / "a"
+    vd_b = tmp_path / "b"
+    V.write_vault(index, notes_dir, vd_a, k=2)
+    V.write_vault(index, notes_dir, vd_b, k=2, force_regen=True)
+    a_files = {p.relative_to(vd_a): p.read_text(encoding="utf-8") for p in vd_a.rglob("*.md")}
+    b_files = {p.relative_to(vd_b): p.read_text(encoding="utf-8") for p in vd_b.rglob("*.md")}
+    assert a_files == b_files
+
+
+def test_force_regen_survives_unserializable_preserved_frontmatter_key(notes_dir, index, tmp_path):
+    """opus 补审必修项回归：merge_note 内 build_frontmatter(preserved=fm) 遇到形状意外的
+    用户 frontmatter（如 `mydates:\\n  - 2024-01-01` 会被 yaml.safe_load 解析成
+    datetime.date 列表，_dump_preserved 的 json.dumps 对其抛 TypeError）时，
+    merge_note 本身包在 try/except 里能优雅降级成 conflict；但 --force-regen 覆盖
+    conflict 时 _force_overwrite_content 内部会拿同一份 preserved 再调一次
+    build_frontmatter，此前这次调用不在任何 try 里，异常会把 write_vault 整轮
+    构建带崩——几百篇一篇不写。现在必须：force_regen 下这篇被正常 force_overwritten
+    （退化成全新 frontmatter），且同一轮里其它论文照常写出，不受牵连。"""
+    vd = tmp_path / "v"
+    kw = dict(include_maybe=True, include_abstract_only=True)   # 把 3 篇全选进来，才能验证「其它论文不受牵连」
+    V.write_vault(index, notes_dir, vd, k=2, **kw)
+    note = vd / V.PAPERS_DIR / "public2025Deep.md"
+    t = note.read_text(encoding="utf-8")
+    t = t.replace("---\n", "---\nmydates:\n  - 2024-01-01\n", 1)
+    note.write_text(t, encoding="utf-8")
+
+    rep = V.write_vault(index, notes_dir, vd, k=2, **kw)          # 不带 force：优雅降级
+    assert "public2025Deep" in rep["conflicts"]
+
+    rep2 = V.write_vault(index, notes_dir, vd, k=2, force_regen=True, **kw)   # 不抛异常
+    assert "public2025Deep" in rep2["force_overwritten"]
+    assert "public2025Deep" not in rep2["conflicts"]
+    # 同一轮里其它两篇正常论文没被这篇的异常连累——都照常存在且不在冲突名单里
+    assert (vd / V.PAPERS_DIR / "lee2025Graph.md").exists()
+    assert (vd / V.PAPERS_DIR / "min2025Paper.md").exists()
+    assert "lee2025Graph" not in rep2["conflicts"]
+    assert "min2025Paper" not in rep2["conflicts"]
+
+
+def test_force_regen_falls_back_to_conflict_when_end_sentinel_missing(notes_dir, index, tmp_path):
+    """opus 补审建议2回归：END 哨兵被用户删掉时 extract_user_zone 返回 None，
+    --force-regen 此前会退回 DEFAULT_USER_ZONE 空白覆盖原文件、还顺手把旁路的
+    .conflict.md 删掉（判定「冲突已用 force 解决」）——用户手写内容的唯一副本
+    就此消失，且没有 .conflict.md 兜底。现在用户区抽不出来时必须整体退回常规
+    conflict 分支：不覆盖原文件、旧 .conflict.md 不删。"""
+    vd = tmp_path / "v"
+    V.write_vault(index, notes_dir, vd, k=2)
+    note = vd / V.PAPERS_DIR / "public2025Deep.md"
+    t = note.read_text(encoding="utf-8")
+    # 删掉 END 哨兵本身，但哨兵之后确实还有用户手写内容（模拟误删哨兵行）
+    t = t.replace(V.GEN_END + "\n", "") + "\n我手写的重要内容，哨兵被我不小心删了 ✍️\n"
+    note.write_text(t, encoding="utf-8")
+    before = note.read_text(encoding="utf-8")
+
+    conflict_path = vd / V.PAPERS_DIR / "public2025Deep.conflict.md"
+    conflict_path.write_text("旧的人工合并占位", encoding="utf-8")
+
+    rep = V.write_vault(index, notes_dir, vd, k=2, force_regen=True)
+
+    assert "public2025Deep" in rep["conflicts"]
+    assert "public2025Deep" not in rep["force_overwritten"]
+    assert note.read_text(encoding="utf-8") == before   # 原文件一字未改，手写内容还在
+    assert conflict_path.exists()                        # 旧 .conflict.md 没被删
 
 
 def test_evidence_third_level_shard_keeps_pages_small():

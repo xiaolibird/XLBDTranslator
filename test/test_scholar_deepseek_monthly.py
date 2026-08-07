@@ -230,6 +230,117 @@ def test_batch_failure_does_not_overwrite_completed(tmp_path):
     assert pending.status == DigestStatus.FAILED
 
 
+def test_summary_not_fabricated_from_translated_abstract(tmp_path):
+    """batch prompt 的输出契约里根本没有 summary 字段（LLM 恒不返回），不得拿
+    translated_abstract[:200] 冒充「AI 归纳」——否则 notes.py/schema.py/docx_builder.py
+    渲染出的 AI 归纳块会与摘要逐字重复，误导读者当成独立信息源。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    seg = make_segment(1, "Paper without a model-produced summary", datetime(2026, 3, 1))
+    batch = [seg]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题", "translated_abstract": "这是一段很长的中文译文摘要内容。"}
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert seg.translated_abstract == "这是一段很长的中文译文摘要内容。"
+    assert seg.summary == ""            # 不再拿译文摘要前 200 字回填假总结
+    assert seg.status == DigestStatus.COMPLETED
+
+
+def test_parse_llm_response_null_abstract_does_not_crash_later_papers(tmp_path):
+    """LLM 对某篇返回 translated_abstract=null 时，None[:200] 不得 TypeError 拖垮
+    本批排在它之后、已解析好的论文——那些论文的结果不该被整批打成 FAILED。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    null_abs = make_segment(1, "Paper with null abstract", datetime(2026, 3, 1))
+    after = make_segment(2, "Paper right after the null one", datetime(2026, 3, 1))
+    batch = [null_abs, after]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题1", "translated_abstract": None},
+        {"id": 2, "translated_title": "标题2", "translated_abstract": "正常译文"},
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert null_abs.translated_abstract == ""
+    assert null_abs.status == DigestStatus.COMPLETED
+    assert after.translated_abstract == "正常译文"
+    assert after.status == DigestStatus.COMPLETED   # 未被前一条的 TypeError 连累成 FAILED
+
+
+def test_parse_llm_response_null_relevance_score_does_not_crash_later_papers(tmp_path):
+    """opus 补审建议1回归：条3的 null 防护只堵了 translated_abstract 一半——
+    relevance_score=null 时 float(None) 曾直接 TypeError，被批级 except 吞掉后连累
+    「排在它之后、已解析正常」的论文也被打成 FAILED。现在必须：该篇自己按 0 分兜底
+    正常完成，后一篇完全不受影响。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    null_score = make_segment(1, "Paper with null relevance_score", datetime(2026, 3, 1))
+    after = make_segment(2, "Paper right after the null one", datetime(2026, 3, 1))
+    batch = [null_score, after]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题1", "relevance_score": None},
+        {"id": 2, "translated_title": "标题2", "relevance_score": 0.8},
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert null_score.metadata.relevance_score == 0.0
+    assert null_score.status == DigestStatus.COMPLETED
+    assert after.metadata.relevance_score == 0.8
+    assert after.status == DigestStatus.COMPLETED   # 未被前一条连累成 FAILED
+
+
+def test_parse_llm_response_null_keywords_does_not_crash_later_papers(tmp_path):
+    """opus 补审建议1回归：keywords=null 若不兜底会静默写进 metadata.keywords=None，
+    让下游 ", ".join(keywords) 二次爆炸；这里同时验证它不连累同批后一篇论文。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    null_kw = make_segment(1, "Paper with null keywords", datetime(2026, 3, 1))
+    after = make_segment(2, "Paper right after the null one", datetime(2026, 3, 1))
+    batch = [null_kw, after]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题1", "keywords": None},
+        {"id": 2, "translated_title": "标题2", "keywords": ["EHR", "缺失"]},
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert null_kw.metadata.keywords == []          # 兜回空列表，不是 None
+    assert ", ".join(null_kw.metadata.keywords) == ""  # 下游 join 不再二次爆炸
+    assert null_kw.status == DigestStatus.COMPLETED
+    assert after.metadata.keywords == ["EHR", "缺失"]
+    assert after.status == DigestStatus.COMPLETED   # 未被前一条连累成 FAILED
+
+
+def test_parse_llm_response_field_error_isolated_per_paper(tmp_path):
+    """priority_breakdown 形状意外（如返回字符串而非 dict）触发的异常也必须只废
+    这一篇——不能冒出单篇 try 之外把同批其它论文一并错杀。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    bad = make_segment(1, "Paper with malformed priority_breakdown", datetime(2026, 3, 1))
+    after = make_segment(2, "Paper right after the malformed one", datetime(2026, 3, 1))
+    batch = [bad, after]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题1", "priority_breakdown": "不是字典"},
+        {"id": 2, "translated_title": "标题2", "relevance_score": 0.5},
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert bad.status == DigestStatus.FAILED
+    assert bad.error_message and "Field update failed" in bad.error_message
+    assert after.status == DigestStatus.COMPLETED
+    assert after.metadata.relevance_score == 0.5
+
+
 def test_h3_split_falls_back_when_siblings_lack_content():
     """嵌套布局（h3 与摘要不同层级）下 h3 切分应放弃，回退旧策略而非产出空摘要"""
     from src.scholar.paper_extractor import ScholarEmailParser

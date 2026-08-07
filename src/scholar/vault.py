@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..utils.logger import get_logger
 from .notes_index import _SECTION_RE, is_missing_citekey, write_if_changed
+from .research_profile import get_bucket_labels
 
 logger = get_logger(__name__)
 
@@ -73,11 +74,9 @@ PAPER_ROLE_CN = {"MUST_ENGAGE": "必须回应", "CITE_SUPPORT": "支持性引用
 FLAG_CN = {"THREAT": "反向结论", "BENCHMARK": "多库外验",
            "OVERCLAIM_PRECEDENT": "过度声称先例"}
 
-# bucket 中文语义取自 config/prompts/whitelist_filter_prompt.md（workflow.py:46-47 同源）
-BUCKET_LABEL = {
-    "A": "缺失机制方法学", "B": "缺失感知建模", "C": "缺失与因果",
-    "D": "跨域跨中心迁移", "E": "对抗性证据", "F": "多库ICU基准", "G": "临床落地场景",
-}
+# bucket 中文语义取自 config/research_profile.yaml（bucket_labels），
+# 与 config/prompts/whitelist_filter_prompt.md 的 inclusion_dims A-G（workflow.py:46-47 同源）一一对应。
+BUCKET_LABEL = get_bucket_labels()
 
 # 全库 82% 的 highlights 是旧三类（方法学创新/重要发现）经 TAG_TO_ROLE 近似映射而来，
 # 不是当时按新三轴标注的。不写明这点，用户会把「重要发现」当成作者亲口给的可引用效应量。
@@ -505,6 +504,38 @@ def merge_note(entry: Dict[str, Any], gen_block: str, existing: Optional[str]
     if generated_block_tampered(body):        # 用户在生成块内部写了东西，别静默覆盖
         return None, "conflict"
     return assemble(build_frontmatter(entry, preserved=fm), gen_block, user_zone), "merged"
+
+
+def _force_overwrite_content(entry: Dict[str, Any], gen_block: str, existing: str
+                             ) -> Optional[str]:
+    """--force-regen 覆盖 conflict 条目时的落盘内容：frontmatter 仍从旧文件尽力抽取
+    保留，抽不出来（YAML 真被改坏）就退回全新 frontmatter——这是用户主动传
+    --force-regen 承担的风险，换回一份可用的生成块，不再让这些条目永远卡在
+    .conflict.md 旁路里。
+
+    preserved 里用户自加的键理论上能解析成 YAML 合法但 JSON 不可序列化的值（如
+    `mydates:\\n  - 2024-01-01` 会被 yaml.safe_load 成 datetime.date 列表），
+    build_frontmatter 内部靠 json.dumps 回写会当场 TypeError——这正是触发本函数被调用
+    的同一份 preserved，这里再吃一次同样的异常是必然事件，不是边角案例。退化到
+    preserved=None（全新 frontmatter）保证本函数本身不再向外抛异常。
+
+    但用户区不同：抽不出来（END 哨兵真被删）时**返回 None**，绝不用 DEFAULT_USER_ZONE
+    空白顶替——那等于用户手写内容被无声抹掉，且调用方原打算据此删掉 .conflict.md 旁路
+    副本，两者叠加就是永久性丢失。返回 None 让调用方退回常规 conflict 分支：不覆盖、
+    不删旧 .conflict.md，留给人工处理。
+    """
+    fm, body = split_frontmatter(existing)
+    preserved = fm if isinstance(fm, dict) else None
+    user_zone = extract_user_zone(body) if isinstance(body, str) else None
+    if user_zone is None:
+        return None
+    try:
+        frontmatter = build_frontmatter(entry, preserved=preserved)
+    except Exception as exc:
+        logger.warning("  {} force-regen 保留 frontmatter 失败（{}），退回全新 frontmatter".format(
+            entry.get("citekey"), type(exc).__name__))
+        frontmatter = build_frontmatter(entry, preserved=None)
+    return assemble(frontmatter, gen_block, user_zone)
 
 
 # ---------------- 语义相似边（图谱主力） ----------------
@@ -967,6 +998,7 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     report: Dict[str, Any] = {
         "selected": len(entries), "written": 0, "new": 0, "merged": 0, "unchanged": 0,
         "conflicts": [], "slice_failures": slice_failures, "moc_pages": 0, "pruned": [],
+        "force_overwritten": [],   # force_regen 下被强制覆盖的 conflict 条目（不再计入 conflicts）
     }
 
     used_lower: Set[str] = set()
@@ -987,9 +1019,23 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     if dry_run:
         for path, gen, e in files:
             existing = path.read_text(encoding="utf-8") if path.exists() else None
-            content, status = merge_note(e, gen, existing)
+            try:
+                content, status = merge_note(e, gen, existing)
+            except OSError:
+                raise
+            except Exception as exc:
+                # 与非 dry-run 路径同一处理：merge_note 内部 build_frontmatter(preserved=fm)
+                # 对形状意外的用户 frontmatter（如能解析成 datetime 的键）会抛异常，
+                # --dry-run 只是预览，不该比真跑还脆弱地把整轮预览带崩。
+                logger.warning("  {} 合并失败（{}），按冲突处理".format(e["citekey"], type(exc).__name__))
+                content, status = None, "conflict"
             if status == "conflict":
-                report["conflicts"].append(e["citekey"])
+                # force_regen 下预览「会被强制覆盖」而非「会卡在冲突」——与非 dry-run 路径
+                # 的判定口径对齐，方便先 --dry-run --force-regen 看一眼再真跑。
+                if force_regen and existing is not None:
+                    report["force_overwritten"].append(e["citekey"])
+                else:
+                    report["conflicts"].append(e["citekey"])
             elif existing is None:
                 report["new"] += 1
             elif content != existing:
@@ -999,6 +1045,7 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
         return report
 
     for path, gen, e in files:
+        existing = None   # 别让上一轮迭代的值在非 OSError 异常时悄悄留存到本轮
         try:
             existing = path.read_text(encoding="utf-8") if path.exists() else None
             content, status = merge_note(e, gen, existing)
@@ -1009,6 +1056,34 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
             logger.warning("  {} 合并失败（{}），按冲突处理".format(e["citekey"], type(exc).__name__))
             content, status = None, "conflict"
         if status == "conflict":
+            if force_regen and existing is not None:
+                # 真正落实 --force-regen：conflict（哨兵被删/frontmatter 改坏/生成块内被
+                # 手写批注）不再永远卡在 .conflict.md 旁路——frontmatter 与用户区从旧文件
+                # 尽力抽取保留，抽不出来（YAML 真坏了/哨兵真没了）就退回全新 frontmatter /
+                # 空用户区，这是用户主动传 --force-regen 承担的风险，而不是本函数默认行为。
+                #
+                # _force_overwrite_content 内部已经把「保留 preserved 失败」的情形自己
+                # 兜住并退化，这里的 try/except 是再加一道防线（万一它自身也炸了，比如
+                # DEFAULT_USER_ZONE/assemble 出问题）——务必不让一篇的异常带崩整轮几百篇
+                # 的构建，宁可退回旧的 .conflict.md 旁路。
+                try:
+                    overwrite = _force_overwrite_content(e, gen, existing)
+                except Exception as exc:
+                    logger.warning("  {} force-regen 覆盖仍失败（{}），退回冲突旁路".format(
+                        e["citekey"], type(exc).__name__))
+                    overwrite = None
+                if overwrite is not None:
+                    if write_if_changed(path, overwrite):
+                        report["written"] += 1
+                    report["force_overwritten"].append(e["citekey"])
+                    stale_conflict = path.with_suffix(".conflict.md")
+                    if stale_conflict.exists():
+                        # 冲突已用 --force-regen 解决，旁路的旧 .conflict.md 不再需要人工
+                        # 合并——留着反而像还有未处理的冲突，删掉避免误导。
+                        stale_conflict.unlink()
+                    continue
+                # overwrite 仍失败：不 unlink 旧 .conflict.md，落到下面的常规冲突分支，
+                # 与 force_regen=False 时行为一致，计入 conflicts。
             report["conflicts"].append(e["citekey"])
             conflict = path.with_suffix(".conflict.md")
             if write_if_changed(conflict, assemble(build_frontmatter(e), gen, DEFAULT_USER_ZONE)):
@@ -1037,43 +1112,56 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
         if write_if_changed(vault_dir / rel, text.rstrip("\n") + "\n"):
             report["written"] += 1
 
-    # 清理过期索引页：_MOC/ 下全是生成内容（无用户数据），分片规则一变旧页就成幽灵，
-    # 会继续出现在图谱和搜索里。01-文献/ 含用户手写，只报告不删。
-    keep = {(vault_dir / rel).resolve() for rel in pages}
-    for stale in sorted((vault_dir / MOC_DIR).rglob("*.md")):
-        if stale.resolve() not in keep:
-            stale.unlink()
-            report["pruned"].append(str(stale.relative_to(vault_dir)))
-    for d in sorted((vault_dir / MOC_DIR).rglob("*"), reverse=True):
-        if d.is_dir() and not any(d.iterdir()):
-            d.rmdir()
+    # limit 是「只处理前 N 篇」的抽样调试语义，不代表其余论文真的落选。下面两段
+    # 清理（MOC 过期索引页 + 01-文献/ 落选笔记）都是靠"当前这轮 entries/pages 有
+    # 没有覆盖到"来判断谁是 stale/orphan 的；limit 截断后 entries/pages/files 只是
+    # 全集的一个前缀，若照常清理，会把「本轮没处理但其实仍在全集里」的其余全部
+    # 笔记与 MOC 页当成落选一并删掉（--limit 5 能删光 --limit 前跑出来的几百篇）。
+    report["cleanup_skipped_due_to_limit"] = bool(limit)
+    report["orphan_papers"] = []
+    if limit:
+        logger.warning(
+            "  ⚠️ --limit={} 生效：跳过 MOC/落选笔记清理（limit 是抽样调试语义，"
+            "用截断后的 entries 判断 stale/orphan 会误删未处理到的其余笔记）".format(limit))
+    else:
+        # 清理过期索引页：_MOC/ 下全是生成内容（无用户数据），分片规则一变旧页就成
+        # 幽灵，会继续出现在图谱和搜索里。01-文献/ 含用户手写，只报告不删。
+        keep = {(vault_dir / rel).resolve() for rel in pages}
+        for stale in sorted((vault_dir / MOC_DIR).rglob("*.md")):
+            if stale.resolve() not in keep:
+                stale.unlink()
+                report["pruned"].append(str(stale.relative_to(vault_dir)))
+        for d in sorted((vault_dir / MOC_DIR).rglob("*"), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
+        # 落选笔记：口径收紧或论文退出索引后，旧笔记会滞留、不被任何 MOC 引用。
+        # 纯生成产物（用户区为空）直接删；写过东西的一律保留并报告——绝不替用户
+        # 做删除决定。known 必须复用写盘阶段实际产出的文件名（files 里的 path 含
+        # 撞名时的 X-2 后缀）；若用独立空集合重算 safe_filename，X-2.md 会被当成
+        # orphan 在同一次运行里写完即删。
+        known = {p.stem for p, _, _ in files}
+        kept_orphans: List[str] = []
+        for p in sorted((vault_dir / PAPERS_DIR).glob("*.md")):
+            if p.stem in known or p.name.endswith(".conflict.md"):
+                continue
+            try:
+                _, body = split_frontmatter(p.read_text(encoding="utf-8"))
+                zone = extract_user_zone(body or "")
+            except Exception:
+                zone = None
+            has_user_text = zone is None or zone.replace(USER_HEADING, "").strip()
+            if has_user_text:
+                kept_orphans.append(p.stem)
+            else:
+                p.unlink()
+                report["pruned"].append(str(p.relative_to(vault_dir)))
+        report["orphan_papers"] = kept_orphans
 
     # _meta.json 是运行记录（每次都变），别让它一直脏着 git status；已存在则尊重用户的版本
     gi = vault_dir / ".gitignore"
     if not gi.exists():
         gi.write_text("{}\n.obsidian/workspace*.json\n".format(META_JSON), encoding="utf-8")
-
-    # 落选笔记：口径收紧或论文退出索引后，旧笔记会滞留、不被任何 MOC 引用。
-    # 纯生成产物（用户区为空）直接删；写过东西的一律保留并报告——绝不替用户做删除决定。
-    # known 必须复用写盘阶段实际产出的文件名（files 里的 path 含撞名时的 X-2 后缀）；
-    # 若用独立空集合重算 safe_filename，X-2.md 会被当成 orphan 在同一次运行里写完即删。
-    known = {p.stem for p, _, _ in files}
-    kept_orphans: List[str] = []
-    for p in sorted((vault_dir / PAPERS_DIR).glob("*.md")):
-        if p.stem in known or p.name.endswith(".conflict.md"):
-            continue
-        try:
-            _, body = split_frontmatter(p.read_text(encoding="utf-8"))
-            zone = extract_user_zone(body or "")
-        except Exception:
-            zone = None
-        has_user_text = zone is None or zone.replace(USER_HEADING, "").strip()
-        if has_user_text:
-            kept_orphans.append(p.stem)
-        else:
-            p.unlink()
-            report["pruned"].append(str(p.relative_to(vault_dir)))
-    report["orphan_papers"] = kept_orphans
 
     meta = {"vault_schema": VAULT_SCHEMA_VERSION,
             "generated_at": datetime.now().isoformat(timespec="seconds"),

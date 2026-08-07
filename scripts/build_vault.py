@@ -33,12 +33,19 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 篇（调试用）")
     ap.add_argument("--dry-run", action="store_true", help="只算不写")
     ap.add_argument("--force-regen", action="store_true",
-                    help="强制重写生成块（用户区仍保留）")
+                    help="强制重写生成块（用户区尽力保留）；同时把原本卡住的 conflict 笔记"
+                         "（哨兵被删/frontmatter 改坏/生成块内被手写批注）也直接覆盖")
     args = ap.parse_args()
     if args.limit < 0:                      # 负值会走 Python 负切片，静默少生成几篇
         ap.error("--limit 不能为负（0=不限）")
     if args.neighbors < 0:
         ap.error("--neighbors 不能为负（0=关闭相似边）")
+    if args.limit and not args.dry_run:
+        # limit 是抽样调试语义：write_vault 会自动跳过 MOC/落选笔记清理，但仍会
+        # 真实写盘这 N 篇——不是纯只读的 dry-run，写盘前把这点说清楚。
+        print("ℹ️ --limit={} + 非 dry-run：只会写这 {} 篇，且本轮跳过 MOC/落选笔记"
+              "清理（不会误删其余未处理到的笔记，也不会补全清理）。".format(
+                  args.limit, args.limit))
 
     notes_dir = repo_path(args.notes_dir)   # 相对路径锚死仓库根，别随 cwd 漂
     index_path = notes_dir / INDEX_JSON
@@ -73,6 +80,8 @@ def main() -> int:
     print("  文献 {} 篇（新建 {} · 更新 {} · 未变 {}）· 索引页 {} 个 · 写盘 {} 个文件".format(
         rep["selected"], rep["new"], rep["merged"], rep["unchanged"],
         rep["moc_pages"], rep["written"]))
+    if rep.get("cleanup_skipped_due_to_limit"):
+        print("  ⏭ 本轮 --limit 生效，已跳过 MOC/落选笔记清理（不代表零落选，只是没算）")
     if rep.get("pruned"):
         notes = [x for x in rep["pruned"] if x.startswith("01-")]
         print("  🧹 清理 {} 个过期文件（{} 篇落选笔记 + {} 个索引页；仅限无手写内容的）".format(
@@ -83,12 +92,17 @@ def main() -> int:
     if rep["slice_failures"]:
         print("  ⚠️ {} 篇切不出正文（索引与 md 失步）：{}".format(
             len(rep["slice_failures"]), ", ".join(rep["slice_failures"][:6])))
+    if rep.get("force_overwritten"):
+        print("  🔧 --force-regen 覆盖了 {} 篇原本冲突的笔记（frontmatter/用户区已尽力保留，"
+              "抽不出来的退回了空白）：".format(len(rep["force_overwritten"])))
+        for k in rep["force_overwritten"][:10]:
+            print("     - {}".format(k))
     if rep["conflicts"]:
         print("  ⛔ {} 篇有冲突（哨兵被删或 frontmatter 坏），已另存 .conflict.md，原文件未动：".format(
             len(rep["conflicts"])))
         for k in rep["conflicts"][:10]:
             print("     - {}".format(k))
-        print("     手工合并后删掉对应 .conflict.md 即可。")
+        print("     手工合并后删掉对应 .conflict.md 即可，或加 --force-regen 直接强制覆盖。")
     print("=" * 66)
     return 1 if (rep["conflicts"] or rep["slice_failures"]) else 0
 
