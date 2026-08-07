@@ -14,7 +14,7 @@
 - **断点续传**：支持意外中断后完美恢复，自动跳过已翻译片段，无需从头开始。
 - **原子化保存**：每批次翻译完成后，立即保存进度，最大程度减少数据丢失风险。
 - **结构化输出**：Gemini 用 `response_schema`、DeepSeek/OpenAI 兼容用 `response_format=json_object` 从根上保证返回合法 JSON；本地 Ollama 仍保留轻量正则安全网。
-- **译后质检回路**：翻译完成后自动扫描失败标记与术语违例段落并定向重译（上限 1 轮），残留失败写入 `quality_report.json` 显式报告，不再把 `[Failed]` 悄悄渲染进成品（可用 `ENABLE_QUALITY_CHECK=false` 关闭）。
+- **译后质检回路**：翻译完成后自动扫描失败标记与术语违例段落并定向重译（上限 1 轮），残留失败写入 `quality_report.json` 显式报告，不再把 `[Failed]` 悄悄渲染进成品（可用 `PROCESSING__ENABLE_QUALITY_CHECK=false` 关闭）。
 - **异步并发优化**：多批次并发翻译，保证结果顺序与原文精确匹配，避免分配错误。
 
 ### 🤖 多模态翻译
@@ -155,7 +155,7 @@ cp config/config.env.template config/config.env
     ```
 
 3.  **模型选择 (可选)**:
-    - 运行 `python check_models.py` 查看当前可用的模型列表（README 不维护硬编码清单，以脚本输出为准）。
+    - 运行 `python scripts/check_models.py` 查看当前可用的模型列表（README 不维护硬编码清单，以脚本输出为准）。
     ```dotenv
     # 主力 DeepSeek（当前在用）
     API__OPENAI_MODEL="deepseek-v4-flash"
@@ -314,7 +314,7 @@ python main.py /data/document.pdf \
 
 除文档翻译外，项目内置一个独立的 Scholar Digest 模块：读取 Gmail 中的 Google Scholar 论文提醒邮件（可选并入 PubMed/arXiv 检索），经两级过滤后调用 LLM 生成中文论文摘要汇总。
 
-**方法学审稿三态裁决**：黑名单保持零成本的确定性关键词匹配，只剔除无歧义的完全离题领域（保守，避免误杀对抗性证据）；相关性判断默认交给 LLM 做方法学审稿裁决（`PROCESSING__FILTER_MODE=llm`，可切回 `keyword`），输出三态 `INCLUDE / MAYBE / EXCLUDE` 加纳入维度（bucket）、危险信号（`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`）、角色（`MUST_ENGAGE` 等）与一句话用处。`MAYBE` 与 `INCLUDE` 一并进入翻译摘要，输出里用裁决徽章区分；标 `THREAT`/`MUST_ENGAGE` 的论文在优先级排序中置顶。每次裁决的判定、理由、模型与 prompt 版本连同被排除论文的完整元数据固化到 `{run_id}_excluded.json`，可审计、可回溯；LLM 调用失败时自动回退关键词匹配，不中断流程。审稿维度可在 `config/prompts/whitelist_filter_prompt.md` 定制，论文主题经 `PROCESSING__RESEARCH_INTERESTS` 注入。
+**方法学审稿三态裁决**：黑名单保持零成本的确定性关键词匹配，只剔除无歧义的完全离题领域（保守，避免误杀对抗性证据）；相关性判断默认交给 LLM 做方法学审稿裁决（`PROCESSING__FILTER_MODE=llm`，可切回 `keyword`），输出三态 `INCLUDE / MAYBE / EXCLUDE` 加纳入维度（bucket）、危险信号（`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`）、角色（`MUST_ENGAGE` 等）与一句话用处。`MAYBE` 与 `INCLUDE` 一并进入翻译摘要，输出里用裁决徽章区分；标 `THREAT`/`MUST_ENGAGE` 的论文在优先级排序中置顶。每次裁决的判定、理由、模型与 prompt 版本连同被排除论文的完整元数据固化到 `{run_id}_excluded.json`，可审计、可回溯；LLM 调用失败时自动回退关键词匹配，不中断流程。审稿维度（A-G 纳入维度、X1-X7 排除维度）可在 `config/research_profile.yaml` 定制，论文主题经 `PROCESSING__RESEARCH_INTERESTS` 注入。
 
 **PubMed / arXiv 检索来源**：除 Gmail 外，可按检索式抓取 PubMed（E-utilities）与 arXiv（Atom API），与邮件结果去重后并入同一条筛选→翻译→摘要流水线，默认随每周 digest 自动运行（`PROCESSING__EXTERNAL_SOURCES_ENABLED=true`，`--external`/`--no-external` 覆盖）。全部公开接口、无需密钥；`--dry-run` 下自动跳过网络请求。检索式见 `PROCESSING__ARXIV_QUERY` / `PROCESSING__PUBMED_QUERY`。
 
@@ -361,10 +361,9 @@ python scholar_main.py digest --provider deepseek --zotero
 
 # 深度研究模式
 python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
-
-# 批量翻译论文（需要环境变量 GEMINI_API_KEY 或 --key 参数）
-python batch_translate_scholar.py --json <papers.json>
 ```
+
+> 批量翻译论文已并入 `scholar_main.py` 主流水线，不再需要独立脚本。
 
 ### 全文精读（句级角色标记 + 可调取 highlights）
 
@@ -429,32 +428,31 @@ bash scripts/install_monthly_backfill.sh    # 每月 1 日 21:30：出上月精�
 ```
 XLBDTranslator/
 ├── main.py                 # 主入口文件
-├── scholar_main.py         # Scholar Digest 入口（Google Scholar 邮件摘要）
-├── batch_translate_scholar.py # Scholar 论文批量翻译
-├── check_models.py         # 检查可用的 Gemini 模型
+├── scholar_main.py         # Scholar Digest 入口（Google Scholar 邮件摘要，含批量翻译）
 ├── requirements.txt        # Python 依赖包
 ├── requirements_scholar.txt # Scholar Digest 依赖包
 ├── LICENSE                 # MIT 开源协议
 ├── README.md              # 中文说明文档
-├── README.md.en           # 英文说明文档
+├── README.en.md           # 英文说明文档
 ├── config/                # 配置文件目录
 │   ├── config.env.template # 环境变量模板
 │   ├── scholar.env.template # Scholar Digest 配置模板
 │   ├── modes.json         # 翻译人格定义
 │   ├── pdf_style.css      # PDF 输出样式
-│   └── prompts/           # 提示词模板
-│       ├── system_instruction.md
-│       ├── system_instruction_simple.md
-│       ├── text_translation_prompt.md
-│       ├── text_translation_prompt_simple.md
-│       ├── vision_translation_prompt.md
-│       ├── scholar_digest_prompt.md
-│       ├── whitelist_filter_prompt.md  # 方法学审稿三态筛选 prompt
-│       └── thesis_introduction_prompt.md
+│   ├── prompts/           # 提示词模板
+│   │   ├── system_instruction.md
+│   │   ├── system_instruction_simple.md
+│   │   ├── text_translation_prompt.md
+│   │   ├── text_translation_prompt_simple.md
+│   │   ├── vision_translation_prompt.md
+│   │   ├── scholar_digest_prompt.md
+│   │   ├── whitelist_filter_prompt.md  # 方法学审稿三态筛选 prompt
+│   │   └── thesis_introduction_prompt.md
+│   └── launchd/            # launchd 配置模板（com.xlbd.scholar-*.plist）
 ├── scripts/               # 部署运维脚本
 │   ├── run_weekly_digest.sh          # 每周 digest 运行脚本
-│   ├── install_weekly_digest.sh      # launchd 定时任务安装/卸载
-│   └── com.xlbd.scholar-digest.plist # launchd 配置模板
+│   ├── check_models.py               # 检查可用的 Gemini 模型
+│   └── install_weekly_digest.sh      # launchd 定时任务安装/卸载
 ├── src/                   # 源代码目录
 │   ├── core/             # 核心模块（数据结构、异常）
 │   │   ├── schema.py     # Pydantic 数据模型

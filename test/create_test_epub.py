@@ -1,7 +1,7 @@
 import zipfile
 from pathlib import Path
 
-epub_path = Path('test.epub')
+epub_path = Path(__file__).resolve().parent / 'test.epub'
 
 # 创建最小的 EPUB 结构
 with zipfile.ZipFile(epub_path, 'w') as epub:

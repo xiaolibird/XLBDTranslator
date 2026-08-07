@@ -18,7 +18,7 @@ set -euo pipefail
 
 LABEL="com.xlbd.scholar-monthly-backfill"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLIST_TEMPLATE="${REPO_ROOT}/scripts/com.xlbd.scholar-monthly.plist"
+PLIST_TEMPLATE="${REPO_ROOT}/config/launchd/com.xlbd.scholar-monthly.plist"
 PLIST_TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/xlbd-scholar-digest"
 GUI_DOMAIN="gui/$(id -u)"

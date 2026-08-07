@@ -12,7 +12,7 @@ An intelligent document translation tool powered by Google Gemini and state-driv
 - **Resume Support**: Perfect recovery after interruptions, auto-skip translated segments
 - **Atomic Saves**: Auto-save progress after each batch, minimizing data loss
 - **Structured Output**: Gemini uses `response_schema`, DeepSeek/OpenAI-compatible use `response_format=json_object` to guarantee valid JSON at the source; local Ollama keeps a lightweight regex safety net.
-- **Post-translation QC loop**: after translation, failed markers and glossary violations are scanned and re-translated (one extra pass at most); residual failures are reported in `quality_report.json` instead of silently rendering `[Failed]` into the output (disable via `ENABLE_QUALITY_CHECK=false`).
+- **Post-translation QC loop**: after translation, failed markers and glossary violations are scanned and re-translated (one extra pass at most); residual failures are reported in `quality_report.json` instead of silently rendering `[Failed]` into the output (disable via `PROCESSING__ENABLE_QUALITY_CHECK=false`).
 - **Robust Error Handling**: Built-in API retry with graceful keyword/regex fallback
 
 ### 🤖 Multi-Modal Translation
@@ -117,7 +117,7 @@ Open the `config/config.env` file and modify according to the following instruct
     ```
 
 3.  **Gemini Model (Optional)**:
-    - Run `python check_models.py` to see available models.
+    - Run `python scripts/check_models.py` to see available models.
     ```dotenv
     # Default is gemini-2.5-flash
     API__GEMINI_MODEL="gemini-2.5-flash"
@@ -240,7 +240,7 @@ Page,Title,Level
 
 Besides document translation, the project ships a standalone Scholar Digest module: it reads Google Scholar alert emails from Gmail (optionally joined by PubMed/arXiv search), runs a two-stage filter, and calls an LLM to produce a Chinese digest of the papers.
 
-**Methodology-review three-state adjudication**: the blacklist stays a zero-cost deterministic keyword match that only removes unambiguously off-topic fields (kept conservative to avoid killing adversarial evidence); the relevance decision is delegated to an LLM methodology-review adjudication by default (`PROCESSING__FILTER_MODE=llm`, switchable back to `keyword`), emitting three states `INCLUDE / MAYBE / EXCLUDE` plus inclusion buckets, danger flags (`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`), a role (`MUST_ENGAGE`, etc.) and a one-line use. `MAYBE` is translated alongside `INCLUDE` (distinguished by a verdict badge in the output); `THREAT`/`MUST_ENGAGE` papers are pushed to the top of the priority order. Every verdict — decision, reason, model, and prompt version — is persisted together with the full metadata of excluded papers into `{run_id}_excluded.json`. If an LLM call fails, that batch falls back to keyword matching instead of aborting the run. Review dimensions live in `config/prompts/whitelist_filter_prompt.md`; the paper topic is injected via `PROCESSING__RESEARCH_INTERESTS`.
+**Methodology-review three-state adjudication**: the blacklist stays a zero-cost deterministic keyword match that only removes unambiguously off-topic fields (kept conservative to avoid killing adversarial evidence); the relevance decision is delegated to an LLM methodology-review adjudication by default (`PROCESSING__FILTER_MODE=llm`, switchable back to `keyword`), emitting three states `INCLUDE / MAYBE / EXCLUDE` plus inclusion buckets, danger flags (`THREAT`/`BENCHMARK`/`OVERCLAIM_PRECEDENT`), a role (`MUST_ENGAGE`, etc.) and a one-line use. `MAYBE` is translated alongside `INCLUDE` (distinguished by a verdict badge in the output); `THREAT`/`MUST_ENGAGE` papers are pushed to the top of the priority order. Every verdict — decision, reason, model, and prompt version — is persisted together with the full metadata of excluded papers into `{run_id}_excluded.json`. If an LLM call fails, that batch falls back to keyword matching instead of aborting the run. Review dimensions (inclusion buckets A-G, exclusion reasons X1-X7) live in `config/research_profile.yaml`; the paper topic is injected via `PROCESSING__RESEARCH_INTERESTS`.
 
 **PubMed / arXiv sources**: beyond Gmail, the digest can fetch PubMed (E-utilities) and arXiv (Atom API) by query, dedup against email results, and feed the same filter→translate→summarize pipeline. Enabled by default for the weekly digest (`PROCESSING__EXTERNAL_SOURCES_ENABLED=true`, override with `--external`/`--no-external`). Public APIs, no keys required; `--dry-run` skips all network calls.
 
@@ -282,10 +282,9 @@ python scholar_main.py digest --no-external   # Gmail only
 
 # Deep research mode
 python scholar_main.py deep-research --papers output/scholar_digest/digest_xxx.json
-
-# Batch-translate papers (needs GEMINI_API_KEY env var or --key)
-python batch_translate_scholar.py --json <papers.json>
 ```
+
+> Batch paper translation has been folded into the `scholar_main.py` pipeline; the standalone script is gone.
 
 ### Full-text close reading (sentence-level color tags)
 
@@ -349,9 +348,7 @@ The two jobs are time-staggered and use physically separate Gmail token copies (
 ```
 XLBDTranslator/
 ├── main.py                 # Main entry point
-├── scholar_main.py         # Scholar Digest entry (Google Scholar email digest)
-├── batch_translate_scholar.py # Batch translation for Scholar papers
-├── check_models.py         # List available Gemini models
+├── scholar_main.py         # Scholar Digest entry (Google Scholar email digest, incl. batch translation)
 ├── requirements.txt        # Python dependencies
 ├── requirements_scholar.txt # Scholar Digest dependencies
 ├── config/                 # Configuration files
@@ -359,11 +356,12 @@ XLBDTranslator/
 │   ├── scholar.env.template # Scholar Digest config template
 │   ├── modes.json         # Translation persona definitions
 │   ├── pdf_style.css      # PDF output styling
-│   └── prompts/           # Prompt templates
+│   ├── prompts/           # Prompt templates
+│   └── launchd/            # launchd config templates (com.xlbd.scholar-*.plist)
 ├── scripts/               # Deployment & ops scripts
 │   ├── run_weekly_digest.sh          # Weekly digest runner
-│   ├── install_weekly_digest.sh      # launchd agent install/uninstall
-│   └── com.xlbd.scholar-digest.plist # launchd config template
+│   ├── check_models.py               # List available Gemini models
+│   └── install_weekly_digest.sh      # launchd agent install/uninstall
 ├── src/                   # Source code
 │   ├── core/             # Core modules (Schema, Exceptions)
 │   ├── parser/           # Document parsers (PDF, EPUB)

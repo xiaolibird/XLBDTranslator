@@ -18,7 +18,7 @@ set -euo pipefail
 
 LABEL="com.xlbd.scholar-digest"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLIST_TEMPLATE="${REPO_ROOT}/scripts/${LABEL}.plist"
+PLIST_TEMPLATE="${REPO_ROOT}/config/launchd/${LABEL}.plist"
 PLIST_TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/xlbd-scholar-digest"
 GUI_DOMAIN="gui/$(id -u)"
