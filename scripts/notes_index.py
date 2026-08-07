@@ -37,8 +37,9 @@ def main():
     index = update_index(notes_dir, full=args.full, since=args.since, until=args.until)
     wrote = write_outputs(index, notes_dir)
     uniq = [e for e in index["papers"] if not e.get("duplicate_of")]
-    print("✅ 索引 {} 个月 / {} 篇（去重后 {}），撞键 {} 组 | 写盘: {}".format(
-        len(index["months"]), len(index["papers"]), len(uniq),
+    n_months = len({v.get("month") for v in index["months"].values()})
+    print("✅ 索引 {} 份札记（{} 个自然月）/ {} 篇（去重后 {}），撞键 {} 组 | 写盘: {}".format(
+        len(index["months"]), n_months, len(index["papers"]), len(uniq),
         len(index["citekey_collisions"]),
         ", ".join(k for k, v in wrote.items() if v) or "无变化"))
     return 0
