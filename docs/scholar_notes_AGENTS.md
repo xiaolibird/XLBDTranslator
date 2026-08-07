@@ -121,7 +121,8 @@ pandoc draft.md --citeproc --bibliography=all_references.json -o draft.docx
 # (按 role 取证 → 写稿 → 出稿的完整写作流:skill `scholar-write`;检索 CLI:scripts/notes_query.py)
 
 # 体检:索引是否落后于札记(数量不一致→先跑 scripts/notes_index.py)
-ls 科研札记_*_全文精读.md | wc -l; jq '.months | length' literature_index.json
+# 注意口径要对齐:months 按文件 stem 键,含 auto+manual 两系列,不能直接对 wc -l 全文精读
+ls 科研札记_*_全文精读.md | wc -l; jq '[.months[] | select(.series=="auto")] | length' literature_index.json
 ```
 
 ## ⚠️ citekey 注意事项(重要)

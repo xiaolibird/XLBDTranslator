@@ -3,6 +3,9 @@ name: read-paper
 description: 手动把一篇 PDF 文献做**深度全文精读**并归档进本机科研札记文献库。当用户说"精读这篇 PDF/read paper/手动精读/深读这篇论文/把这个 PDF 加进文献库"并给出 PDF 时使用。区别于自动流水线：agent 亲自读完整本 PDF + 脚本双轨交叉核验，力求彻底通读。
 ---
 
+> 真相源：本文件在仓库 `docs/skills/read-paper/SKILL.md`；改完须跑
+> `bash scripts/install_skills.sh` 同步到 `~/.claude/skills/`。
+
 # 手动 PDF 深度精读（agent 亲读 + 脚本交叉核验）
 
 仓库：`/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev`（命令都在此目录、加 `PYTHONPATH=.` 运行）。
@@ -13,11 +16,25 @@ description: 手动把一篇 PDF 文献做**深度全文精读**并归档进本�
 ## 协议（严格按序）
 
 ### 1. ingest —— 脚本先出草稿
+
+**单篇：**
 ```bash
 cd /Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
 PYTHONPATH=. python scripts/read_pdf.py ingest <pdf 路径> [--month YYYY-MM] [--title "手动标题"]
 ```
-它抽全文、拉 Crossref/arXiv 权威元数据、分块通读出**脚本草稿**，落 `output/scholar_notes/manual/<月>/<paper_id>.paper.json`（status=draft）。记下打印的 **bundle 路径**与 **「亲读范围」那一行**（总页数 + 20 页窗口切分，第 2 步照它读）。
+
+**批量**：`ingest` 的 `pdf` 参数实际是 `nargs="+"`，支持多路径混写、目录展开、`-r` 递归子目录；
+一条命令即可把一批 PDF 都推上草稿：
+```bash
+PYTHONPATH=. python scripts/read_pdf.py ingest a.pdf b.pdf                    # 多个文件
+PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/              # 整个目录（非递归）
+PYTHONPATH=. python scripts/read_pdf.py ingest ~/Papers/ -r                   # 递归子目录
+```
+`--title` 只对单篇有意义（多篇/目录时元数据解析失败的条目会退化成 `anon*` 键，事后单独对
+那一篇重跑 `--title` 即可，不影响同批其余篇）。批量按文件名去重（真实路径 resolve 后），
+同一篇不会因写法不同被读两遍。
+
+它抽全文、拉 Crossref/arXiv 权威元数据、分块通读出**脚本草稿**，落 `output/scholar_notes/manual/<月>/<paper_id>.paper.json`（status=draft）。每篇单独打印 **bundle 路径**与 **「亲读范围」那一行**（总页数 + 20 页窗口切分，第 2 步照它读）。
 
 已 final 的 bundle **不会被覆盖**，只打印 `⛔ 已 final，本次跳过`（确需重跑加 `--force`，会丢弃已有核验成果）。
 
@@ -61,6 +78,24 @@ PYTHONPATH=. python scripts/read_pdf.py finalize <bundle 路径>
 给用户：归档的 md/docx 路径、本月手动深读篇数、索引撞键组数（非 0 时提示先跑
 `PYTHONPATH=. python scripts/notes_index.py --fix-collisions`）；若 ingest 提示"索引里已有同文"，
 说明这篇现已成为 keeper（自动浅读版被标 duplicate）。
+
+此后可用 `scholar-notes` skill 按 role/highlights 查这批新入库的文献；写论文取证用
+`scholar-write` skill 按 citable/refutable/method 三轴调证据。
+
+## 批量协议（多篇 PDF 一起精读）
+
+Step 1 一条命令能同时 ingest 一批 PDF，但第 2–4 步（亲读→核验→写回）**必须逐 bundle 做**——
+LLM/agent 一次只能扎实读一篇，混批读会互相串页/串数字。协议：
+
+1. Step 1 批量 ingest，拿到全部 bundle 路径列表（打印里每篇一段，逐条记下）。
+2. **对每个 bundle 循环**做第 2–4 步：亲读整本 PDF → 交叉核验草稿 → 写回该 bundle 的
+   `close_reading_final`/`cross_check_report`、`status="final"`。一篇写完再开下一篇，
+   不要并行开多个 PDF 同时读（上下文会话里容易读串）。
+3. 全批都写成 `final` 后，**只需跑一次 `finalize`**（任取批内一个 bundle 路径即可）：
+   `finalize` 是按月重建，会把当月目录下所有 `final` bundle 一并归档，不必每篇单独 finalize。
+   跨月批次（同批 PDF 落在不同月）要对每个涉及的月各跑一次 finalize。
+4. 汇报时给全批的篇数、跨月分布、索引撞键组数；哪几篇因元数据解析失败退化成 `anon*` 键要
+   单独点出，方便事后 `--title` 重跑纠正。
 
 ## 回退协议（`draft_status: api_error` —— API 没钱时）
 

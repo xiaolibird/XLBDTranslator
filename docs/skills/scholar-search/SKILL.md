@@ -3,6 +3,9 @@ name: scholar-search
 description: 对话式临时检索 arXiv/PubMed 学术文献（不入库、只报结果，命中自动标注是否已在本机札记库）。当用户说"搜文献/查论文/search papers/arXiv 上找/PubMed 搜/有没有关于 X 的新论文"等临时检索需求时使用。区别于月度 digest 流水线（自动筛选入库）与 scholar-notes（只查已入库札记）。
 ---
 
+> 真相源：本文件在仓库 `docs/skills/scholar-search/SKILL.md`；改完须跑
+> `bash scripts/install_skills.sh` 同步到 `~/.claude/skills/`。
+
 # 临时文献检索（arXiv + PubMed，不入库）
 
 复用 XLBDTranslator 流水线的检索客户端，公开 API、无需密钥。命中结果会对照
@@ -75,6 +78,10 @@ PYTHONPATH=. python scripts/search_pubs.py "<检索式>" [选项]
 一句话摘要要点；结尾说明命中数。用户想深入某篇时的衔接：
 - 「精读这篇」→ 让用户提供 PDF（或 OA 可得时先下载）走 `read-paper` skill；
 - 「札记库里有没有相关的」→ 走 `scholar-notes` skill。
+
+判断"库里是否已有类似文献"（比自动的 📚 标注更模糊的相似判断）可用语义检索：
+`PYTHONPATH=. python scripts/notes_search.py "<标题或摘要句>" --level paper --limit 5`
+（XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。
 
 ## 边界
 

@@ -3,6 +3,9 @@ name: scholar-write
 description: 用本机科研札记文献库支撑论文写作：按 role 轴(可引证据/可反驳观点/方法借鉴)取证 → 正文写 [@citekey] → pandoc 挂全局书目出 docx/LaTeX。当用户在写论文/综述/related work/discussion 并要"找证据支撑这个论点/找可引用的数字/找可反驳的观点/加引用/出参考文献/转 docx/转 latex/pandoc"时使用。区别于 scholar-notes(浏览查库)、scholar-search(临时检索不入库)、read-paper(精读入库)。
 ---
 
+> 真相源：本文件在仓库 `docs/skills/scholar-write/SKILL.md`；改完须跑
+> `bash scripts/install_skills.sh` 同步到 `~/.claude/skills/`。
+
 # 札记库 → 论文写作
 
 仓库：`/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev`（命令在仓库根运行）。
@@ -36,6 +39,24 @@ python scripts/notes_query.py <关键词...> --role citable|refutable|method [�
 
 多词是 AND（每个词都要命中标题/一句话用处/highlights 任一）。命中太少就减词、去掉 `--role`。
 输出末行 `↳ 科研札记_2026-07_手动精读.md:273` 是跳转位置——需要上下文时 `Read` 该文件那一段。
+`notes_query.py` 靠 `__file__` 定位索引路径（不是 cwd 相对），换目录跑也不会找错文件——但仓库根
+运行仍是约定写法，方便相对路径粘贴跳转行。
+
+**取证路由（何时切到语义检索）**：
+
+| 场景 | 用哪个 |
+|---|---|
+| 确切术语 / citekey / role 硬门槛取证（notes_query 有命中） | `notes_query.py`（原样，AND 精确匹配） |
+| 中文概念找英文文献表述、换一种说法、或 notes_query 查询空手 | `scripts/notes_search.py`（语义检索，支持 `--role`/`--cite`/`--json`，参数面与 notes_query 对齐但 JSON schema 不同） |
+
+```bash
+python scripts/notes_search.py <中文或英文查询...> --role citable|refutable|method [--cite] [--json]
+```
+`--mode` 默认 `hybrid`（dense 向量 + BM25 关键词 RRF 融合），也可 `--mode dense`/`--mode sparse`。
+两路都跑过、结果按 citekey 去重合并即可。**注意覆盖面**：句级证据（highlights）只覆盖库内精读
+文献（截至 2026-08 约 508 篇，占 keeper 的 24%）——`notes_search` 命中若标注"该篇无精读句级证据"，
+只是语义命中了标题/一句话用处，不能当句级可引证据用；真要引用还得回 `notes_query`/原文核实有没有
+对应句子。
 
 ### 2. 写稿
 
@@ -92,7 +113,7 @@ pandoc draft.md -f markdown-smart --citeproc --bibliography="$BIB" -s --css=pape
 ## 硬规则
 
 - **引用前确认无撞键**：`jq '.citekey_collisions' output/scholar_notes/literature_index.json` 应为 `[]`；
-  非空先跑 `python scripts/notes_index.py --fix-collisions`（否则同键不同文会串引用）。
+  非空先跑 `PYTHONPATH=. python scripts/notes_index.py --fix-collisions`（否则同键不同文会串引用）。
 - **书目落后于札记时**先刷新：`PYTHONPATH=. python scripts/notes_index.py`
   （会同时重建 `literature_index.json` 与 `all_references.json`，内容未变不落盘）。
 - **全局书目只覆盖 keeper 键**（`duplicate_of == null`）：被判重条目自己的 citekey 不在其中。
