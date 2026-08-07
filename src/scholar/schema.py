@@ -3,12 +3,14 @@
 Scholar Digest 数据结构定义
 使用 Pydantic 2.0 进行数据验证和序列化
 模仿 src/core/schema.py 的设计模式
+
+配置类（ScholarSettings 及其子类）已拆分至 settings.py，本文件末尾
+re-export 保持旧 import 路径（from .schema import ScholarSettings 等）向后兼容。
 """
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, date
 import json
 import os
@@ -187,6 +189,32 @@ class PaperSegment(BaseModel):
             "field": self.metadata.field,
         }
 
+    @classmethod
+    def from_digest_json(cls, seg_data: Dict[str, Any]) -> 'PaperSegment':
+        """从旧版 digest JSON 的单条 segment dict 还原（deep-research 加载论文用）。
+
+        metadata 里的 date/datetime 字段在裸 JSON 里是 ISO 字符串，PaperMetadata(**dict)
+        不会自动 fromisoformat（那是 model_validate 才有的行为），需先手动转换。
+        无效数据交给调用方 try/except 处理（原逻辑：跳过并记录警告，不中断整批）。
+        """
+        meta_data = dict(seg_data.get('metadata', {}))
+        if meta_data.get('publication_date') and isinstance(meta_data['publication_date'], str):
+            meta_data['publication_date'] = date.fromisoformat(meta_data['publication_date'])
+        if meta_data.get('email_received_at') and isinstance(meta_data['email_received_at'], str):
+            meta_data['email_received_at'] = datetime.fromisoformat(meta_data['email_received_at'])
+        if meta_data.get('extracted_at') and isinstance(meta_data['extracted_at'], str):
+            meta_data['extracted_at'] = datetime.fromisoformat(meta_data['extracted_at'])
+
+        meta = PaperMetadata(**meta_data)
+        return cls(
+            segment_id=seg_data.get('segment_id', 0),
+            paper_id=seg_data.get('paper_id', ''),
+            metadata=meta,
+            original_abstract=seg_data.get('original_abstract', ''),
+            translated_abstract=seg_data.get('translated_abstract', ''),
+            priority_score=seg_data.get('priority_score', 0.0),
+        )
+
 
 class EmailMetadata(BaseModel):
     """邮件元数据"""
@@ -232,7 +260,7 @@ class FilterDecision(BaseModel):
     one_line: str = Field(default="", description="一句话用处说明（≤30字）")
     confidence: Optional[float] = Field(None, description="裁决置信度 0.0-1.0")
     model: Optional[str] = Field(None, description="做出裁决的 LLM 模型（确定性阶段为 None）")
-    prompt_version: Optional[str] = Field(None, description="裁决 prompt 版本标签+模板哈希（如 filter-v2@a1b2c3d4）")
+    prompt_version: Optional[str] = Field(None, description="裁决 prompt 版本标签+模板哈希（如 filter-v3@a1b2c3d4）")
     decided_at: datetime = Field(default_factory=datetime.now, description="裁决时间")
     # RAG phase 3：札记库语义近邻（{citekey, year, one_line, sim}），随裁决固化供复盘；
     # 向量库/Ollama 不可用时上游返回空列表，此处默认 [] 且不影响旧 digest JSON 反序列化。
@@ -516,303 +544,15 @@ class DigestOutput(BaseModel):
         return "\n".join(lines)
 
 
-# ==================== 配置类 ====================
-
-class GmailAPISettings(BaseModel):
-    """Gmail API 配置"""
-    credentials_path: Path = Field(
-        Path("config/credentials.json"),
-        validation_alias=AliasChoices("credentials_path", "GMAIL_CREDENTIALS_PATH"),
-        description="OAuth 2.0 客户端凭据文件路径"
-    )
-    token_path: Path = Field(
-        Path("config/token.json"),
-        validation_alias=AliasChoices("token_path", "GMAIL_TOKEN_PATH"),
-        description="OAuth 2.0 令牌存储路径"
-    )
-    scopes: List[str] = Field(
-        default_factory=lambda: [
-            "https://www.googleapis.com/auth/gmail.readonly",
-            "https://www.googleapis.com/auth/gmail.modify"
-        ],
-        description="Gmail API 权限范围"
-    )
-    
-    @field_validator('credentials_path', 'token_path', mode='before')
-    @classmethod
-    def convert_to_path(cls, v):
-        if v is None:
-            return v
-        return Path(v)
-
-
-class LLMSettings(BaseModel):
-    """LLM 配置（用于论文摘要）"""
-    provider: str = Field("deepseek", validation_alias=AliasChoices("provider", "LLM_PROVIDER"), description="LLM提供商 (gemini, deepseek, ollama, claude-agent, openai-compatible)")
-    api_key: Optional[str] = Field(None, validation_alias=AliasChoices("api_key", "GEMINI_API_KEY"), description="Gemini API密钥")
-    model: str = Field("deepseek-v4-flash", validation_alias=AliasChoices("model", "LLM_MODEL"), description="模型名称")
-    # 回退链（逗号分隔）：主 provider 欠费/认证失败/CLI 缺失/内容拦截时依序切换。
-    # 与 translator 侧对齐的推荐链：deepseek → ollama → claude-agent → gemini
-    fallback_providers: str = Field("", validation_alias=AliasChoices("fallback_providers", "FALLBACK_PROVIDERS"), description="回退提供商链，逗号分隔（如 'ollama,claude-agent,gemini'）")
-    # 本地 Ollama 独立配置（与 openai 兼容组分离，可同链共存）
-    ollama_base_url: str = Field("http://localhost:11434/v1", validation_alias=AliasChoices("ollama_base_url", "OLLAMA_BASE_URL"), description="Ollama 服务地址（OpenAI 兼容端点）")
-    ollama_model: str = Field("qwen3.5:35b", validation_alias=AliasChoices("ollama_model", "OLLAMA_MODEL"), description="Ollama 模型名称")
-    # 札记库语义检索用（scripts/notes_embed.py / notes_search.py），与翻译/摘要模型完全独立
-    embedding_model: str = Field("bge-m3", validation_alias=AliasChoices("embedding_model", "EMBEDDING_MODEL"), description="本地 embedding 模型（札记库语义检索）")
-    embedding_base_url: Optional[str] = Field(None, validation_alias=AliasChoices("embedding_base_url", "EMBEDDING_BASE_URL"), description="Embedding 服务地址；None 时从 ollama_base_url 去掉尾部 /v1 派生")
-
-    # OpenAI 兼容提供商（DeepSeek 等）。未设置时回退复用主配置
-    # config/config.env 中的 API__OPENAI_API_KEY / API__OPENAI_BASE_URL
-    openai_api_key: Optional[str] = Field(None, validation_alias=AliasChoices("openai_api_key", "OPENAI_API_KEY"), description="OpenAI兼容API密钥（DeepSeek等）")
-    base_url: Optional[str] = Field(None, validation_alias=AliasChoices("base_url", "LLM_BASE_URL"), description="OpenAI兼容API地址")
-
-    # 白名单裁决专用模型（None 时复用主模型 model）
-    filter_model: Optional[str] = Field(None, validation_alias=AliasChoices("filter_model", "FILTER_MODEL"), description="过滤裁决使用的模型，未设置时复用 model")
-    # 全文精读专用模型（强模型；None 时复用主模型 model）
-    closeread_model: Optional[str] = Field(None, validation_alias=AliasChoices("closeread_model", "CLOSEREAD_MODEL"), description="全文精读使用的强模型，未设置时复用 model")
-
-    # 生成参数
-    temperature: float = Field(0.3, description="生成温度")
-    max_output_tokens: int = Field(8192, description="最大输出token数")
-
-
-class ProcessingSettings(BaseModel):
-    """处理配置"""
-    batch_size: int = Field(5, validation_alias=AliasChoices("batch_size", "BATCH_SIZE"), description="批量处理大小")
-    max_emails: int = Field(100, validation_alias=AliasChoices("max_emails", "MAX_EMAILS"), description="最大处理邮件数")
-    days_to_fetch: int = Field(7, validation_alias=AliasChoices("days_to_fetch", "DAYS_TO_FETCH"), description="获取最近N天的邮件")
-    
-    # 过滤
-    scholar_sender: str = Field(
-        "scholaralerts-noreply@google.com",
-        description="Google Scholar 发件人地址"
-    )
-    
-    # 过滤模式：llm = 黑名单确定性预过滤 + LLM 相关性裁决（宽松语义匹配）
-    #           keyword = 传统黑白名单关键词匹配
-    filter_mode: Literal["llm", "keyword"] = Field(
-        "llm",
-        validation_alias=AliasChoices("filter_mode", "FILTER_MODE"),
-        description="白名单过滤模式：llm（LLM 相关性裁决）或 keyword（关键词匹配）"
-    )
-
-    # 研究方向描述 / 论文主题与定位（注入 LLM 裁决 prompt 的 {{RESEARCH_INTERESTS}}）
-    research_interests: str = Field(
-        "论文主题：EHR 缺失机制（MNAR）与「缺失条件依赖结构」的跨中心可迁移性；"
-        "定位为 causal hypothesis generation，不做 causal identification。"
-        "基础工作：MA-GCT（特征专属可学习掩码嵌入 + Guide/Prior 注意力约束）。",
-        validation_alias=AliasChoices("research_interests", "RESEARCH_INTERESTS"),
-        description="论文主题与定位，用于 LLM 方法学审稿裁决"
-    )
-
-    # 关键词过滤（keyword 模式的白名单；两种模式共用黑名单做确定性预过滤）
-    whitelist: List[str] = Field(
-        default_factory=lambda: [
-            # EHR / 临床预测
-            "EHR", "Electronic Health Record", "EMR", "Electronic Medical Record",
-            "Clinical Prediction", "Predictive Model", "Risk Prediction", "Clinical Decision Support",
-            # 缺失机制方法学
-            "MNAR", "MAR", "missing not at random", "missingness", "informative missingness",
-            "missing data", "imputation", "mask embedding", "missingness-aware", "missingness indicator",
-            # 缺失 × 因果
-            "missingness graph", "m-graph", "causal discovery", "causal structure", "identifiability",
-            # 跨域 / 迁移
-            "transportability", "domain shift", "dataset shift", "distribution shift",
-            "external validation", "LODO", "site heterogeneity", "generalization",
-            # 建模
-            "GNN", "Graph Neural Network", "Graph Convolutional", "attention", "feature propagation",
-            "LLM", "Large Language Model", "foundation model", "Transformer",
-            "Semi-supervised", "Active Learning",
-            # venue 基准 / 临床场景
-            "MIMIC", "eICU", "AmsterdamUMCdb", "HiRID", "ICU",
-            "sepsis", "AKI", "acute kidney injury", "CKD", "mortality prediction",
-        ],
-        description="白名单关键词：keyword 模式下必须命中其一；llm 模式下仅作 LLM 失败时的回退"
-    )
-    blacklist: List[str] = Field(
-        default_factory=lambda: [
-            # 只保留与 EHR/临床机器学习方法学“明确无关”的领域，避免抢在 LLM 之前误杀
-            # 影像/基因组/信号等由 LLM 依 X1..X7 判定（否则会误杀 MNAR×影像 等对抗性证据）。
-            "天文", "Astronomy", "Astrophysics", "天体",
-            "材料科学", "Materials Science", "地质", "Geology",
-            "农业", "Agriculture", "考古", "Archaeology",
-            "particle physics", "量子化学", "Quantum Chemistry", "催化", "Catalysis",
-            "植物学", "Botany", "昆虫", "Entomology",
-        ],
-        description="黑名单关键词：仅无歧义的完全离题领域（确定性预过滤）；X1-X7 交给 LLM 判定"
-    )
-    
-    # 外部检索来源（PubMed / arXiv，并入每周 digest）
-    external_sources_enabled: bool = Field(
-        True,
-        validation_alias=AliasChoices("external_sources_enabled", "EXTERNAL_SOURCES_ENABLED"),
-        description="是否在 digest 中并入 PubMed/arXiv 检索式抓取的论文"
-    )
-    external_max_results: int = Field(
-        25,
-        validation_alias=AliasChoices("external_max_results", "EXTERNAL_MAX_RESULTS"),
-        description="每个外部来源最多抓取的论文数"
-    )
-    external_email: str = Field(
-        "",
-        validation_alias=AliasChoices("external_email", "EXTERNAL_EMAIL"),
-        description="NCBI E-utilities 礼貌参数用的联系邮箱（可选，无需密钥）"
-    )
-    arxiv_query: str = Field(
-        "(all:MNAR OR all:\"missing not at random\" OR all:\"informative missingness\" "
-        "OR all:\"missingness mechanism\") AND (all:EHR OR all:\"electronic health record\" "
-        "OR all:ICU OR all:\"clinical prediction\") AND (all:\"causal discovery\" "
-        "OR all:transportability OR all:\"distribution shift\" OR all:\"external validation\" "
-        "OR all:attention OR all:\"graph neural network\")",
-        validation_alias=AliasChoices("arxiv_query", "ARXIV_QUERY"),
-        description="arXiv 检索式（Atom API 语法，字段前缀 all:/abs:）"
-    )
-    pubmed_query: str = Field(
-        "(missing not at random OR MNAR OR informative missingness OR missingness mechanism) "
-        "AND (electronic health record OR EHR OR ICU OR clinical prediction) "
-        "AND (causal discovery OR causal structure OR transportability OR distribution shift "
-        "OR external validation OR attention OR graph neural network)",
-        validation_alias=AliasChoices("pubmed_query", "PUBMED_QUERY"),
-        description="PubMed 检索式（E-utilities term 语法）"
-    )
-
-    # Zotero 联动（B1 全自动写库 + citekey + pandoc 札记）
-    # 默认关闭：写库需 Zotero 桌面端在线，无人值守 cron 下可能没开，建议交互式运行。
-    zotero_enabled: bool = Field(
-        False,
-        validation_alias=AliasChoices("zotero_enabled", "ZOTERO_ENABLED"),
-        description="digest 后是否把入选论文写入 Zotero 并生成 pandoc 札记"
-    )
-    zotero_base_url: str = Field(
-        "http://localhost:23119",
-        validation_alias=AliasChoices("zotero_base_url", "ZOTERO_BASE_URL"),
-        description="Zotero 连接器服务地址（本地）"
-    )
-    zotero_collection: str = Field(
-        "",
-        validation_alias=AliasChoices("zotero_collection", "ZOTERO_COLLECTION"),
-        description="要求写入的分类名（防呆）：设了就必须在 Zotero 里选中同名分类，否则拒绝写入；空=写入当前选中"
-    )
-    zotero_attach_pdf: bool = Field(
-        True,
-        validation_alias=AliasChoices("zotero_attach_pdf", "ZOTERO_ATTACH_PDF"),
-        description="是否解析 OA PDF（arXiv/Unpaywall）作为附件让 Zotero 自抓"
-    )
-    zotero_enrich_crossref: bool = Field(
-        True,
-        validation_alias=AliasChoices("zotero_enrich_crossref", "ZOTERO_ENRICH_CROSSREF"),
-        description="写库前用 Crossref 标题检索规范作者+补 DOI（修正 Scholar 邮件解析的脏作者）"
-    )
-    zotero_translation_server_url: str = Field(
-        "",
-        validation_alias=AliasChoices("zotero_translation_server_url", "ZOTERO_TRANSLATION_SERVER_URL"),
-        description="Zotero translation-server 地址（如 http://localhost:1969）。设了则把标识符交给它做权威解析；空=用自建 item"
-    )
-    zotero_email: str = Field(
-        "",
-        validation_alias=AliasChoices("zotero_email", "ZOTERO_EMAIL"),
-        description="Unpaywall 礼貌参数邮箱（联系句柄，非密钥）；为空时复用 external_email"
-    )
-    notes_dir: Path = Field(
-        Path("output/scholar_notes"),
-        validation_alias=AliasChoices("notes_dir", "NOTES_DIR"),
-        description="pandoc 科研札记输出目录"
-    )
-    notes_instruction: str = Field(
-        "",
-        validation_alias=AliasChoices("notes_instruction", "NOTES_INSTRUCTION"),
-        description="自定义归纳指令（写入札记手记区注释，指导你后续整理）"
-    )
-    # 全文精读（从正文归纳 + 句级三色联想）
-    closeread_enabled: bool = Field(
-        False,
-        validation_alias=AliasChoices("closeread_enabled", "CLOSEREAD_ENABLED"),
-        description="是否对高优先级 top-N 做全文精读（下 PDF 抽全文 → 强模型精读）"
-    )
-    closeread_top_n: int = Field(
-        5,
-        validation_alias=AliasChoices("closeread_top_n", "CLOSEREAD_TOP_N"),
-        description="每次精读覆盖的高优先级论文数（控成本）"
-    )
-    # 分块深读（复用 manual 精读的 chunk→synth 通路）。**默认关**：它是唯一真正抬高
-    # 无人值守产线成本的开关（单批 top_n=5 约 42 次 LLM 调用，最坏 65 次），
-    # 不打开则全部产线行为与今天逐字节一致，回退 = 把开关关回去。
-    closeread_deep: bool = Field(
-        False,
-        validation_alias=AliasChoices("closeread_deep", "CLOSEREAD_DEEP"),
-        description="精读是否走分块深读（切块逐块通读 + 汇总），关闭则维持单跳精读"
-    )
-    # 120000 的依据：263 篇实测正文长度 p75=100,086、p90=128,272，120k 覆盖 p75；
-    # 该上限下实测最坏块数 11，正好被下面 12 的块顶卡住（两个数是配套的，改一个要重算另一个）。
-    closeread_max_chars: int = Field(
-        120000,
-        validation_alias=AliasChoices("closeread_max_chars", "CLOSEREAD_MAX_CHARS"),
-        description="深读模式下喂进模型的正文上限（仅 closeread_deep=True 生效；"
-                    "关闭时一律沿用 AUTO_MAX_CHARS=40000）"
-    )
-    closeread_max_chunks: int = Field(
-        12,
-        validation_alias=AliasChoices("closeread_max_chunks", "CLOSEREAD_MAX_CHUNKS"),
-        description="深读模式下的块数硬顶（防病态长 PDF 切出几十块吃掉整夜窗口）"
-    )
-    # 样式化 docx 输出
-    notes_emit_docx: bool = Field(
-        True,
-        validation_alias=AliasChoices("notes_emit_docx", "NOTES_EMIT_DOCX"),
-        description="生成札记时是否同时产出样式化 docx（单元格着色/句级三色/字体区分）"
-    )
-    notes_docx_cjk_font: str = Field(
-        "",
-        validation_alias=AliasChoices("notes_docx_cjk_font", "NOTES_DOCX_CJK_FONT"),
-        description="docx 中文字体名（如 思源宋体/宋体）；空=不显式设置"
-    )
-
-    # 输出
-    output_dir: Path = Field(
-        Path("output/scholar_digest"),
-        validation_alias=AliasChoices("output_dir", "OUTPUT_DIR"),
-        description="输出目录"
-    )
-    
-    # 功能开关
-    auto_mark_read: bool = Field(True, description="自动标记邮件为已读")
-    translate_abstracts: bool = Field(False, description="是否翻译摘要")
-    generate_summary: bool = Field(True, description="是否生成AI总结")
-
-    @field_validator('output_dir', mode='before')
-    @classmethod
-    def convert_to_path(cls, v):
-        if v is None:
-            return Path("output/scholar_digest")
-        return Path(v)
-
-
-class ScholarSettings(BaseSettings):
-    """Scholar Digest 全局设置"""
-    gmail: GmailAPISettings = Field(default_factory=GmailAPISettings)
-    llm: LLMSettings = Field(default_factory=LLMSettings)
-    processing: ProcessingSettings = Field(default_factory=ProcessingSettings)
-    
-    # 日志
-    log_level: str = Field("INFO", validation_alias="LOG_LEVEL", description="日志级别")
-    log_file: Optional[Path] = Field(
-        Path("logs/scholar_digest.log"),
-        validation_alias="LOG_FILE",
-        description="日志文件路径"
-    )
-
-    model_config = SettingsConfigDict(
-        env_file=Path('config/scholar.env'),
-        env_file_encoding='utf-8',
-        env_nested_delimiter='__',
-        case_sensitive=False,
-        extra='ignore'
-    )
-
-    @classmethod
-    def from_env_file(cls, env_file_path: Path = Path('config/scholar.env')) -> 'ScholarSettings':
-        """从指定的 .env 文件路径加载设置"""
-        return cls(_env_file=env_file_path)
+# ==================== 配置类 re-export ====================
+# 实体定义已迁往 settings.py；此处 re-export 保持旧路径
+# `from .schema import ScholarSettings` / `from src.scholar.schema import LLMSettings` 等继续可用。
+from .settings import (  # noqa: E402,F401
+    GmailAPISettings,
+    LLMSettings,
+    ProcessingSettings,
+    ScholarSettings,
+)
 
 
 # ==================== 类型别名 ====================
