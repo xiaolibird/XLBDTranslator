@@ -16,8 +16,8 @@ citekey/role 硬门槛场景用它）；本工具是语义检索，专治"中文
   dense  ：query 整句嵌入一次，与向量库做余弦相似度（原 phase 1 逻辑）
   sparse ：BM25(k1=1.2, b=0.75) 纯关键词倒排检索，分词复用 vault.tokenize（英文词+
            中文2-gram），不调用 Ollama，query 走 --mode dense/hybrid 才需要 embedding
-  hybrid ：默认模式。dense 与 sparse 各自在 paper 级、highlight 级分别取 top-50，
-           RRF(k=60) 融合排序；展示用的 score 优先给 dense 余弦（人更好理解 0~1 的
+  hybrid ：默认模式。dense 与 sparse 各自在 paper 级、highlight 级分别取
+           top-200（TOP_K_PER_LEVEL），RRF(k=60) 融合排序；展示用的 score 优先给 dense 余弦（人更好理解 0~1 的
            数），只有 dense 没命中、纯靠关键词命中的条目才展示 RRF 分并标 [关键词]
 
 覆盖面警告：句级证据只覆盖库内 480 篇精读文献（23%）。若某篇只有 paper 级命中，
@@ -46,10 +46,9 @@ from src.scholar.schema import ScholarSettings                            # noqa
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
-from src.scholar.embed_store import VectorStore, VectorStoreError         # noqa: E402
+from src.scholar.embed_store import DB_NAME, VectorStore, VectorStoreError, model_matches  # noqa: E402
 from src.scholar.vault import tokenize                                    # noqa: E402
 
-DB_NAME = "embeddings.sqlite3"
 INDEX_NAME = "literature_index.json"
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
@@ -203,8 +202,7 @@ def _load_store(db_path: Path, expected_model: str):
         store = VectorStore.load(db_path)
     except VectorStoreError as e:
         return None, str(e)
-    if (expected_model and store.model
-            and store.model.split(":")[0] != expected_model.split(":")[0]):
+    if expected_model and store.model and not model_matches(store.model, expected_model):
         return None, (
             "向量库使用的 embedding 模型是 '{}'，配置当前模型是 '{}'（不一致会导致向量空间"
             "不可比，检索结果无意义）\n请跑：PYTHONPATH=. python scripts/notes_embed.py --full".format(
@@ -251,12 +249,15 @@ def main() -> int:
         ap.error("--limit 不能为负（0=不限量）")
     if args.month and not MONTH_RE.match(args.month):
         ap.error("--month 格式应为 YYYY / YYYY-MM / YYYY-MM-DD，收到：{}".format(args.month))
+    if args.level == "paper" and args.role:
+        ap.error("--level paper 与 --role 互斥：paper 级 chunk 无 role，该组合必然 0 命中"
+                 "（--role 请配 --level auto 或 highlight）")
 
     query = " ".join(q.strip() for q in args.query if q and q.strip())
     if not query:
         ap.error("查询词为空")
 
-    cfg = Path(args.config)
+    cfg = repo_path(args.config)
     settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
     notes_dir = repo_path(settings.processing.notes_dir)
     db_path = notes_dir / DB_NAME
@@ -384,8 +385,12 @@ def main() -> int:
 
     if not shown:
         if no_query_tokens:
-            print("查询无法分词（单字中文/纯数字/纯符号），关键词分支必然 0 命中。"
-                  "建议用 --mode dense/hybrid 或多字短语。")
+            if args.mode == "sparse":
+                print("查询无法分词（单字中文/纯数字/纯符号），关键词检索必然 0 命中。"
+                      "建议用 --mode dense/hybrid 或多字短语。")
+            else:
+                print("无命中。注：查询无法分词（单字中文/纯数字/纯符号），本次只有语义"
+                      "检索实际生效。试试换个说法或降低 --min-score。")
         else:
             print("无命中（试试换个说法、降低 --min-score、去掉 --role/--tier 过滤）")
         return 1

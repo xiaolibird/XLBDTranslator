@@ -25,7 +25,6 @@
 """
 import argparse
 import json
-import subprocess
 import sys
 import traceback
 from datetime import date, datetime, timedelta
@@ -37,21 +36,9 @@ from src.scholar import ingest as ing                        # noqa: E402
 from src.scholar.paths import repo_path                         # noqa: E402
 from src.scholar.schema import ScholarSettings               # noqa: E402
 from src.utils.logger import get_logger                      # noqa: E402
+from src.utils.notify import notify                          # noqa: E402
 
 logger = get_logger("ingest_cli")
-
-
-def notify(title, text):
-    """失败时弹系统通知（仿 scripts/backfill_notes.py）。launchd 周一 09:30 无人值守跑
-    --auto，退出码 1 只有翻日志才看得见，通知才是用户真正的告警面。osascript 不可用
-    就静默——告警本身不该反过来把入库弄挂。"""
-    try:
-        subprocess.run(
-            ["osascript", "-e",
-             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
-            capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 def parse_pick(spec: str, n: int) -> list:
@@ -150,7 +137,7 @@ def main() -> int:
         except ValueError as e:
             print("日期格式应为 YYYY-MM-DD：{}".format(e), file=sys.stderr)
             return 2
-        segs = ing.load_digest_segments(Path(args.digest_dir), since=since, until=until)
+        segs = ing.load_digest_segments(repo_path(args.digest_dir), since=since, until=until)
         label = args.label or since.strftime("%Y-%m-%d")
         logger.info("digest 窗口 {} → {}：入选 {} 篇（复用已有裁决，未重跑筛选）".format(
             since, until, len(segs)))
@@ -215,19 +202,22 @@ def main() -> int:
         # 不中断脚本——向量库是索引的纯派生物，缺一次同步不影响本次入库结果。
         try:
             from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-            from src.scholar.embed_store import sync_store
+            from src.scholar.embed_store import DB_NAME, sync_store
             client = EmbeddingClient(
                 base_url=resolve_embedding_base_url(settings.llm),
                 model=settings.llm.embedding_model,
             )
             try:
-                stats = sync_store(nd / "embeddings.sqlite3", index_data, client)
+                stats = sync_store(nd / DB_NAME, index_data, client)
             finally:
                 client.close()
             logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
                 stats.embedded, stats.deleted, stats.meta_refreshed))
         except Exception as e:
             logger.warning("向量库同步跳过（不影响入库）：{}".format(e))
+            # launchd 无人值守时 warning 没人看——弹系统通知，向量库静默落后要有人知道
+            # （notify 自身失败静默，不会反过来影响入库退出码）
+            notify("Scholar 周入库", "向量库同步失败（札记已入库）：{}".format(str(e)[:120]))
 
     print("\n{}".format("=" * 66))
     print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))

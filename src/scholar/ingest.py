@@ -16,6 +16,7 @@ top-N 全文精读 → write_notes）：
 `notes_index.NOTE_MD_RE` 接受（手动精读系列在用同款日期后缀），vault 的
 `month_key()` 会把同月的周文件折进一个 `2026-07` 月度页，两边都不用改。
 """
+import concurrent.futures
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -49,7 +50,7 @@ def week_label(d: Optional[date] = None) -> str:
 
 def dedup_key(meta: PaperMetadata) -> str:
     """全局去重键（权威实现在 notes_index，与索引同源同规则）。"""
-    from .notes_index import dedup_key_fields
+    from ._citekey_utils import dedup_key_fields
     return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
 
 
@@ -68,14 +69,14 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
                 hit = enrich_metadata(seg.metadata, email=email, client=xc)
                 if hit:
                     cr += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Crossref enrich 失败 [{}]: {}", seg.paper_id, e)
             if not hit and seg.metadata.arxiv_id:
                 try:
                     if enrich_from_arxiv(seg.metadata, client=xc):
                         ax += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("arXiv enrich 失败 [{}]: {}", seg.paper_id, e)
             # 无摘要的论文若拿不到 OA 全文，精读会因空正文整篇落空——先去 PubMed 补一份
             if not (seg.original_abstract or "").strip():
                 try:
@@ -84,8 +85,8 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
                     if abs_:
                         seg.original_abstract = abs_
                         pm += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("PubMed 补摘要失败 [{}]: {}", seg.paper_id, e)
     if pm:
         logger.info("  PubMed 补摘要：{} 篇（原本无摘要，避免精读空转）".format(pm))
     if ts_url:
@@ -93,30 +94,48 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
             try:
                 if resolve_and_apply(seg.metadata, base_url=ts_url):
                     ts += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("translation-server 解析失败 [{}]: {}", seg.paper_id, e)
     return cr, ax, ts
 
 
 def resolve_citekeys(segs: Sequence[PaperSegment],
-                     base_url: str) -> Dict[str, Optional[str]]:
+                     base_url: str,
+                     max_workers: int = 4) -> Dict[str, Optional[str]]:
     """尽力回查 BBT citekey；Zotero 未开/拿不到则返回 None（札记用兜底键，自包含可渲染）。"""
     citekeys: Dict[str, Optional[str]] = {seg.paper_id: None for seg in segs}
+    if not segs:
+        return citekeys
     try:
         from .zotero_sync import ZoteroConnectorClient
+        # 先探活一次，避免每个 worker 都去 ping 失败
         cli = ZoteroConnectorClient(base_url=base_url)
         if not cli.ping():
             logger.info("  Zotero 未开，citekey 全用兜底键")
             cli.close()
             return citekeys
-        for seg in segs:
-            m = seg.metadata
-            try:
-                citekeys[seg.paper_id] = cli.resolve_citekey(
-                    doi=m.doi, title=m.title, retries=2, delay=0.5)
-            except Exception:
-                pass
         cli.close()
+
+        def _resolve_batch(batch):
+            """单 worker 内串行解析一批 segment（每个 worker 持有独立 client）。"""
+            cli2 = ZoteroConnectorClient(base_url=base_url)
+            try:
+                for seg in batch:
+                    m = seg.metadata
+                    try:
+                        citekeys[seg.paper_id] = cli2.resolve_citekey(
+                            doi=m.doi, title=m.title, retries=2, delay=0.5)
+                    except Exception as e:
+                        logger.debug("citekey 回查失败 [{}]: {}", seg.paper_id, e)
+            finally:
+                cli2.close()
+
+        workers = min(max_workers, len(segs))
+        seg_list = list(segs)
+        chunk_size = max(1, len(seg_list) // workers)
+        chunks = [seg_list[i:i + chunk_size] for i in range(0, len(seg_list), chunk_size)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            list(executor.map(_resolve_batch, chunks))
     except Exception as e:
         logger.warning("  citekey 回查异常（全用兜底）: {}".format(e))
     return citekeys
@@ -264,7 +283,10 @@ def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
     from .workflow import ScholarWorkflow
     wf = ScholarWorkflow(settings)
     wf.segments = list(segs)
-    wf._step_filter_papers()              # 裁决就地写进每个 seg.filter_decision（含被排除的）
+    try:
+        wf._step_filter_papers()          # 裁决就地写进每个 seg.filter_decision（含被排除的）
+    finally:
+        wf.close_rag_resources()
     if not force_include:
         return
     for seg in segs:
@@ -333,13 +355,17 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     if close_read:
         from .closereading import close_read_segments
         from .llm_client import LLMClient
-        done = close_read_segments(
-            segs, proc.research_interests, LLMClient(settings.llm),
-            top_n=top_n, email=email,
-            model=(settings.llm.closeread_model or settings.llm.model),
-            scratch_dir=Path("output/scholar_pdfs"),
-            deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-            max_chunks=proc.closeread_max_chunks)
+        llm_client = LLMClient(settings.llm)
+        try:
+            done = close_read_segments(
+                segs, proc.research_interests, llm_client,
+                top_n=top_n, email=email,
+                model=(settings.llm.closeread_model or settings.llm.model),
+                scratch_dir=Path("output/scholar_pdfs"),
+                deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+                max_chunks=proc.closeread_max_chunks)
+        finally:
+            llm_client.close()
         if top_n > 0 and segs and done == 0:
             # 0/N 成功几乎只出现在 claude-agent 限流/欠费这类通路级故障；照常写盘会让
             # 降级札记被索引 seen 去重永久固化（周度没有 --force 入口）。宁可本批不写：
@@ -356,8 +382,8 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
             existing_ckeys = {p.get("citekey") for p in
                               json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
                               if p.get("citekey")}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("literature_index.json 读取失败 [{}]: {}", idx_path, e)
     res = write_notes(
         list(segs), citekeys, out_dir=Path(proc.notes_dir),
         instruction=proc.notes_instruction,

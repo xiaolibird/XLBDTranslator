@@ -79,8 +79,11 @@ class AcademicSearchClient:
                 query, s.strftime("%Y%m%d"), e.strftime("%Y%m%d"))
         items: List[Dict[str, Any]] = []
         page = min(100, max_results)
+        max_pages = max_results // page + 2
         start = 0
-        while len(items) < max_results:
+        pages_fetched = 0
+        while len(items) < max_results and pages_fetched < max_pages:
+            pages_fetched += 1
             params = {
                 "search_query": q, "start": start, "max_results": page,
                 "sortBy": "submittedDate", "sortOrder": "descending",
@@ -95,6 +98,8 @@ class AcademicSearchClient:
                 break
             start += page
             time.sleep(0.5)  # arXiv 礼貌限速
+        if pages_fetched >= max_pages:
+            logger.warning("arXiv 检索触及最大页数上限 %d（已取 %d 条），可能未取完", max_pages, len(items))
         items = items[:max_results]
         if days is not None and not date_range:
             cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
@@ -177,18 +182,25 @@ class AcademicSearchClient:
         if not ids:
             return []
 
-        time.sleep(0.34)  # NCBI 礼貌限速（<3 req/s）
-        efetch_params = {
-            "db": "pubmed",
-            "id": ",".join(ids),
-            "retmode": "xml",
-            "tool": self.tool,
-        }
-        if self.email:
-            efetch_params["email"] = self.email
-        resp2 = self._client.get(f"{self.EUTILS}/efetch.fcgi", params=efetch_params)
-        resp2.raise_for_status()
-        return self.parse_pubmed(resp2.text)
+        # efetch 用 GET 会把 PMID 拼进 URL；大量 PMID（如期刊全量 2500 个）
+        # 会触发 414 Request-URI Too Long。按块取，每块最多 200 个 PMID。
+        efetch_batch = 200
+        items: List[Dict[str, Any]] = []
+        for chunk_start in range(0, len(ids), efetch_batch):
+            chunk_ids = ids[chunk_start:chunk_start + efetch_batch]
+            time.sleep(0.34)  # NCBI 礼貌限速（<3 req/s）
+            efetch_params = {
+                "db": "pubmed",
+                "id": ",".join(chunk_ids),
+                "retmode": "xml",
+                "tool": self.tool,
+            }
+            if self.email:
+                efetch_params["email"] = self.email
+            resp2 = self._client.get(f"{self.EUTILS}/efetch.fcgi", params=efetch_params)
+            resp2.raise_for_status()
+            items.extend(self.parse_pubmed(resp2.text))
+        return items
 
     @staticmethod
     def parse_pubmed(xml_text: str) -> List[Dict[str, Any]]:

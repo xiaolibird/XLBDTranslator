@@ -13,11 +13,17 @@
 import json
 import os
 import re
-from itertools import product
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from ._citekey_utils import (
+    _suffix_seq, _priority_tier, _TIER_MAP, _reading_depth,
+    _collect_highlights, dedup_key_fields, entry_from_segment, _norm_title,
+)
+
+# 向后兼容：旧公开 API
+norm_title = _norm_title
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,123 +66,6 @@ _CR_SECTION_RE = re.compile(r"^\*\*【(.+?)】\*\*\s*$")   # 精读分节标题�
 _TAG_LINE_RE = re.compile(
     r"^- 〔(可引用证据|可反驳观点|方法论借鉴|方法学创新|重要发现|研究背景)〕(.*)$")
 _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}|[a-z\-]+/\d{7})")
-
-_TIER_MAP = {"🔴 高": "high", "🔴": "high", "🟠 中": "mid", "🟢 低": "low"}
-
-
-# ---------------- 去重键（权威实现，backfill delegate 到此） ----------------
-
-def norm_title(t: Optional[str]) -> str:
-    return "".join(ch.lower() for ch in (t or "") if ch.isalnum())
-
-
-def dedup_key_fields(doi: Optional[str], arxiv_id: Optional[str], title: Optional[str],
-                     fallback: str = "") -> str:
-    """全局去重键：优先 DOI，其次 arXiv id，最后规范标题。
-
-    标题也为空时退回 fallback（paper_id/citekey），避免多篇「三无」论文
-    共享空键 "title:" 而被误判为同一篇（丢篇/吞篇）。
-    """
-    if doi:
-        return "doi:" + doi.strip().lower().replace("https://doi.org/", "")
-    if arxiv_id:
-        return "arxiv:" + arxiv_id.strip().lower()
-    t = norm_title(title)
-    if t:
-        return "title:" + t
-    return "id:" + (str(fallback or "").strip() or "unknown")
-
-
-# ---------------- 句级角色 → highlights（工作流可调取的核心结构） ----------------
-
-def _collect_highlights(triples):
-    """把 (section_heading, tag, text) 三元组流聚合成 highlights[] + tag_counts。
-
-    - tag 经 schema.TAG_TO_ROLE 归一到英文 role slug（citable/refutable/method）；
-      映射为 None 的（如旧「研究背景」）丢弃，天然去噪。
-    - highlights 项：{role, tag(原始中文), section, text}，供工作流按 role 跨库 jq 检索。
-    - tag_counts 键为 role slug，口径与 highlights 一致（历史/新数据可比）。
-    """
-    from .schema import TAG_TO_ROLE
-    highlights: List[Dict[str, Any]] = []
-    tag_counts: Dict[str, int] = {}
-    for heading, tag, text in triples:
-        if not tag:
-            continue
-        role = TAG_TO_ROLE.get(tag)
-        if role is None:
-            continue
-        highlights.append({"role": role, "tag": tag,
-                           "section": heading or "", "text": (text or "").strip()})
-        tag_counts[role] = tag_counts.get(role, 0) + 1
-    return highlights, tag_counts
-
-
-# ---------------- 从内存对象构造条目（write_notes sidecar 复用，无损） ----------------
-
-def _reading_depth(cr, series: str) -> Optional[str]:
-    """条目的阅读深度。manual 链路必须兜住：pdf_ingest.synthesize_deep_read 不写 reading_depth，
-    而 manual 正是全库读得最深的一批（逐块深读）；不兜的话量尺上最深的条目反倒落成 null。
-    """
-    if cr is None:
-        return None
-    if series == "manual" or cr.source == "manual-pdf":
-        return getattr(cr, "reading_depth", None) or "chunked"
-    return getattr(cr, "reading_depth", None)
-
-
-def entry_from_segment(seg, citekey: str, rank: int, total: int,
-                       citekey_source: str = "fallback",
-                       series: str = "auto") -> Dict[str, Any]:
-    """从 PaperSegment 直接构造索引条目（不含 month/note_file 等落盘上下文，索引时补）。"""
-    from .notes import _priority_tier  # 延迟导入，避免与 notes.py 的 sidecar 钩子成环
-    meta = seg.metadata
-    fd = seg.filter_decision
-    cr = seg.close_reading
-
-    year = None
-    if getattr(meta, "publication_date", None):
-        year = meta.publication_date.year
-    elif getattr(meta, "email_received_at", None):
-        year = meta.email_received_at.year
-
-    highlights, tag_counts = _collect_highlights(
-        (sec.heading, st.tag, st.text)
-        for sec in (cr.sections if cr else [])
-        for st in sec.sentences)
-
-    return {
-        "citekey": citekey,
-        "citekey_source": citekey_source,
-        "series": series,
-        "doi": meta.doi or None,
-        "arxiv_id": meta.arxiv_id or None,
-        "title": meta.title or "",
-        "title_zh": seg.translated_title or None,
-        "authors": list(meta.authors or []),
-        "year": year,
-        "journal": meta.journal or None,
-        "url": meta.url or None,
-        "priority_tier": _TIER_MAP.get(_priority_tier(rank, total), "low"),
-        "priority_rank": rank + 1,
-        "priority_score": round(float(seg.priority_score or 0.0), 4),
-        "decision": fd.decision if fd else None,
-        "one_line": (fd.one_line or "") if fd else "",
-        "bucket": list(fd.bucket) if fd and fd.bucket else [],
-        "role": (fd.role if fd and fd.role and fd.role != "NONE" else None),
-        "confidence": (fd.confidence if fd else None),
-        "flags": list(fd.flags) if fd and fd.flags else [],
-        "has_full_text_reading": bool(cr and cr.from_full_text),
-        "reading_source": (cr.source if cr else None),
-        "fulltext_chars": (cr.body_chars if cr else None),
-        "fulltext_chars_raw": (cr.body_chars_raw if cr else None),
-        "fulltext_truncated": (cr.truncated if cr else None),
-        "reading_depth": _reading_depth(cr, series),
-        "tag_counts": tag_counts,
-        "highlights": highlights,
-        "dedup_key": dedup_key_fields(meta.doi, meta.arxiv_id, meta.title,
-                                      fallback=meta.paper_id),
-    }
 
 
 # ---------------- 存量札记：md 解析 + CSL 合并 ----------------
@@ -434,7 +323,7 @@ def _entry_keys(e: Dict[str, Any]) -> List[str]:
     一级键不同但实为同文（如预印本/正刊双收）。
     """
     keys = [e["dedup_key"]]
-    t = norm_title(e.get("title"))
+    t = _norm_title(e.get("title"))
     if t:
         tk = "title:" + t
         if tk != e["dedup_key"]:
@@ -803,7 +692,11 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
         logger.warning("  ⚠️ 未在 {} 找到 {}，跳过".format(md.name, tag_old))
         return False
     lines[hit_line] = lines[hit_line].replace(tag_old, tag_new)
-    md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # 原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致
+    content = "\n".join(lines) + "\n"
+    tmp = md.with_suffix(md.suffix + ".tmp-{}".format(os.getpid()))
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, md)
 
     ref_name = entry.get("references_json")
     if ref_name:
@@ -817,8 +710,10 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
                        cand[0] if cand else None)
             if tgt is not None:
                 tgt["id"] = new
-                rp.write_text(json.dumps(items, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+                content = json.dumps(items, ensure_ascii=False, indent=2)
+                tmp = rp.with_suffix(rp.suffix + ".tmp-{}".format(os.getpid()))
+                tmp.write_text(content, encoding="utf-8")
+                os.replace(tmp, rp)  # 原子写防崩溃撕裂
         except Exception as e:
             logger.warning("  ⚠️ 同步 references.json 失败（{}）: {}".format(ref_name, e))
 
@@ -835,25 +730,15 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
                        cand[0] if cand else None)
             if tgt is not None:
                 tgt["citekey"] = new
-                sc.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                              encoding="utf-8")
+                content = json.dumps(data, ensure_ascii=False, indent=2)
+                tmp = sc.with_suffix(sc.suffix + ".tmp-{}".format(os.getpid()))
+                tmp.write_text(content, encoding="utf-8")
+                os.replace(tmp, sc)  # 原子写防崩溃撕裂
             else:
                 logger.warning("  ⚠️ sidecar {} 中未找到 {}，改键可能被回滚".format(sc.name, old))
         except Exception as e:
             logger.warning("  ⚠️ 同步 sidecar 失败（{}）: {}".format(sc.name, e))
     return True
-
-
-def _suffix_seq(max_len: int = 3):
-    """消歧后缀序列：b…z、bb…zz、bbb…（仿 BBT）。
-
-    恒为纯小写字母——曾用 chr(ord('b')+n) 递增，'z' 之后落到 '{' '|'，
-    而 pandoc 会在这些字符处截断 citekey，把引用**静默指到基键那篇论文**。
-    """
-    letters = [chr(c) for c in range(ord("b"), ord("z") + 1)]
-    for n in range(1, max_len + 1):
-        for combo in product(letters, repeat=n):
-            yield "".join(combo)
 
 
 def fix_citekey_collisions(notes_dir: Path) -> int:

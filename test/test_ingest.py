@@ -263,7 +263,7 @@ def _mock_pipeline(monkeypatch, done):
     import src.scholar.closereading as closereading
     monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: done)
     import src.scholar.llm_client as llm_client
-    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: None)
+    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: type('Mock', (), {'close': lambda self: None, 'call': lambda self, *a, **k: ''})())
 
 
 def test_closeread_zero_success_raises_and_writes_nothing(tmp_path, monkeypatch):

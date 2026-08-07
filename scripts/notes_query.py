@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-INDEX_PATH = REPO / "output" / "scholar_notes" / "literature_index.json"
+INDEX_PATH = REPO / "output" / "scholar_notes" / "literature_index.json"  # 模块级常量，向后兼容
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
@@ -86,6 +86,10 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
     ap.add_argument("--json", action="store_true", dest="as_json", help="结构化输出（含 total）")
+    ap.add_argument("--notes-dir", default=None,
+                    help="札记目录（默认 output/scholar_notes）")
+    ap.add_argument("--index", default=None,
+                    help="文献索引 JSON 路径（默认 notes_dir/literature_index.json）")
     args = ap.parse_args()
 
     terms = [t.strip().lower() for t in args.terms if t and t.strip()]
@@ -96,7 +100,17 @@ def main() -> int:
     if args.month and not MONTH_RE.match(args.month):
         ap.error("--month 格式应为 YYYY / YYYY-MM / YYYY-MM-DD，收到：{}".format(args.month))
 
-    index = _load_index(INDEX_PATH)
+    if args.notes_dir:
+        notes_dir = REPO / args.notes_dir
+    else:
+        notes_dir = None
+    if args.index:
+        index_path = Path(args.index)
+    elif notes_dir:
+        index_path = notes_dir / "literature_index.json"
+    else:
+        index_path = INDEX_PATH  # 模块级常量，允许测试 monkeypatch
+    index = _load_index(index_path)
     if index is None:
         return 2
     if index.get("citekey_collisions"):

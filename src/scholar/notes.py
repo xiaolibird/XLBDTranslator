@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from .schema import PaperSegment, PaperMetadata
+from ._citekey_utils import _fallback_citekey, _priority_tier, _suffix_seq, entry_from_segment
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,31 +27,6 @@ logger = get_logger(__name__)
 #   旧（历史 bundle，原样保留以诚实反映当时标注）：方法学创新 / 重要发现 / 研究背景
 _TAG_MARK = {"可引用证据", "可反驳观点", "方法论借鉴",
              "方法学创新", "重要发现", "研究背景"}
-
-_STOP_WORDS = {"the", "a", "an", "of", "for", "and", "with", "using", "based",
-               "from", "into", "via", "toward", "towards", "study", "novel"}
-
-
-def _fallback_citekey(meta: PaperMetadata) -> str:
-    """headless 回填无 Zotero key 时，生成人读的临时引用键（作者姓+年+标题实词，仿 BBT 动态键）。"""
-    author = ""
-    if meta.authors:
-        first = (meta.authors[0] or "").strip()
-        surname = first.split(",")[0].split()[-1] if first else ""
-        author = "".join(c for c in surname if c.isalpha()).lower()
-    year = ""
-    if getattr(meta, "publication_date", None):
-        year = str(meta.publication_date.year)
-    elif getattr(meta, "email_received_at", None):
-        year = str(meta.email_received_at.year)
-    word = ""
-    for w in (meta.title or "").split():
-        cw = "".join(c for c in w if c.isalnum())
-        if len(cw) >= 4 and cw.lower() not in _STOP_WORDS:
-            word = cw[:1].upper() + cw[1:].lower()
-            break
-    key = "{}{}{}".format(author or "anon", year, word)
-    return key or "ref{}".format((meta.doi or meta.paper_id or "x")[:8])
 
 
 def _slug(text: str, maxlen: int = 60) -> str:
@@ -64,17 +40,6 @@ def _slug(text: str, maxlen: int = 60) -> str:
 
 def _yaml_list(items: List[str]) -> str:
     return "[" + ", ".join(json.dumps(i, ensure_ascii=False) for i in items) + "]"
-
-
-def _priority_tier(rank: int, total: int) -> str:
-    """按排名分三级着色标记（Word 里 emoji 可见，跨格式稳定）。"""
-    if total <= 1:
-        return "🔴"
-    if rank < max(1, total // 3):
-        return "🔴 高"
-    if rank < max(2, 2 * total // 3):
-        return "🟠 中"
-    return "🟢 低"
 
 
 def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[int] = None,
@@ -306,10 +271,13 @@ def write_notes(
             if citekeys.get(seg.paper_id):
                 continue
             base = _fallback_citekey(seg.metadata)
-            key, suf = base, ord("a")
-            while key in used:
-                key = "{}{}".format(base, chr(suf))
-                suf += 1
+            key = base
+            if key in used:
+                for suf in _suffix_seq():
+                    cand = "{}{}".format(base, suf)
+                    if cand not in used:
+                        key = cand
+                        break
             used.add(key)
             citekeys[seg.paper_id] = key
 
@@ -331,7 +299,6 @@ def write_notes(
     sidecar_path = None
     if emit_index_sidecar:
         try:
-            from .notes_index import entry_from_segment  # 延迟导入，避免循环依赖
             ordered = sorted(segments, key=lambda s: s.priority_score, reverse=True)
             entries = []
             for i, seg in enumerate(ordered):

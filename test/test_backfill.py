@@ -128,7 +128,7 @@ def test_run_month_undecided_not_in_notes(tmp_path, monkeypatch):
     monkeypatch.setattr(closereading, "close_read_segments", fake_close_read)
 
     import src.scholar.llm_client as llm_client
-    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: None)
+    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: type('Mock', (), {'close': lambda self: None, 'call': lambda self, *a, **k: ''})())
 
     import src.scholar.notes as notes
 
@@ -140,7 +140,7 @@ def test_run_month_undecided_not_in_notes(tmp_path, monkeypatch):
 
     args = argparse.Namespace(force=False, no_close_read=False, top_n=1,
                               summary=False, batch_size=15)
-    res = bn.run_month(2026, 6, settings, set(), args)
+    res = bn.run_month(2026, 6, settings, set(), set(), args)
 
     assert res["status"] == "ok"
     assert captured["write_notes"] == ["paper_1"]
@@ -176,7 +176,8 @@ def test_main_month_error_exits_1_and_notifies(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)  # progress 文件写进 tmp，别污染仓库 output/
     calls = []
-    monkeypatch.setattr(bn.subprocess, "run",
+    import src.utils.notify as notify_mod
+    monkeypatch.setattr(notify_mod.subprocess, "run",
                         lambda cmd, *a, **k: calls.append(cmd))
     monkeypatch.setattr(bn, "run_month",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("LLM 故障")))
@@ -201,7 +202,8 @@ def test_main_stale_progress_error_does_not_fail_run(tmp_path, monkeypatch):
         json.dumps({"results": [{"month": "2026-05", "status": "error", "error": "旧的"}]}),
         encoding="utf-8")
     calls = []
-    monkeypatch.setattr(bn.subprocess, "run",
+    import src.utils.notify as notify_mod
+    monkeypatch.setattr(notify_mod.subprocess, "run",
                         lambda cmd, *a, **k: calls.append(cmd))
     monkeypatch.setattr(bn, "run_month",
                         lambda y, m, *a, **k: {"month": "{:04d}-{:02d}".format(y, m),
@@ -243,7 +245,7 @@ def test_failed_month_keys_not_in_seen_for_later_months(tmp_path, monkeypatch):
     import src.scholar.closereading as closereading
     monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: 1)
     import src.scholar.llm_client as llm_client
-    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: None)
+    monkeypatch.setattr(llm_client, "LLMClient", lambda cfg: type('Mock', (), {'close': lambda self: None, 'call': lambda self, *a, **k: ''})())
 
     import src.scholar.notes as notes
     state = {"fail": True, "written": []}
@@ -260,11 +262,11 @@ def test_failed_month_keys_not_in_seen_for_later_months(tmp_path, monkeypatch):
                               summary=False, batch_size=15)
     seen: set = set()
     with pytest.raises(IOError):
-        bn.run_month(2026, 5, settings, seen, args)
+        bn.run_month(2026, 5, settings, seen, set(), args)
     assert seen == set()  # 失败月的键不并入
 
     state["fail"] = False
-    res = bn.run_month(2026, 6, settings, seen, args)
+    res = bn.run_month(2026, 6, settings, seen, set(), args)
     assert res["status"] == "ok"
     assert state["written"] == ["paper_1"]  # 同一篇在后续月份未被幽灵键 dedup 掉
     assert seen  # 落盘成功后键才并入

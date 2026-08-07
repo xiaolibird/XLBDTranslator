@@ -15,7 +15,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 from .schema import PaperSegment
-from .notes import _priority_tier
+from ._citekey_utils import _priority_tier
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)

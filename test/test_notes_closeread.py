@@ -55,7 +55,8 @@ def test_markdown_falls_back_to_summary_without_closeread():
 def test_fallback_citekeys_replace_missing(tmp_path):
     """headless 回填：无 Zotero key 时用人读临时键（作者+年+词），不出现 MISSING-KEY，且写入 CSL。"""
     from datetime import date
-    from src.scholar.notes import write_notes, _fallback_citekey
+    from src.scholar.notes import write_notes
+    from src.scholar._citekey_utils import _fallback_citekey
     seg = PaperSegment(
         segment_id=1, paper_id="p1", priority_score=0.5,
         metadata=PaperMetadata(paper_id="p1", title="Missing Data Mechanisms in EHR",

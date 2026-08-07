@@ -71,6 +71,21 @@ class LLMClient:
         self._chain = chain
         self._chain_idx = 0
 
+    def close(self):
+        """关闭内部 HTTP 连接池，避免 fd 泄漏。
+
+        ingest/backfill 等长生命周期调用方在完成所有调用后须显式 close。
+        """
+        if self._conn is not None and isinstance(self._conn, dict):
+            c = self._conn.get('client')
+            if isinstance(c, httpx.Client):
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            # 非 httpx.Client（如 gemini genai.Client / claude-agent dict）不需要显式关闭
+        self._conn = None
+
     @property
     def current_provider(self) -> str:
         return self._chain[self._chain_idx]
@@ -106,6 +121,15 @@ class LLMClient:
                 return False
             old = self._chain[self._chain_idx]
             self._chain_idx += 1
+            # 旧 conn 若持有 httpx.Client 须显式关闭，否则 fd 泄漏（Ollama 与
+            # openai-compatible 路径各创建一个 Client，gemini/claude-agent 不涉及）。
+            if self._conn is not None and isinstance(self._conn, dict):
+                c = self._conn.get('client')
+                if isinstance(c, httpx.Client):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
             self._conn = None
             logger.warning("🛟 LLM provider '{}' 判定不可用（{}），切换到 '{}'".format(
                 old, reason[:160], self._chain[self._chain_idx]))
@@ -242,6 +266,8 @@ class LLMClient:
         mtok = self.settings.max_output_tokens if max_tokens is None else max_tokens
 
         last_exc = None
+        # 防御 max_retries=0：range(0) 不执行会导致静默返回 None 而非抛异常
+        max_retries = max(max_retries, 1)
         for attempt in range(max_retries):
             try:
                 if provider == 'claude-agent':

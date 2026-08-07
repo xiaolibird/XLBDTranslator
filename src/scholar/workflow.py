@@ -21,6 +21,7 @@ from .schema import (
     FilterDecision,
 )
 from .gmail_client import GmailClient
+from .paths import repo_path
 from .paper_extractor import ScholarEmailParser
 from ..utils.logger import get_logger
 
@@ -30,7 +31,7 @@ logger = get_logger(__name__)
 FILTER_BATCH_SIZE = 20
 
 # 裁决 prompt 模板文件；缺失时使用内嵌兜底模板（保证 cron 无人值守可跑）
-FILTER_PROMPT_FILE = Path("config/prompts/whitelist_filter_prompt.md")
+FILTER_PROMPT_FILE = repo_path("config/prompts/whitelist_filter_prompt.md")
 
 FILTER_PROMPT_FALLBACK = """<!-- version: filter-v2-embedded -->
 # ROLE
@@ -124,6 +125,7 @@ class ScholarWorkflow:
         # segment_id -> [{citekey, year, one_line, sim}, ...]；向量库/Ollama 不可用时值为 []。
         self._library_neighbors_cache: Dict[int, List[dict]] = {}
         self._vector_store = None  # 懒加载的 embed_store.VectorStore，失败后不重试
+        self._paper_mask = None  # 随 _vector_store 一次算好的 paper 级布尔掩码（万级 records 别每批重建）
         self._embedding_client = None  # 懒加载的 embeddings.EmbeddingClient
         self._library_neighbors_unavailable = False  # 一次失败后本次 run 内不再重试，避免刷屏
 
@@ -224,7 +226,9 @@ class ScholarWorkflow:
         except Exception as e:
             logger.error("工作流执行失败: {}".format(e))
             raise
-    
+        finally:
+            self.close_rag_resources()
+
     def _step_fetch_emails(self):
         """Step 1: 获取 Google Scholar 邮件"""
         logger.info("\nStep 1: 获取 Google Scholar 邮件")
@@ -685,20 +689,23 @@ class ScholarWorkflow:
         try:
             import numpy as np
 
-            from .embed_store import VectorStore
+            from .embed_store import DB_NAME, VectorStore, model_matches
             from .embeddings import EmbeddingClient, EmbeddingError, resolve_embedding_base_url
 
             if self._vector_store is None:
-                db_path = self.settings.processing.notes_dir / "embeddings.sqlite3"
+                # repo_path 自锚定：不依赖调用方（scholar_main 锚了，screen_journal 之类的新
+                # 调用方忘了锚就会指向 <cwd>/output/... 并被下面的 except 吞成静默降级）
+                db_path = repo_path(self.settings.processing.notes_dir) / DB_NAME
                 self._vector_store = VectorStore.load(db_path)
                 want_model = getattr(self.settings.llm, "embedding_model", None) or "bge-m3"
-                # 只比基础名：`bge-m3:latest` 与 `bge-m3` 是同一模型
-                if (self._vector_store.model or "").split(":")[0] != want_model.split(":")[0]:
+                if not model_matches(self._vector_store.model, want_model):
                     raise EmbeddingError(
                         "向量库 embedding 模型 {} 与配置 {} 不一致，先跑 notes_embed.py --full 重建"
                         .format(self._vector_store.model, want_model))
+                self._paper_mask = np.array(
+                    [rec.get("level") == "paper" for rec in self._vector_store.records], dtype=bool)
             store = self._vector_store
-            mask = np.array([rec.get("level") == "paper" for rec in store.records], dtype=bool)
+            mask = self._paper_mask
 
             if self._embedding_client is None:
                 base_url = resolve_embedding_base_url(self.settings.llm)
@@ -741,6 +748,18 @@ class ScholarWorkflow:
                 result[paper.segment_id] = []
 
         return result
+
+    def close_rag_resources(self):
+        """释放近邻检索占用的资源（httpx 连接、内存向量矩阵）。幂等；execute() 收尾
+        与 classify_segments 的临时 workflow 都会调，忘调也只是等进程退出兜底。"""
+        if self._embedding_client is not None:
+            try:
+                self._embedding_client.close()
+            except Exception:
+                pass
+            self._embedding_client = None
+        self._vector_store = None
+        self._paper_mask = None
 
     def _build_filter_prompt(self, batch: List[PaperSegment]) -> str:
         """构建批量裁决 prompt"""
@@ -933,28 +952,24 @@ class ScholarWorkflow:
             return 0.4
     
     def _get_recency_score(self, pub_date) -> float:
-        """计算时效性评分"""
+        """计算时效性评分。
+
+        每年衰减 0.2，5 年以上归零（1.0 - 5*0.2 = 0.0），clamp 到 [0.0, 1.0]。
+        当前年及未来论文 = 1.0，无法解析年份默认 0.3（中性分，既不当成最新也不归零）。
+        """
         if not pub_date:
-            return 0.5
-        
+            return 0.3
+
         from datetime import date
         current_year = date.today().year
-        
+
         if hasattr(pub_date, 'year'):
             year = pub_date.year
         else:
-            return 0.5
-        
-        if year >= current_year:
-            return 1.0
-        elif year == current_year - 1:
-            return 0.9
-        elif year == current_year - 2:
-            return 0.7
-        elif year == current_year - 3:
-            return 0.5
-        else:
             return 0.3
+
+        score = 1.0 - (current_year - year) * 0.2
+        return max(0.0, min(1.0, score))
     
     def _get_type_score(self, paper_type: str) -> float:
         """计算论文类型评分"""
@@ -1051,7 +1066,7 @@ class ScholarWorkflow:
 ## 评分规则
 - source_score: 顶级期刊(Lancet/NEJM/Nature)=1.0, 专业期刊(JAMIA/JBI)=0.9, 一般期刊=0.7, 会议=0.6, 预印本=0.4
 - field_score: 医学信息学/EHR/临床预测=1.0, 医学AI=0.9, 通用ML=0.6, 其他=0.3
-- recency_score: 2026年=1.0, 2025年=0.9, 2024年=0.7, 2023年=0.5
+- recency_score: 当前年份=1.0, 每早一年扣 0.2（如去年=0.8, 两年前=0.6, 五年以上=0.0）
 - type_score: 综述/Meta分析=1.0, 方法论=0.9, 原创研究=0.7, 应用研究=0.5
 - citation_score: 引用量 > 1000 = 1.0, > 100 = 0.7, > 10 = 0.4, 0 = 0.0
 - priority_score = 0.25*source + 0.25*field + 0.15*recency + 0.15*type + 0.2*citation

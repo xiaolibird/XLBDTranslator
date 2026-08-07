@@ -269,7 +269,8 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
     oa 非空时复用预解析结果（close_read_segments 择优时已解析，避免重复网络请求）。
     deep=True 时走分块深读（预算放宽到 max_chars），失败回落单跳；默认值即现行行为。
     """
-    scratch_dir = Path(scratch_dir or "output/scholar_pdfs")
+    from .paths import repo_path
+    scratch_dir = repo_path(scratch_dir or "output/scholar_pdfs")  # 锚定仓库根，防 cwd 漂移双树缓存
     if oa is None:
         oa = resolve_oa_pdf(seg.metadata, email=email)
     full_text, from_full, source = "", False, None

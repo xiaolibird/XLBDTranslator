@@ -120,7 +120,11 @@ class EmbeddingClient:
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             rows.append(self._embed_batch(batch))
-        mat = np.vstack(rows).astype(np.float32)
+        try:
+            mat = np.vstack(rows).astype(np.float32)
+        except ValueError as e:
+            # 批间维度不一致（服务端模型热切换等罕见情况）——调用方契约是只捕 EmbeddingError
+            raise EmbeddingError("embedding 批间维度不一致：{}".format(e)) from e
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         norms[norms == 0] = 1.0  # 全零向量（异常输入）避免除零，原样保留
         return mat / norms

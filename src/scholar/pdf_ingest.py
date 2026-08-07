@@ -633,7 +633,7 @@ def find_duplicate(index_path: Optional[Path], meta: PaperMetadata) -> Optional[
     if not index_path or not Path(index_path).exists():
         return None
     try:
-        from .notes_index import dedup_key_fields
+        from ._citekey_utils import dedup_key_fields
         key = dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
         data = json.loads(Path(index_path).read_text(encoding="utf-8"))
         for e in data.get("papers", []):

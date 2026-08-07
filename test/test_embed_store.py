@@ -147,3 +147,265 @@ def test_blob_dim_match_loads(tmp_path):
     store = VectorStore.load(db)
     assert len(store) == 1
     assert store.mat.shape == (1, 4)
+
+
+# ---------------- sync_store 增量 diff / 防护（假 client，不连 Ollama） ----------------
+
+from src.scholar.embed_store import sync_store, model_matches  # noqa: E402
+
+
+class _FakeEmbedClient:
+    """确定性假 embedding：文本 sha256 前 4 字节 → L2 归一 4 维向量。"""
+    model = "bge-m3"
+
+    def __init__(self):
+        self.embed_calls = 0
+
+    def embed(self, texts, batch_size=64):
+        self.embed_calls += 1
+        out = np.zeros((len(texts), 4), dtype=np.float32)
+        for i, t in enumerate(texts):
+            h = hashlib.sha256(t.encode("utf-8")).digest()
+            v = np.frombuffer(h[:4], dtype=np.uint8).astype(np.float32) + 1.0
+            out[i] = v / np.linalg.norm(v)
+        return out
+
+
+def _db_citekeys(db):
+    import sqlite3
+    conn = sqlite3.connect(str(db))
+    try:
+        return {r[0] for r in conn.execute("SELECT DISTINCT citekey FROM chunks")}
+    finally:
+        conn.close()
+
+
+def test_sync_store_initial_then_noop(tmp_path):
+    """首次同步全量嵌入；索引不变的第二次同步 0 嵌入、全部 meta_refreshed。"""
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1")]),
+                      _paper("b2024B")],
+           "generated_at": "2026-01-01T00:00:00"}
+    stats = sync_store(db, idx, _FakeEmbedClient())
+    assert (stats.total, stats.embedded, stats.deleted) == (3, 3, 0)
+    stats2 = sync_store(db, idx, _FakeEmbedClient())
+    assert (stats2.embedded, stats2.deleted, stats2.meta_refreshed) == (0, 0, 3)
+
+
+def test_sync_store_incremental_add_change_delete(tmp_path):
+    """增量四路：改文本→重嵌、没动→meta_refresh、消失→删除、新增→嵌入。"""
+    db = tmp_path / "e.sqlite3"
+    idx1 = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1")]),
+                       _paper("b2024B")]}
+    sync_store(db, idx1, _FakeEmbedClient())
+    idx2 = {"papers": [_paper("a2024A", one_line="改了", highlights=[_hl("citable", "s1")]),
+                       _paper("c2024C")]}
+    stats = sync_store(db, idx2, _FakeEmbedClient())
+    assert stats.embedded == 2            # a 的 paper 文本变了 + c 新增
+    assert stats.deleted == 1             # b 的 paper chunk
+    assert stats.meta_refreshed == 1      # a 的 highlight 没动
+    assert _db_citekeys(db) == {"a2024A", "c2024C"}
+
+
+def test_sync_store_dry_run_touches_nothing(tmp_path):
+    """dry_run 只算计划：不建库、不调 embed。"""
+    db = tmp_path / "e.sqlite3"
+    client = _FakeEmbedClient()
+    stats = sync_store(db, {"papers": [_paper("a2024A")]}, client, dry_run=True)
+    assert stats.embedded == 1 and stats.dry_run
+    assert not db.exists()
+    assert client.embed_calls == 0
+
+
+def test_sync_store_empty_index_rejected(tmp_path):
+    """空期望集一律拒绝落库（防 --full 把好库清成 0 行）。"""
+    with pytest.raises(VectorStoreError, match="拒绝"):
+        sync_store(tmp_path / "e.sqlite3", {"papers": []}, _FakeEmbedClient())
+
+
+def test_sync_store_full_shrink_guard(tmp_path):
+    """--full 前索引骤缩（<50%）→ 拒绝替换现有库。"""
+    db = tmp_path / "e.sqlite3"
+    idx_big = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1"), _hl("method", "s2")]),
+                          _paper("b2024B", highlights=[_hl("citable", "s3")])]}
+    sync_store(db, idx_big, _FakeEmbedClient())          # 5 chunks
+    idx_small = {"papers": [_paper("c2024C")]}           # 1 chunk < 5*0.5
+    with pytest.raises(VectorStoreError, match="不到现有库"):
+        sync_store(db, idx_small, _FakeEmbedClient(), full=True)
+    assert _db_citekeys(db) == {"a2024A", "b2024B"}      # 原库毫发无损
+
+
+def test_sync_store_full_rebuild(tmp_path):
+    """--full 全量重建：tmp+replace 后库内容与索引一致。"""
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1")]), _paper("b2024B")]}
+    sync_store(db, idx, _FakeEmbedClient())
+    stats = sync_store(db, idx, _FakeEmbedClient(), full=True)
+    assert stats.embedded == 3 and stats.full
+    assert _db_citekeys(db) == {"a2024A", "b2024B"}
+    assert not list(tmp_path.glob("*.tmp-*"))            # 无临时库残留
+
+
+def test_empty_paper_text_skipped():
+    """title 与 one_line 都空 → 整条跳过（不嵌空串占检索名额）。"""
+    idx = {"papers": [_paper("g2025Empty", title="", one_line="",
+                             highlights=[_hl("citable", "有句子也不进")])]}
+    assert chunks_from_index(idx) == []
+
+
+def test_model_matches_base_name():
+    """bge-m3:latest 与 bge-m3 视为同一模型；不同基础名不同。"""
+    assert model_matches("bge-m3:latest", "bge-m3")
+    assert model_matches("bge-m3", "bge-m3:latest")
+    assert not model_matches("bge-m3", "bge-large")
+    assert not model_matches(None, "bge-m3")
+
+
+# ---------------- VectorStore.search mask 语义 ----------------
+
+def test_search_mask_excludes_rows():
+    """mask=False 的行即使余弦最高也不得出现；窄过滤不空手。"""
+    meta = {"model": "bge-m3", "dim": "2"}
+    records = [{"level": "paper"}, {"level": "highlight"}, {"level": "paper"}]
+    mat = np.array([[1, 0], [1, 0], [0, 1]], dtype=np.float32)
+    store = VectorStore(meta, records, mat)
+    q = np.array([1, 0], dtype=np.float32)
+    hits = store.search(q, mask=np.array([False, True, True]), top_k=3)
+    idxs = [i for i, _ in hits]
+    assert 0 not in idxs
+    assert idxs[0] == 1                                  # 掩码内最相似者居首
+
+
+# ---------------- workflow._library_neighbors 降级分支 ----------------
+
+def test_library_neighbors_degrades_silently(tmp_path):
+    """向量库缺失 → 返回空近邻并置 unavailable，第二次调用短路不再尝试。"""
+    from types import SimpleNamespace
+    from src.scholar.workflow import ScholarWorkflow
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)        # 绕开 __init__（Gmail/输出目录副作用）
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=tmp_path),  # 绝对路径 repo_path 原样返回；库不存在
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None,
+                            ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = None
+    wf._paper_mask = None
+    wf._embedding_client = None
+    wf._library_neighbors_unavailable = False
+
+    seg = SimpleNamespace(segment_id=1, metadata=SimpleNamespace(title="t"), original_abstract="a")
+    assert wf._library_neighbors([seg]) == {1: []}
+    assert wf._library_neighbors_unavailable is True
+    seg2 = SimpleNamespace(segment_id=2, metadata=SimpleNamespace(title="t2"), original_abstract="")
+    assert wf._library_neighbors([seg2]) == {2: []}      # 短路分支
+
+    wf.close_rag_resources()                             # 幂等收尾不炸
+    wf.close_rag_resources()
+
+
+# ---------------- 第二轮审查回归：并发/骤缩/归一化契约 ----------------
+
+class _RaceEmbedClient(_FakeEmbedClient):
+    """embed 期间对库做一次并发写，模拟另一进程的增量同步。"""
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db_path = db_path
+
+    def embed(self, texts, batch_size=64):
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("UPDATE chunks SET text_hash='RACED' WHERE rowid=1")
+        conn.commit()
+        conn.close()
+        return super().embed(texts, batch_size=batch_size)
+
+
+def test_sync_store_snapshot_recheck_catches_concurrent_write(tmp_path):
+    """embed 阶段（无锁窗口）被并发修改 → BEGIN IMMEDIATE 后快照复核必须拒绝本次同步。"""
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("a2024A"), _paper("b2024B")]}
+    sync_store(db, idx, _FakeEmbedClient())
+    idx2 = {"papers": [_paper("a2024A"), _paper("b2024B"), _paper("c2024C")]}
+    with pytest.raises(VectorStoreError, match="并发修改"):
+        sync_store(db, idx2, _RaceEmbedClient(db))
+
+
+def test_sync_store_incremental_shrink_guard(tmp_path):
+    """增量同步遇到骤缩索引（<50%）→ 拒绝执行，不做无上限批删。"""
+    db = tmp_path / "e.sqlite3"
+    idx_big = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1"), _hl("method", "s2")]),
+                          _paper("b2024B", highlights=[_hl("citable", "s3")])]}
+    sync_store(db, idx_big, _FakeEmbedClient())          # 5 chunks
+    idx_small = {"papers": [_paper("c2024C")]}           # 1 chunk
+    with pytest.raises(VectorStoreError, match="拒绝增量"):
+        sync_store(db, idx_small, _FakeEmbedClient())
+    assert _db_citekeys(db) == {"a2024A", "b2024B"}
+
+
+def test_embedding_client_l2_normalizes(monkeypatch):
+    """EmbeddingClient.embed 契约：输出行 L2 归一；全零向量不除零、原样保留。
+    检索余弦正确性完全依赖这一前提（库内与 query 侧共用此入口）。"""
+    from src.scholar.embeddings import EmbeddingClient
+    client = EmbeddingClient()
+    raw = np.array([[3.0, 4.0], [0.0, 0.0]], dtype=np.float32)   # 未归一 + 全零
+    monkeypatch.setattr(client, "_embed_batch", lambda batch: raw[:len(batch)])
+    out = client.embed(["a", "b"])
+    assert out.shape == (2, 2)
+    assert abs(np.linalg.norm(out[0]) - 1.0) < 1e-6              # 归一化
+    assert np.linalg.norm(out[1]) == 0.0                          # 零向量原样保留不 NaN
+    assert not np.isnan(out).any()
+
+
+def test_multiline_title_keeps_one_line_alignment():
+    """title 含内嵌换行时，paper 文本仍只有一个分隔换行——split('\\n',1) 还原不错位。"""
+    idx = {"papers": [_paper("h2025NL", title="Line1\nLine2", one_line="一句话")]}
+    cks = [c for c in chunks_from_index(idx) if c.level == "paper"]
+    assert len(cks) == 1
+    parts = cks[0].text.split("\n", 1)
+    assert parts[0] == "Line1 Line2"
+    assert parts[1] == "一句话"
+
+
+# ---------------- workflow._library_neighbors happy path ----------------
+
+def test_library_neighbors_happy_path():
+    """min_sim 过滤 + one_line 还原 + 缓存写入，全链路（假 store/假 client，不连 Ollama）。"""
+    from types import SimpleNamespace
+    from src.scholar.workflow import ScholarWorkflow
+
+    # 三条 paper 级记录：与 query 余弦分别为 1.0 / 0.7 / 0.3（最后者应被 min_sim=0.65 滤掉）
+    meta = {"model": "bge-m3", "dim": "2"}
+    records = [
+        {"level": "paper", "citekey": "hit2025A", "year": 2025, "text": "T甲\n一句话甲"},
+        {"level": "paper", "citekey": "hit2024B", "year": 2024, "text": "T乙"},   # 无 one_line
+        {"level": "paper", "citekey": "far2023C", "year": 2023, "text": "T丙\n一句话丙"},
+    ]
+    v = np.array([[1, 0], [0.7, np.sqrt(1 - 0.49)], [0.3, np.sqrt(1 - 0.09)]], dtype=np.float32)
+    store = VectorStore(meta, records, v)
+
+    class _Client:
+        model = "bge-m3"
+        def probe(self):
+            return {"model": "bge-m3", "dim": 2}
+        def embed(self, texts, batch_size=64):
+            return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (len(texts), 1))
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=Path(".")),
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None, ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = store
+    wf._paper_mask = np.array([True, True, True])
+    wf._embedding_client = _Client()
+    wf._library_neighbors_unavailable = False
+
+    seg = SimpleNamespace(segment_id=7, metadata=SimpleNamespace(title="q"), original_abstract="a")
+    out = wf._library_neighbors([seg], k=3, min_sim=0.65)
+    hits = out[7]
+    assert [h["citekey"] for h in hits] == ["hit2025A", "hit2024B"]   # 0.3 被滤掉
+    assert hits[0]["one_line"] == "一句话甲"
+    assert hits[1]["one_line"] == ""                                   # 无 one_line 不错位
+    assert wf._library_neighbors_cache[7] == hits                      # 已入缓存

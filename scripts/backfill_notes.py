@@ -24,7 +24,7 @@
 """
 import argparse
 import json
-import subprocess
+import os
 import sys
 import time
 import traceback
@@ -37,21 +37,9 @@ from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.schema import ScholarSettings, DigestOutput, DigestStatus  # noqa: E402
 from src.scholar.workflow import ScholarWorkflow  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
+from src.utils.notify import notify      # noqa: E402
 
 logger = get_logger("backfill")
-
-
-def notify(title, text):
-    """失败时弹系统通知（仿 scripts/sync_vault.py）。launchd 月度 job 无人值守，
-    退出码 1 只有翻日志才看得见，通知才是用户真正的告警面。osascript 不可用就静默——
-    告警本身不该反过来把回填弄挂。"""
-    try:
-        subprocess.run(
-            ["osascript", "-e",
-             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
-            capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 def month_list(since: str, until: str):
@@ -81,7 +69,7 @@ from src.scholar.ingest import (dedup_key, enrich_segments,  # noqa: E402,F401
                                 resolve_citekeys)
 
 
-def run_month(y, m, settings, seen: set, args) -> dict:
+def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
     proc = settings.processing
     label = "{:04d}-{:02d}".format(y, m)
     note_md = Path(proc.notes_dir) / "科研札记_{}_全文精读.md".format(label)
@@ -134,15 +122,19 @@ def run_month(y, m, settings, seen: set, args) -> dict:
     if not args.no_close_read:
         from src.scholar.closereading import close_read_segments
         from src.scholar.llm_client import LLMClient
-        done = close_read_segments(
-            fresh, proc.research_interests, LLMClient(settings.llm),
-            top_n=args.top_n, email=email,
-            model=(settings.llm.closeread_model or settings.llm.model),
-            scratch_dir=Path("output/scholar_pdfs"),
-            # 与周度 ingest 同一个开关：漏传会让 CLOSEREAD_DEEP 打开后周度深读、
-            # 月度回填仍单跳，两代札记在同一索引里无声混存
-            deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-            max_chunks=proc.closeread_max_chunks)
+        llm_client = LLMClient(settings.llm)
+        try:
+            done = close_read_segments(
+                fresh, proc.research_interests, llm_client,
+                top_n=args.top_n, email=email,
+                model=(settings.llm.closeread_model or settings.llm.model),
+                scratch_dir=Path("output/scholar_pdfs"),
+                # 与周度 ingest 同一个开关：漏传会让 CLOSEREAD_DEEP 打开后周度深读、
+                # 月度回填仍单跳，两代札记在同一索引里无声混存
+                deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+                max_chunks=proc.closeread_max_chunks)
+        finally:
+            llm_client.close()
         if args.top_n > 0 and fresh and done == 0:
             # 0/N 成功几乎只有 LLM 通路整体故障（限流/欠费）一种解释；照常写盘会把
             # 降级札记固化成"已完成"（note_md.exists() 永久跳过，--force 需要人先发现），
@@ -151,16 +143,8 @@ def run_month(y, m, settings, seen: set, args) -> dict:
                 min(args.top_n, len(fresh))))
         full_text = sum(1 for s in fresh if s.close_reading and s.close_reading.from_full_text)
 
+    # existing_ckeys 已在 main() 中从 literature_index.json 一次性计算，避免 41 个月重复 IO
     from src.scholar.notes import write_notes
-    existing_ckeys = set()
-    idx_path = Path(proc.notes_dir) / "literature_index.json"
-    if idx_path.exists():
-        try:
-            existing_ckeys = {p.get("citekey") for p in
-                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
-                              if p.get("citekey")}
-        except Exception:
-            pass
     res = write_notes(
         fresh, citekeys, out_dir=Path(proc.notes_dir),
         instruction=proc.notes_instruction,
@@ -202,7 +186,7 @@ def main():
     if args.prev_month:
         args.since = args.until = prev_month_label()
 
-    settings = ScholarSettings.from_env_file(Path(args.config))
+    settings = ScholarSettings.from_env_file(repo_path(args.config))
     # 相对 notes_dir 锚死仓库根，别随 cwd 漂（见 paths.repo_path）
     settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
     # 并行分片：每个进程用独立 token 副本，避免多进程刷新时并发写 config/token.json 损坏
@@ -216,6 +200,7 @@ def main():
         settings.gmail.token_path = tp
     if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
         settings.llm.provider = "deepseek"  # 与既有 pipeline 一致，走 deepseek
+        logger.info("LLM provider 从 gemini 自动切换为 deepseek（model={}）".format(settings.llm.model))
     months = month_list(args.since, args.until)
     logger.info("=" * 60)
     logger.info("按月回填：{} → {}，共 {} 个月".format(args.since, args.until, len(months)))
@@ -224,7 +209,7 @@ def main():
     logger.info("=" * 60)
 
     # 进度文件按分片区分，避免多进程并行时互相覆盖
-    prog_path = Path("output/scholar_notes/backfill_progress_{}_{}.json".format(args.since, args.until))
+    prog_path = Path(settings.processing.notes_dir) / "backfill_progress_{}_{}.json".format(args.since, args.until)
     prog_path.parent.mkdir(parents=True, exist_ok=True)
     results = []
     if prog_path.exists():
@@ -240,6 +225,16 @@ def main():
         Path(settings.processing.notes_dir) / "literature_index.json",
         exclude_months=run_months if args.force else None)
     logger.info("跨运行去重集：从索引恢复 {} 个键".format(len(seen)))
+    # 与 seen 同源一次性计算 existing_ckeys，避免 41 个月每轮重复读 literature_index.json
+    existing_ckeys: set = set()
+    idx_path = Path(settings.processing.notes_dir) / "literature_index.json"
+    if idx_path.exists():
+        try:
+            existing_ckeys = {p.get("citekey") for p in
+                              json.loads(idx_path.read_text(encoding="utf-8")).get("papers", [])
+                              if p.get("citekey")}
+        except Exception:
+            pass
 
     for i, (y, m) in enumerate(months, 1):
         label = "{:04d}-{:02d}".format(y, m)
@@ -248,7 +243,7 @@ def main():
         logger.info("#" * 60)
         t0 = time.time()
         try:
-            r = run_month(y, m, settings, seen, args)
+            r = run_month(y, m, settings, seen, existing_ckeys, args)
         except SystemExit:
             raise
         except Exception as e:
@@ -257,8 +252,12 @@ def main():
             r = {"month": label, "status": "error", "error": str(e)}
         r["elapsed_sec"] = round(time.time() - t0, 1)
         results = [x for x in results if x.get("month") != label] + [r]
-        prog_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2),
-                             encoding="utf-8")
+        # 原子写：先写 tmp 再 os.replace，避免半写 JSON 丢失整月进度
+        # （参考 src/scholar/notes_index.write_if_changed() 的 tmp+replace 模式）
+        tmp_path = prog_path.with_suffix(prog_path.suffix + '.tmp-{}'.format(os.getpid()))
+        tmp_path.write_text(json.dumps({"results": results}, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        os.replace(tmp_path, prog_path)
         logger.info("  ⏱️ {} 用时 {}s".format(label, r["elapsed_sec"]))
 
     # 收尾：增量刷新文献索引（供论文项目 agent 检索；也是下次运行去重集的来源）
@@ -273,19 +272,21 @@ def main():
             # best-effort 向量同步：batch 回填后跟进向量库（失败只 warning，不影响回填结果）
             try:
                 from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-                from src.scholar.embed_store import sync_store
+                from src.scholar.embed_store import DB_NAME, sync_store
                 client = EmbeddingClient(
                     base_url=resolve_embedding_base_url(settings.llm),
                     model=settings.llm.embedding_model,
                 )
                 try:
-                    stats = sync_store(notes_dir / "embeddings.sqlite3", index_data, client)
+                    stats = sync_store(notes_dir / DB_NAME, index_data, client)
                 finally:
                     client.close()
                 logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
                     stats.embedded, stats.deleted, stats.meta_refreshed))
             except Exception as e2:
                 logger.warning("向量库同步跳过（不影响回填结果）：{}".format(e2))
+                # 每月 1 日 launchd 无人值守——弹系统通知，向量库静默落后要有人知道
+                notify("Scholar 月度回填", "向量库同步失败（回填已完成）：{}".format(str(e2)[:120]))
         except Exception as e:
             index_err = e
             logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))

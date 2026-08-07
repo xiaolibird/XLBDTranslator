@@ -22,12 +22,11 @@ from src.scholar.schema import ScholarSettings                            # noqa
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
-from src.scholar.embed_store import sync_store, read_store_meta, SCHEMA_VERSION, VectorStoreError  # noqa: E402
+from src.scholar.embed_store import DB_NAME, sync_store, read_store_meta, SCHEMA_VERSION, VectorStoreError  # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
 
 logger = get_logger("notes_embed")
 
-DB_NAME = "embeddings.sqlite3"
 INDEX_NAME = "literature_index.json"
 
 
@@ -89,7 +88,7 @@ def main() -> int:
     ap.add_argument("--stats", action="store_true", help="只读库报告统计，不连 Ollama")
     args = ap.parse_args()
 
-    cfg = Path(args.config)
+    cfg = repo_path(args.config)
     if cfg.exists():
         settings = ScholarSettings.from_env_file(cfg)
     else:

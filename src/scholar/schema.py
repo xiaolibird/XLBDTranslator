@@ -411,7 +411,7 @@ class DigestOutput(BaseModel):
 
         # tmp+replace 原子写（同 merge_final.py）：digest JSON 是周度入库唯一裁决来源，
         # 半写文件会让整周论文静默不入库；一处改动同时保护 Step 4 首写与 Step 4.5 精读回写
-        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+        tmp_path = output_path.with_suffix(output_path.suffix + '.tmp-{}'.format(os.getpid()))
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(self.model_dump(mode='json'), f, ensure_ascii=False, indent=2, default=str)
         os.replace(tmp_path, output_path)

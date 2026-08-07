@@ -39,7 +39,7 @@ def _cur_month():
 
 
 def _load_settings(config):
-    settings = ScholarSettings.from_env_file(Path(config))
+    settings = ScholarSettings.from_env_file(repo_path(config))
     # 与既有 pipeline 一致：gemini 模型名走 deepseek provider
     if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
         settings.llm.provider = "deepseek"
@@ -197,13 +197,13 @@ def _sync_embedding_best_effort(notes_dir: Path, index: dict, settings) -> None:
     """
     try:
         from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-        from src.scholar.embed_store import sync_store
+        from src.scholar.embed_store import DB_NAME, sync_store
         client = EmbeddingClient(
             base_url=resolve_embedding_base_url(settings.llm),
             model=settings.llm.embedding_model,
         )
         try:
-            stats = sync_store(notes_dir / "embeddings.sqlite3", index, client)
+            stats = sync_store(notes_dir / DB_NAME, index, client)
         finally:
             client.close()
         logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(

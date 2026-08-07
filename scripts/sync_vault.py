@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.paths import repo_path            # noqa: E402
 from src.scholar.notes_index import INDEX_JSON     # noqa: E402
+from src.utils.notify import notify                # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 BUILD_VAULT = REPO / "scripts" / "build_vault.py"
@@ -42,17 +43,6 @@ BUILD_VAULT = REPO / "scripts" / "build_vault.py"
 
 def log(msg):
     print("[{}] {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
-
-
-def notify(title, text):
-    """失败时弹系统通知。osascript 不存在或被拒就静默跳过——告警本身不该让同步失败。"""
-    try:
-        subprocess.run(
-            ["osascript", "-e",
-             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
-            capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 def read_index(index_path, tries, settle):

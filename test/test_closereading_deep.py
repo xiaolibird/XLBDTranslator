@@ -68,6 +68,9 @@ class _DeepLLM:
             raise RuntimeError("单跳也挂了")
         return _SINGLE_RESP
 
+    def close(self):
+        pass  # mock：LLMClient.close() 兼容
+
     @property
     def n_synth_calls(self):
         return sum(1 for p in self.calls if p.startswith("你在把一篇论文"))

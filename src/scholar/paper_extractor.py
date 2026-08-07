@@ -41,8 +41,10 @@ class ScholarEmailParser:
     ]
     
     # DOI 正则表达式
+    # 长度上限 {1,2000} 防 ReDoS：DOI 实际最长约 255 字符，2000 留足余量避免
+    # 恶意超长输入触发 [^\s<>"']+ 的灾难性回溯
     DOI_PATTERN = re.compile(
-        r'(?:doi[:\s]*)?10\.\d{4,}/[^\s<>"\']+',
+        r'(?:doi[:\s]*)?10\.\d{4,}/[^\s<>"\']{1,2000}',
         re.IGNORECASE
     )
     
@@ -488,8 +490,8 @@ class ScholarEmailParser:
     
     def _extract_abstract(self, block: Any) -> str:
         """提取摘要/描述"""
-        # 获取块中的所有文本
-        full_text = block.get_text(separator=' ', strip=True)
+        # 获取块中的所有文本（用换行符连接节点，让后续 split('\n') 能按行拆分）
+        full_text = block.get_text(separator='\n', strip=True)
         
         # 移除标题和作者（通常在开头）
         lines = full_text.split('\n')

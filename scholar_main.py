@@ -8,23 +8,11 @@ import os
 import sys
 import json
 import argparse
-import subprocess
 from pathlib import Path
 from datetime import date, timedelta
 import traceback
 
-
-def notify(title, text):
-    """失败时弹系统通知（同 scripts/backfill_notes.py，本文件内复制以免跨脚本 import）。
-    launchd 周一 09:00 无人值守跑 digest，失败只落 err.log 无人翻——Gmail 凭据/TCC
-    路径问题历史上真实发生过。osascript 不可用就静默，告警本身不该把任务再弄挂。"""
-    try:
-        subprocess.run(
-            ["osascript", "-e",
-             'display notification {} with title {}'.format(json.dumps(text), json.dumps(title))],
-            capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
+from src.utils.notify import notify
 
 
 def _parse_month_range(args):
@@ -485,7 +473,7 @@ def main():
             args.command = 'digest'
         
         # 加载配置
-        config_path = Path(args.config)
+        config_path = repo_path(args.config)
         if config_path.exists():
             settings = ScholarSettings.from_env_file(config_path)
             logger.info("已加载配置文件: {}".format(config_path))
@@ -495,6 +483,7 @@ def main():
         # notes_dir/output_dir 默认是相对路径，语义是「仓库里的那个目录」；不锚定的话
         # 从别处（或 launchd 里 cwd 未设对）启动就会静默写去另一棵目录树。见 paths.repo_path
         settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
+        settings.processing.output_dir = repo_path(settings.processing.output_dir)
         
         # 设置调试日志
         if args.debug:
