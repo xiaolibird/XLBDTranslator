@@ -65,6 +65,27 @@ def _is_retryable_gemini_error(e: BaseException) -> bool:
     return False
 
 
+
+# 只有错误文本明确指向 context cache 本身失效（过期/被删/找不到）才值得清空
+# cache_refs + 磁盘元数据并降级无缓存重发；429/401/402/404 等 provider 级故障、
+# 网络超时等瞬态问题与缓存健康与否无关，不应被牵连着一起清缓存。
+_CACHE_INVALID_PATTERNS = ('cached content', 'cachedcontent', 'cache_not_found', 'cache not found')
+
+
+def _looks_like_cache_invalidity(exc: Exception) -> bool:
+    """判断异常是否明确指示 Gemini context cache 本身失效。
+
+    见 _generate_content 的缓存降级分支：此前 `except Exception` 不加区分地
+    把 429/401/402/404/超时等一切错误都当成「缓存坏了」处理——一次瞬态限流
+    就会把健康的 cache 引用清空、磁盘元数据删掉，并立刻无缓存重发同一批（对
+    429 等于双倍烧配额），此后全书剩余批次全部改为无缓存全价发送。这里改为
+    先看错误文本是否明确提到 cache/cached content，不是的话原样上抛，交给
+    @retry（_is_retryable_gemini_error）或回退链按各自既有语义处理，缓存
+    保持不变，下次重试仍可复用。"""
+    text = str(exc).lower()
+    return any(p in text for p in _CACHE_INVALID_PATTERNS)
+
+
 def _is_retryable_openai_error(e: BaseException) -> bool:
     """OpenAI 兼容路径重试谓词：_chat_completions 把 402/401/404 HTTPError 一律
     包装成 APIError，按类型匹配（retry_if_exception_type）会让欠费/认证失败/模型下线
@@ -484,10 +505,13 @@ class GeminiTranslator(BaseTranslator):
             # 内容级错误：缓存是好的，直接上抛给调用方按内容失败处理
             raise
         except Exception as e:
-            # 缓存失败时降级
-            if cache_name:
+            # 缓存失败时降级——但仅当错误明确指示 cache 本身失效时才清缓存+
+            # 无缓存重发；429/401/402/404/超时等与缓存健康无关的错误原样上抛，
+            # 交给 @retry / 回退链按既有语义处理，避免误杀健康的 context cache
+            # （见 _looks_like_cache_invalidity 的说明）
+            if cache_name and _looks_like_cache_invalidity(e):
                 logger.warning(f"⚠️  {purpose} 缓存使用失败，降级为普通调用: {e}")
-                
+
                 # P1修复：清理失效的缓存引用。
                 # 用原子 pop 而非 check-then-del：异步线程池共享同一 cache_refs，
                 # TTL 到期瞬间多个在飞请求同时进此分支，check-then-del 会二次
@@ -553,46 +577,63 @@ class GeminiTranslator(BaseTranslator):
         else:
             return self._translate_text_batch(segments, context, glossary)
 
+    @retry(
+        stop=_stop_by_settings,
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        # 与 _translate_text_batch 同款谓词：致命错误（401/402/404 等）不重试，
+        # 立即上抛给外层 except 做 _reraise_if_provider_fatal 判定。
+        retry=retry_if_exception(_is_retryable_gemini_error),
+        reraise=True
+    )
+    def _translate_titles_once(self, titles: List[str]) -> TranslationMap:
+        """标题翻译单次尝试，供 translate_titles 的 @retry 包装调用。
+
+        此前无重试：一次瞬态错误（429/超时）就被外层 except 静默吞成 {}，
+        整批标题留原文且回退链感知不到失败。现让异常在此原样上抛，
+        由装饰器负责瞬态重试，外层 except 只处理重试耗尽后的最终结果。
+        """
+        input_json_str = json.dumps(titles, ensure_ascii=False)
+        original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
+
+        response = self._generate_content(
+            contents=original_prompt,
+            generation_config=self.generation_config,
+            use_cache=True,
+            purpose="Title Translation"
+        )
+        raw_text = response.candidates[0].content.parts[0].text
+        # 解析响应（含正则兜底）
+        parsed_data = self._parse_json_response(
+            raw_text,
+            is_title_translation=True
+        )
+
+        # 归一化处理
+        if isinstance(parsed_data, dict):
+            return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
+        elif isinstance(parsed_data, list) and parsed_data:
+            result = {}
+            for item in parsed_data:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        if k != 'id':  # 跳过 id 字段
+                            result[str(k)] = str(v)
+            return result
+
+        return {}
+
     def translate_titles(self, titles: List[str]) -> TranslationMap:
         """翻译标题列表"""
         if not titles:
             return {}
 
-        input_json_str = json.dumps(titles, ensure_ascii=False)
-        original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
-
         try:
-            response = self._generate_content(
-                contents=original_prompt,
-                generation_config=self.generation_config,
-                use_cache=True,
-                purpose="Title Translation"
-            )
-            raw_text = response.candidates[0].content.parts[0].text
-            # 解析响应（含正则兜底）
-            parsed_data = self._parse_json_response(
-                raw_text,
-                is_title_translation=True
-            )
-
-            # 归一化处理
-            if isinstance(parsed_data, dict):
-                return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
-            elif isinstance(parsed_data, list) and parsed_data:
-                result = {}
-                for item in parsed_data:
-                    if isinstance(item, dict):
-                        for k, v in item.items():
-                            if k != 'id':  # 跳过 id 字段
-                                result[str(k)] = str(v)
-                return result
-
-            return {}
-
+            return self._translate_titles_once(titles)
         except Exception as e:
             # provider 级错误（hard：欠费/认证/模型下线；soft：配额限流）必须上抛
             # 而非降级为空 {}：标题翻译若静默返回空表，回退链无从触发/计数，
-            # 标题会整批留原文。瞬态错误维持原语义——降级返回 {} 由调用方兜底。
+            # 标题会整批留原文。瞬态错误经 _translate_titles_once 的 @retry
+            # 重试耗尽后仍失败——维持原语义，降级返回 {} 由调用方兜底。
             _reraise_if_provider_fatal(e)
             logger.error(f"Title translation failed even after correction attempts: {e}")
             return {}
@@ -1420,7 +1461,6 @@ class OpenAICompatibleTranslator(BaseTranslator):
 
     def __init__(self, settings: Settings, provider: str = 'openai-compatible'):
         super().__init__(settings)
-        self.prompt_manager = PromptManager(settings)
         self._async_translator: Optional[AsyncOpenAICompatibleTranslator] = None
 
         # provider='ollama' 读独立的 ollama_* 配置组：deepseek 与本地 ollama
@@ -1434,14 +1474,21 @@ class OpenAICompatibleTranslator(BaseTranslator):
             self.api_key: Optional[str] = settings.api.openai_api_key
             self.base_url: str = settings.api.openai_base_url
             self.model: str = settings.api.openai_model
-        
+
         # 验证和修复 base_url 配置
         self.base_url = self._validate_and_fix_base_url(self.base_url)
-        
+
         # 自动检测是否为本地服务（Ollama）或 DeepSeek API
         # 适配 M2 Pro 16GB 硬件环境，本地模式需要特殊处理
         self.is_local: bool = self._detect_local_service(self.base_url)
         self.is_deepseek: bool = self._detect_deepseek_api(self.base_url)
+
+        # PromptManager 的简化版/完整版选择必须由**本实例**是否本地决定，
+        # 不能只看主 provider（settings.api.translator_provider）——回退链里
+        # 主 provider=ollama 时，本实例若是 deepseek/openai-compatible（云端
+        # 回退），self.is_local 为 False，仍然拿完整版；反之主 provider 是
+        # 云端而本实例是 ollama 时，self.is_local 为 True，强制降级到简化版
+        self.prompt_manager = PromptManager(settings, force_simple=self.is_local)
         
         # DeepSeek 长文本模式：_chat_completions 会把 system instruction（正式
         # 阶段含 mode+glossary）并入单条 user message
@@ -1600,6 +1647,21 @@ class OpenAICompatibleTranslator(BaseTranslator):
         context: str = "",
         glossary: Optional[Dict[str, str]] = None,
     ) -> List[str]:
+        # 本方法（主翻译路径的唯一入口）无需自带 @retry：429/超时/连接抖动的
+        # tenacity 覆盖已在被调用的 _translate_text_batch 上（本文件
+        # _translate_text_batch 定义处的 @retry(stop=_stop_by_settings,
+        # retry=retry_if_exception(_is_retryable_openai_error), reraise=True)）。
+        # 调用路径：同步走 workflow._run_sync_batches 直接调本方法；异步走
+        # workflow._process_single_batch → AsyncOpenAICompatibleTranslator.
+        # translate_text_batch_async → self.base._translate_text_batch（见本
+        # 文件 AsyncOpenAICompatibleTranslator.translate_text_batch_async），
+        # 两条路径最终都落到同一个被 @retry 包装的 _translate_text_batch，
+        # 而不是本方法 translate_batch 自身——异步路径并不经过本方法。
+        # _http_post_json 把超时/连接抖动/HTTP 4xx&5xx 一律包装成
+        # APIError/APITimeoutError（core/exceptions.py），
+        # _is_retryable_openai_error 按 classify_fatal!='hard' 放行重试，
+        # 402/401/404 等致命错误立即 reraise 不空转——与 Gemini 侧同款语义，
+        # 核实为已覆盖，此处不再补一份重复的 @retry。
         if not segments:
             return []
 
@@ -1608,42 +1670,61 @@ class OpenAICompatibleTranslator(BaseTranslator):
             return self._translate_vision_batch(segments, context, glossary)
         return self._translate_text_batch(segments, context, glossary)
 
+    @retry(
+        stop=_stop_by_settings,
+        wait=wait_exponential(multiplier=1, min=1, max=20),
+        # 与 _translate_text_batch 同款谓词：致命错误（401/402/404 等）不重试，
+        # 立即上抛给外层 except 做 _reraise_if_provider_fatal 判定。
+        retry=retry_if_exception(_is_retryable_openai_error),
+        reraise=True,
+    )
+    def _translate_titles_once(self, titles: List[str]) -> TranslationMap:
+        """标题翻译单次尝试，供 translate_titles 的 @retry 包装调用。
+
+        此前无重试：一次瞬态错误（429/超时/连接抖动）就被外层 except 静默吞成
+        {}，整批标题留原文——而 DeepSeek/Ollama 是本项目的主力 provider，
+        标题翻译这条路径反而比 Gemini 更缺重试保护。与 Gemini 版
+        _translate_titles_once 同款模式：异常在此原样上抛，由装饰器负责瞬态
+        重试，外层 except 只处理重试耗尽后的最终结果。
+        """
+        input_json_str = json.dumps(titles, ensure_ascii=False)
+        original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
+
+        raw_text = self._chat_completions(
+            system_instruction=self._build_system_instruction(use_vision=False),
+            user_content=original_prompt,
+        )
+
+        parsed_data = self._parse_json_response(
+            raw_text=raw_text,
+            is_dict_like=True,
+        )
+
+        if isinstance(parsed_data, dict):
+            return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
+
+        if isinstance(parsed_data, list) and parsed_data:
+            result: Dict[str, str] = {}
+            for item in parsed_data:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        if k != 'id':
+                            result[str(k)] = str(v)
+            return result
+
+        return {}
+
     def translate_titles(self, titles: List[str]) -> TranslationMap:
         if not titles:
             return {}
 
-        input_json_str = json.dumps(titles, ensure_ascii=False)
-        original_prompt = self.prompt_manager.format_title_prompt(input_json_str)
-
         try:
-            raw_text = self._chat_completions(
-                system_instruction=self._build_system_instruction(use_vision=False),
-                user_content=original_prompt,
-            )
-
-            parsed_data = self._parse_json_response(
-                raw_text=raw_text,
-                is_dict_like=True,
-            )
-
-            if isinstance(parsed_data, dict):
-                return {str(k): str(v) for k, v in parsed_data.items() if isinstance(v, str)}
-
-            if isinstance(parsed_data, list) and parsed_data:
-                result: Dict[str, str] = {}
-                for item in parsed_data:
-                    if isinstance(item, dict):
-                        for k, v in item.items():
-                            if k != 'id':
-                                result[str(k)] = str(v)
-                return result
-
-            return {}
+            return self._translate_titles_once(titles)
         except Exception as e:
             # 对齐 Gemini 版降级语义：标题阶段位于全部译文落盘之后、渲染之前，
             # 一次瞬态错误若上抛会让 100% 完成的翻译产不出任何成品。
-            # provider 级致命错误仍上抛给回退链；其余降级返回 {}，
-            # 标题保用原文，渲染继续。
+            # provider 级致命错误仍上抛给回退链；瞬态错误经 @retry 耗尽后
+            # 仍失败——维持原语义，降级返回 {}，标题保用原文，渲染继续。
             _reraise_if_provider_fatal(e)
             logger.warning(f"Title translation failed; keeping original titles: {e}")
             return {}

@@ -236,6 +236,13 @@ def test_is_retryable_gemini_error(exc, expected):
 # 此前中途抛异常会把 pending_segments 里已成功批次的译文整体覆写为 [Failed:]
 # 并随 structure_map 落盘销毁，下次运行 get_pending_segments 按失败标记
 # 重新入队，等于成功批次全部重付费。与 scholar 链 944f0ab 的修法对齐。
+#
+# 语义已随逐批隔离升级（test_sync_batch_isolation.py）：非致命瞬态失败现在
+# 按批隔离，不再整体上抛——只有 (a) 全部批次都失败，或 (b) 命中
+# classify_fatal=='hard'（如回退链耗尽 FallbackExhaustedError）/连续失败
+# 熔断阈值，才会整体 raise。下面第一条用例断言的是新语义：批次级瞬态失败
+# 已完成段保留、失败批打 [Failed:] 标记、函数正常返回不 raise；第二条用例
+# 补 FallbackExhaustedError 触发 hard 短路时仍整体 raise 的行为。
 # ---------------------------------------------------------------------------
 
 
@@ -248,6 +255,9 @@ def _make_sync_workflow(segments, batch_size=3, use_rich=False):
             batch_size=batch_size,
             checkpoint_interval=1000,  # 避免周期性落盘干扰断言
             max_context_length=0,
+            rate_limit_delay=0,  # HEAD 上就存在的 fixture 漂移：_run_sync_batches
+            # 批间限速判断会读该属性，SimpleNamespace 缺失时在真正调用
+            # translate_batch 之前就抛 AttributeError，掩盖了下面的契约冲突
         )
     )
     wf.glossary = {}
@@ -259,8 +269,10 @@ def _make_sync_workflow(segments, batch_size=3, use_rich=False):
 
 
 def test_sync_catchall_preserves_completed_segments_on_midway_failure():
-    """10 段、batch_size=3：前 2 批成功后第 3 批抛 APIError →
-    前 6 段译文与 completed 状态保留，仅未成功段带 [Failed:]，异常仍上抛"""
+    """10 段、batch_size=3：前 2 批成功后第 3 批抛非致命 APIError →
+    与逐批隔离新语义对齐：前 6 段译文与 completed 状态保留，失败批打
+    [Failed:] 标记，函数正常返回、不整体 raise（非致命瞬态失败已按批隔离，
+    不再像旧契约那样整体上抛）。"""
     segments = [
         ContentSegment(segment_id=i, original_text=f"原文{i}", content_type="text")
         for i in range(10)
@@ -272,6 +284,8 @@ def test_sync_catchall_preserves_completed_segments_on_midway_failure():
     def fake_translate_batch(batch, context="", glossary=None):
         call_count["n"] += 1
         if call_count["n"] >= 3:
+            # 非致命：classify_fatal 判不出 'hard'，也未连续达熔断阈值
+            # （4 批里只失败 2 批），按批隔离语义应继续跑完剩余批次
             raise APIError("boom on batch 3")
         return [f"译文{s.segment_id}" for s in batch]
 
@@ -283,25 +297,69 @@ def test_sync_catchall_preserves_completed_segments_on_midway_failure():
         {s.segment_id: s.translated_text for s in segs}
     )
 
-    # 异常必须向上 raise（保留原有传导语义）
-    with pytest.raises(APIError):
-        wf._run_sync_translation(SegmentList(segments))
+    # 非致命、未达熔断阈值：函数正常返回，不 raise
+    wf._run_sync_translation(SegmentList(segments))
 
     # 前 2 批（seg 0-5）：译文保留、checkpoint 仍 completed、未被标失败
     for i in range(6):
         assert segments[i].translated_text == f"译文{i}", "已成功译文不许被覆写"
         assert i in wf.checkpoint.completed
         assert i not in wf.checkpoint.failed
-    # 第 3 批抛异常的 seg 6-8 与从未尝试的 seg 9：带 [Failed:] 标记并标失败
+    # 第 3、4 批抛异常的 seg 6-9：带 [Failed:] 标记并标失败
     for i in range(6, 10):
         assert (segments[i].translated_text or "").startswith("[Failed:")
         assert i in wf.checkpoint.failed
         assert i not in wf.checkpoint.completed
 
     # catch-all 落盘的 structure_map 与上述内存状态一致
-    assert structure_snapshots, "catch-all 应落盘 structure_map"
+    assert structure_snapshots, "应落盘 structure_map"
     final = structure_snapshots[-1]
     for i in range(6):
         assert final[i] == f"译文{i}", "落盘内容不许销毁已付费译文"
     for i in range(6, 10):
         assert (final[i] or "").startswith("[Failed:")
+
+
+def test_sync_catchall_raises_when_fallback_chain_exhausted():
+    """回退链耗尽（FallbackExhaustedError）时 classify_fatal 直接短路判 'hard'：
+    即便前面批次已成功，也必须整体 raise，不能让剩余批次全部空转成 [Failed:]
+    后正常返回、退出码 0。"""
+    from src.translator.fallback import FallbackExhaustedError
+
+    segments = [
+        ContentSegment(segment_id=i, original_text=f"原文{i}", content_type="text")
+        for i in range(10)
+    ]
+    wf = _make_sync_workflow(segments, batch_size=3, use_rich=False)
+
+    call_count = {"n": 0}
+
+    def fake_translate_batch(batch, context="", glossary=None):
+        call_count["n"] += 1
+        if call_count["n"] >= 3:
+            raise FallbackExhaustedError(
+                "所有翻译 provider 均不可用（回退链已耗尽）",
+                context={"providers": ["deepseek", "gemini"]},
+            )
+        return [f"译文{s.segment_id}" for s in batch]
+
+    wf.translator = SimpleNamespace(translate_batch=fake_translate_batch)
+
+    with pytest.raises(FallbackExhaustedError):
+        wf._run_sync_translation(SegmentList(segments))
+
+    # 前 2 批（seg 0-5）已成功落盘的译文与 completed 状态必须保住
+    for i in range(6):
+        assert segments[i].translated_text == f"译文{i}"
+        assert i in wf.checkpoint.completed
+        assert i not in wf.checkpoint.failed
+
+    # 第 3 批（触发 hard 短路）与从未被尝试的第 4 批（seg 9）均标为失败——
+    # hard 短路必须在遇到致命错误后立即停止后续批次，不能任其空转
+    for i in range(6, 10):
+        assert (segments[i].translated_text or "").startswith("[Failed:")
+        assert i in wf.checkpoint.failed
+        assert i not in wf.checkpoint.completed
+
+    # 第 4 批 [9] 从未被调用过 translate_batch（fatal 短路提前终止循环）
+    assert call_count["n"] == 3

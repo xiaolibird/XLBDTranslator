@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, List
 
 from ..core.schema import Settings, SegmentList, ContentSegment, contains_failed_marker
-from ..core.exceptions import TranslationError
+from ..core.exceptions import TranslationError, APIError
 from ..utils.logger import logger
 from datetime import datetime
 from ..utils.file import create_output_directory, get_file_hash
@@ -30,6 +30,17 @@ except ImportError:
 # （漏掉 'openai_compatible' 别名）让云端 provider 落进"本地模型"分支，
 # batch_size 不压且日志误报；单一常量从结构上杜绝复发。
 OPENAI_COMPATIBLE_PROVIDERS = frozenset({'deepseek', 'openai', 'openai-compatible', 'openai_compatible'})
+
+# 成功率闸门的最小样本量下限：_run_translation_loop 收尾处的整体成功率检查
+# （见下方 min_ratio 判定）只在本轮实际尝试段数 >= 本常量时才生效。
+# 理由：增量续跑场景下 pending 可能只有个位数/十位数（如全书 99% 已完成，
+# 仅剩 5 段因某种原因失败重入队），此时 1 段偶发失败就把比率拉到 20%——
+# 远低于统计意义所需的样本量，若照样 raise 会让整本书的渲染/清理全部跳过，
+# 且此时 checkpoint 已经落盘过（_run_translation_loop 收尾处的强制保存发生
+# 在本检查之前），下次重跑会直接命中同样的 pending 集合再次自锁。真正的
+# 局部持续失败会在下一轮 digest/续跑或本函数之后的译后质检回路（_quality_
+# check，定向重译硬失败段）里被兜住，小样本没有必要在这里就掐断产出。
+MIN_GATE_SAMPLE = 20
 
 # provider 参数上限查表：(max_safe_chars, prompt_overhead, batch_size 硬上限或 None)。
 # 三组常量是原三分支复制代码的唯一实质差异，抽表后计算与日志各只留一份。
@@ -237,7 +248,25 @@ class TranslationWorkflow:
             self._quality_check()
 
             # 7. 翻译完成后处理标题（利用术语表保持一致性）
-            self._post_translate_titles()
+            #
+            # 此步位于全部正文译文已落盘之后、渲染之前：一次标题阶段的
+            # soft/瞬态错误若上抛，会让 100% 翻完的书产不出任何成品。
+            # translator.translate_titles 内部的 _reraise_if_provider_fatal
+            # 对 hard 与 soft 一视同仁上抛（那层的职责是让回退链感知配额/
+            # 认证状态，不能改）——这里是标题阶段结束后的最后一道网：只有
+            # hard 致命（402 欠费/401 认证/404 模型下线，provider 确定不可用）
+            # 才继续上抛终止整轮；soft（429/quota）及其他瞬态失败降级为
+            # 标题保留原文 + 记警告，继续走 cleanup/render，不重复回退链的
+            # 判定逻辑，只补"标题失败不该拖垒正文成果"这一层。
+            try:
+                self._post_translate_titles()
+            except Exception as e:
+                from ..translator.fallback import classify_fatal
+                if classify_fatal(e) == 'hard':
+                    raise
+                logger.warning(
+                    f"⚠️ 标题翻译阶段失败（非致命，已降级为标题保留原文，继续渲染）: {e}"
+                )
 
             # 8. 清理资源
             self._cleanup_resources()
@@ -842,15 +871,44 @@ class TranslationWorkflow:
         )
         
         if use_async:
-            self._run_async_translation(pending_segments)
+            success_count = self._run_async_translation(pending_segments)
         else:
-            self._run_sync_translation(pending_segments)
-        
+            success_count = self._run_sync_translation(pending_segments)
+
         # 翻译循环结束后，强制保存一次
         logger.info("🔒 翻译循环完成，执行强制保存...")
         self._save_structure_map(self.all_segments)
         self.checkpoint.save_checkpoint()
         logger.info("✅ 强制保存完成")
+
+        # 整体成功率下限检查：只在本轮确实尝试过翻译时才检查（本函数走到这里
+        # 说明 pending_segments 非空，即"本轮实际尝试了翻译"），分母用本轮
+        # pending 总数而非全书段数——纯增量续跑（如全书仅剩 3 段失败 1 段）
+        # 不应被全书基数误判成"大面积失败"。engine 部分失败常降级为
+        # "[Failed: ...]" 字符串正常返回而不抛异常（结构化输出缺 id、视觉
+        # 逐段隔离等），_run_sync_batches/_process_single_batch 各自的连续
+        # 失败熔断只统计"整批 0 成功"，对"每批恰 1 段成功"这种持续性局部
+        # 退化视而不见——这里补最后一道全局闸门。
+        #
+        # 最小样本量下限（MIN_GATE_SAMPLE）：本轮尝试段数 < 该常量时豁免，
+        # 不 raise。小样本续跑（如 pending=5 仅 1 段成功）没有统计意义，
+        # 强行按比率掐断会让整本 99% 完成的书颗粒无收，且此时 checkpoint
+        # 已经落盘（见上方强制保存），重跑会直接自锁在同样的 pending 集合上；
+        # 失败段落自有译后质检回路（_quality_check，见下方，定向重译硬失败
+        # 段）与下一轮续跑兜底，无需在此处过度反应。大样本（>=20）仍按原逻辑
+        # 拦截，防止真正的 provider 持续性退化被小样本豁免误伤放过。
+        if success_count is not None:
+            total_attempted = len(pending_segments)
+            if total_attempted >= MIN_GATE_SAMPLE:
+                min_ratio = float(getattr(self.settings.processing, 'min_success_ratio', 0.5))
+                actual_ratio = success_count / total_attempted
+                if actual_ratio < min_ratio:
+                    raise APIError(
+                        f"本轮翻译成功率过低：{success_count}/{total_attempted} "
+                        f"= {actual_ratio:.1%}，低于下限 {min_ratio:.0%}"
+                        "（provider 可能已退化为局部持续失败，为避免产出大半 "
+                        "[Failed:] 的成品已中止，未渲染最终文档）"
+                    )
 
     def _glossary_violations(self, seg: ContentSegment) -> List[tuple]:
         """检查单个已译段落是否违反术语表：原文（整词）出现某术语英文 key，
@@ -1008,9 +1066,23 @@ class TranslationWorkflow:
         """
         success_count = 0
         batch_size = self.settings.processing.batch_size
+        total_batches = 0
+        failed_batches = 0
+        consecutive_failures = 0
+        last_batch_exc: Optional[Exception] = None
+        fatal_exc: Optional[Exception] = None
+        # 连续失败熔断阈值：回退链耗尽时 fallback.py 抛的纯中文 APIError
+        # （"所有翻译 provider 均不可用（回退链已耗尽）"）、本地 Ollama 中途
+        # 断连时 engine.py 抛的 APITimeoutError（Connection refused）都不带
+        # 状态码，classify_fatal 判不出 'hard'——不熔断的话会让剩余批次全部
+        # continue 空转成 [Failed:]，正常返回后 execute 照常质检+渲染，
+        # 产出一本大半 [Failed:] 的成品且退出码 0。
+        CONSECUTIVE_FAILURE_THRESHOLD = 3
 
         for i in range(0, len(pending_segments), batch_size):
             batch = pending_segments[i:i+batch_size]
+            batch_no = i // batch_size + 1
+            total_batches += 1
             # 为当前batch的第一个segment获取上下文
             context = ""
             if batch:
@@ -1024,13 +1096,67 @@ class TranslationWorkflow:
                 # 批间限速（PROCESSING__RATE_LIMIT_DELAY，此前无任何消费者）；
                 # 异步路径由 semaphore 控并发，不做逐批 sleep
                 time.sleep(self.settings.processing.rate_limit_delay)
-            results = self.translator.translate_batch(batch, context=context, glossary=self.glossary)
 
+            try:
+                results = self.translator.translate_batch(batch, context=context, glossary=self.glossary)
+            except Exception as e:
+                # 逐批隔离：tenacity 重试耗尽后的一次瞬态错误（429/超时/连接）此前
+                # 直接上抛整晚任务，与异步路径 _process_single_batch 的 per-batch
+                # try 语义不对齐——本地 Ollama 强制走同步路径最受影响。
+                # 现只把该批标记失败、记日志、继续后续批次；failed 段不进
+                # completed（support.py:117），下次运行 get_pending_segments 会重收。
+                logger.error(f"❌ 批次 {batch_no} 翻译失败: {e}")
+                failed_batches += 1
+                consecutive_failures += 1
+                last_batch_exc = e
+                # 只把尚未成功的段标记失败，不覆写本批已算出的译文——batch 内
+                # translate_batch 抛异常前个别 seg 可能已在上轮跑成功并落过盘，
+                # 覆写会销毁已付费译文（与 _run_sync_translation 外层守卫同款）
+                for seg in batch:
+                    if not seg.translated_text or contains_failed_marker(seg.translated_text):
+                        seg.translated_text = f"[Failed: {str(e)}]"
+                        self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
+                    if on_progress:
+                        on_progress()
+
+                if batch_no % self.settings.processing.checkpoint_interval == 0:
+                    self._save_structure_map(self.all_segments)
+                    self.checkpoint.save_checkpoint()
+
+                # 硬性致命错误（402 欠费/401 认证/404 模型下线）或连续失败达
+                # 熔断阈值：裸引擎（无 fallback 链）/ 回退链已耗尽 / 本地
+                # Ollama 断连都不会自愈，continue 会让剩余批次全部空转成
+                # [Failed:]，execute 仍照常质检+渲染出一本几乎全失败的成品、
+                # 退出码正常。本批已标记失败并落盘（保住进度）后立即 break，
+                # 交给循环收尾统一 raise，让 execute 感知 provider 已不可用。
+                from src.translator.fallback import classify_fatal
+                if classify_fatal(e) == 'hard' or consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
+                    fatal_exc = e
+                    break
+                continue
+
+            # 熔断盲区：engine 部分失败不抛异常，而是把单段/整批降级为
+            # "[Failed: ...]" 字符串正常返回（如 vision 逐段隔离、DeepSeek
+            # 缺失翻译兜底键等）。此前这里无条件清零 consecutive_failures，
+            # 相当于回退链耗尽后每批都"成功返回"一堆 [Failed:] 字符串，
+            # 连续失败熔断永远不会命中——只统计本批实际成功数，0 成功才计入
+            # 连续失败（不清零），达阈值同样熔断；只要本批有成功才清零。
+            batch_success_count = 0
+            if results is not None and len(results) != len(batch):
+                # engine 返回条数与批大小不一致：zip 会静默截断多出的段，
+                # 这些段的 translated_text 保持不变（可能是空字符串）且不进
+                # completed/failed 任一 checkpoint 分支，问题会一直潜伏到
+                # 渲染阶段才以空白译文的形式暴露，此处先落一条日志留痕。
+                logger.warning(
+                    f"⚠️ 批次 {batch_no} engine 返回 {len(results)} 条结果，"
+                    f"与批大小 {len(batch)} 不一致，多出的段将被 zip 静默丢弃"
+                )
             for seg, trans in zip(batch, results):
                 if trans and not contains_failed_marker(trans):
                     seg.translated_text = trans
                     self.checkpoint.mark_segment_completed(seg.segment_id)
                     success_count += 1
+                    batch_success_count += 1
                 else:
                     seg.translated_text = trans if trans else "[Failed: Empty response]"
                     self.checkpoint.mark_segment_failed(seg.segment_id, trans or "Empty response")
@@ -1044,15 +1170,69 @@ class TranslationWorkflow:
                     on_progress()
 
             # 定期保存检查点
-            if (i // batch_size + 1) % self.settings.processing.checkpoint_interval == 0:
+            if batch_no % self.settings.processing.checkpoint_interval == 0:
                 self._save_structure_map(self.all_segments)
                 self.checkpoint.save_checkpoint()
 
-        logger.info(f"✅ 同步翻译完成: {success_count}/{len(pending_segments)} 成功")
+            if batch_success_count == 0:
+                failed_batches += 1
+                consecutive_failures += 1
+                # last_batch_exc 用于收尾「全部批次都失败」时的整体 raise；
+                # 这条路径没有真实异常对象（engine 降级为字符串未抛异常），
+                # 补一个代表性 APIError。无条件覆写（而非 or 短路）：全败场景下
+                # 每一批都会落到这里，覆写让收尾 raise 报告的是最新一批的批号，
+                # 而不是永远指向第一批——排障时最新失败批次更接近真实故障点。
+                last_batch_exc = APIError(
+                    f"批次 {batch_no} 翻译 0 成功（engine 未抛异常，[Failed:] 字符串降级）"
+                )
+                if consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD:
+                    fatal_exc = APIError(
+                        f"连续 {consecutive_failures} 批翻译 0 成功"
+                        "（engine 未抛异常，[Failed:] 字符串降级），熔断终止"
+                    )
+                    break
+            else:
+                consecutive_failures = 0
+
+        # fatal / 全败时不打「✅ 完成」误导排障——后面紧接着就会整体 raise，
+        # 调用方（execute）看到 ✅ 却接着看到异常堆栈会误判是不是又出了别的问题。
+        if fatal_exc:
+            logger.warning(
+                f"⚠️ 同步翻译熔断终止: {success_count}/{len(pending_segments)} 成功后触发致命错误: {fatal_exc}"
+            )
+        elif total_batches > 0 and failed_batches == total_batches:
+            logger.warning(f"⚠️ 同步翻译全部批次失败: 0/{len(pending_segments)} 成功")
+        else:
+            logger.info(f"✅ 同步翻译完成: {success_count}/{len(pending_segments)} 成功")
+
+        # 硬性致命错误短路：即便前面已有批次成功，也不能让 execute 把
+        # 剩下全空转成 [Failed:] 的批次当正常结果去质检+渲染成品。修完
+        # FallbackExhaustedError（classify_fatal 直接短路判 'hard'）后，
+        # 这里与异步路径 _process_single_batch 的 fatal_holder 短路语义对齐，
+        # 但两侧的短路时机不同：同步侧批次严格串行，判到 'hard' 当批立即
+        # break，循环里尚未开始的批次天然不会被跑到；异步侧批次已并发建
+        # task，'hard' 只能在当批异常处理内置位 fatal_holder，已在飞的
+        # 其他批次仍会跑完，只有后续新批次在拿到 semaphore 入口时检查到
+        # fatal_holder 才会跳过、不再发起真实请求。同步侧额外保留
+        # CONSECUTIVE_FAILURE_THRESHOLD 连续失败熔断，兜底 classify_fatal
+        # 判不出 'hard' 的持续性故障（如本地 Ollama 断连的 APITimeoutError）。
+        # 先落盘保住已完成进度，再统一在这里 raise。
+        if fatal_exc:
+            raise fatal_exc
+
+        # 全部批次都失败（且都是瞬态失败，无 hard fatal）才整体抛错；
+        # 单批瞬态失败已就地标记并继续，不应终止整晚任务。
+        if total_batches > 0 and failed_batches == total_batches:
+            raise last_batch_exc
+
         return success_count
 
-    def _run_sync_translation(self, pending_segments: SegmentList) -> None:
-        """同步翻译模式（带进度条）"""
+    def _run_sync_translation(self, pending_segments: SegmentList) -> int:
+        """同步翻译模式（带进度条）
+
+        返回本轮实际成功段数（供 _run_translation_loop 做整体成功率下限
+        检查；_quality_check 的定向重译调用会忽略该返回值，不受影响）。
+        """
         logger.info("🔄 使用同步模式翻译")
         logger.info(f"📝 开始同步翻译 {len(pending_segments)} 个片段...")
 
@@ -1076,17 +1256,19 @@ class TranslationWorkflow:
                     console=None,  # 使用默认console
                 ) as progress:
                     task = progress.add_task("[cyan]同步翻译中...", total=len(pending_segments))
-                    self._run_sync_batches(
+                    success_count = self._run_sync_batches(
                         pending_segments,
                         on_progress=lambda: progress.update(task, advance=1),
                     )
             else:
                 # 简单模式（无进度条）：同一实现，仅不传进度回调
-                self._run_sync_batches(pending_segments, on_progress=None)
+                success_count = self._run_sync_batches(pending_segments, on_progress=None)
 
             # 最终保存
             self._save_structure_map(self.all_segments)
             self.checkpoint.save_checkpoint()
+
+            return success_count
 
         except Exception as e:
             logger.error(f"❌ 同步翻译失败: {e}")
@@ -1100,13 +1282,13 @@ class TranslationWorkflow:
             self.checkpoint.save_checkpoint()
             raise
     
-    def _run_async_translation(self, pending_segments: SegmentList) -> None:
+    def _run_async_translation(self, pending_segments: SegmentList) -> int:
         """异步翻译模式（多批次并发执行，真正的并行翻译）
-        
+
         架构优化：
         - 之前：batch 串行执行，实际并发度 = 1
         - 现在：多个 batch 并发执行，实际并发度 = max_concurrent_batches
-        
+
         调用链：
         workflow._run_async_translation (同步入口)
           └── asyncio.run(_run_concurrent_batches)  [单次调用]
@@ -1114,14 +1296,15 @@ class TranslationWorkflow:
                       └── _process_single_batch (每个 batch)
                             └── async_t.translate_vision_batch_async (批内含 image 段)
                                 / async_t.translate_text_batch_async (纯文本批)
+
+        返回本轮实际成功段数（供 _run_translation_loop 做整体成功率下限检查）。
         """
         logger.info("⚡ 使用异步模式翻译（多批次并发+即时保存）")
-        
+
         # 检查translator是否支持异步
         if not hasattr(self.translator, 'async_translator') or self.translator.async_translator is None:
             logger.warning("⚠️ 当前translator不支持异步模式，降级到同步模式")
-            self._run_sync_translation(pending_segments)
-            return
+            return self._run_sync_translation(pending_segments)
         
         batch_size = self.settings.processing.batch_size
         batches = [
@@ -1139,7 +1322,18 @@ class TranslationWorkflow:
         
         # 用于线程安全的计数和保存
         lock = threading.Lock()
-        stats = {"success": 0, "processed": 0, "completed_batches": 0}
+        stats = {"success": 0, "processed": 0, "completed_batches": 0, "consecutive_zero_success": 0}
+
+        # 连续 0 成功熔断阈值：与同步路径 _run_sync_batches 的
+        # CONSECUTIVE_FAILURE_THRESHOLD 同款语义，兜底 engine 不抛异常、只把
+        # 结果降级成 "[Failed: ...]" 字符串正常 return 的持续性故障（如结构化
+        # 输出缺失 id 兜底键、Gemini 重试耗尽后返回占位字符串）——这类故障
+        # classify_fatal 拿不到异常对象，下面的 fatal_holder 硬性致命错误
+        # 短路永不命中，224 批全会照常发真实请求、每批还带内部重试，直到
+        # _quality_check 才发现整本书都是 [Failed:]。批次并发执行、完成顺序
+        # 不严格按派发顺序，这里的“连续”是按完成顺序统计的近似值，与同步路径
+        # 严格串行的语义略有差异，但足以在持续性故障下及时止损。
+        CONSECUTIVE_FAILURE_THRESHOLD = 3
 
         # provider 致命错误（欠费/认证/模型下线）的全书级短路点：
         # _process_single_batch 内部为了落盘失败状态会捕获所有异常，若不在此
@@ -1151,6 +1345,26 @@ class TranslationWorkflow:
         async def _process_single_batch(batch_idx: int, batch: SegmentList, semaphore: asyncio.Semaphore):
             """处理单个 batch（在 semaphore 控制下）"""
             async with semaphore:
+                # 致命错误真短路：hard fatal 已由某个先完成的批次置位到
+                # fatal_holder。同步侧遇 hard fatal 是当批 break，循环体天然
+                # 不会再跑后续批次；异步侧批次在创建时已全部并发建好 task，
+                # 只能在这里——真正拿到 semaphore 名额、即将发起请求之前——
+                # 拦一次：还没跑到这一步说明本批尚未发出请求，直接短路标
+                # 失败即可，不必再对已知报废的 provider 发一次注定失败的
+                # 请求（省配额、省时间）。此前这里没有这道检查，_process_
+                # _single_batch 每批都会照常发起真实请求，fatal 置位后剩余
+                # 批次仍会全部空转打一遍失败才收尾。
+                if fatal_holder["exc"]:
+                    with lock:
+                        for seg in batch:
+                            if not seg.translated_text or contains_failed_marker(seg.translated_text):
+                                seg.translated_text = "[Failed: 致命错误熔断，本批未发起请求]"
+                                self.checkpoint.mark_segment_failed(
+                                    seg.segment_id, "致命错误熔断，本批未发起请求"
+                                )
+                            stats["processed"] += 1
+                        stats["completed_batches"] += 1
+                    return batch_idx, False
                 try:
                     # 获取上下文（读取当前已翻译的内容）
                     context = ""
@@ -1195,8 +1409,28 @@ class TranslationWorkflow:
                                     except Exception:
                                         logger.debug("Failed to record blocked segment")
                             stats["processed"] += 1
-                        
+
                         stats["completed_batches"] += 1
+
+                        # 连续 0 成功熔断：engine 把整批降级成 [Failed:] 字符串
+                        # 正常 return，不会走下面的 except 分支，只能在这里统计。
+                        # batch_success==0 才计入连续失败（不清零），只要本批
+                        # 有成功即清零；达阈值时补一个代表性 APIError 写入
+                        # fatal_holder，复用上面 1281 行现成的短路分支——后续
+                        # 尚未拿到 semaphore 的批次会被拦掉，不必再对已知报废
+                        # 的 provider 发真实请求。
+                        if batch_success == 0:
+                            stats["consecutive_zero_success"] += 1
+                            if (
+                                stats["consecutive_zero_success"] >= CONSECUTIVE_FAILURE_THRESHOLD
+                                and not fatal_holder["exc"]
+                            ):
+                                fatal_holder["exc"] = APIError(
+                                    f"连续 {stats['consecutive_zero_success']} 批翻译 0 成功"
+                                    "（engine 未抛异常，[Failed:] 字符串降级），熔断终止"
+                                )
+                        else:
+                            stats["consecutive_zero_success"] = 0
 
                         # 按 checkpoint_interval 节流（与同步路径对齐）。
                         # 此前每批全量落盘 2.7MB structure_map + fsync 且在锁内、
@@ -1217,7 +1451,8 @@ class TranslationWorkflow:
                     # 记入 fatal_holder：本批仍按现逻辑标记失败并保存（保住已有进度），
                     # 但收尾时必须整体短路，不能让后续批次继续空转烧配额。
                     from src.translator.fallback import classify_fatal
-                    if classify_fatal(e) == 'hard':
+                    is_hard_fatal = classify_fatal(e) == 'hard'
+                    if is_hard_fatal:
                         fatal_holder["exc"] = e
 
                     # 标记失败（线程安全）。与同步路径同款守卫：只把尚未成功的段
@@ -1229,16 +1464,25 @@ class TranslationWorkflow:
                                 seg.translated_text = f"[Failed: {str(e)}]"
                                 self.checkpoint.mark_segment_failed(seg.segment_id, str(e))
                             stats["processed"] += 1
-                        
+
                         stats["completed_batches"] += 1
-                        
-                        # 保存失败状态
-                        try:
-                            self._save_structure_map(self.all_segments)
-                            self.checkpoint.save_checkpoint()
-                        except Exception as save_exc:
-                            logger.error(f"保存失败状态时出错: {save_exc}")
-                    
+
+                        # 保存失败状态：按 checkpoint_interval 节流，与成功分支
+                        # （上面 :1319-1326）对齐。此前失败分支无条件每批落盘，
+                        # provider 挂掉后剩余批次逐一走到这里，224 批的书会写
+                        # ~600MB（每批全量 structure_map + fsync）。置位
+                        # fatal_holder 的那一批（provider 刚失效的瞬间）无条件
+                        # 立即落盘兜底——一旦确认 provider 已挂，后续新批次会被
+                        # 上面的短路分支拦掉，可能再也不会有机会走到常规的
+                        # 按间隔落盘，必须保证这一刻的进度先落地。
+                        interval = max(1, getattr(self.settings.processing, 'checkpoint_interval', 1))
+                        if is_hard_fatal or stats["completed_batches"] % interval == 0:
+                            try:
+                                self._save_structure_map(self.all_segments)
+                                self.checkpoint.save_checkpoint()
+                            except Exception as save_exc:
+                                logger.error(f"保存失败状态时出错: {save_exc}")
+
                     return batch_idx, False
         
         async def _run_concurrent_batches(on_batch_done: Optional[Callable[[], None]] = None):
@@ -1319,7 +1563,9 @@ class TranslationWorkflow:
         logger.info(f"📊 成功: {stats['success']}/{stats['processed']} 片段")
         logger.info(f"📊 速度: {stats['processed']/elapsed:.2f} segments/s")
         logger.info(f"📊 并发效率: {max_concurrent} batches 同时运行")
-    
+
+        return stats["success"]
+
     def _cleanup_resources(self) -> None:
         """清理资源
 

@@ -41,6 +41,9 @@ def test_is_translated_and_pending_agree_on_failed_marker():
     ckpt = CheckpointManager.__new__(CheckpointManager)
     # 直接调用判定逻辑：把三段喂给 get_pending_segments，需要 completed_ids 为空
     ckpt.checkpoint_data = {"completed_segments": [], "failed_segments": [], "title_translations": {}}
+    # __new__ 绕过 __init__：get_completed_segment_ids 读的是 self._completed
+    # （内部 set 缓存，非 checkpoint_data），必须显式补齐，否则 AttributeError
+    ckpt._completed = set()
     # get_completed_segment_ids 读 completed_segments
     pending = ckpt.get_pending_segments([seg_ok, seg_failed, seg_trunc])
     pending_ids = {s.segment_id for s in pending}
@@ -125,6 +128,7 @@ def test_sync_translate_batch_receives_glossary(use_rich):
             batch_size=2,
             checkpoint_interval=1000,
             max_context_length=0,
+            rate_limit_delay=0,
         )
     )
     wf.glossary = {"MNAR": "非随机缺失"}

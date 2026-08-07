@@ -5,14 +5,21 @@
 - 429/quota 软性错误连续达到阈值才切换（期间原样抛出交给上层重试）
 - 成功调用重置软性失败计数
 - provider 构建失败（缺 key）自动跳过
-- 链耗尽抛 APIError；非致命错误不触发切换
+- 链耗尽抛 FallbackExhaustedError（APIError 子类，classify_fatal 判 'hard'）；非致命错误不触发切换
 """
+import asyncio
+
 import pytest
 
 from src.core.exceptions import APIError, APIAuthenticationError
 from src.translator import fallback as fb
-from src.translator.fallback import FallbackTranslator, classify_fatal, SOFT_SWITCH_THRESHOLD
-from src.core.schema import Settings
+from src.translator.fallback import (
+    FallbackTranslator,
+    FallbackExhaustedError,
+    classify_fatal,
+    SOFT_SWITCH_THRESHOLD,
+)
+from src.core.schema import Settings, APISettings, FileSettings, ProcessingSettings, LoggingSettings
 
 
 # ----------------------------------------------------------------------
@@ -46,7 +53,7 @@ class FakeTranslator:
         pass
 
 
-def _make_wrapper(monkeypatch, factories):
+def _make_wrapper(monkeypatch, factories, settings=None):
     """factories: {provider_name: callable() -> FakeTranslator（可抛错）}"""
     created = {}
 
@@ -57,9 +64,29 @@ def _make_wrapper(monkeypatch, factories):
 
     monkeypatch.setattr(fb, "_create_translator", _fake_create)
     # FallbackTranslator 只把 settings 透传给底层构造器（已被 mock），最小实例即可
-    settings = Settings.model_construct()
+    settings = settings if settings is not None else Settings.model_construct()
     wrapper = FallbackTranslator(settings, list(factories.keys()))
     return wrapper, created
+
+
+def _real_settings(**api_overrides):
+    """带真实 api/processing 配置的 Settings（async_translator 本地判定需要读
+    settings.api.ollama_base_url / openai_base_url，model_construct() 拿不到）。
+    APISettings 字段带 validation_alias（如 OPENAI_BASE_URL），直接构造后按
+    python 字段名覆盖属性，绕开 alias-only 校验限制。
+    注意：openai_base_url 的默认值同样是 'http://localhost:11434'（非仅
+    ollama_base_url），所以任何要单独验证 ollama 分支的用例都必须显式传
+    openai_base_url 指向远程地址，否则 deepseek（canonical→openai-compatible）
+    会先于 ollama 命中 localhost 而让断言空转。"""
+    api = APISettings()
+    for key, value in api_overrides.items():
+        setattr(api, key, value)
+    return Settings(
+        api=api,
+        files=FileSettings(),
+        processing=ProcessingSettings(),
+        logging=LoggingSettings(),
+    )
 
 
 class _Seg:
@@ -182,6 +209,23 @@ def test_chain_exhausted_raises(monkeypatch):
         wrapper.translate_batch([_Seg()])
 
 
+def test_chain_exhausted_raises_dedicated_exception_classified_hard(monkeypatch):
+    """链耗尽必须抛专用的 FallbackExhaustedError（APIError 子类，不破坏现有
+    except APIError 调用方），且 classify_fatal 对它直接短路判 'hard'——
+    这样同步路径的 hard 短路立即生效，不必等连续失败熔断凑够阈值；异步路径
+    _process_single_batch 只判 classify_fatal=='hard' 的 fatal_holder 逻辑
+    也自动覆盖到这个场景。"""
+    err402 = APIError("402 Insufficient Balance")
+    err401 = APIAuthenticationError("invalid key")
+    wrapper, _ = _make_wrapper(monkeypatch, {
+        "deepseek": lambda: FakeTranslator("deepseek", [err402]),
+        "gemini": lambda: FakeTranslator("gemini", [err401]),
+    })
+    with pytest.raises(FallbackExhaustedError) as excinfo:
+        wrapper.translate_batch([_Seg()])
+    assert classify_fatal(excinfo.value) == 'hard'
+
+
 def test_non_fatal_error_does_not_switch(monkeypatch):
     err = APIError("connection reset")
     wrapper, created = _make_wrapper(monkeypatch, {
@@ -193,3 +237,83 @@ def test_non_fatal_error_does_not_switch(monkeypatch):
     # 未切换：下一次调用仍走 deepseek
     assert wrapper.translate_batch([_Seg()]) == ["deepseek-ok"]
     assert "gemini" not in created
+
+
+# ----------------------------------------------------------------------
+# async_translator 本地保护：链中含 ollama 必须强制同步（返回 None）
+# ----------------------------------------------------------------------
+
+def test_async_translator_none_when_chain_has_ollama(monkeypatch):
+    """回退链 deepseek→ollama→gemini：ollama_base_url 走独立配置组，
+    不能只靠 openai_base_url 探测，否则线程池会以 async_max_workers 并发压垮本地 Ollama。
+
+    openai_base_url 显式指向远程地址，确保 True 只能由 ollama_base_url 分支
+    产生——若误用默认 _real_settings()，deepseek 会先于 ollama 命中
+    localhost（openai_base_url 默认值同样是 localhost），令本用例空转。"""
+    wrapper, _ = _make_wrapper(
+        monkeypatch,
+        {
+            "deepseek": lambda: FakeTranslator("deepseek"),
+            "ollama": lambda: FakeTranslator("ollama"),
+            "gemini": lambda: FakeTranslator("gemini"),
+        },
+        settings=_real_settings(openai_base_url="https://api.deepseek.com/v1"),
+    )
+    assert wrapper.async_translator is None
+
+
+def test_async_translator_available_when_chain_lacks_ollama(monkeypatch):
+    """与上一条同 settings、只是链去掉 ollama（deepseek→gemini），构成真正的差分：
+    async_translator 不应再被强制置 None。"""
+    wrapper, _ = _make_wrapper(
+        monkeypatch,
+        {
+            "deepseek": lambda: FakeTranslator("deepseek"),
+            "gemini": lambda: FakeTranslator("gemini"),
+        },
+        settings=_real_settings(openai_base_url="https://api.deepseek.com/v1"),
+    )
+    assert wrapper.async_translator is not None
+
+
+def test_async_translator_none_when_openai_compatible_localhost(monkeypatch):
+    wrapper, _ = _make_wrapper(
+        monkeypatch,
+        {"deepseek": lambda: FakeTranslator("deepseek")},
+        settings=_real_settings(openai_base_url="http://localhost:11434"),
+    )
+    assert wrapper.async_translator is None
+
+
+def test_async_translator_available_when_chain_all_remote(monkeypatch):
+    """链中无本地 provider（deepseek 指向远程地址、gemini 无本地概念）时应正常给出异步实例"""
+    wrapper, _ = _make_wrapper(
+        monkeypatch,
+        {
+            "deepseek": lambda: FakeTranslator("deepseek"),
+            "gemini": lambda: FakeTranslator("gemini"),
+        },
+        settings=_real_settings(openai_base_url="https://api.deepseek.com/v1"),
+    )
+    assert wrapper.async_translator is not None
+
+
+# ----------------------------------------------------------------------
+# AsyncFallbackTranslator.cleanup() 后禁止复用（否则会静默换用默认线程池）
+# ----------------------------------------------------------------------
+
+def test_async_batch_after_cleanup_raises(monkeypatch):
+    wrapper, _ = _make_wrapper(
+        monkeypatch,
+        {
+            "deepseek": lambda: FakeTranslator("deepseek"),
+            "gemini": lambda: FakeTranslator("gemini"),
+        },
+        settings=_real_settings(openai_base_url="https://api.deepseek.com/v1"),
+    )
+    async_t = wrapper.async_translator
+    assert async_t is not None
+    async_t.cleanup()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(async_t.translate_text_batch_async([_Seg()], context=""))

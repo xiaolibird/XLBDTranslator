@@ -46,6 +46,19 @@ _HARD_CODE_RE = re.compile(r'\b(401|402|403|404)\b')
 _SOFT_CODE_RE = re.compile(r'\b429\b')
 SOFT_SWITCH_THRESHOLD = 3
 
+class FallbackExhaustedError(APIError):
+    """回退链已耗尽：链上所有 provider 均已判定不可用（构建失败/致命错误）。
+
+    专用异常类而非裸 APIError：classify_fatal 对它直接短路判 'hard'，让
+    同步路径 _run_sync_batches 的 hard 短路立即生效（不必等连续失败熔断
+    凑够 CONSECUTIVE_FAILURE_THRESHOLD），异步路径 _process_single_batch
+    的 fatal_holder 判定同样自动生效——两侧共用同一个 classify_fatal 入口，
+    这是同时解掉两侧的最小改法。继承 APIError：现有 except APIError 的
+    调用方行为不变。
+    """
+    pass
+
+
 _AGENT_PROVIDERS = {'claude-agent', 'claude_agent', 'agent', 'claude'}
 
 SUPPORTED_PROVIDERS = {
@@ -60,6 +73,10 @@ def classify_fatal(exc: Exception) -> Optional[str]:
     Returns:
         'hard' / 'soft' / None（非致命）
     """
+    if isinstance(exc, FallbackExhaustedError):
+        # 回退链本身已耗尽：没有下一个 provider 可切，必须直接判 hard，
+        # 让同步/异步两侧的致命短路立即生效，不必等连续失败熔断。
+        return 'hard'
     if isinstance(exc, APIAuthenticationError):
         return 'hard'
     # google.genai / google.api_core 的错误对象带数字 code
@@ -196,7 +213,7 @@ class FallbackTranslator(BaseTranslator):
                     logger.warning(f"⚠️ provider '{provider}' 初始化失败，跳过: {e}")
                     self._dead.add(idx)
                     self._current_idx += 1
-            raise APIError(
+            raise FallbackExhaustedError(
                 "所有翻译 provider 均不可用（回退链已耗尽）",
                 context={"providers": self.providers},
             )
@@ -261,15 +278,33 @@ class FallbackTranslator(BaseTranslator):
     def extract_glossary(self, segments: SegmentList) -> Dict[str, str]:
         return self._call_with_fallback('extract_glossary', segments)
 
+    def _chain_has_local_provider(self) -> bool:
+        """判断回退链中是否含指向本机的 provider（ollama 或指向 localhost/127.0.0.1
+        的 openai-compatible）。
+
+        ollama 的地址在独立的 settings.api.ollama_base_url（非 openai_base_url），
+        必须单独检查——否则线程池会以 async_max_workers（默认 10）并发打本地
+        Ollama，压垮本机资源。
+        """
+        for p in self.providers:
+            backend = canonical_provider(p)
+            if backend == 'ollama':
+                base_url = (getattr(self.settings.api, 'ollama_base_url', '') or '').lower()
+            elif backend == 'openai-compatible':
+                base_url = (getattr(self.settings.api, 'openai_base_url', '') or '').lower()
+            else:
+                continue
+            if 'localhost' in base_url or '127.0.0.1' in base_url:
+                return True
+        return False
+
     @property
     def async_translator(self) -> Optional['AsyncFallbackTranslator']:
         # 尊重本地模型的强制同步保护（engine.is_local → async_translator=None）：
-        # 链中含指向 localhost 的 openai-compatible provider 时，线程池并发
-        # 会压垮本地 Ollama（16GB 内存），返回 None 让 workflow 走同步路径
-        if any(canonical_provider(p) == 'openai-compatible' for p in self.providers):
-            base_url = (getattr(self.settings.api, 'openai_base_url', '') or '').lower()
-            if 'localhost' in base_url or '127.0.0.1' in base_url:
-                return None
+        # 链中含本地 provider 时，线程池并发会压垮本地服务，返回 None 让
+        # workflow 走同步路径
+        if self._chain_has_local_provider():
+            return None
         if self._async_translator is None:
             self._async_translator = AsyncFallbackTranslator(self)
         return self._async_translator
@@ -351,6 +386,11 @@ class AsyncFallbackTranslator(BaseAsyncTranslator):
         context: str,
         glossary: Optional[Dict[str, str]] = None,
     ) -> List[str]:
+        if self.executor is None:
+            # cleanup() 后线程池已释放；若在此静默传 None 给 run_in_executor，
+            # asyncio 会改用默认线程池（无并发上限），绕过 async_max_workers
+            # 对本地/远程 provider 的保护，必须显式报错而非悄悄换池子
+            raise RuntimeError("AsyncFallbackTranslator 已 cleanup()，线程池已释放，不可再调用")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self.executor,

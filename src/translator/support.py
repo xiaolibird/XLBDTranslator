@@ -508,13 +508,17 @@ class PromptManager:
         self.mode_entity = settings.processing.translation_mode_entity
 
         # 根据translator provider选择prompt版本
-        # claude 系列也算云端：主 provider 为 claude-agent 时，回退链中的
-        # gemini/deepseek 翻译器不能因此被降级到简化版 prompt
-        # （ClaudeAgentTranslator 自身通过 force_simple=True 显式选简化版）
+        # claude/ollama 系列也算"默认云端"：主 provider 为 claude-agent 或
+        # ollama 时，回退链中的 gemini/deepseek 等云端翻译器不能因此被降级到
+        # 简化版 prompt——is_cloud_provider 只反映"主 provider 是否倾向本地"，
+        # 具体某个 Translator 实例是否真的本地，由该实例自己通过
+        # force_simple 显式声明（ClaudeAgentTranslator 用 force_simple=False
+        # 强制留在完整版；OpenAICompatibleTranslator 的 ollama 分支用
+        # force_simple=self.is_local 强制降级到简化版）。
         provider = getattr(settings.api, 'translator_provider', 'gemini').lower()
         is_cloud_provider = provider in {
             'deepseek', 'openai', 'openai-compatible', 'openai_compatible', 'gemini',
-            'claude-agent', 'claude_agent', 'agent', 'claude',
+            'claude-agent', 'claude_agent', 'agent', 'claude', 'ollama',
         }
 
         if is_cloud_provider and not force_simple:

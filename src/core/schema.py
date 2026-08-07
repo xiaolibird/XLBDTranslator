@@ -5,9 +5,11 @@
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
+
+from .exceptions import ConfigError
 
 # 统一的翻译失败/不完整标记词表。
 # 此前 is_translated（本文件）只认 "[Translation Failed"，而 checkpoint 的 get_pending_segments
@@ -232,6 +234,13 @@ class ProcessingSettings(BaseModel):
     enable_quality_check: bool = Field(True, validation_alias="ENABLE_QUALITY_CHECK", description="是否启用译后质检与定向重译")
     qc_semantic: bool = Field(False, validation_alias="QC_SEMANTIC", description="是否启用廉价模型语义漏译抽检（默认关，控成本，预留）")
 
+    # 整体成功率下限：provider 退化成"每批恰 1 段成功"时，_run_sync_batches/
+    # _process_single_batch 的连续失败熔断永不触发（每批都有 >=1 成功，
+    # consecutive_failures 每次都被清零）——会产出大半 [Failed:] 的成品且
+    # 退出码 0。_run_translation_loop 用本轮 pending 总数做分母校验整体成功率，
+    # 低于此阈值判定 provider 已退化，raise APIError 阻断静默降级完工。
+    min_success_ratio: float = Field(0.5, validation_alias="MIN_SUCCESS_RATIO", description="本轮翻译成功率下限 (0.0-1.0)，低于此值判定 provider 退化并中止")
+
     @field_validator('batch_size')
     def validate_batch_size(cls, v):
         if v < 1 or v > 20:
@@ -288,14 +297,19 @@ class Settings(BaseSettings):
         return self
 
     @classmethod
-    def _known_env_keys(cls) -> set:
-        """枚举全部合法的 env 键（SECTION__FIELD 大写 + 各字段 validation_alias）。"""
-        keys = set()
-        sections = {
+    def _env_sections(cls) -> dict:
+        """SECTION 前缀 → 对应 pydantic 子模型，供未知键校验复用（_known_env_keys /
+        from_env_file 共用同一份，避免两处 section 列表各写一遍导致漂移）。"""
+        return {
             'API': APISettings, 'FILES': FileSettings, 'PROCESSING': ProcessingSettings,
             'LOGGING': LoggingSettings, 'DOCUMENT': DocumentConfig,
         }
-        for prefix, model in sections.items():
+
+    @classmethod
+    def _known_env_keys(cls) -> set:
+        """枚举全部合法的 env 键（SECTION__FIELD 大写 + 各字段 validation_alias）。"""
+        keys = set()
+        for prefix, model in cls._env_sections().items():
             for name, field in model.model_fields.items():
                 keys.add(f"{prefix}__{name}".upper())
                 alias = getattr(field, 'validation_alias', None)
@@ -304,29 +318,97 @@ class Settings(BaseSettings):
         return keys
 
     @classmethod
+    def _bare_field_hints(cls) -> dict:
+        """裸字段名（无 SECTION__ 前缀，大写）→ 正确 SECTION__FIELD 写法的提示
+        映射，从各 Settings 子模型的字段名/validation_alias 动态生成。用于致命
+        ConfigError 消息里给出「XXX → SECTION__XXX」这类具体修正建议，而不是
+        只说"缺少合法前缀"却不指明该缺的前缀是什么。"""
+        hints: dict = {}
+        for prefix, model in cls._env_sections().items():
+            for name, field in model.model_fields.items():
+                correct = f"{prefix}__{name}".upper()
+                hints.setdefault(name.upper(), correct)
+                alias = getattr(field, 'validation_alias', None)
+                if isinstance(alias, str):
+                    hints.setdefault(alias.upper(), correct)
+        return hints
+
+    @classmethod
     def from_env_file(cls, env_file_path: Path = Path('config/config.env')) -> 'Settings':
         """
         从指定的 .env 文件路径加载设置。
 
-        pydantic-settings 对未知键静默忽略——键名手滑（如曾经的
-        PROCESSING__MAX_CONTEXT_LENGT）会让配置无声失效。这里对照已声明
-        字段做一次校验，未识别的键 warning 出来。
+        Settings 的 extra 是默认的 'forbid'，不是「静默忽略」，但哪些键会真正
+        触发 extra_forbidden 由 pydantic-settings 的 dotenv provider 自己一套
+        豁免规则决定（sources/providers/dotenv.py __call__），不是"有无合法
+        SECTION__ 前缀"这么简单——实测两类键 pydantic 从不报错：
+        - 空值键：`FOO=`、`PROXY_URL=""`、裸 `FOO`（无等号）在
+          `if not env_value: continue` 处直接跳过，从不进入 extra 判定；
+        - 键名前缀撞上任一顶层字段的 env 名（哪怕没有 `__`，如 `API_KEY`/
+          `APIX`/`FILESY`/`DOCUMENTATION_URL` 分别撞上 api/files/document 字段
+          的 env 名 API/FILES/DOCUMENT）：复杂字段走的是
+          `env_name.startswith(field_env_name)` 纯前缀匹配，同样不会报错，
+          只是静默丢弃这个键（不生效，但也不致命）。
+        这些豁免是 pydantic-settings 的内部实现细节，随版本升级会漂移，本地
+        复刻等于自己预测另一个库的行为——预测错了就会把原本能正常启动的
+        config.env 判成假阳性致命错误。因此这里不再对"无合法 SECTION__ 前缀"
+        直接下判断；只保留"合法前缀但字段名手滑"这一条确定性强的 warning
+        提示（如曾经的 PROCESSING__MAX_CONTEXT_LENGT，pydantic 确认会静默
+        忽略），真正的致命性交给下面 cls(_env_file=...) 权威裁决——捕获它抛出
+        的 extra_forbidden ValidationError 后转成可读的 ConfigError，零假阳性。
+        转换时附带 _bare_field_hints() 生成的「XXX → SECTION__XXX」修正建议
+        （从各子模型字段名/alias 动态生成），而不是只说"缺前缀"却不指明具体
+        该写成哪个 SECTION__FIELD。
+
+        键的枚举用 python-dotenv 的 dotenv_values 而非手写 `line.split('=', 1)`：
+        后者不认 `export KEY=VAL` 前缀（会把整行第一个词错判成键名 "EXPORT
+        API__XXX"），也不处理带换行的引号取值（`KEY="a\nfoo=bar\n"` 会被当成
+        两行、"foo" 被误判为未知键）——这两种在裸 pydantic/dotenv 加载下本就合法
+        的写法，手写解析会把它们错误地升级成致命 ConfigError。dotenv_values 与
+        下面 `cls(_env_file=...)` 走的是同一套解析器，因此这里枚举出的键集合与
+        pydantic-settings 实际看到的键集合始终一致。
         """
         try:
+            from dotenv import dotenv_values
+            raw_keys = dotenv_values(env_file_path)
+        except OSError:
+            raw_keys = None  # 文件读不到时交给下面的 pydantic 正常报错路径
+
+        if raw_keys is not None:
             known = cls._known_env_keys()
-            for line in env_file_path.read_text(encoding='utf-8').splitlines():
-                line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
+            known_prefixes = tuple(f"{p}__" for p in cls._env_sections())
+            for raw_key in raw_keys:
+                key = raw_key.strip().upper()
+                if key in known:
                     continue
-                key = line.split('=', 1)[0].strip().upper()
-                if key not in known:
+                if key.startswith(known_prefixes):
                     import logging
                     logging.getLogger(__name__).warning(
                         f"⚠️ 配置文件中的未知键将被忽略: {key}（检查拼写，格式为 SECTION__FIELD 双下划线）"
                     )
-        except OSError:
-            pass  # 文件读不到时交给下面的 pydantic 正常报错路径
-        return cls(_env_file=env_file_path)
+                # 无合法 SECTION__ 前缀的键不在这里预判致命——上面的豁免规则
+                # 证明"前缀不合法"不等于"pydantic 会报错"，交给下面权威裁决。
+
+        try:
+            return cls(_env_file=env_file_path)
+        except ValidationError as e:
+            unknown_keys = sorted({
+                '.'.join(str(part) for part in err['loc']).upper()
+                for err in e.errors()
+                if err.get('type') == 'extra_forbidden'
+            })
+            if unknown_keys:
+                hints = cls._bare_field_hints()
+                described = [
+                    f"{key} → {hints[key]}" if key in hints else key
+                    for key in unknown_keys
+                ]
+                raise ConfigError(
+                    f"配置文件中存在非法键: {'; '.join(described)}（缺少合法的 SECTION__ "
+                    f"前缀，会导致程序启动失败，请按提示改为 SECTION__FIELD 格式）",
+                    context={"keys": unknown_keys, "env_file": str(env_file_path)},
+                ) from e
+            raise  # 其他类型的校验错误（类型不匹配等）保持原样上抛，不在此处转换
 
 
 # 便捷类型别名
