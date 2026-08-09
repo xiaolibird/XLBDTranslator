@@ -17,7 +17,7 @@ description: 用本机科研札记文献库支撑论文写作：按 role 轴(可
 ### 1. 取证据 —— 按 role 轴查
 
 ```bash
-python scripts/notes_query.py <关键词...> --role citable|refutable|method [选项]
+/Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_query.py <关键词...> --role citable|refutable|method [选项]
 ```
 
 | role | 中文标记 | 什么时候用 |
@@ -50,7 +50,7 @@ python scripts/notes_query.py <关键词...> --role citable|refutable|method [�
 | 中文概念找英文文献表述、换一种说法、或 notes_query 查询空手 | `scripts/notes_search.py`（语义检索，支持 `--role`/`--cite`/`--json`，参数面与 notes_query 对齐但 JSON schema 不同） |
 
 ```bash
-python scripts/notes_search.py <中文或英文查询...> --role citable|refutable|method [--cite] [--json]
+/Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py <中文或英文查询...> --role citable|refutable|method [--cite] [--json]
 ```
 `--mode` 默认 `hybrid`（dense 向量 + BM25 关键词 RRF 融合），也可 `--mode dense`/`--mode sparse`。
 两路都跑过、结果按 citekey 去重合并即可。**注意覆盖面**：句级证据（highlights）只覆盖库内精读
@@ -113,8 +113,8 @@ pandoc draft.md -f markdown-smart --citeproc --bibliography="$BIB" -s --css=pape
 ## 硬规则
 
 - **引用前确认无撞键**：`jq '.citekey_collisions' output/scholar_notes/literature_index.json` 应为 `[]`；
-  非空先跑 `PYTHONPATH=. python scripts/notes_index.py --fix-collisions`（否则同键不同文会串引用）。
-- **书目落后于札记时**先刷新：`PYTHONPATH=. python scripts/notes_index.py`
+  非空先跑 `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py --fix-collisions`（否则同键不同文会串引用）。
+- **书目落后于札记时**先刷新：`PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py`
   （会同时重建 `literature_index.json` 与 `all_references.json`，内容未变不落盘）。
 - **全局书目只覆盖 keeper 键**（`duplicate_of == null`）：被判重条目自己的 citekey 不在其中。
   所以渲染**月度札记 md 本身**时仍用同月的 `科研札记_*.references.json`，别用全局书目。

@@ -24,7 +24,7 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),正文含句级证据 callout + TF-IDF 相邻文献 +
 `_MOC/` 静态索引页。**它是索引的派生视图,不是真相源**——数字与全文以 `literature_index.json` 和月度 md 为准。
 索引一变即自动同步(launchd `com.xlbd.scholar-vault` 监视 `literature_index.json`);手动补跑:
-`PYTHONPATH=. python scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault`(加 `--force` 忽略陈旧判定)。
+`PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault`(加 `--force` 忽略陈旧判定)。
 ⚠️ 该目录含用户手写内容(`## 我的札记` 与自加的 frontmatter 键/tag),**不要直接编辑或覆盖那部分**。
 
 ## 四步法
@@ -70,7 +70,7 @@ n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),�
 "informative missingness"）。这类场景改用语义检索（在 XLBDTranslator-dev 仓库根目录跑）：
 
 ```bash
-PYTHONPATH=. python scripts/notes_search.py <中文或英文查询...> [--role citable|refutable|method] [--limit N] [--cite] [--json]
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py <中文或英文查询...> [--role citable|refutable|method] [--limit N] [--cite] [--json]
 ```
 
 `--mode` 默认 `hybrid`（向量 + BM25 关键词 RRF 融合，也可 `--mode dense`/`--mode sparse`；
@@ -84,7 +84,7 @@ PYTHONPATH=. python scripts/notes_search.py <中文或英文查询...> [--role c
 同步机制：向量库随周度自动入库（`ingest_notes.py`）best-effort 自动同步，Ollama 没起时只
 跳过不报错。**手动改了月度/手动精读 md 里的句子或标签后**，向量库不会自动跟上，需要手跑：
 ```bash
-PYTHONPATH=. python scripts/notes_index.py && PYTHONPATH=. python scripts/notes_embed.py
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py && PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_embed.py
 ```
 
 ## 往库里加论文
@@ -93,15 +93,15 @@ PYTHONPATH=. python scripts/notes_index.py && PYTHONPATH=. python scripts/notes_
 
 ```bash
 # 1) 本周 Scholar 告警(周一 09:00 digest 已判过,复用裁决不重跑筛选)
-PYTHONPATH=. python scripts/ingest_notes.py --list          # 先看判出了什么
-PYTHONPATH=. python scripts/ingest_notes.py --pick 2,3,5    # 只入这几篇
-PYTHONPATH=. python scripts/ingest_notes.py --auto          # 全入（launchd 周一 09:30 自动跑这条）
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --list          # 先看判出了什么
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --pick 2,3,5    # 只入这几篇
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --auto          # 全入（launchd 周一 09:30 自动跑这条）
 
 # 2) 任意 DOI / arXiv id / 标题(可能压根没在告警里出现过),一行一个
-PYTHONPATH=. python scripts/ingest_notes.py --papers papers.txt
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --papers papers.txt
 
 # 3) 本地 PDF(单篇、整个目录、或递归)——走三段式 agent 交叉核验,见 skill `read-paper`
-PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py ingest ~/Downloads/待读/
 ```
 
 前两条产出周札记 `科研札记_YYYY-MM-DD_全文精读.md` 并自动刷索引;第三条产出手动精读系列。
@@ -113,5 +113,5 @@ PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/
 - 索引可能落后于札记:`.months` 按文件 stem 键,含 auto+manual 两系列,不能直接跟只数
   `_全文精读` 的 `wc -l` 比;要对齐口径用 `ls 科研札记_*_全文精读.md | wc -l` 与
   `jq '[.months[]|select(.series=="auto")]|length'`,不一致时先在 XLBDTranslator-dev 仓库跑
-  `python scripts/notes_index.py` 再检索。
+  `/Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py` 再检索。
 - docx 是人读版,agent 只解析 md/json。

@@ -15,7 +15,7 @@ description: 对话式临时检索 arXiv/PubMed 学术文献（不入库、只�
 
 ```bash
 cd /Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
-PYTHONPATH=. python scripts/search_pubs.py "<检索式>" [选项]
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/search_pubs.py "<检索式>" [选项]
 ```
 
 选项：
@@ -80,7 +80,7 @@ PYTHONPATH=. python scripts/search_pubs.py "<检索式>" [选项]
 - 「札记库里有没有相关的」→ 走 `scholar-notes` skill。
 
 判断"库里是否已有类似文献"（比自动的 📚 标注更模糊的相似判断）可用语义检索：
-`PYTHONPATH=. python scripts/notes_search.py "<标题或摘要句>" --level paper --limit 5`
+`PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py "<标题或摘要句>" --level paper --limit 5`
 （XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。
 
 ## 边界

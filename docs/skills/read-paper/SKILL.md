@@ -20,15 +20,15 @@ description: 手动把一篇 PDF 文献做**深度全文精读**并归档进本�
 **单篇：**
 ```bash
 cd /Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
-PYTHONPATH=. python scripts/read_pdf.py ingest <pdf 路径> [--month YYYY-MM] [--title "手动标题"]
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py ingest <pdf 路径> [--month YYYY-MM] [--title "手动标题"]
 ```
 
 **批量**：`ingest` 的 `pdf` 参数实际是 `nargs="+"`，支持多路径混写、目录展开、`-r` 递归子目录；
 一条命令即可把一批 PDF 都推上草稿：
 ```bash
-PYTHONPATH=. python scripts/read_pdf.py ingest a.pdf b.pdf                    # 多个文件
-PYTHONPATH=. python scripts/read_pdf.py ingest ~/Downloads/待读/              # 整个目录（非递归）
-PYTHONPATH=. python scripts/read_pdf.py ingest ~/Papers/ -r                   # 递归子目录
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py ingest a.pdf b.pdf                    # 多个文件
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py ingest ~/Downloads/待读/              # 整个目录（非递归）
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py ingest ~/Papers/ -r                   # 递归子目录
 ```
 `--title` 只对单篇有意义（多篇/目录时元数据解析失败的条目会退化成 `anon*` 键，事后单独对
 那一篇重跑 `--title` 即可，不影响同批其余篇）。批量按文件名去重（真实路径 resolve 后），
@@ -69,14 +69,14 @@ PYTHONPATH=. python scripts/read_pdf.py ingest ~/Papers/ -r                   # 
 
 ### 5. finalize —— 归档
 ```bash
-PYTHONPATH=. python scripts/read_pdf.py finalize <bundle 路径>
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py finalize <bundle 路径>
 ```
 它从当月**全部 final bundle** 重建手动精读四件套并刷新索引（同月可多篇追加、幂等）。
 交叉核验报告会自动渲染为精读末节「交叉核验记录」。
 
 ### 6. 汇报
 给用户：归档的 md/docx 路径、本月手动深读篇数、索引撞键组数（非 0 时提示先跑
-`PYTHONPATH=. python scripts/notes_index.py --fix-collisions`）；若 ingest 提示"索引里已有同文"，
+`PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py --fix-collisions`）；若 ingest 提示"索引里已有同文"，
 说明这篇现已成为 keeper（自动浅读版被标 duplicate）。
 
 此后可用 `scholar-notes` skill 按 role/highlights 查这批新入库的文献；写论文取证用

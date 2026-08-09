@@ -23,16 +23,16 @@ cd /Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
 
 ```bash
 # Step 1: 检索+黑名单（纯 PubMed HTTP，不花钱。跑完检查降量分布是否合理）
-PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" \
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/screen_journal.py "NPJ Digit Med" \
     --from 2021-08-01 --to 2026-08-01 --stage search
 
 # Step 2: filter-v3 裁决（LLM 批量送审，需花钱。候选列表含决策+维度+角色+一句话用途）
-PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" --stage filter
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/screen_journal.py "NPJ Digit Med" --stage filter
 ```
 
 也可以一步到底：
 ```bash
-PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" \
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/screen_journal.py "NPJ Digit Med" \
     --from 2021-08-01 --to 2026-08-01 --stage all
 ```
 
@@ -52,7 +52,7 @@ PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" \
 `one_line="关键词命中: <词>"`），`confidence` **恒为 0.5**（不是真实置信度，只是占位数字）。
 `filter_method` 字段会是 `"keyword_only"`：
 ```bash
-PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" --stage filter --no-llm
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/screen_journal.py "NPJ Digit Med" --stage filter --no-llm
 ```
 
 ⚠️ 文末「面向 agent 自动化」那条 jq（按（`decision=="INCLUDE"` 或 `flags` 含 `THREAT`）且
@@ -125,7 +125,7 @@ jq -r '.candidates[] | select(.decision=="KEYWORD") | select(.doi != null and .d
 
 保存后：
 ```bash
-PYTHONPATH=. python scripts/ingest_notes.py --papers picks.txt
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --papers picks.txt
 ```
 
 ## 黑名单
@@ -148,7 +148,7 @@ agent 调用时可跳过人工审查，直接按置信度阈值入库：
 # agent: 筛选 + 自动入库（取 INCLUDE 或带 THREAT 旗标的、且 confidence≥0.7 的——两条件是并集，
 # 任一满足就要人工看：INCLUDE 是裁决判它该入库，THREAT 是裁决认为它挑战/威胁现有结论，
 # 优先级不同但都不该漏过；confidence 门槛对两者都生效，防低置信度噪声）
-PYTHONPATH=. python scripts/screen_journal.py "NPJ Digit Med" \
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/screen_journal.py "NPJ Digit Med" \
     --from 2021-08-01 --to 2026-08-01 --stage all
 
 # 提取高置信候选 DOI（括号必须加：jq 里 | 的优先级低于 and，裸写 .flags | index("THREAT")
@@ -158,7 +158,7 @@ jq -r '.candidates[] | select((.decision=="INCLUDE" or (.flags | index("THREAT")
     output/journal_screen/npj_digit_med_candidates.json > picks.txt
 
 # 入库
-PYTHONPATH=. python scripts/ingest_notes.py --papers picks.txt
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ingest_notes.py --papers picks.txt
 ```
 
 无 DOI 的候选（`.doi` 为 `null` 或空字符串 `""`）不会被上面这条自动管线捡进 `picks.txt`——
