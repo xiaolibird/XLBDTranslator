@@ -42,6 +42,7 @@ class TranslationMode(BaseModel):
     name: str = Field(description="模式名称")
     role_desc: str = Field(description="角色描述")
     style: str = Field(description="风格指南")
+    few_shot: Optional[str] = Field(None, description="示范译例（源文→理想译文），随模式注入 system instruction")
     context_len: ContextLength = Field(default=ContextLength.MEDIUM, description="上下文长度")
 
     model_config = {'use_enum_values': True}

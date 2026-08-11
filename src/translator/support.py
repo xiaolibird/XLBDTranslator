@@ -599,6 +599,13 @@ class PromptManager:
 
 **CRITICAL**: You MUST follow this mode's philosophy for ALL translations.
 """
+            few_shot = getattr(self.mode_entity, 'few_shot', None)
+            if few_shot:
+                mode_section += f"""
+**Exemplar (few-shot)** — the quality bar for this mode; imitate its handling, not its content:
+
+{few_shot}
+"""
             parts.append(mode_section)
         
         # 添加术语表（正式翻译时）
