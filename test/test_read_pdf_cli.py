@@ -204,3 +204,89 @@ def test_rebuild_month_keeps_existing_citekey_stable_across_reruns(tmp_path):
     assert r3["papers"] == 3
     assert _citekey_of(tmp_path, "Missing Data Structures Paper") == key_a_first
     assert _citekey_of(tmp_path, "Second Independent Paper") == key_b
+
+
+# ---------------- _rebuild_month 沿用札记侧改过的 citekey ----------------
+
+def _sidecar_rename(notes_dir, month, old, new):
+    """模拟 audit_citekeys_vs_pmlr.py --apply：只改札记侧三处，不碰 bundle。"""
+    stem = "科研札记_{}_手动精读".format(month)
+    md = notes_dir / (stem + ".md")
+    md.write_text(md.read_text(encoding="utf-8").replace(
+        "[@{}]".format(old), "[@{}]".format(new)), encoding="utf-8")
+    sp = notes_dir / (stem + ".index.json")
+    data = json.loads(sp.read_text(encoding="utf-8"))
+    for r in data["papers"]:
+        if r.get("citekey") == old:
+            r["citekey"] = new
+    sp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    rp = notes_dir / (stem + ".references.json")
+    items = json.loads(rp.read_text(encoding="utf-8"))
+    for it in items:
+        if it.get("id") == old:
+            it["id"] = new
+    rp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_rebuild_month_reuses_renamed_citekey_instead_of_reverting(tmp_path):
+    """札记侧改过的 citekey 必须被 regen 沿用，不能被 bundle 里的旧元数据顶回去。
+
+    bundle 里没有 citekey 字段，此前 _rebuild_month 对每篇现算 _fallback_citekey，
+    于是 audit 按 PMLR 官方 slug 修正过的键（复姓/年份）会在下次 regen 全部丢失。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pa", "Uncertainty Aware Logistic Regression", "Fuertes", "10.1/a")
+    _write_final_bundle(tmp_path, month, seg, "/a.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    old = _citekey_of(tmp_path, "Uncertainty Aware Logistic Regression")
+
+    fixed = "torresfuertes2026Uncertainty"          # 官方 slug 修正后的键
+    assert fixed != old
+    _sidecar_rename(tmp_path, month, old, fixed)
+
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert _citekey_of(tmp_path, "Uncertainty Aware Logistic Regression") == fixed
+
+    # 沿用的是兜底键，不能在 sidecar 里冒充 Zotero 权威键
+    sc = json.loads((tmp_path / "科研札记_{}_手动精读.index.json".format(month))
+                    .read_text(encoding="utf-8"))
+    row = next(r for r in sc["papers"] if r["citekey"] == fixed)
+    assert row["citekey_source"] == "fallback"
+
+
+def test_rebuild_month_new_paper_still_gets_fallback_key(tmp_path):
+    """沿用机制不能挡住新论文：库里没有的照常现算兜底键，且不与沿用键相撞。"""
+    month = "2026-08"
+    seg = _manual_seg("pa", "First Paper About Masking", "Fani", "10.1/a")
+    _write_final_bundle(tmp_path, month, seg, "/a.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    _sidecar_rename(tmp_path, month,
+                    _citekey_of(tmp_path, "First Paper About Masking"), "fani2026Masking")
+
+    segB = _manual_seg("pb", "Second Paper About Masking", "Fani", "10.1/b")
+    _write_final_bundle(tmp_path, month, segB, "/b.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert _citekey_of(tmp_path, "First Paper About Masking") == "fani2026Masking"
+    kb = _citekey_of(tmp_path, "Second Paper About Masking")
+    assert kb and kb != "fani2026Masking"
+
+
+def test_rebuild_month_refuses_reuse_when_batch_has_duplicate_dedup_key(tmp_path):
+    """本批两份 bundle 同 dedup_key（同 DOI 换标题重 ingest）时拒绝沿用——
+    否则两篇会拿到同一个显式键，而 write_notes 对显式键不做查重 = 静默撞键。"""
+    month = "2026-08"
+    seg = _manual_seg("pa", "Shared DOI Paper", "Zhang", "10.1/dup")
+    _write_final_bundle(tmp_path, month, seg, "/a.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    _sidecar_rename(tmp_path, month,
+                    _citekey_of(tmp_path, "Shared DOI Paper"), "zhang2026Shared")
+
+    # 同 DOI、不同 paper_id/标题 —— dedup_key 相同
+    segB = _manual_seg("pb", "Shared DOI Paper Revised Title", "Zhang", "10.1/dup")
+    _write_final_bundle(tmp_path, month, segB, "/b.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    idx = json.loads((tmp_path / "literature_index.json").read_text(encoding="utf-8"))
+    keys = [p["citekey"] for p in idx["papers"] if p.get("month") == month]
+    assert len(keys) == len(set(keys)), "撞键：{}".format(keys)

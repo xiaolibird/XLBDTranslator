@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  札记库 → 语义向量库（embeddings.sqlite3）自动增量同步（launchd 用户代理）。
+
+  和 com.xlbd.scholar-vault 是同一套思路，监视同一个文件：literature_index.json 一变
+  就跑一次增量同步。为什么必须是 WatchPaths 而不是定时：
+
+    向量库的 chunk 上带着 citekey 与 year 两列，是语义检索结果回传给写作侧的**唯一
+    身份来源**。它会因为「入库」之外的原因变旧——改键（audit_citekeys_vs_pmlr.py
+    --apply、notes_index.py --fix-collisions）、改元数据、手工重建索引。一旦变旧，
+    notes_search --cite 就会吐出磁盘上已不存在的 citekey，粘进稿子后 pandoc 报
+    citation not found；digest 的近邻注入还会把旧键旧年份喂给 LLM 裁决。
+
+    在此之前，唯一的自动同步入口是周度入库 com.xlbd.scholar-weekly-ingest（周一 09:30），
+    而那条路径只在「本周有新论文」时才走到同步——空窗周整段跳过。于是「改了键 + 接下来
+    几周没有新论文」= 陈旧状态无限期存续，且没有任何一条日志会说「该同步了」。
+    索引是所有这些改动的公共下游，盯住它就一网打尽。
+
+  由 scripts/install_embed_sync.sh 安装：__REPO_ROOT__ / __PYTHON_BIN__ / __LOG_DIR__
+  会被替换后拷入 ~/Library/LaunchAgents/。
+
+  与其它 job 的关系：
+  - 本 job 与 com.xlbd.scholar-vault 监视同一个文件，两者并行跑互不干扰：
+    vault job 只写 vault 目录，本 job 只写 output/scholar_notes/embeddings.sqlite3。
+  - 周度 ingest / 月度 backfill / read_pdf 收尾本来就各自调 sync_store，本 job 跑的是
+    同一个增量算法，重复触发只是空跑（diff 为零时既不 embed 也不写库）。
+
+  ThrottleInterval 600：嵌入比 vault 渲染慢得多（首建 bge-m3 全量 2-6 分钟，增量按变更量
+  几秒到几分钟），而一次索引刷新会连带写多个文件、可能触发多次 WatchPaths。10 分钟节流
+  既避免叠跑，又远快于「等到下周一」。sync_store 增量模式靠 WAL + BEGIN IMMEDIATE 隔离，
+  万一真叠上了也不会写坏库（最坏是后来者报 database is locked 并被 notes_embed.py 以
+  退出码 2 收场，下次索引变动再补）。
+
+  RunAtLoad true：睡眠/关机期间发生的索引变动 WatchPaths 抓不到，靠登录时补一次。
+  库本来就最新时这一次是秒级空跑（diff 为零，不连 Ollama 之外的任何东西）。
+
+  Ollama 没起时 notes_embed.py 以退出码 3 收场并把原因写进 cron_embed.err.log；
+  launchd 不会因此反复重启（没有 KeepAlive），下一次索引变动会自然重试。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-embed</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/notes_embed.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__</string>
+        <!-- ⚠️ 必须绕开本机代理，否则这个 job 永远失败（实测 2026-08-16）：
+             macOS 系统代理开着时（如 Clash 的 127.0.0.1:7890），httpx 会经
+             urllib.request.getproxies() 读到 System Configuration 的设置，
+             把 http://localhost:11434 也送进代理，Clash 对本地地址回 502 →
+             notes_embed.py 判定「Ollama 不可用」以退出码 3 收场。
+             交互 shell 里通常已有 no_proxy 所以手跑没事，launchd 的干净环境里没有，
+             于是「手动能跑、定时永远挂」。curl 不读系统代理，故 curl 探活会误报健康。 -->
+        <key>no_proxy</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1,::1</string>
+    </dict>
+
+    <!-- 索引一变就跑增量同步 -->
+    <key>WatchPaths</key>
+    <array>
+        <string>__REPO_ROOT__/output/scholar_notes/literature_index.json</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>600</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_embed.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_embed.err.log</string>
+</dict>
+</plist>

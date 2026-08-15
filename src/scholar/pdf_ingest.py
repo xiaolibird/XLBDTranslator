@@ -165,6 +165,7 @@ def _meta_from_crossref(hit: Dict[str, Any]) -> PaperMetadata:
         title=hit.get("title") or "",
         authors=authors,
         publication_date=hit.get("publication_date"),
+        date_precision=hit.get("date_precision"),
         journal=hit.get("journal"),
         doi=hit.get("doi"),
         volume=hit.get("volume"),
@@ -217,6 +218,7 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                     title=it.get("title") or "",
                     authors=it.get("authors") or [],
                     publication_date=it.get("published"),
+                    date_precision=it.get("date_precision"),
                     journal=it.get("journal"),
                     doi=it.get("doi") or doi,
                     arxiv_id=arxiv_id,
@@ -246,9 +248,11 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
             authors = [a for a in (data.get("authors") or []) if isinstance(a, str)]
             year = data.get("year")
             pub = None
+            pub_prec = None
             if isinstance(year, int) and 1900 < year < 2100:
                 from datetime import date
-                pub = date(year, 1, 1)
+                pub = date(year, 1, 1)   # date 必须凑齐三段，1/1 是占位
+                pub_prec = "year"        # ……真实精度只到年，记下来给产出层截断
             t = (data.get("title") or title or "").strip()
             # LLM 抽出的标题比「首页第一行够长的行」这种启发式干净得多（后者常抓到页眉、
             # 会议名、作者行）。拿它再查一次 Crossref：命中就能补齐作者/年份/卷期页，
@@ -266,7 +270,7 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
             meta = PaperMetadata(
                 paper_id=_generate_paper_id(t, authors),
                 title=t, authors=authors,
-                publication_date=pub,
+                publication_date=pub, date_precision=pub_prec,
                 journal=(data.get("journal") or None) or None,
                 doi=doi, arxiv_id=arxiv_id,
                 field=PaperField.OTHER, source_type="manual-pdf",
@@ -504,6 +508,7 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
   "sections": [
     {{"heading": "研究问题", "sentences": [{{"text": "…", "tag": null}}]}},
     {{"heading": "方法与数据", "sentences": [{{"text": "…", "tag": "方法论借鉴"}}]}},
+    {{"heading": "实验方法", "sentences": [{{"text": "…（数据集/划分/超参/评估协议/基线/代码可得性；原文未报告的写「原文未报告：X」）", "tag": "方法论借鉴"}}]}},
     {{"heading": "结果与效应量", "sentences": [{{"text": "…（保留关键数值）", "tag": "可引用证据"}}]}},
     {{"heading": "图表与补充材料要点", "sentences": [{{"text": "…", "tag": null}}]}},
     {{"heading": "局限与可质疑点", "sentences": [{{"text": "…", "tag": "可反驳观点"}}]}},
@@ -636,7 +641,8 @@ def find_duplicate(index_path: Optional[Path], meta: PaperMetadata) -> Optional[
         return None
     try:
         from ._citekey_utils import dedup_key_fields
-        key = dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
+        key = dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id,
+                               url=getattr(meta, "url", None))
         data = json.loads(Path(index_path).read_text(encoding="utf-8"))
         for e in data.get("papers", []):
             if e.get("dedup_key") == key and not e.get("duplicate_of"):

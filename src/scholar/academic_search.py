@@ -134,6 +134,8 @@ class AcademicSearchClient:
                 continue
             results.append({
                 "source": "arxiv",
+                # arXiv 的 published 是完整时间戳，是全库唯一的全精度日期来源
+                "date_precision": "day" if published else None,
                 "title": title,
                 "abstract": summary,
                 "authors": authors,
@@ -248,13 +250,19 @@ class AcademicSearchClient:
 
             # 发表日期
             published = None
+            date_precision = None
             pubdate = article.find("./Journal/JournalIssue/PubDate")
             if pubdate is not None:
                 y = pubdate.findtext("Year")
-                m = pubdate.findtext("Month") or "1"
-                d = pubdate.findtext("Day") or "1"
+                raw_m = pubdate.findtext("Month")
+                raw_d = pubdate.findtext("Day")
+                m = raw_m or "1"
+                d = raw_d or "1"
                 if y:
                     published = _safe_date(y, m, d)
+                    # PubMed 绝大多数只给到 Year+Month，补出来的「1 号」是假的
+                    date_precision = ("day" if raw_d else
+                                      "month" if raw_m else "year") if published else None
 
             if not title:
                 continue
@@ -269,6 +277,7 @@ class AcademicSearchClient:
                 "pmid": pmid,
                 "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
                 "published": published,
+                "date_precision": date_precision,
             })
         return results
 
@@ -295,6 +304,7 @@ def item_to_segment(item: Dict[str, Any], segment_id: int) -> PaperSegment:
         title=item.get("title", ""),
         authors=authors,
         publication_date=item.get("published"),
+        date_precision=item.get("date_precision"),
         journal=item.get("journal"),
         doi=item.get("doi"),
         arxiv_id=item.get("arxiv_id"),

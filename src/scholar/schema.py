@@ -53,6 +53,15 @@ class PaperMetadata(BaseModel):
     
     # 发布信息
     publication_date: Optional[date] = Field(None, description="发布日期")
+    # 上面那个 date 的**真实精度**。date 类型必须凑齐年月日才能构造，所以各来源在只拿到
+    # 「年」或「年月」时一律补 1 —— 全库 445 条 [[Y,1,1]] 与 689 条 [[Y,M,1]] 就是这么来的，
+    # 参考文献于是渲染出论文并不存在的月份（如 "2026 (January)"）。
+    # 解法不是让 publication_date 可空（那会连累 citekey 取年与索引 year 字段），
+    # 而是**另存精度、只在产出层截断**：CSL 的 issued（出版日期，注意与 issue 期号不是一回事）
+    # 按 day/month/year 输出三/二/一段 date-parts；Zotero 的 date 同理截断 ISO 串。
+    # None = 存量条目，精度未知，产出层用启发式（(m,d)==(1,1)→年、d==1→年月）兜底。
+    date_precision: Optional[Literal["day", "month", "year"]] = Field(
+        None, description="publication_date 的真实精度（None=存量未知）")
     journal: Optional[str] = Field(None, description="期刊/会议名称")
     volume: Optional[str] = Field(None, description="卷号")
     issue: Optional[str] = Field(None, description="期号")

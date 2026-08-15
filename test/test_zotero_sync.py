@@ -41,7 +41,8 @@ def test_paper_to_zotero_item_journal():
     assert it["DOI"] == "10.1/abc"
     assert it["publicationTitle"] == "npj Digital Medicine"
     assert it["abstractNote"] == "abs text"
-    assert it["date"] == "2025-03-01"
+    # 精度未知的存量条目：日=1 视为占位，只写到月（Zotero date 接受部分日期）
+    assert it["date"] == "2025-03"
     assert "PMID: 12345" in it["extra"]
     assert {"tag": "source:pubmed"} in it["tags"]
 
@@ -327,8 +328,30 @@ def test_build_csl_item():
                                      publication_date=date(2025, 3, 1)), "public2025mnar")
     assert csl["id"] == "public2025mnar"
     assert csl["DOI"] == "10.1/abc"
-    assert csl["issued"]["date-parts"] == [[2025, 3, 1]]
+    # 精度未知（存量）+ 日=1 → 启发式判为月精度，不把占位的 1 号当确切出版日
+    assert csl["issued"]["date-parts"] == [[2025, 3]]
     assert csl["author"][0]["family"] == "Public"
+
+
+def test_build_csl_item_respects_explicit_date_precision():
+    """date_precision 是权威，压过启发式：明说 day 就渲染三段，明说 year 就只渲染年。"""
+    m = _meta(doi="10.1/abc", publication_date=date(2025, 3, 1))
+    m.date_precision = "day"          # 真的是 3 月 1 日出版
+    assert notes.build_csl_item(m, "k")["issued"]["date-parts"] == [[2025, 3, 1]]
+    assert zotero_sync.paper_to_zotero_item(m)["date"] == "2025-03-01"
+
+    m.date_precision = "year"         # 只知道年（如 pdf-llm 只抽到 year）
+    assert notes.build_csl_item(m, "k")["issued"]["date-parts"] == [[2025]]
+    assert zotero_sync.paper_to_zotero_item(m)["date"] == "2025"
+
+
+def test_build_csl_item_heuristic_for_legacy_entries():
+    """存量（precision=None）按月日形状倒推：1/1→年、日=1→年月、其余→日。"""
+    def parts(d):
+        return notes.build_csl_item(_meta(doi="10.1/x", publication_date=d), "k")["issued"]["date-parts"]
+    assert parts(date(2026, 1, 1)) == [[2026]]        # 全库 445 条这种占位
+    assert parts(date(2026, 5, 1)) == [[2026, 5]]     # PubMed 真月假日
+    assert parts(date(2026, 5, 5)) == [[2026, 5, 5]]  # 真实全日期不动
 
 
 def _seg_with_decision_2():

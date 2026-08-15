@@ -254,3 +254,24 @@ def test_enrich_abstract_from_pubmed_needs_an_identifier():
     meta = PaperMetadata(paper_id="p1", title="只有标题")
     client = httpx.Client(transport=httpx.MockTransport(boom))
     assert enrich_abstract_from_pubmed(meta, "", client=client) is None
+
+
+def test_pubmed_reports_true_date_precision():
+    """PubMed 绝大多数只给 Year+Month，补出来的「1 号」是假的——精度必须如实记录。"""
+    from src.scholar.academic_search import AcademicSearchClient
+    xml = """<PubmedArticleSet><PubmedArticle><MedlineCitation>
+      <PMID>1</PMID><Article><ArticleTitle>T</ArticleTitle>
+      <Journal><JournalIssue><PubDate>{}</PubDate></JournalIssue></Journal>
+      </Article></MedlineCitation></PubmedArticle></PubmedArticleSet>"""
+    parse = AcademicSearchClient.parse_pubmed
+
+    only_year = parse(xml.format("<Year>2026</Year>"))
+    assert only_year[0]["date_precision"] == "year"
+    assert only_year[0]["published"].month == 1      # 占位，但已标明只到年
+
+    with_month = parse(xml.format("<Year>2026</Year><Month>May</Month>"))
+    assert with_month[0]["date_precision"] == "month"
+    assert with_month[0]["published"].day == 1       # 占位日
+
+    full = parse(xml.format("<Year>2026</Year><Month>May</Month><Day>5</Day>"))
+    assert full[0]["date_precision"] == "day"

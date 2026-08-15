@@ -13,6 +13,7 @@
 """
 import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 import yaml
@@ -919,3 +920,15 @@ def test_belong_month_link_matches_page(notes_dir, index, tmp_path):
     e = dict(_entry(index, "public2025Deep"), month="2026-07-17")
     block = V.render_generated_block(e, [], [], {})
     assert "_MOC/月度/2026-07|" in block and "2026-07-17|" not in block
+
+
+def test_repo_dedup_overrides_are_isolated_from_this_file():
+    """R2-3：本文件的 update_index → _global_pass 链也必须读不到仓库那份真裁决文件。
+
+    隔离原先只挂在 test_notes_index.py 上（单文件 autouse fixture），而这条链在本文件
+    与 test_pdf_ingest.py 里同样会走：往 config/dedup_overrides.json 里加一条涉及
+    doi:10.1/aaa 之类测试假键的真实裁决，就会让本文件里不相干的用例变红。
+    夹具现在在 test/conftest.py，对整个 test/ 目录生效。
+    """
+    assert ni._read_override_files(None) == []
+    assert not Path(ni.REPO_OVERRIDES_PATH).exists()

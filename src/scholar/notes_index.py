@@ -9,8 +9,13 @@
 
 去重与 scripts/backfill_notes.py 同源同规则（doi: > arxiv: > title: 规范化，最早月优先）；
 本模块即权威实现，backfill delegate 到这里。重复条目不删除，标 `duplicate_of` 供消费方过滤。
+
+判重三层（_global_pass，并查集成簇保传递性）：精确身份键 → dedup_overrides.json 人工确认对
+→ 标题相似度（IDF 加权余弦 ≥ AUTO_MERGE_SIM 且无身份冲突）。中间带 [REVIEW_SIM,
+AUTO_MERGE_SIM) 只报候选到 index["title_near_duplicates"]，不合并。
 """
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -20,6 +25,7 @@ from typing import Any, Dict, List, Optional, Set
 from ._citekey_utils import (
     _suffix_seq, _priority_tier, _TIER_MAP, _reading_depth,
     _collect_highlights, dedup_key_fields, entry_from_segment, _norm_title,
+    recompute_entry_key,
 )
 
 # 向后兼容：旧公开 API
@@ -38,6 +44,13 @@ INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"
 AGENTS_MD = "AGENTS.md"
 ALL_REFS_JSON = "all_references.json"
+# 人工确认的合并/不合并裁决（标题相似度无法安全自动判定时的通道），格式见 _load_dedup_overrides
+DEDUP_OVERRIDES_JSON = "dedup_overrides.json"
+# 仓库内那份裁决文件（受版本控制）。提成模块级常量而非写死在 _read_override_files 里：
+# 单测得以把 override 来源完全限定在 tmp_path 内（monkeypatch 掉本常量），否则每个
+# _global_pass 用例都会连带读进这份真实文件，测试结果跟着仓库状态飘。
+# ⚠️ 生产行为不变：仍与 notes_dir 那份**取并集**（理由见 _read_override_files 文档）。
+REPO_OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "config" / DEDUP_OVERRIDES_JSON
 
 # 成品札记 md 命名：_全文精读=自动流水线；_手动精读=手动 PDF 深度精读
 # （天然排除 demo/ideal/validate/digest_* 等杂档）
@@ -166,7 +179,7 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
     for e in entries:
         e.pop("_cur_section", None)
         e["dedup_key"] = dedup_key_fields(e["doi"], e["arxiv_id"], e["title"],
-                                          fallback=e["citekey"])
+                                          fallback=e["citekey"], url=e.get("url"))
     return entries
 
 
@@ -218,7 +231,8 @@ def _merge_csl(entry: Dict[str, Any], item: Dict[str, Any]) -> None:
     if item.get("container-title"):
         entry["journal"] = item["container-title"]
     entry["dedup_key"] = dedup_key_fields(entry["doi"], entry["arxiv_id"], entry["title"],
-                                          fallback=entry.get("citekey", ""))
+                                          fallback=entry.get("citekey", ""),
+                                          url=entry.get("url"))
 
 
 def _locate_headings(md_path: Path) -> Dict[str, List[Any]]:
@@ -290,6 +304,16 @@ def build_month_entries(month: str, md_path: Path,
     for e in entries:
         e["month"] = month
         e["series"] = series          # 文件名权威（覆盖 sidecar/md 默认）
+        # dedup_key 一律**按当前规则重算**，不沿用 sidecar 里落盘时的值。
+        # sidecar 是 write_notes 当时写下的快照，dedup_key 也被冻在那一刻；键梯规则一改
+        # （如 2026-08-15 加 pmlr:/openreview: 层），md 解析那条路生效、sidecar 这条路却
+        # 纹丝不动——同一篇论文两条来源拿到两个键，且**毫无迹象**。实测踩中：手动精读的
+        # fani26a 有 proceedings.mlr.press 的 url 却仍持 title: 键，人工合并裁决因此失配。
+        # 例外：重算落到 "id:"（doi/arxiv/场地 id/标题全空）时保留原值——sidecar 用
+        # paper_id 兜底比这里能拿到的 citekey 更稳，重算反而更差。
+        # ⚠️ 重算规则收在 _citekey_utils.recompute_entry_key 一处：ingest 的整篇覆盖守卫
+        #    （_existing_note_dedup_keys）读同一批 sidecar，两处各写各的就会键梯漂移。
+        e["dedup_key"] = recompute_entry_key(e)
         # 存量精读条目回填 reading_depth（两条并列的对称规则；series 已由文件名权威定死）。
         # 不重跑任何存量精读——只在量尺上标出「这批读到什么程度」，让下游能显式区分两代札记。
         # (a) auto 存量：既没有 reading_depth 又确实做过精读的，只可能是加分块开关之前跑的单跳，
@@ -345,34 +369,342 @@ def _entry_keys(e: Dict[str, Any]) -> List[str]:
 
 
 def _keeper_rank(e: Dict[str, Any]) -> tuple:
-    """keeper 优先级（越小越优先当权威）：手动深读 > 最早月份 > 更高优先级排名。
+    """keeper 优先级（越小越优先当权威）：手动深读 > 书目更全 > 最早月份 > 更高优先级排名。
 
-    手动 PDF 深度精读是论文 agent 应优先读到的权威版本，即使月份晚于自动浅读。
+    手动 PDF 深度精读是论文 agent 应优先读到的权威版本，即使月份晚于自动浅读，
+    故 series 始终是第一顺位——正文内容比元数据完整度重要。
+
+    「书目更全」是**同系列内**的次级顺位：keeper 是下游唯一可见的记录（其余按
+    duplicate_of 过滤），若它是个作者/DOI/期刊全空的残缺条目，合并等于把完好记录
+    换成了残条。实测本库 76 个重复簇里有 6 组踩中，典型是预印本被解析成 `anon*`
+    无作者条目、却因月份更早而压过带作者的正刊记录（如 Research Square 版
+    《Federated Learning used for predicting outcomes in SARS-COV-2 patients》
+    压过 Nature Medicine 版）。月份只在完整度相同时才决定胜负。
     """
+    completeness = sum(1 for f in ("authors", "doi", "journal") if e.get(f))
     return (0 if e.get("series") == "manual" else 1,
-            e["month"], e.get("priority_rank") or 9999)
+            -completeness, e["month"], e.get("priority_rank") or 9999)
 
 
-def _global_pass(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """全局排序 + 跨月去重标记（keeper 规则见 _keeper_rank）+ 撞键检测的前置排序。"""
+# ---------------- 标题相似度层（捕获改写题名的漏网重复） ----------------
+#
+# 精确标题键（_entry_keys 二级键）只认逐字相同的题名，预印本→正刊常改写标题而两侧
+# 又都无 DOI 时会漏网（实测：arXiv《Volatility-Aware Masking Improves…》与 ML4H
+# 正刊《Coefficient of Variation Masking: A Volatility-Aware Strategy…》）。
+#
+# 度量选型（在本库 2264 篇真实标题上标定，见下）：IDF 加权余弦。
+#   - 用 IDF 而非裸 Jaccard：领域高频词（clinical/prediction/model）不该撑起相似度，
+#     真正的信号是稀有词共现（volatility/masking）。
+#   - 不用 containment（交集/较短者）：短标题与截断标题会退化成 1.0（实测
+#     「Healthcare Analytics」对任意含该词的长标题都是 1.0），假阳性极高。
+# 阈值标定（加下述守卫后，全库跨簇对的人工判读结果）：
+#   cos≥0.85 → 3 对，全部真重复；0.70–0.85 → 2 对，全部真重复；
+#   0.60–0.70 → 4 对，已混入 2 对不同论文；0.50–0.60 → 8 对，多数是不同论文。
+# 故 0.70 以上自动合并，0.45–0.70 只报候选（title_near_duplicates）交人工确认——
+# **误合并会静默吞掉一篇论文**（下游一律按 duplicate_of 过滤），代价远高于漏合并。
+AUTO_MERGE_SIM = 0.70
+REVIEW_SIM = 0.45
+
+_TITLE_STOP = {
+    "the", "and", "for", "with", "from", "using", "via", "into", "over", "under",
+    "that", "this", "these", "those", "are", "was", "were", "its", "their",
+    "based", "toward", "towards", "through", "between", "among", "study",
+    "approach", "novel", "new", "use", "used", "can", "does", "what", "how", "why",
+    "when", "not",
+}
+
+
+def _title_tokens(title: Optional[str]) -> Set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower())
+            if len(w) >= 3 and w not in _TITLE_STOP}
+
+
+def _first_surname(e: Dict[str, Any]) -> str:
+    """首作者姓氏（小写）；取不到返回 ""（视作「未知」，不参与冲突判定）。
+
+    authors 为空时退回 citekey 前缀，但 `anon`（元数据解析失败的兜底键）要当未知，
+    否则两篇互不相干的 anon 条目会被误判为「同一作者」。
+    """
+    authors = e.get("authors") or []
+    if authors:
+        parts = str(authors[0]).replace(",", " ").split()
+        if parts:
+            s = re.sub(r"[^a-z]", "", parts[-1].lower())
+            if s:
+                return s
+    m = re.match(r"([a-z]+)\d{4}", e.get("citekey") or "")
+    s = m.group(1) if m else ""
+    return "" if s == "anon" else s
+
+
+def _identity_conflict(a: Dict[str, Any], b: Dict[str, Any]) -> str:
+    """两条目是否有「铁证不同篇」的冲突；返回冲突原因，无冲突返回 ""。
+
+    只在**双方都有**该字段时才判冲突：一方缺失是常态（PMLR 无 DOI、anon 无作者），
+    缺失不能当作证据。守卫存在的意义是把标题相似度的阈值压低到可用区间而不误吞——
+    实测姊妹篇（Static vs Time-varying Feature Settings）正是靠 arXiv id 冲突拦下的。
+    """
+    da, db = (a.get("doi") or "").strip().lower(), (b.get("doi") or "").strip().lower()
+    if da and db and da != db:
+        return "doi"
+    xa, xb = (a.get("arxiv_id") or "").strip().lower(), (b.get("arxiv_id") or "").strip().lower()
+    if xa and xb and xa.split("v")[0] != xb.split("v")[0]:
+        return "arxiv"
+    sa, sb = _first_surname(a), _first_surname(b)
+    if sa and sb and sa != sb:
+        return "author"
+    ya, yb = a.get("year"), b.get("year")
+    if isinstance(ya, int) and isinstance(yb, int) and abs(ya - yb) > 3:
+        return "year"
+    return ""
+
+
+def _title_sim_pairs(papers: List[Dict[str, Any]],
+                     cluster_of) -> List[Dict[str, Any]]:
+    """跨簇标题相似对（已过守卫），按相似度降序。cluster_of(i) 给出条目 i 的现有簇。
+
+    倒排索引分块：只比较共享至少一个非高频词的对，避免 O(n²) 全比。
+    """
+    idxs = [i for i, e in enumerate(papers) if _title_tokens(e.get("title"))]
+    toks = {i: _title_tokens(papers[i].get("title")) for i in idxs}
+    df: Dict[str, int] = {}
+    for i in idxs:
+        for w in toks[i]:
+            df[w] = df.get(w, 0) + 1
+    # n 取下限 50：语料太小时 IDF 会反转——共享词必然 df≥2、在 n=2 时权重反而最低，
+    # 相似度恒塌成 0，特征在小札记库（或单元测试）里静默失效。加下限后小语料退化成
+    # 近似均匀权重（即纯 token 重叠度），大语料（本库 2260 篇）不受影响。
+    n = max(len(idxs), 50)
+    idf = {w: math.log((n + 1) / (c + 0.5)) for w, c in df.items()}
+    norms = {i: math.sqrt(sum(idf[w] ** 2 for w in toks[i])) for i in idxs}
+
+    inv: Dict[str, List[int]] = {}
+    for i in idxs:
+        for w in toks[i]:
+            if df[w] <= 300:                     # 高频词不作分块键
+                inv.setdefault(w, []).append(i)
+
+    seen: Set[tuple] = set()
+    out: List[Dict[str, Any]] = []
+    for w, ids in inv.items():
+        if len(ids) > 500:
+            continue
+        for x in range(len(ids)):
+            for y in range(x + 1, len(ids)):
+                i, j = (ids[x], ids[y]) if ids[x] < ids[y] else (ids[y], ids[x])
+                if (i, j) in seen:
+                    continue
+                seen.add((i, j))
+                if cluster_of(i) == cluster_of(j):        # 精确键已合并
+                    continue
+                if not norms[i] or not norms[j]:
+                    continue
+                inter = toks[i] & toks[j]
+                if not inter:
+                    continue
+                sim = sum(idf[w2] ** 2 for w2 in inter) / (norms[i] * norms[j])
+                if sim < REVIEW_SIM:
+                    continue
+                conflict = _identity_conflict(papers[i], papers[j])
+                if conflict:
+                    continue
+                out.append({"i": i, "j": j, "similarity": round(sim, 4)})
+    out.sort(key=lambda r: -r["similarity"])
+    return out
+
+
+def _read_override_files(notes_dir: Optional[Path]) -> List[Dict[str, Any]]:
+    """读出两处 dedup_overrides.json 的原始内容（解析失败者跳过并告警）。
+
+    两处来源取并集：仓库 `config/`（受版本控制，人工裁决不该随 output/ 被 gitignore
+    吞掉——札记库重建或换机后还得靠它）+ `notes_dir/`（该库私有、可选）。取并集而非
+    择一，避免本地文件静默遮蔽仓库里已确认的裁决。
+    """
+    cands = [Path(REPO_OVERRIDES_PATH)]
+    if notes_dir:
+        cands.append(Path(notes_dir) / DEDUP_OVERRIDES_JSON)
+    out: List[Dict[str, Any]] = []
+    for p in cands:
+        if not p.exists():
+            continue
+        try:
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception as exc:
+            logger.warning("  ⚠️ {} 解析失败，本次忽略其中的人工裁决：{}".format(p, exc))
+    return out
+
+
+def _pairs_from(files: List[Dict[str, Any]], field: str) -> List[List[str]]:
+    """从已读入的 override 文件里取某个字段的键对列表（去重、忽略残缺行）。"""
+    pairs: List[List[str]] = []
+    seen: Set[tuple] = set()
+    for data in files:
+        for row in (data.get(field) or []):
+            if isinstance(row, (list, tuple)) and len(row) >= 2 and all(row[:2]):
+                a, b = str(row[0]), str(row[1])
+                k = (a, b) if a <= b else (b, a)
+                if k not in seen:
+                    seen.add(k)
+                    pairs.append([a, b])
+    return pairs
+
+
+def _report_stale(pairs, by_dedup_key: Dict[str, Any], kind: str) -> int:
+    """列出键在库中找不到的人工裁决对，逐条 WARNING。返回失配条数。
+
+    ⚠️ 键失配必须**告警**，不能沉默：dedup_key 会随元数据变动（Crossref 补上 DOI、标题
+    修正、键梯升级），一旦某侧键漂了，这条人工裁决就永久失效且无任何迹象——人以为
+    「已确认过」，实际每次重建都没生效。札记被删是合理的失配来源，但也该看得见。
+
+    merge 与 distinct 两条通道**同等对待**：distinct 那半原先完全没有这项检查，键一漂
+    就永久不再压制那对候选，人工确认过的假阳性每次重建原样重报——正是 _load_dedup_distinct
+    文档字符串声称要解决的「永不收敛」问题本身。
+    """
+    stale: List[str] = []
+    for ka, kb in pairs:
+        ia, ib = ka in by_dedup_key, kb in by_dedup_key
+        if ia and ib:
+            continue
+        # 三种情况分别措辞：只报「缺 前者」会误导人只去查前一个键
+        which = "两侧都缺" if not ia and not ib else ("缺 前者" if not ia else "缺 后者")
+        stale.append("{} ↮ {}（{}）".format(ka, kb, which))
+    if stale:
+        logger.warning("  ⚠️ {} 里有 {} 条人工{}裁决未生效（键在库中找不到，多因元数据变动"
+                       "导致 dedup_key 漂移或札记已删）——请核对后更新："
+                       .format(DEDUP_OVERRIDES_JSON, len(stale), kind))
+        for s in stale:
+            logger.warning("      {}".format(s))
+    return len(stale)
+
+
+def _load_dedup_overrides(notes_dir: Optional[Path]) -> List[List[str]]:
+    """人工确认的合并对：dedup_overrides.json 的 {"merge": [[keyA, keyB], ...]}。
+
+    标题相似度**无法**安全覆盖所有改写题名（本库实测：真重复只有 cos=0.50，与一堆
+    0.5x 的不同论文混在同一区间），故保留人工裁决通道：确认过的对写进此文件，
+    无条件合并且不受阈值变动影响。键用 dedup_key（doi:/arxiv:/title:/id:）。
+    """
+    return _pairs_from(_read_override_files(notes_dir), "merge")
+
+
+def _load_dedup_distinct(notes_dir: Optional[Path]) -> Set[tuple]:
+    """人工确认「**不是**同一篇」的对：dedup_overrides.json 的 {"distinct": [[keyA, keyB], ...]}。
+
+    没有这一半，人工复核通道就**永不收敛**：落在 [REVIEW_SIM, AUTO_MERGE_SIM) 的假阳性
+    （短标题、同领域套话、跨语言噪声）每次重建索引都会原样再报一遍，人看过多少次都不减少，
+    真正的新增待确认项因此被淹没。判为不同的写进这里，此后不再出现在 title_near_duplicates。
+    只影响报告，不影响合并——它压制的是「请人看一眼」，本来就没合并过任何东西。
+    """
+    return {tuple(sorted(pr)) for pr in _pairs_from(_read_override_files(notes_dir), "distinct")}
+
+
+def _global_pass(papers: List[Dict[str, Any]],
+                 notes_dir: Optional[Path] = None,
+                 review_out: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """全局排序 + 跨月去重标记（keeper 规则见 _keeper_rank）+ 撞键检测的前置排序。
+
+    三层合并，用并查集统一成簇（保证传递性：A≈B、B≈C 时三者同簇同 keeper）：
+      1. 精确身份键（dedup_key + 规范标题键）——原有行为，不变；
+      2. 人工确认的 dedup_overrides.json 合并对；
+      3. 标题相似度 ≥ AUTO_MERGE_SIM 且无身份冲突的跨簇对。
+    落在 [REVIEW_SIM, AUTO_MERGE_SIM) 的对不合并，追加到 review_out 供上层报告。
+    """
     papers.sort(key=lambda e: (e["month"], e.get("priority_rank") or 9999))
     for e in papers:
         e["duplicate_months"] = []
         e["duplicate_of"] = None
-    # 先按 keeper 优先级选出每个身份键的权威条目（手动优先，其次最早月）
-    keeper_by_key: Dict[str, Dict[str, Any]] = {}
-    for e in sorted(papers, key=_keeper_rank):
+
+    parent: Dict[int, int] = {i: i for i in range(len(papers))}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # 1) 精确身份键
+    owner: Dict[str, int] = {}
+    for i, e in enumerate(papers):
         for k in _entry_keys(e):
-            keeper_by_key.setdefault(k, e)
-    # 再标记重复：在条目**全部身份键**指向的 keeper 里取最优者（防条目经自己的一级键
-    # 匹配到自身、漏掉经二级标题键指向的更早 keeper —— 预印本/正刊同文双收场景）
-    for e in papers:
-        cands = [keeper_by_key[k] for k in _entry_keys(e) if k in keeper_by_key]
-        keeper = min(cands, key=_keeper_rank) if cands else None
-        if keeper is not None and keeper is not e:
+            if k in owner:
+                union(i, owner[k])
+            else:
+                owner[k] = i
+
+    # 2) 人工确认对（按 dedup_key 找条目）——键失配一律告警，理由见 _report_stale
+    by_dedup_key: Dict[str, List[int]] = {}
+    for i, e in enumerate(papers):
+        by_dedup_key.setdefault(e["dedup_key"], []).append(i)
+    override_files = _read_override_files(notes_dir)
+    applied_overrides = 0
+    merge_pairs = _pairs_from(override_files, "merge")
+    for ka, kb in merge_pairs:
+        ia, ib = by_dedup_key.get(ka), by_dedup_key.get(kb)
+        if ia and ib:
+            union(ia[0], ib[0])
+            applied_overrides += 1
+    if applied_overrides:
+        logger.info("  人工合并对（{}）：应用 {} 组".format(DEDUP_OVERRIDES_JSON, applied_overrides))
+    _report_stale(merge_pairs, by_dedup_key, "合并")
+    # distinct 的漂键检查与 merge 同处执行（不藏在 review_out 分支里）：漂了就永久不再
+    # 压制那对候选，与是否要出报告无关。
+    distinct_pairs = _pairs_from(override_files, "distinct")
+    _report_stale(distinct_pairs, by_dedup_key, "非同文")
+
+    # 3) 标题相似度层
+    sim_pairs = _title_sim_pairs(papers, find)
+    auto, review = [], []
+    for pr in sim_pairs:
+        if pr["similarity"] >= AUTO_MERGE_SIM:
+            union(pr["i"], pr["j"])
+            auto.append(pr)
+        else:
+            review.append(pr)
+    if auto:
+        logger.info("  标题相似度自动合并 {} 组（cos≥{}）".format(len(auto), AUTO_MERGE_SIM))
+
+    # 每簇选 keeper，其余标 duplicate_of
+    clusters: Dict[int, List[int]] = {}
+    for i in range(len(papers)):
+        clusters.setdefault(find(i), []).append(i)
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        keeper = min((papers[i] for i in members), key=_keeper_rank)
+        for i in members:
+            e = papers[i]
+            if e is keeper:
+                continue
             if e["month"] not in keeper["duplicate_months"]:
                 keeper["duplicate_months"].append(e["month"])
             e["duplicate_of"] = "{}@{}".format(keeper["dedup_key"], keeper["month"])
+
+    if review_out is not None:
+        distinct = {tuple(sorted(pr)) for pr in distinct_pairs}
+        suppressed = 0
+        for pr in review:
+            a, b = papers[pr["i"]], papers[pr["j"]]
+            if find(pr["i"]) == find(pr["j"]):
+                continue                  # 已被别的层归到同簇，无需人工再看
+            if tuple(sorted((a["dedup_key"], b["dedup_key"]))) in distinct:
+                suppressed += 1           # 人工已判「不是同一篇」，不再反复上报
+                continue
+            review_out.append({
+                "similarity": pr["similarity"],
+                "a": {"dedup_key": a["dedup_key"], "month": a["month"],
+                      "citekey": a.get("citekey"), "title": a.get("title")},
+                "b": {"dedup_key": b["dedup_key"], "month": b["month"],
+                      "citekey": b.get("citekey"), "title": b.get("title")},
+            })
+        if suppressed:
+            logger.info("  人工已判非同文（{} 的 distinct）：压制 {} 对不再上报"
+                        .format(DEDUP_OVERRIDES_JSON, suppressed))
+        review_out.sort(key=lambda r: -r["similarity"])
     return papers
 
 
@@ -441,16 +773,22 @@ def update_index(notes_dir: Path, *, full: bool = False,
 
     for e in papers:
         e.pop("_source", None)
-    papers = _global_pass(papers)
+    review_pairs: List[Dict[str, Any]] = []
+    papers = _global_pass(papers, notes_dir=notes_dir, review_out=review_pairs)
     index = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "months": months_meta,
         "citekey_collisions": _citekey_collisions(papers),
+        "title_near_duplicates": review_pairs,
         "papers": papers,
     }
     logger.info("  索引：{} 个札记文件（重解析 {}，沿用 {}），共 {} 篇，撞键 {} 组".format(
         len(months_meta), reparsed, kept, len(papers), len(index["citekey_collisions"])))
+    if review_pairs:
+        logger.info("  ⚠️ 疑似同文待人工确认 {} 对（标题相似 {}–{}）：见 INDEX.md「疑似重复」节，"
+                    "确认后写入 {}".format(len(review_pairs), REVIEW_SIM, AUTO_MERGE_SIM,
+                                          DEDUP_OVERRIDES_JSON))
     return index
 
 
@@ -504,7 +842,30 @@ def build_index_md(index: Dict[str, Any]) -> str:
             len(index["citekey_collisions"]),
             "; ".join("`{}` ({})".format(c["citekey"], ",".join(c["months"]))
                       for c in index["citekey_collisions"])))
+    near = index.get("title_near_duplicates") or []
+    if near:
+        lines.append("- 🔎 **疑似同文待人工确认 {} 对**（标题相似 {}–{}；≥{} 已自动合并）"
+                     .format(len(near), REVIEW_SIM, AUTO_MERGE_SIM, AUTO_MERGE_SIM))
     lines.append("")
+    if near:
+        lines.extend([
+            "## 疑似重复（人工确认后写入 `{}`）".format(DEDUP_OVERRIDES_JSON), "",
+            "确认为同一篇 → 把两侧 `dedup_key` 作为一对写进 `{}` 的 `merge` 数组，"
+            "下次建索引即永久合并（不受阈值变动影响）；确认为不同论文 → 无需操作。"
+            .format(DEDUP_OVERRIDES_JSON), "",
+            "| 相似度 | A（月份 / citekey / 标题） | B（月份 / citekey / 标题） | dedup_key 对 |",
+            "|:-:|---|---|---|"])
+        esc0 = lambda s: (s or "").replace("|", "/")
+        for r in near[:40]:
+            a, b = r["a"], r["b"]
+            lines.append("| {:.2f} | {} `{}` {} | {} `{}` {} | `{}` ↔ `{}` |".format(
+                r["similarity"], a["month"], a.get("citekey") or "", esc0(a.get("title"))[:70],
+                b["month"], b.get("citekey") or "", esc0(b.get("title"))[:70],
+                a["dedup_key"], b["dedup_key"]))
+        if len(near) > 40:
+            lines.append("| … | 另有 {} 对，见 `literature_index.json` 的 `title_near_duplicates` | | |"
+                         .format(len(near) - 40))
+        lines.append("")
     esc = lambda s: (s or "").replace("|", "/")
     tier_emoji = {"high": "🔴", "mid": "🟠", "low": "🟢"}
     for month in sorted(all_months, reverse=True):
@@ -682,21 +1043,57 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
 
 # ---------------- citekey 撞键修复 ----------------
 
+def _atomic_write(path: Path, content: str) -> None:
+    """原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致。"""
+    tmp = path.with_suffix(path.suffix + ".tmp-{}".format(os.getpid()))
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+RENAME_OK = "ok"              # 三处（凡存在者）都已改到位
+RENAME_REFUSED = "refused"    # 一处都没改，磁盘与调用前逐字节相同
+RENAME_PARTIAL = "partial"    # 写盘中途失败且回滚也失败——磁盘处于半改状态
+
+
 def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
-                            old: str, new: str) -> bool:
-    """把 entry 所在札记里的 [@old] 改为 [@new]，并同步 references.json 的 id。
+                            old: str, new: str) -> str:
+    """把 entry 所在札记里的 [@old] 改为 [@new]，并同步 references.json 与 sidecar。
+
+    返回三态字符串（**不是 bool**，别写 `if _rename_citekey_in_note(...)`——
+    "refused" 是真值，会被当成成功）：
+      - RENAME_OK      三处（凡存在者）都改到位；
+      - RENAME_REFUSED 磁盘零改动（预检不过，或写盘失败但已成功回滚）；
+      - RENAME_PARTIAL 写盘失败**且回滚也失败** → 磁盘半改，必须人工核对。
 
     必须按 entry.note_line 定点替换——同 citekey 在同一份 md 里可以出现多次（近重复
     文献各自精读），"全文首个命中" 回退会在这种情况下改错节：改的是另一条同 key 条目
     的标题行，而当前 entry 真正所在的那一节反而没改。note_line 没命中就跳过并报错，
     不瞎猜。
+
+    ⚠️ **先全量预检、再全量写盘，写盘失败按逆序回滚**（要么三处都改、要么一处不动）。
+    最早的写法是「md 先原子写，refs/sidecar 的异常吞成 warning、函数照样返回 True」，
+    于是调用方把它当成三处都成功：
+      - refs 没同步 → md 里已是 [@new]、references.json 里还是 id: old，pandoc 出稿时
+        该引用**解析不到条目**（本仓库最在意的「引用静默失效」），而脚本汇报为成功；
+      - sidecar 没同步 → build_month_entries 优先采信 sidecar，下一次索引重建会把 md 里
+        改好的键覆盖回旧值，撞键永远修不掉。
+    加了预检之后这个状态只是从预检阶段挪到了写盘阶段：pending 顺序是 [md, refs, sidecar]，
+    md 先落盘，第 2/3 个文件写失败（磁盘满、卷只读、tmp 路径被占）时 md 已是新键，而函数
+    返回 False、调用方汇报「磁盘未改动」——重跑必然再失败（md 里已无 [@old]），札记就永久
+    停在半改状态且不再有任何新信号。更糟的是 fix_citekey_collisions 只在成功时占用新键，
+    于是同一个 new 会再发给下一条撞键条目：**修撞键的工具在磁盘上新造一个撞键**。
+    故写盘阶段留存每个文件的原内容，任一步失败就按已写成功的逆序写回原内容。
+
+    refs 里查无此 id **不算失败**：那说明本来就没有对应条目（引用原就悬空），改不改
+    都不会新造出不一致。sidecar 查无此 citekey 则算失败——它会把 md 的改动顶回去。
     """
     md = Path(notes_dir) / entry["note_file"]
     try:
-        lines = md.read_text(encoding="utf-8").splitlines()
+        md_old_text = md.read_text(encoding="utf-8")
     except Exception as e:
         logger.warning("  ⚠️ 读札记失败，跳过改键 {}: {}".format(md, e))
-        return False
+        return RENAME_REFUSED
+    lines = md_old_text.splitlines()
     tag_old, tag_new = "[@{}]".format(old), "[@{}]".format(new)
     ln = entry.get("note_line")
     if ln and 1 <= ln <= len(lines) and tag_old in lines[ln - 1]:
@@ -705,55 +1102,174 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
         logger.warning(
             "  ⚠️ {} 的 note_line={} 未命中 {}，跳过改键（同 key 多节时拒绝瞎猜首个命中）".format(
                 md.name, ln, tag_old))
-        return False
+        return RENAME_REFUSED
     lines[hit_line] = lines[hit_line].replace(tag_old, tag_new)
-    # 原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致
-    content = "\n".join(lines) + "\n"
-    tmp = md.with_suffix(md.suffix + ".tmp-{}".format(os.getpid()))
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, md)
+    # (路径, 新内容, 原内容)：原内容留着给写盘失败时逆序回滚用
+    pending: List[Any] = [(md, "\n".join(lines) + "\n", md_old_text)]
+    doi = (entry.get("doi") or "").lower()
 
+    # ---- 预检 references.json ----
     ref_name = entry.get("references_json")
     if ref_name:
         rp = Path(notes_dir) / ref_name
+        if not rp.exists():
+            logger.warning("  ⚠️ 索引记着 {} 却找不到该文件，拒绝改键 {}（md 未动）"
+                           .format(ref_name, old))
+            return RENAME_REFUSED
         try:
-            items = json.loads(rp.read_text(encoding="utf-8"))
+            rp_old_text = rp.read_text(encoding="utf-8")
+            items = json.loads(rp_old_text)
             cand = [it for it in items if isinstance(it, dict) and it.get("id") == old]
             # 按 DOI 精确挑（同文件同 id 极罕见，防御一下）
-            doi = (entry.get("doi") or "").lower()
             tgt = next((it for it in cand if doi and (it.get("DOI") or "").lower() == doi),
                        cand[0] if cand else None)
             if tgt is not None:
                 tgt["id"] = new
-                content = json.dumps(items, ensure_ascii=False, indent=2)
-                tmp = rp.with_suffix(rp.suffix + ".tmp-{}".format(os.getpid()))
-                tmp.write_text(content, encoding="utf-8")
-                os.replace(tmp, rp)  # 原子写防崩溃撕裂
+                pending.append((rp, json.dumps(items, ensure_ascii=False, indent=2),
+                                rp_old_text))
         except Exception as e:
-            logger.warning("  ⚠️ 同步 references.json 失败（{}）: {}".format(ref_name, e))
+            logger.warning("  ⚠️ references.json 不可解析（{}）: {}；拒绝改键 {}（md 未动）"
+                           .format(ref_name, e, old))
+            return RENAME_REFUSED
 
-    # sidecar `{stem}.index.json` 在 build_month_entries 里**优先于 md** 被采信，
-    # 不同步改这里的话，下一次索引重建会把 md 里改好的键覆盖回旧值——撞键永远修不掉。
+    # ---- 预检 sidecar `{stem}.index.json` ----
     sc = Path(notes_dir) / "{}.index.json".format(Path(entry["note_file"]).stem)
     if sc.exists():
         try:
-            data = json.loads(sc.read_text(encoding="utf-8"))
+            sc_old_text = sc.read_text(encoding="utf-8")
+            data = json.loads(sc_old_text)
             rows = data if isinstance(data, list) else data.get("papers", [])
-            doi = (entry.get("doi") or "").lower()
             cand = [r for r in rows if isinstance(r, dict) and r.get("citekey") == old]
             tgt = next((r for r in cand if doi and (r.get("doi") or "").lower() == doi),
                        cand[0] if cand else None)
-            if tgt is not None:
-                tgt["citekey"] = new
-                content = json.dumps(data, ensure_ascii=False, indent=2)
-                tmp = sc.with_suffix(sc.suffix + ".tmp-{}".format(os.getpid()))
-                tmp.write_text(content, encoding="utf-8")
-                os.replace(tmp, sc)  # 原子写防崩溃撕裂
-            else:
-                logger.warning("  ⚠️ sidecar {} 中未找到 {}，改键可能被回滚".format(sc.name, old))
+            if tgt is None:
+                logger.warning("  ⚠️ sidecar {} 中未找到 {}，拒绝改键（否则下次重建会把 md "
+                               "改回旧值）".format(sc.name, old))
+                return RENAME_REFUSED
+            tgt["citekey"] = new
+            pending.append((sc, json.dumps(data, ensure_ascii=False, indent=2), sc_old_text))
         except Exception as e:
-            logger.warning("  ⚠️ 同步 sidecar 失败（{}）: {}".format(sc.name, e))
-    return True
+            logger.warning("  ⚠️ sidecar 不可解析（{}）: {}；拒绝改键 {}（md 未动）"
+                           .format(sc.name, e, old))
+            return RENAME_REFUSED
+
+    # ---- 预检全过，逐个原子写；任一步失败则逆序回滚已写的 ----
+    written: List[Any] = []
+    for path, content, old_content in pending:
+        try:
+            _atomic_write(path, content)
+        except Exception as e:
+            logger.error("  ❌ 写入 {} 失败：{}；{} → {} 开始回滚已改的 {} 个文件"
+                         .format(path.name, e, old, new, len(written)))
+            rollback_failed = []
+            for done_path, done_old in reversed(written):
+                try:
+                    _atomic_write(done_path, done_old)
+                except Exception as e2:
+                    rollback_failed.append(done_path.name)
+                    logger.error("  ❌ 回滚 {} 失败：{}".format(done_path.name, e2))
+            if rollback_failed:
+                logger.error("  ⛔ {} → {} 已半改且回滚失败（{}），请人工核对 md/references/"
+                             "sidecar 三处".format(old, new, "、".join(rollback_failed)))
+                return RENAME_PARTIAL
+            logger.warning("  ↩️ {} → {} 写盘失败已全部回滚，磁盘未改动".format(old, new))
+            return RENAME_REFUSED
+        written.append((path, old_content))
+    return RENAME_OK
+
+
+REKEY_SYNC_HINT = "PYTHONPATH=. python scripts/notes_embed.py"
+REKEY_RENDER_HINT = "scripts/render_notes.sh"
+
+
+def announce_rekey_side_effects(notes_dir: Path,
+                                renamed_entries: List[Dict[str, Any]],
+                                *, settings: Any = None) -> Dict[str, Any]:
+    """改键收尾：把两个**派生物**的失效讲出来，并 best-effort 把向量库同步回去。
+
+    改 citekey 只落在 md + references.json + sidecar 三处。另外两样东西也带着 citekey，
+    却没有任何机制跟着变：
+      - 向量库 embeddings.sqlite3：chunk id 内嵌 citekey（`p:<citekey>`），chunks 表还有
+        citekey / year 两列，是检索结果回传给写作侧的唯一身份来源。库一旧，notes_search
+        --cite 就会吐出磁盘上已不存在的死键（pandoc 渲染成 `(key?)`），digest 的近邻注入
+        还会把旧键旧年份喂给 LLM 裁决。机制本身是好的——sync_store 的 diff 会让旧 id 消失、
+        新 id 出现——缺的纯粹是**触发**：全仓 sync_store 的调用点原本全在 ingest 侧，
+        两条改键路径一个都不覆盖，改完就静默退出，运维零信号。
+      - 已渲染的 docx：人读/传阅的成品，正文里写死了 citekey，读者据此回查会查不到。
+        这里只列清单交给人重渲染（`scripts/render_notes.sh`）。
+        注：手动精读那份现在**可以**安全地由 read_pdf.py finalize/regen 重渲染——
+        `_reuse_citekeys` 已按 dedup_key 沿用札记侧的现有键（2026-08-15）；
+        在那之前 regen 会用 bundle 里的旧元数据重算兜底键、把改过的新键顶回去。
+
+    向量库同步走 best-effort（比照 ingest_notes.py 的挂钩）：Ollama 没起、模型没 pull、
+    库被别的进程锁着，都只 log warning 并打出重建命令，绝不改变改键本身的成败。
+    库文件不存在时直接跳过同步（没建过向量库的环境/临时目录用不着），只打提示。
+    """
+    out: Dict[str, Any] = {"stale_docx": [], "synced": False, "error": None}
+    if not renamed_entries:
+        return out
+
+    notes_dir = Path(notes_dir)
+    seen: Set[str] = set()
+    for e in renamed_entries:
+        nf = (e or {}).get("note_file") or ""
+        if not nf.endswith(".md"):
+            continue
+        docx = notes_dir / (nf[:-3] + ".docx")
+        if docx.exists() and str(docx) not in seen:
+            seen.add(str(docx))
+            out["stale_docx"].append({"month": (e or {}).get("month"), "path": str(docx)})
+    out["stale_docx"].sort(key=lambda d: d["path"])
+
+    if out["stale_docx"]:
+        logger.warning("  ⚠️ {} 份已渲染 docx 内嵌的是旧 citekey，需重渲染（受影响月份 {}）："
+                       .format(len(out["stale_docx"]),
+                               ", ".join(sorted({str(d["month"]) for d in out["stale_docx"]}))))
+        for d in out["stale_docx"]:
+            logger.warning("      {}".format(d["path"]))
+        logger.warning("      重渲染：{} <该月 .md>".format(REKEY_RENDER_HINT))
+
+    from .embed_store import DB_NAME
+    db_path = notes_dir / DB_NAME
+    if not db_path.exists():
+        logger.warning("  ⚠️ 已改 {} 个 citekey。向量库 {} 不存在，跳过同步；"
+                       "建库后请跑：{}".format(len(renamed_entries), db_path.name, REKEY_SYNC_HINT))
+        return out
+
+    logger.warning("  ⚠️ 已改 {} 个 citekey，向量库 {} 即刻失效（里面仍是旧键，"
+                   "notes_search --cite 会吐死引用）。现在尝试自动同步；"
+                   "若失败请手动跑：{}".format(len(renamed_entries), db_path.name, REKEY_SYNC_HINT))
+    try:
+        from .embed_store import sync_store
+        from .embeddings import EmbeddingClient, resolve_embedding_base_url
+        if settings is None:
+            from .paths import repo_path
+            from .schema import ScholarSettings
+            cfg = repo_path("config/scholar.env")
+            settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
+        # 必须拿**改键之后**的索引去同步：磁盘上那份 literature_index.json 此刻还是旧键，
+        # 拿它 diff 等于什么都不改。刷完顺手落盘，调用方紧接着的那次重建会自然变成空跑。
+        index_data = update_index(notes_dir)
+        write_outputs(index_data, notes_dir)
+        client = EmbeddingClient(
+            base_url=resolve_embedding_base_url(settings.llm),
+            model=settings.llm.embedding_model,
+        )
+        try:
+            stats = sync_store(db_path, index_data, client)
+        finally:
+            client.close()
+        out["synced"] = True
+        out["stats"] = {"embedded": stats.embedded, "deleted": stats.deleted,
+                        "meta_refreshed": stats.meta_refreshed}
+        logger.info("  ✅ 向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+            stats.embedded, stats.deleted, stats.meta_refreshed))
+    except Exception as e:
+        out["error"] = "{}: {}".format(type(e).__name__, e)
+        logger.warning("  ⚠️ 向量库自动同步失败（改键本身已完成，不影响退出码）：{}\n"
+                       "      向量库现在是**陈旧**的，检索会吐已注销的旧 citekey，"
+                       "务必手动跑：{}".format(out["error"], REKEY_SYNC_HINT))
+    return out
 
 
 def fix_citekey_collisions(notes_dir: Path) -> int:
@@ -761,6 +1277,13 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
     后出现者加 b/c… 后缀（仿 BBT 消歧），就地改 md + references.json。
 
     返回重命名条数；调用方随后应重建索引（md 已变更）。docx 为人读版不回写。
+
+    _rename_citekey_in_note 的三态必须**分流**处理（别当 bool 用）：
+      - RENAME_REFUSED 一处都没改，新键没落到磁盘上 → 不占用 all_keys，下一条撞键条目
+        沿用同一个后缀正合语义；汇总里说「磁盘未改动」是实话。
+      - RENAME_PARTIAL 新键**已经写在 md 上**了 → 必须 all_keys.add(new)，否则同组的下一条
+        会拿到同一个新键，修撞键的工具反而在磁盘上新造一个撞键；且汇总不得说「磁盘未改动」，
+        要单列成「已半改」优先展示。
     """
     notes_dir = Path(notes_dir)
     index = update_index(notes_dir)
@@ -770,6 +1293,9 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
     for e in live:
         by_key.setdefault(e.get("citekey") or "", []).append(e)
     renamed = 0
+    failed: List[str] = []
+    partial: List[str] = []
+    touched: List[Dict[str, Any]] = []      # 键真落到磁盘上的条目（OK + PARTIAL），供收尾告知派生物
     for key, group in sorted(by_key.items()):
         if not key or len(group) <= 1 or len({e["dedup_key"] for e in group}) <= 1:
             continue
@@ -781,10 +1307,32 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
                 if cand not in all_keys:
                     new = cand
                     break
-            if _rename_citekey_in_note(notes_dir, e, key, new):
+            res = _rename_citekey_in_note(notes_dir, e, key, new)
+            desc = "{} → {}（{} / {}）".format(key, new, e["month"], e["note_file"])
+            if res == RENAME_OK:
                 all_keys.add(new)
                 renamed += 1
+                touched.append(e)
                 logger.info("  🔧 改键 {} → {}（{}）".format(key, new, e["month"]))
+            elif res == RENAME_PARTIAL:
+                all_keys.add(new)                # 键已落在 md 上，绝不能再发给下一条
+                partial.append(desc)
+                touched.append(e)                # 新键已在磁盘上 → 派生物同样失效，一并告知
+            else:
+                failed.append(desc)
+    if partial:
+        logger.error("  ⛔ {} 条改键**已半改且回滚失败**（md/references/sidecar 可能不一致），"
+                     "务必优先人工核对：".format(len(partial)))
+        for s in partial:
+            logger.error("      {}".format(s))
+    if failed:
+        logger.warning("  ⚠️ {} 条撞键未能修复（md/references/sidecar 预检不过，磁盘未改动）"
+                       "，需人工处理：".format(len(failed)))
+        for s in failed:
+            logger.warning("      {}".format(s))
+    # 派生物（向量库 / docx）不会自己跟着改键走，收尾统一告知 + best-effort 同步。
+    # 判据用 touched 而非 renamed：半改条目的新键也已经落在磁盘上，派生物照样失效。
+    announce_rekey_side_effects(notes_dir, touched)
     return renamed
 
 

@@ -325,6 +325,8 @@ class ScholarEmailParser:
                 title=title,
                 authors=authors,
                 publication_date=pub_date,
+                # 本抽取器只从正文正则里捞 4 位年，月日恒为占位 1/1
+                date_precision="year" if pub_date else None,
                 journal=journal,
                 doi=doi,
                 arxiv_id=arxiv_id,
@@ -532,7 +534,7 @@ class ScholarEmailParser:
         if year_match:
             try:
                 year = int(year_match.group())
-                pub_date = date(year, 1, 1)  # 默认1月1日
+                pub_date = date(year, 1, 1)  # 只抽到年份，月日是占位（精度见构造处）
             except:
                 pass
         

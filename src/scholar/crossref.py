@@ -57,8 +57,11 @@ def parse_crossref_work(item: Dict[str, Any]) -> Dict[str, Any]:
     container = item.get("container-title") or []
     journal = container[0] if container else None
 
-    # 日期：issued > published-print > published-online
+    # 日期：issued（出版日期，非期号 issue） > published-print > published-online
+    # date 对象照旧补 1（下游 citekey 取年、索引 year 都依赖它非空），但**原始 date-parts
+    # 的长度就是真实精度**，单独记进 date_precision，供 CSL/Zotero 产出层按精度截断。
     pub_date = None
+    date_precision = None
     for key in ("issued", "published-print", "published-online", "published"):
         parts = (item.get(key) or {}).get("date-parts") or []
         if parts and parts[0]:
@@ -69,6 +72,8 @@ def parse_crossref_work(item: Dict[str, Any]) -> Dict[str, Any]:
             if y:
                 try:
                     pub_date = date(int(y), int(m or 1), int(d or 1))
+                    date_precision = ("day" if len(dp) >= 3 else
+                                      "month" if len(dp) >= 2 else "year")
                 except Exception:
                     pub_date = None
             break
@@ -83,6 +88,7 @@ def parse_crossref_work(item: Dict[str, Any]) -> Dict[str, Any]:
         "issue": (item.get("issue") or "").strip() or None,
         "pages": (item.get("page") or "").strip() or None,
         "publication_date": pub_date,
+        "date_precision": date_precision,
         "url": item.get("URL") or (f"https://doi.org/{doi}" if doi else None),
     }
 

@@ -134,9 +134,15 @@ def apply_item_to_meta(meta: PaperMetadata, item: Dict[str, Any]) -> bool:
         meta.issue = item["issue"]
     if item.get("pages"):
         meta.pages = item["pages"]
-    d = _parse_date(item.get("date", ""))
+    raw_date = item.get("date", "")
+    d = _parse_date(raw_date)
     if d and not meta.publication_date:
         meta.publication_date = d
+        # _parse_date 的日恒为 1、月解析不出时也退到 1，所以真实精度只能从原串倒推：
+        # 原串里除年之外还挑得出 1-12 的数 → 月精度，否则只有年。签名不动（有测试钉死）。
+        import re as _re
+        toks = [t for t in _re.findall(r"\d+", raw_date or "") if t != str(d.year)]
+        meta.date_precision = "month" if any(1 <= int(t) <= 12 for t in toks) else "year"
     return True
 
 

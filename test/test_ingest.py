@@ -420,3 +420,98 @@ def test_run_ingest_excludes_own_week_note_citekeys_from_existing_ckeys(tmp_path
     assert rep["status"] == "ok"
     assert "wang2024Missing" not in captured["existing_citekeys"]
     assert "other2023Key" in captured["existing_citekeys"]
+
+
+# ---------------- R3-3：空窗周也必须刷索引 + 同步向量库 ----------------
+
+def _r3_env(tmp_path):
+    """最小可用 config：notes_dir 指向 tmp，绝不让早退路径碰到真实札记库。"""
+    env_file = tmp_path / "scholar_r3.env"
+    env_file.write_text(
+        "GMAIL__CREDENTIALS_PATH=fake/creds.json\n"
+        "GMAIL__TOKEN_PATH=fake/token.json\n"
+        "LLM__PROVIDER=gemini\n"
+        "LLM__GEMINI_API_KEY=FAKE_KEY_FOR_TEST\n"
+        "LLM__MODEL=fake-model\n"
+        "PROCESSING__NOTES_DIR={}\n".format(tmp_path / "notes"),
+        encoding="utf-8")
+    return env_file
+
+
+def _load_cli():
+    import importlib.util
+    spec_ = importlib.util.spec_from_file_location("ing_cli_r3", CLI)
+    mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(mod)
+    return mod
+
+
+def _cli_with_spy(tmp_path, monkeypatch, digest_segs, run_ingest_report=None):
+    """把 CLI 的两个外部依赖钉死，只留下「早退时走不走 _refresh_index_and_vectors」这一个变量。"""
+    mod = _load_cli()
+    calls = []
+    monkeypatch.setattr(mod, "_refresh_index_and_vectors", lambda s: calls.append(s))
+    monkeypatch.setattr(mod.ing, "load_digest_segments",
+                        lambda *a, **k: list(digest_segs))
+    if run_ingest_report is not None:
+        monkeypatch.setattr(mod.ing, "run_ingest", lambda *a, **k: run_ingest_report)
+    return mod, calls
+
+
+def test_empty_week_still_refreshes_index_and_vectors(tmp_path, monkeypatch):
+    """R3-3：「本周无新论文」不蕴含「向量库不需要动」。
+
+    周度 ingest 是向量库唯一的自动同步入口，而向量库会因为**入库之外**的原因变旧
+    （改 citekey、改元数据、手工重建索引）。原先这条早退直接 return 1，跳过索引刷新与
+    向量同步，于是只要连着几周没有新论文，陈旧状态就无限期存续——而日志上写着
+    「无新论文」，读起来像一切正常。
+    """
+    from src.scholar import notes_index as NI
+    seg = _seg(1, "Already Ingested", doi="10.1/dup")
+    mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
+    monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: {ING.dedup_key(seg.metadata)})
+    monkeypatch.setattr(mod.sys, "argv",
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto"])
+
+    rc = mod.main()
+    assert rc == 1                       # 退出码语义不变（没有新论文可入）
+    assert len(calls) == 1               # 但索引+向量同步照跑
+
+
+def test_empty_after_run_ingest_still_refreshes_index_and_vectors(tmp_path, monkeypatch):
+    """第二条早退（run_ingest 二次去重后为空）同理。"""
+    from src.scholar import notes_index as NI
+    seg = _seg(1, "New Paper", doi="10.1/new")
+    mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg],
+                               run_ingest_report={"status": "empty"})
+    monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: set())
+    monkeypatch.setattr(mod.sys, "argv",
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto"])
+
+    assert mod.main() == 1
+    assert len(calls) == 1
+
+
+def test_read_only_entries_do_not_write_anything_on_empty_week(tmp_path, monkeypatch):
+    """--list / --dry-run 是「只看不写」的入口，空窗时不得顺手刷索引写盘。"""
+    from src.scholar import notes_index as NI
+    seg = _seg(1, "Already Ingested", doi="10.1/dup")
+    for flag in ("--list", "--dry-run"):
+        mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
+        monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: {ING.dedup_key(seg.metadata)})
+        monkeypatch.setattr(mod.sys, "argv",
+                            ["ingest", "--config", str(_r3_env(tmp_path)), flag])
+        assert mod.main() == 1
+        assert calls == []
+
+
+def test_no_index_flag_still_suppresses_the_refresh(tmp_path, monkeypatch):
+    """--no-index 的语义是「收尾不刷索引」，早退路径也要一致遵守。"""
+    from src.scholar import notes_index as NI
+    seg = _seg(1, "Already Ingested", doi="10.1/dup")
+    mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
+    monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: {ING.dedup_key(seg.metadata)})
+    monkeypatch.setattr(mod.sys, "argv",
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-index"])
+    assert mod.main() == 1
+    assert calls == []

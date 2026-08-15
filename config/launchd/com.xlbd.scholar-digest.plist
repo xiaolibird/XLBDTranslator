@@ -26,6 +26,21 @@
         <string>8</string>
     </array>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ⚠️ 绕开本机代理：macOS 系统代理开着时（如 Clash 的 127.0.0.1:7890），
+             httpx 经 urllib.request.getproxies() 读到系统设置，会把 http://localhost:11434
+             也送进代理，Clash 对本地地址回 502 → 本机 Ollama 一律不可用。
+             交互 shell 通常已有 no_proxy 所以手跑没事，launchd 干净环境没有，
+             于是「手动能跑、定时永远挂」（curl 不读系统代理，用 curl 探活会误报健康）。
+             本 job 会用到本地 Ollama：LLM__FALLBACK_PROVIDERS=ollama 的回退，
+             以及 sync_store 的 bge-m3 嵌入。2026-08-16 实测并修。 -->
+        <key>no_proxy</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1,::1</string>
+    </dict>
+
     <key>WorkingDirectory</key>
     <string>__REPO_ROOT__</string>
 

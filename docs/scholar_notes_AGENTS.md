@@ -40,10 +40,170 @@
 **`highlights[]`——句级取证的核心**:每项 `{role, tag, section, text}`。`role` 是按**对后续工作流的用途**的三分:
 `citable`(可引用证据:含数字/效应量/可溯源结果)、`refutable`(可反驳观点:作者主张/可质疑处,写 critique 的靶子;手动精读还含对抗核验的纠错条)、`method`(方法论借鉴:可迁移的方法思路)。`tag` 是对应的中文原标记,`section` 是精读分节名(溯源用)。工作流按 role 跨全库直取句子,无需打开 md。历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃),新精读由 LLM/subagent 直接精确产出。
 
-顶层还有 `months{}`(按**文件 stem** 键,含 month/series)与 `citekey_collisions[]`(撞键警告,见下)。
+顶层还有 `months{}`(按**文件 stem** 键,含 month/series)、`citekey_collisions[]`(撞键警告,见下)与
+`title_near_duplicates[]`(疑似同文待人工确认,见下)。
 
-**keeper 规则**:同一论文多处出现时,`series:"manual"`(手动深读)恒为 keeper(即使月份晚于自动版),
-自动浅读版被标 `duplicate_of`。所以按 `duplicate_of == null` 过滤后,你读到的就是**最彻底的那版精读**。
+**keeper 规则**(依次比较):`series:"manual"`(手动深读)恒为 keeper(即使月份晚于自动版)→ **书目更全者**
+(authors/doi/journal 三项中非空的更多)→ 月份更早 → 优先级更高。所以按 `duplicate_of == null` 过滤后,
+你读到的就是**最彻底的那版精读**,且不会是个作者/DOI 全空的残缺条目。
+
+> 第二顺位是 2026-08-14 补的:此前只按月份,预印本被解析成 `anon*` 无作者条目时会因月份更早
+> 压过带作者的正刊记录(实测 76 个重复簇里 6 组踩中,如 Research Square 版压过 Nature Medicine 版),
+> 合并等于把完好记录换成残条。series 仍是第一顺位——正文内容比元数据完整度重要。
+
+**判重三层**(并查集合成簇,保证传递性;每簇按 keeper 规则选权威):
+1. 精确身份键:`dedup_key`(**doi: > arxiv: > 场地原生 id > 规范标题 > id:兜底**)+ 规范化标题二级键;
+2. 人工确认对:`dedup_overrides.json` 的 `merge[[keyA,keyB],…]`,无条件合并;
+3. 标题相似度:IDF 加权余弦 ≥ **0.70** 且无身份冲突(双方都有 DOI/arXiv id 而不同、
+   首作者姓氏不同、年份差 >3 → 一律不合并)时自动合并,捕获**改写题名**的漏网重复
+   (预印本→正刊常改标题,两侧又都无 DOI 时精确键判不出)。
+
+### 场地原生 id(无 DOI 的会议论文,2026-08-15 加)
+
+`pmlr:v287/elsharief25a`、`openreview:x4UK4GadLd` —— 从 `url` 抽出(id 恰好也长在 PDF 文件名与
+官方 BibTeX key 上)。它由**出版方分配**、不可变、全局唯一;而标题键是派生量,标题被解析截断
+(库里出现过 "Healthcare Analytics"、"ICU ADMISSION PREDICTION" 这种残条)身份就跟着变。
+
+⚠️ **大小写**:PMLR slug 本身全小写,归一化无害;OpenReview 的 forum id 是**区分大小写**的
+base62 串,`.lower()` 会把两个仅大小写不同的 id 折成同一个键 → 并查集判成同一篇 → 落败方
+标 `duplicate_of` 后被下游一律过滤 = **静默吞篇**。故 PMLR 小写归一、OpenReview 原样保留
+(2026-08-15 修正;`dedup_overrides.json` 里 3 个 `openreview:` 键同步改回原始大小写)。
+
+url 变体由 `urlsplit + parse_qs` 拆开后匹配,不依赖参数顺序或路径形状:`?x=1` 无扩展名、
+`?noteId=…&id=…` 换序、`attachment?id=`、`references/pdf?id=`、附件 `xxx-supp.pdf`、
+以及 PMLR 官方 GitHub 镜像 `raw.githubusercontent.com/mlresearch/vNNN/…` 全部认得。
+抽不出时静默退回 `title:` 键——正好回到这一层要解决的问题,所以宁可放宽也别漏。
+
+为什么非要有这一层:实测本库 44 篇无 DOI 的 PMLR 论文,OpenAlex 只认出 33 篇且**全部经由
+arXiv/PubMed**(0 篇有 PMLR 落点);剩下 8 篇在任何外部库里都不存在,**PMLR slug 是它们唯一的
+正经标识符**。排在 arXiv id 之后:预印本记录没有 PMLR url、正刊记录没有 arXiv id,两者本就
+拿不到同一个键,那是人工裁决层的职责。
+
+⚠️ **改键梯规则后必须 `--full` 重建**。增量重建按 md 的 mtime/size 判断是否重解析,**不看代码
+版本**,规则改了却不动文件的月份会沿用旧键。
+
+sidecar 里的 `dedup_key` 是落盘时的快照,**磁盘上的值永不回写**——两条读取路径一律经
+`_citekey_utils.recompute_entry_key()` 按当前规则重算(落到 `id:` 时才保留原值):
+- 索引侧 `notes_index.build_month_entries`;
+- 整篇覆盖守卫 `ingest._existing_note_dedup_keys`。
+
+两处**必须共用同一个函数**。曾经只有索引侧重算、守卫侧直读冻结键,于是键梯一升级同一篇论文
+两边拿到两个键,守卫把「本批已覆盖」算成「本批未覆盖」,同 label 重跑被误报「会丢数据」而拒写,
+提示换 `--label`——而换 label 会真的产出重复札记(实测库内 43 条 sidecar 处于该状态)。
+
+### 出版日期的精度(`date_precision`,2026-08-15 加)
+
+⚠️ 先分清两个名字:CSL 的 **`issued` = 出版日期**、**`issue` = 期号**,毫无关系。
+
+`PaperMetadata.publication_date` 是 `date` 类型,**必须凑齐年月日**;而 Crossref 常只给
+`[[2026]]`、PubMed 常只给 Year+Month、pdf-llm 只抽得到年 —— 各来源一律补 1。于是参考文献
+会渲染出论文并不存在的月份(`2026 (January)`)。
+
+解法**不是**让 `publication_date` 可空(那会连累 `_fallback_citekey` 取年与索引的 `year` 字段),
+而是新增 `date_precision: "day"|"month"|"year"|null` 如实记录精度,**只在产出层截断**:
+- CSL 的 `issued` → `date_parts()`:day/month/year 各出三/二/一段;
+- Zotero 的 `date` → `date_string()`:`2026-05-05` / `2026-05` / `2026`(该字段是自由文本,接受部分日期)。
+
+`null` = 存量条目精度未知,产出层用启发式倒推(`infer_date_precision`):`(m,d)==(1,1)`→年、
+`d==1`→年月、其余→日。**存量归一脚本与 regen 重写共用同一启发式**,故 finalize 不会冲掉归一成果。
+已知误伤:真实"某月 1 日出版"降为月精度、真实元旦降为年精度(全库量级约 29 条与 2-3 条),
+只丢渲染用的月/日,**年份永不丢**,检索与身份键完全不受影响。
+
+一次性存量迁移:`scripts/normalize_pub_dates.py`(有 DOI 的回查 Crossref 拿真实精度,其余走启发式;
+默认 dry-run,`--apply` 需带 `--i-know-this-is-a-one-shot-migration`)。**跑完别再跑**——
+此后新入库的论文带真实 precision,其中不乏确实是某月 1 日出版的,重跑会误截。
+
+### citekey 不是身份
+
+`citekey` 是**给 pandoc 渲染引用的人读标签**,不是标识符:它由「首作者姓+年+标题首个实词」现算,
+三项都可能错(实测 44 篇 PMLR 里 23 篇与官方 slug 不符——复姓被截断、首作者解析错、
+论文集出版年与会议年差一年);它会撞(库里 38 个 citekey 出现多次);而且 `--fix-collisions`
+会主动改写它。跨系统对账一律用 `dedup_key`。
+
+**改过的 citekey 不会被 regen 顶回**(2026-08-15 起):`read_pdf.py` 的 `_reuse_citekeys` 在整月重建前
+读上一版 sidecar,按 **dedup_key** 把现有 citekey 沿用回来;bundle 里根本没有 citekey 字段
+(它是每次现算的派生量),此前 finalize/regen 会用 bundle 的旧元数据重算,把改过的键全部还原。
+两侧撞键都拒绝沿用(旧 sidecar 同 dedup_key 多条 / 本批多份 bundle 同 dedup_key),退回 fallback 让
+`used` 集合去消歧——否则两篇会拿到同一个显式键,而显式键不进消歧循环 = 静默撞键。
+沿用的键在 sidecar 里仍标 `citekey_source: "fallback"`(`write_notes(explicit_citekey_source=...)`),
+不冒充 Zotero 权威键。
+
+校验工具:`PYTHONPATH=. python3 scripts/audit_citekeys_vs_pmlr.py`,拿 slug 当权威源反查首作者姓
+与年份。改键前**先跑 `--apply --dry-run`** 看一遍将要生成的新键,确认后再去掉 `--dry-run`。
+三道闸(任何一道不过就跳过并点名,绝不拼垃圾键、绝不留下半改状态):
+1. 原 citekey 必须能拆出「姓+4 位年」,否则拿不到标题实词尾巴 —— 库里真实存在 23 个拆不出的
+   (`molaeiFederated` 无年、`куксенко2024Аналіз` 西里尔),而无年 citekey 正是 PMLR 常态
+   (`publication_date` 缺失时兜底键的 year 为空);
+2. 新键必须过 pandoc 合法字符校验(否则引用会在非法字符处被截断/解析不到 = 静默失效);
+3. `_rename_citekey_in_note` 对 md + references.json + sidecar **先全量预检、再全量写盘,
+   写盘中途失败按已写成功的逆序回滚**——要么三处都改、要么一处不动。
+   返回值是**三态字符串,不是 bool**(`if ret:` 会把 `"refused"` 当成成功):
+   - `"ok"` 三处都改到位;
+   - `"refused"` 磁盘零改动(预检不过,或写盘失败但已回滚干净);
+   - `"partial"` 写盘失败**且回滚也失败** → 磁盘半改,单列清单、优先展示、必须人工核对三处。
+   两个调用方(`fix_citekey_collisions` / `audit_citekeys_vs_pmlr.py --apply`)按三态分流:
+   `refused` 与 `partial` 都非零退出/告警,但只有 `refused` 能说「磁盘未改动」;
+   `partial` 时新键**已落在 md 上**,`fix_citekey_collisions` 必须把它计入 `all_keys`,
+   否则同组下一条会拿到同一个新键 —— 修撞键的工具反而在磁盘上新造一个撞键。
+   (曾经是 md 先写、后两处异常吞成 warning 仍返回 True:refs 没同步 → pandoc 解析不到条目;
+   sidecar 没同步 → 下次重建把 md 改回旧值,撞键永远修不掉。加预检后这个状态一度只是从
+   预检阶段挪到了写盘阶段,故补了回滚与三态。)
+
+⚠️ **改键还有两个不会自己跟上的派生物**——三处写完不等于全库一致:
+- **向量库 `embeddings.sqlite3`**:chunk id 内嵌 citekey(`p:<citekey>`),`chunks` 表另有
+  `citekey` / `year` 两列,是语义检索结果回传给写作侧的**唯一身份来源**。库一旧,
+  `notes_search --cite` 就输出磁盘上已不存在的键(pandoc 渲染成 `(key?)`),而索引驱动的
+  `notes_query` 输出的是新键——同一篇论文,两条取证 CLI 互相矛盾,粘进同一篇稿子就有一半
+  引用挂不上书目。digest 的语义近邻注入吃的也是这两列,陈旧库会把旧键旧年份喂进 LLM 裁决。
+- **已渲染的 docx**:人读/传阅成品,正文里写死了 citekey,读者据此回查会查不到。
+  注意手动精读那份**不能靠 `read_pdf.py regen` 重渲染**——它从 `manual/<month>/*.bundle`
+  重算兜底键,而 bundle 没经过改键,重跑会把新键顶回旧键。只能定点改或人工确认。
+
+两条改键路径(`fix_citekey_collisions` / `audit_citekeys_vs_pmlr.py --apply`)收尾都会调
+`notes_index.announce_rekey_side_effects()`:列出受影响月份的过期 docx,并 best-effort
+刷索引 + 跑 `sync_store`(失败只 warning 并打出 `PYTHONPATH=. python scripts/notes_embed.py`,
+绝不改变改键本身的成败)。判据是「新键是否落到磁盘上」(OK **与** PARTIAL 都算),不是 renamed 计数。
+
+向量库的兜底自愈有两层,别只依赖其中一层:
+- `scripts/ingest_notes.py` 周度入库收尾会同步。它在「本周无新论文」时**也会走**——
+  「本批没有新内容要嵌」不蕴含「向量库不需要动」,改键/改元数据同样让它变旧
+  (只有 `--list` / `--dry-run` / `--no-index` 这三个只读入口才跳过);
+- `config/launchd/com.xlbd.scholar-embed.plist`(需人工装:`bash scripts/install_embed_sync.sh`)
+  照抄 vault sync 的思路,`WatchPaths` 盯住 `literature_index.json`,索引一变就跑增量同步——
+  索引是所有改动的公共下游,盯住它就一网打尽。
+
+落在 **0.45–0.70** 的对**不合并**,列进 `title_near_duplicates[]` 等人工确认——该区间实测混有
+大量不同论文(短标题/截断标题尤其容易假阳性),而**误合并会静默吞掉一篇**(下游一律按
+`duplicate_of` 过滤),代价高于漏合并。
+
+裁决结果两侧都要写回 `dedup_overrides.json`,**判为不同也要写**:
+- 判为同文 → 写进 `merge[[keyA,keyB],…]`,无条件合并,不受阈值变动影响;
+- 判为不同 → 写进 `distinct[[keyA,keyB],…]`,此后不再出现在 `title_near_duplicates[]`。
+
+`distinct` 只压制"请人看一眼",不影响合并(这些对本就没被合并);同一对同时出现在 merge 与
+distinct 时以 merge 为准。
+
+⚠️ **两侧的键都会被漂移检查盯着**:重建索引时 `merge` 与 `distinct` 的每个键都要能在库中找到,
+找不到就逐条 WARNING「未生效」并区分「缺前者/缺后者/两侧都缺」。裁决文件从两处取并集
+(仓库 `config/` + `notes_dir/`),**正常输出里未生效应恒为 0**——出现就说明某个键漂了
+(元数据变动/键梯升级/札记已删),那条裁决已经悄悄失效,必须立刻核对更新。**没有这一半人工复核通道就永不收敛**:假阳性每次重建索引都原样再报,
+看过多少遍都不减少,真正的新增待确认项被淹没。2026-08-14 一次性裁决 16 对(2 合并 14 判异),
+`title_near_duplicates[]` 归零。
+
+## 精读分节里的「实验方法」(2026-08-15 起的新精读才有)
+
+分节 `heading` 是自由文本,渲染/解析/索引/嵌入/查询全链路无白名单,所以加节不影响任何存量条目。
+新增的 **「实验方法」** 节按"他人照着能复现"整理:数据集/队列与划分(比例、分层、防泄漏)、预处理、
+模型配置与超参(优化器/学习率/batch/epoch/随机种子/硬件)、评估协议与指标、基线及其配置、
+代码与数据可得性(仓库链接、许可)。**原文未报告的项显式写「原文未报告:X」**——与出版日期那条同一
+原则:空就说空,不省略、不推测填补。可移植做法打〔方法论借鉴〕,具体数字/配置打〔可引用证据〕。
+
+⚠️ **存量 220 篇手动精读不回填**(沿用既定"存量不重跑"方针)。要某一篇的实验细节,走 skill
+`read-paper` 对那篇手动重读。存量条目的实验细节散在「方法与数据」节里,深浅不一(实测 66 篇里
+超参出现 23 次、随机种子 18 次、GitHub 链接仅 1 次),**别假设老条目有这一节**。
+
+只有摘要的降级篇(`has_full_text_reading == false`)本节通常很短或整节都是「原文未报告」,
+这是正确行为——单跳 prompt 明确要求"仅在可得文本确有报告时"才写,防止照着摘要编造超参。
 
 ## 阅读深度量尺 `reading_depth`(⚠️ 库里并存两代精读,取证前先看这个)
 

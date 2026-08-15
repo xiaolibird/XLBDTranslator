@@ -5,8 +5,11 @@ test_roundtrip_md_parse 是 md 格式契约：以后改 notes._paper_section 的
 提醒同步更新 notes_index 的解析正则。
 """
 import json
+import os
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from src.scholar.schema import (
     PaperSegment, PaperMetadata, FilterDecision,
@@ -14,6 +17,10 @@ from src.scholar.schema import (
 )
 from src.scholar.notes import write_notes
 from src.scholar import notes_index as ni
+
+
+# 人工裁决来源的隔离夹具 _isolate_repo_overrides 已提到 test/conftest.py（对整个 test/
+# 目录生效）——原先只挂在本文件上，test_vault.py / test_pdf_ingest.py 仍读仓库真文件。
 
 
 def _fd(pid, decision="INCLUDE", **kw):
@@ -243,7 +250,7 @@ def test_rename_citekey_in_note_skips_on_note_line_mismatch(tmp_path):
     entry_bad = dict(b)
     entry_bad["note_line"] = 1     # 伪造一个不含 [@shared2025Key] 的行号（文件顶端 front matter）
     ok = ni._rename_citekey_in_note(tmp_path, entry_bad, "shared2025Key", "shared2025Keyb")
-    assert ok is False
+    assert ok == ni.RENAME_REFUSED
     text = md.read_text(encoding="utf-8")
     assert text.count("[@shared2025Key]") == 2   # 两条都原样保留，谁也没被误改
 
@@ -375,6 +382,146 @@ def test_references_json_field_none_when_file_absent(tmp_path):
                                      ref_path=tmp_path / (stem + ".references.json"),
                                      sidecar_path=None)
     assert entries and all(e["references_json"] is None for e in entries)
+
+
+# ---------------- 标题相似度层（改写题名的漏网重复） ----------------
+
+def _pe(month, title, key, **kw):
+    e = {"month": month, "priority_rank": 1, "title": title, "dedup_key": key,
+         "citekey": kw.pop("citekey", "k" + month.replace("-", "")), "series": kw.pop("series", "auto")}
+    e.update(kw)
+    return e
+
+
+def test_title_similarity_merges_rewritten_title():
+    """同一论文预印本→正刊改写题名、两侧都无 DOI：精确标题键漏网，相似度层须合并。"""
+    papers = [
+        _pe("2025-03", "Recurrent neural network models (CovRNN) for predicting outcomes of "
+                      "patients with COVID-19 on admission", "title:covrnnA", authors=["Laila Rasmy"]),
+        _pe("2025-06", "Recurrent Neural Network Models (CovRNN) for Predicting Outcomes of "
+                      "Patients With COVID-19 on Admission to Hospital", "doi:10.1/s2589",
+           authors=["Laila Rasmy"], doi="10.1/s2589"),
+    ]
+    out = ni._global_pass(papers)
+    dups = [e for e in out if e["duplicate_of"]]
+    # keeper 取书目更全的正刊版（带 DOI），而非月份更早的预印本——见 _keeper_rank
+    assert len(dups) == 1 and dups[0]["month"] == "2025-03"
+    assert [e for e in out if not e["duplicate_of"]][0]["doi"] == "10.1/s2589"
+
+
+def test_title_similarity_blocked_by_identity_conflict():
+    """标题高度相似但身份铁证冲突（不同 DOI / 不同首作者）：绝不合并——
+    误合并会静默吞掉一篇（下游按 duplicate_of 过滤），代价高于漏合并。"""
+    base = ("Evaluation of Active Feature Acquisition Methods for {} Feature Settings")
+    doi_conflict = [
+        _pe("2025-03", base.format("Static"), "doi:10.48550/arxiv.2312.03619",
+           doi="10.48550/arXiv.2312.03619", authors=["Henrik von Kleist"]),
+        _pe("2025-04", base.format("Time-varying"), "doi:10.48550/arxiv.2312.01530",
+           doi="10.48550/arXiv.2312.01530", authors=["Henrik von Kleist"]),
+    ]
+    assert all(e["duplicate_of"] is None for e in ni._global_pass(doi_conflict))
+
+    author_conflict = [
+        _pe("2025-03", "Improving Generalizability of Extracting Social Determinants of Health",
+           "title:improvingsdoh", authors=["Bo Peng"]),
+        _pe("2025-04", "Enhancing Generalizability in Social Determinants of Health Extraction",
+           "title:enhancingsdoh", authors=["Ivana Ciganic"]),
+    ]
+    assert all(e["duplicate_of"] is None for e in ni._global_pass(author_conflict))
+
+
+def test_anon_citekey_is_not_an_author_match():
+    """两篇互不相干的 anon 条目不得因 citekey 前缀同为 anon 而被当成同作者。"""
+    a = {"citekey": "anon2025Foo", "authors": []}
+    b = {"citekey": "anon2025Bar", "authors": []}
+    assert ni._first_surname(a) == "" and ni._first_surname(b) == ""
+    assert ni._identity_conflict(a, b) == ""          # 未知 ≠ 冲突，但也不构成佐证
+
+
+def test_mid_band_pairs_go_to_review_not_merged():
+    """相似度落在 [REVIEW_SIM, AUTO_MERGE_SIM) 的对只报候选、不合并。"""
+    papers = [
+        _pe("2025-03", "Volatility-Aware Masking Improves Performance and Efficiency of "
+                      "Pretrained EHR Foundation Models", "title:volatilityaware"),
+        _pe("2025-08", "Coefficient of Variation Masking: A Volatility-Aware Strategy for "
+                      "EHR Foundation Models", "title:coefficientvariation", series="manual"),
+    ]
+    review = []
+    out = ni._global_pass(papers, review_out=review)
+    assert all(e["duplicate_of"] is None for e in out)          # 未自动合并
+    assert len(review) == 1
+    assert ni.REVIEW_SIM <= review[0]["similarity"] < ni.AUTO_MERGE_SIM
+    assert {review[0]["a"]["dedup_key"], review[0]["b"]["dedup_key"]} == {
+        "title:volatilityaware", "title:coefficientvariation"}
+
+
+def test_manual_override_merges_and_keeper_is_manual(tmp_path):
+    """人工确认对无条件合并，且 keeper 规则照旧（手动深读胜过自动浅读）。"""
+    (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(json.dumps(
+        {"merge": [["title:volatilityaware", "title:coefficientvariation"]]}), encoding="utf-8")
+    papers = [
+        _pe("2025-03", "Volatility-Aware Masking Improves Performance", "title:volatilityaware"),
+        _pe("2025-08", "Coefficient of Variation Masking", "title:coefficientvariation",
+           series="manual"),
+    ]
+    review = []
+    out = ni._global_pass(papers, notes_dir=tmp_path, review_out=review)
+    keeper = [e for e in out if not e["duplicate_of"]]
+    dup = [e for e in out if e["duplicate_of"]]
+    assert len(keeper) == 1 and keeper[0]["series"] == "manual"     # 手动版当权威
+    assert len(dup) == 1 and dup[0]["month"] == "2025-03"
+    assert dup[0]["duplicate_of"] == "title:coefficientvariation@2025-08"
+    assert review == []                                             # 已合并即不再待确认
+
+
+def test_override_transitivity_and_bad_file_is_tolerated(tmp_path):
+    """A≈B、B≈C 时三者同簇同 keeper；覆盖文件损坏只告警不炸索引。"""
+    (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(json.dumps(
+        {"merge": [["title:a", "title:b"], ["title:b", "title:c"]]}), encoding="utf-8")
+    papers = [_pe("2025-01", "Alpha", "title:a"), _pe("2025-02", "Beta", "title:b"),
+              _pe("2025-03", "Gamma", "title:c")]
+    out = ni._global_pass(papers, notes_dir=tmp_path)
+    assert sum(1 for e in out if not e["duplicate_of"]) == 1
+    assert all(e["duplicate_of"] == "title:a@2025-01" for e in out if e["duplicate_of"])
+
+    (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text("{ 半个 JSON", encoding="utf-8")
+    papers2 = [_pe("2025-01", "Alpha", "title:a"), _pe("2025-02", "Beta", "title:b")]
+    out2 = ni._global_pass(papers2, notes_dir=tmp_path)
+    assert all(e["duplicate_of"] is None for e in out2)      # 未合并但也未抛异常
+
+
+def test_distinct_override_suppresses_review_pair_without_merging(tmp_path):
+    """人工判「非同文」的对不再上报待确认，且不因此被合并（distinct 只影响报告）。"""
+    pair = ["title:volatilityaware", "title:coefficientvariation"]
+    papers = lambda: [
+        _pe("2025-03", "Volatility-Aware Masking Improves Performance and Efficiency of "
+                       "Pretrained EHR Foundation Models", pair[0]),
+        _pe("2025-08", "Coefficient of Variation Masking: A Volatility-Aware Strategy for "
+                       "EHR Foundation Models", pair[1], series="manual"),
+    ]
+    review = []
+    ni._global_pass(papers(), review_out=review)
+    assert len(review) == 1                                  # 无覆盖文件时照旧上报
+
+    (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(
+        json.dumps({"distinct": [pair]}), encoding="utf-8")
+    review2 = []
+    out = ni._global_pass(papers(), notes_dir=tmp_path, review_out=review2)
+    assert review2 == []                                     # 已判非同文 → 不再上报
+    assert all(e["duplicate_of"] is None for e in out)        # 且绝不因此被合并
+
+
+def test_distinct_does_not_override_merge(tmp_path):
+    """同一对同时写进 merge 与 distinct 时，合并优先——distinct 压制的只是「请人看一眼」。"""
+    pair = ["title:volatilityaware", "title:coefficientvariation"]
+    (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(
+        json.dumps({"merge": [pair], "distinct": [pair]}), encoding="utf-8")
+    papers = [_pe("2025-03", "Volatility-Aware Masking Improves Performance", pair[0]),
+              _pe("2025-08", "Coefficient of Variation Masking", pair[1], series="manual")]
+    review = []
+    out = ni._global_pass(papers, notes_dir=tmp_path, review_out=review)
+    assert sum(1 for e in out if not e["duplicate_of"]) == 1  # 仍然合并成一簇
+    assert review == []
 
 
 # ---------------- 手动精读系列（series）+ keeper 规则 ----------------
@@ -761,3 +908,674 @@ def test_digest_output_save_to_file_roundtrip(tmp_path):
     assert [s.paper_id for s in loaded.segments] == ["pa", "pb", "pc"]
     assert loaded.total_papers == 3
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_keeper_prefers_complete_bibliography_but_manual_still_wins():
+    """同系列内书目更全者当 keeper；但手动深读始终压过自动浅读，哪怕元数据更薄。"""
+    # 同为 auto：无作者无 DOI 的早月残条不该压过带作者的正刊记录
+    out = ni._global_pass([
+        _pe("2021-01", "Federated Learning used for predicting outcomes in SARS-COV-2 patients",
+            "title:flsars", citekey="anon2021Federated"),
+        _pe("2021-09", "Federated Learning used for predicting outcomes in SARS-COV-2 patients",
+            "doi:10.1038/s41591-021-01506-3", citekey="dayan2021Federated",
+            authors=["I Dayan"], doi="10.1038/s41591-021-01506-3", journal="Nature Medicine"),
+    ])
+    keeper = [e for e in out if not e["duplicate_of"]]
+    assert len(keeper) == 1 and keeper[0]["citekey"] == "dayan2021Federated"
+
+    # 手动 vs 自动：series 仍是第一顺位，元数据完整度不得反超
+    out2 = ni._global_pass([
+        _pe("2025-01", "Same Paper", "title:same", series="manual"),
+        _pe("2025-02", "Same Paper", "title:same", authors=["A B"], doi="10.1/x",
+            journal="J", citekey="rich"),
+    ])
+    keeper2 = [e for e in out2 if not e["duplicate_of"]]
+    assert len(keeper2) == 1 and keeper2[0]["series"] == "manual"
+
+
+def test_stale_override_key_warns_instead_of_silently_skipping(tmp_path):
+    """人工裁决的键在库中找不到时必须告警——沉默会让裁决永久失效且无迹象。
+
+    日志走 loguru（caplog 收不到它绑定的 sink），临时挂一个自己的 sink 来收。
+    """
+    from loguru import logger as _lg
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(json.dumps(
+            {"merge": [["title:a", "title:键已漂走"]]}), encoding="utf-8")
+        papers = [_pe("2025-01", "Alpha", "title:a"), _pe("2025-02", "Beta", "title:b")]
+        out = ni._global_pass(papers, notes_dir=tmp_path)
+    finally:
+        _lg.remove(sink)
+    assert all(e["duplicate_of"] is None for e in out)       # 确实没合并
+    assert any("键已漂走" in s for s in lines)                # 且逐条点名了失配的键
+    assert any("未生效" in s for s in lines)
+
+
+# ---------------- 场地原生 id 键层（无 DOI 的会议论文） ----------------
+
+def test_venue_native_id_extraction():
+    from src.scholar._citekey_utils import venue_native_id as v
+    assert v("https://proceedings.mlr.press/v287/elsharief25a.html") == "pmlr:v287/elsharief25a"
+    assert v("https://proceedings.mlr.press/v225/ren23a/ren23a.pdf") == "pmlr:v225/ren23a"
+    assert v("http://proceedings.mlr.press/v146/kalmady21a") == "pmlr:v146/kalmady21a"
+    assert v("https://proceedings.mlr.press/v297/torres-fuertes26a.html") == \
+        "pmlr:v297/torres-fuertes26a"          # 复姓 slug 带连字符，不能被切
+    # OpenReview id 区分大小写，原样保留（折叠会静默吞篇，见下方专门用例）
+    assert v("https://openreview.net/forum?id=x4UK4GadLd") == "openreview:x4UK4GadLd"
+    assert v("https://openreview.net/pdf?id=F3G2udCF3Q") == "openreview:F3G2udCF3Q"
+    assert v("https://arxiv.org/abs/2412.07712") is None
+    assert v(None) is None
+
+
+def test_dedup_key_ladder_puts_venue_id_above_title_below_arxiv():
+    from src.scholar._citekey_utils import dedup_key_fields as k
+    url = "https://proceedings.mlr.press/v287/elsharief25a.html"
+    # 无 DOI 无 arXiv：场地 id 顶掉标题键
+    assert k(None, None, "MedMod: Multimodal Benchmark", url=url) == "pmlr:v287/elsharief25a"
+    # 标题被解析截断也不影响身份——这正是这一层要解决的问题
+    assert k(None, None, "Healthcare Analytics", url=url) == "pmlr:v287/elsharief25a"
+    # DOI / arXiv 仍优先
+    assert k("10.1/x", None, "T", url=url) == "doi:10.1/x"
+    assert k(None, "2501.01234", "T", url=url) == "arxiv:2501.01234"
+    # 无 url 时行为不变
+    assert k(None, None, "Some Title") == "title:" + ni.norm_title("Some Title")
+
+
+def test_sidecar_dedup_key_is_recomputed_not_frozen(tmp_path):
+    """sidecar 里冻结的旧 dedup_key 必须按当前规则重算——否则键梯改了它纹丝不动。"""
+    stem = "科研札记_2025-03_全文精读"
+    (tmp_path / (stem + ".md")).write_text(
+        "## 🔴 高 1. Paper [@x2025Paper]\n", encoding="utf-8")
+    (tmp_path / (stem + ".index.json")).write_text(json.dumps({"papers": [{
+        "citekey": "x2025Paper", "title": "Paper", "doi": None, "arxiv_id": None,
+        "url": "https://proceedings.mlr.press/v287/elsharief25a.html",
+        "dedup_key": "title:paper",          # 落盘时（旧规则）冻下来的键
+        "highlights": [], "tag_counts": {},
+    }]}), encoding="utf-8")
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=None,
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    assert entries[0]["dedup_key"] == "pmlr:v287/elsharief25a"
+
+
+def test_sidecar_id_fallback_key_is_preserved(tmp_path):
+    """重算会落到 id: 的「三无」条目保留 sidecar 原键（paper_id 比 citekey 更稳）。"""
+    stem = "科研札记_2025-04_全文精读"
+    (tmp_path / (stem + ".md")).write_text("## 🔴 高 1.  [@anon2025X]\n", encoding="utf-8")
+    (tmp_path / (stem + ".index.json")).write_text(json.dumps({"papers": [{
+        "citekey": "anon2025X", "title": "", "doi": None, "arxiv_id": None, "url": None,
+        "dedup_key": "id:pdf-abc123", "highlights": [], "tag_counts": {},
+    }]}), encoding="utf-8")
+    entries = ni.build_month_entries("2025-04", tmp_path / (stem + ".md"),
+                                     ref_path=None,
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    assert entries[0]["dedup_key"] == "id:pdf-abc123"
+
+
+# ---------------- R1 对抗审查回归（2026-08-15） ----------------
+
+def test_openreview_id_is_case_sensitive_pmlr_is_folded():
+    """R1-6：OpenReview forum id 区分大小写，.lower() 会把两个不同 id 折成同一个键。
+
+    折叠 → 并查集判成同一篇 → 落败方标 duplicate_of 后被下游一律过滤 = 静默吞篇。
+    PMLR slug 本身全小写，继续归一化无害。
+    """
+    from src.scholar._citekey_utils import venue_native_id as v
+    assert v("https://openreview.net/forum?id=x4UK4GadLd") == "openreview:x4UK4GadLd"
+    assert v("https://openreview.net/forum?id=x4UK4GadLd") != \
+        v("https://openreview.net/forum?id=X4uk4gAdLD")
+    # PMLR 仍小写归一（大小写域名/大写 slug 都折到同一个键）
+    assert v("https://PROCEEDINGS.MLR.PRESS/v287/ELSHARIEF25A.html") == "pmlr:v287/elsharief25a"
+
+
+def test_venue_native_id_handles_real_url_variants():
+    """R1-7：带 query 无扩展名、参数换序、attachment/references 链接、GitHub 镜像都要认得。
+
+    抽不出时无任何日志、直接退回 title: 键——标题被解析截断身份就跟着漂，正是这一层
+    存在的全部理由。
+    """
+    from src.scholar._citekey_utils import venue_native_id as v
+    assert v("https://proceedings.mlr.press/v287/elsharief25a?x=1") == "pmlr:v287/elsharief25a"
+    assert v("https://proceedings.mlr.press/v287/elsharief25a/elsharief25a-supp.pdf") == \
+        "pmlr:v287/elsharief25a"          # 附件后缀不得被当成 slug 的一部分
+    assert v("https://openreview.net/forum?noteId=abc&id=x4UK4GadLd") == "openreview:x4UK4GadLd"
+    assert v("https://openreview.net/attachment?id=x4UK4GadLd&name=pdf") == \
+        "openreview:x4UK4GadLd"
+    assert v("https://openreview.net/references/pdf?id=x4UK4GadLd") == "openreview:x4UK4GadLd"
+    # PMLR 官方 GitHub 镜像（本库真实存在一条）
+    assert v("https://raw.githubusercontent.com/mlresearch/v281/main/assets/"
+             "noshin25a/noshin25a.pdf") == "pmlr:v281/noshin25a"
+    # 反例：profile 链接的 ~id 不是 forum id；非场地 url 照旧 None
+    assert v("https://openreview.net/profile?id=~John_Doe1") is None
+    assert v("https://raw.githubusercontent.com/someone/v281/main/x.pdf") is None
+    assert v("https://arxiv.org/abs/2412.07712") is None
+
+
+def test_openreview_id_only_from_paper_paths():
+    """R2-2：OpenReview 的 `?id=` 只有长在论文端点上才是论文身份。
+
+    group/search/venue 页的 `?id=` 装的是**会场名/检索词**，抽成身份键会让两篇不相干的
+    论文拿到同一个 dedup_key → 并查集判同篇 → 落败方标 duplicate_of 被下游一律过滤，
+    即「代价远高于漏合并」的静默吞篇。
+    """
+    from src.scholar._citekey_utils import venue_native_id as v
+    # 非论文端点：一律不抽
+    assert v("https://openreview.net/group?id=NeurIPS") is None
+    assert v("https://openreview.net/group?id=MIDL") is None
+    assert v("https://openreview.net/search?term=ehr&id=abc") is None
+    assert v("https://openreview.net/venue?id=ICLR2024") is None
+    assert v("https://openreview.net/?id=x4UK4GadLd") is None          # 首页 query 不承载身份
+    # 论文端点：五种都要照常抽出（白名单不能把真实变体一起挡掉）
+    for u in ("https://openreview.net/forum?id=x4UK4GadLd",
+              "https://openreview.net/pdf?id=x4UK4GadLd",
+              "https://openreview.net/attachment?id=x4UK4GadLd&name=pdf",
+              "https://openreview.net/references?id=x4UK4GadLd",
+              "https://openreview.net/revisions?id=x4UK4GadLd"):
+        assert v(u) == "openreview:x4UK4GadLd", u
+
+
+def test_existing_note_dedup_keys_recomputed_like_index(tmp_path):
+    """R1-2：整篇覆盖守卫读 sidecar 时必须按当前键梯重算，否则同 label 重跑被误判丢数据。
+
+    sidecar 里冻结的是落盘那一刻的键；run_ingest 那侧走 dedup_key(seg.metadata) 是新键。
+    两侧不等 → existing - new 非空 → RuntimeError 拒写，提示换 --label（换了会真的产生
+    重复札记）。
+    """
+    from src.scholar.ingest import _existing_note_dedup_keys, dedup_key
+    from src.scholar.schema import PaperMetadata
+    stem = "科研札记_2026-08_全文精读"
+    (tmp_path / (stem + ".md")).write_text("x\n", encoding="utf-8")
+    (tmp_path / (stem + ".index.json")).write_text(json.dumps({"papers": [{
+        "citekey": "anon2021Automation", "title": "Towards Automation of Knowledge Graph",
+        "doi": None, "arxiv_id": None,
+        "url": "https://openreview.net/pdf?id=N4cz2jRFFlp",
+        "dedup_key": "title:towardsautomationofknowledgegraph",      # 旧规则冻结值
+    }]}), encoding="utf-8")
+    existing = _existing_note_dedup_keys(tmp_path, stem)
+    new = dedup_key(PaperMetadata(paper_id="p1", title="Towards Automation of Knowledge Graph",
+                                  url="https://openreview.net/pdf?id=N4cz2jRFFlp"))
+    assert existing == {new} == {"openreview:N4cz2jRFFlp"}
+    assert existing - {new} == set()          # 守卫不会再误报「本批未覆盖」
+    # 与索引侧同一函数、同一结果（杜绝两处漂移）
+    entries = ni.build_month_entries("2026-08", tmp_path / (stem + ".md"), ref_path=None,
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    assert entries[0]["dedup_key"] == new
+
+
+def test_existing_note_dedup_keys_keeps_id_fallback(tmp_path):
+    """R1-2 边界：重算落到 id: 的「三无」条目仍用 sidecar 冻结值（paper_id 比 citekey 稳）。"""
+    from src.scholar.ingest import _existing_note_dedup_keys
+    stem = "科研札记_2026-09_全文精读"
+    (tmp_path / (stem + ".md")).write_text("x\n", encoding="utf-8")
+    (tmp_path / (stem + ".index.json")).write_text(json.dumps({"papers": [{
+        "citekey": "anon2025X", "title": "", "doi": None, "arxiv_id": None, "url": None,
+        "dedup_key": "id:pdf-abc123",
+    }]}), encoding="utf-8")
+    assert _existing_note_dedup_keys(tmp_path, stem) == {"id:pdf-abc123"}
+
+
+def test_rename_citekey_refuses_when_references_json_is_broken(tmp_path):
+    """R1-3：refs 不可解析时不得「md 已改却返回 True」——那会让 pandoc 静默解析不到条目。"""
+    stem = "科研札记_2026-05_全文精读"
+    md = tmp_path / (stem + ".md")
+    md.write_text("## 🔴 高 1. Some Paper [@torres2026Uncertainty]\n", encoding="utf-8")
+    rp = tmp_path / (stem + ".references.json")
+    rp.write_text("{ 这不是合法 JSON", encoding="utf-8")
+    entry = {"note_file": md.name, "note_line": 1,
+             "references_json": rp.name, "doi": None}
+    ok = ni._rename_citekey_in_note(tmp_path, entry, "torres2026Uncertainty",
+                                    "torresfuertes2026Uncertainty")
+    assert ok == ni.RENAME_REFUSED
+    # 关键：md 一个字都不许动（预检不过 = 磁盘零改动）
+    assert md.read_text(encoding="utf-8") == \
+        "## 🔴 高 1. Some Paper [@torres2026Uncertainty]\n"
+    assert rp.read_text(encoding="utf-8") == "{ 这不是合法 JSON"
+
+
+def test_rename_citekey_refuses_when_sidecar_lacks_the_key(tmp_path):
+    """R1-3：sidecar 里找不到旧 citekey 时也算失败——下次重建会把 md 顶回旧值。"""
+    stem = "科研札记_2026-06_全文精读"
+    md = tmp_path / (stem + ".md")
+    md.write_text("## 🔴 高 1. P [@a2026X]\n", encoding="utf-8")
+    (tmp_path / (stem + ".index.json")).write_text(
+        json.dumps({"papers": [{"citekey": "别的键", "doi": None}]}), encoding="utf-8")
+    entry = {"note_file": md.name, "note_line": 1, "references_json": None, "doi": None}
+    assert ni._rename_citekey_in_note(tmp_path, entry, "a2026X", "b2026X") == ni.RENAME_REFUSED
+    assert "[@a2026X]" in md.read_text(encoding="utf-8")
+
+
+def test_rename_citekey_writes_all_three_when_preflight_passes(tmp_path):
+    """R1-3 正面：三处预检都过时，md + references.json + sidecar 一起改。"""
+    stem = "科研札记_2026-07_全文精读"
+    md = tmp_path / (stem + ".md")
+    md.write_text("## 🔴 高 1. P [@a2026X]\n", encoding="utf-8")
+    rp = tmp_path / (stem + ".references.json")
+    rp.write_text(json.dumps([{"id": "a2026X", "title": "P"}]), encoding="utf-8")
+    sc = tmp_path / (stem + ".index.json")
+    sc.write_text(json.dumps({"papers": [{"citekey": "a2026X", "doi": None}]}),
+                  encoding="utf-8")
+    entry = {"note_file": md.name, "note_line": 1, "references_json": rp.name, "doi": None}
+    assert ni._rename_citekey_in_note(tmp_path, entry, "a2026X", "b2026X") == ni.RENAME_OK
+    assert "[@b2026X]" in md.read_text(encoding="utf-8")
+    assert json.loads(rp.read_text(encoding="utf-8"))[0]["id"] == "b2026X"
+    assert json.loads(sc.read_text(encoding="utf-8"))["papers"][0]["citekey"] == "b2026X"
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+# ---------------- R2-1：写盘阶段的事务性（回滚 + 三态） ----------------
+
+_COLLIDE_TITLES = {
+    "2026-01": "Alpha Retrieval Of Cardiac Waveforms",
+    "2026-02": "Beta Federated Graph Kernels For Sepsis",
+    "2026-03": "Gamma Tensor Phenotyping With Missing Labels",
+}
+
+
+def _write_collide_notes(d, key="dup2026Key"):
+    """三个月、三篇**不同**论文共用一个 citekey（无 sidecar）：撞键修复的最小现场。"""
+    for month, title in _COLLIDE_TITLES.items():
+        stem = "科研札记_{}_全文精读".format(month)
+        (d / (stem + ".md")).write_text(
+            "# 论文\n## 🔴 高 1. {} [@{}]\n**优先级**: `0.5`\n".format(title, key),
+            encoding="utf-8")
+        (d / (stem + ".references.json")).write_text(
+            json.dumps([{"id": key, "title": title}], ensure_ascii=False), encoding="utf-8")
+
+
+def _md_key(d, month):
+    stem = "科研札记_{}_全文精读".format(month)
+    line = next(l for l in (d / (stem + ".md")).read_text(encoding="utf-8").splitlines()
+                if "[@" in l)
+    return line.split("[@")[-1].rstrip("]")
+
+
+def _refs_id(d, month):
+    stem = "科研札记_{}_全文精读".format(month)
+    return json.loads((d / (stem + ".references.json")).read_text(encoding="utf-8"))[0]["id"]
+
+
+def test_rename_citekey_rolls_back_when_a_later_write_fails(tmp_path):
+    """R2-1：md 已落盘、references.json 写失败 → 必须把 md 回滚，返回 refused（磁盘零改动）。
+
+    预检全过之后写盘循环本身也要有事务性：pending 顺序是 [md, refs, sidecar]，md 先落盘，
+    第 2/3 个文件写失败（磁盘满、卷只读、tmp 路径被占）时旧写法直接 return False，
+    而 md 已是新键 —— 调用方汇报「磁盘未改动」，重跑必然再失败（md 里已无 [@old]），
+    札记永久停在半改状态且不再有任何新信号。
+    """
+    stem = "科研札记_2026-04_全文精读"
+    md = tmp_path / (stem + ".md")
+    md.write_text("## 🔴 高 1. P [@a2026X]\n", encoding="utf-8")
+    rp = tmp_path / (stem + ".references.json")
+    rp.write_text(json.dumps([{"id": "a2026X", "title": "P"}]), encoding="utf-8")
+    md_before, rp_before = md.read_text(encoding="utf-8"), rp.read_text(encoding="utf-8")
+    # 自然触发写失败：占住 _atomic_write 的 tmp 路径（等价于磁盘满/只读卷，不打桩）
+    (tmp_path / (rp.name + ".tmp-{}".format(os.getpid()))).mkdir()
+    entry = {"note_file": md.name, "note_line": 1, "references_json": rp.name, "doi": None}
+    assert ni._rename_citekey_in_note(tmp_path, entry, "a2026X", "b2026X") == ni.RENAME_REFUSED
+    # 关键：md 必须被回滚成原样，逐字节相同
+    assert md.read_text(encoding="utf-8") == md_before
+    assert rp.read_text(encoding="utf-8") == rp_before
+
+
+def test_rename_citekey_reports_partial_when_rollback_also_fails(tmp_path):
+    """R2-1：写盘失败**且回滚也失败** → 返回 partial（不是 refused），磁盘确实是半改的。"""
+    stem = "科研札记_2026-04_全文精读"
+    md = tmp_path / (stem + ".md")
+    md.write_text("## 🔴 高 1. P [@a2026X]\n", encoding="utf-8")
+    rp = tmp_path / (stem + ".references.json")
+    rp.write_text(json.dumps([{"id": "a2026X", "title": "P"}]), encoding="utf-8")
+    real = ni._atomic_write
+
+    def flaky(path, content):
+        if path.name == rp.name:
+            raise OSError("模拟磁盘满")
+        if path.name == md.name and "[@a2026X]" in content:
+            raise OSError("模拟回滚也失败")      # 只在写回原内容（回滚）时炸
+        return real(path, content)
+
+    entry = {"note_file": md.name, "note_line": 1, "references_json": rp.name, "doi": None}
+    try:
+        ni._atomic_write = flaky
+        assert ni._rename_citekey_in_note(tmp_path, entry, "a2026X",
+                                          "b2026X") == ni.RENAME_PARTIAL
+    finally:
+        ni._atomic_write = real
+    assert "[@b2026X]" in md.read_text(encoding="utf-8")        # md 半改，如实汇报
+    assert _load_json_id(rp) == "a2026X"
+
+
+def _load_json_id(p):
+    return json.loads(p.read_text(encoding="utf-8"))[0]["id"]
+
+
+def test_fix_citekey_collisions_disk_matches_report_when_write_fails(tmp_path):
+    """R2-1 端到端①：写盘中途失败并回滚成功 → 磁盘要么全改要么全没改，汇总口径与磁盘一致。"""
+    from loguru import logger as _lg
+    _write_collide_notes(tmp_path)
+    md2_before = (tmp_path / "科研札记_2026-02_全文精读.md").read_text(encoding="utf-8")
+    rp2 = tmp_path / "科研札记_2026-02_全文精读.references.json"
+    rp2_before = rp2.read_text(encoding="utf-8")
+    (tmp_path / (rp2.name + ".tmp-{}".format(os.getpid()))).mkdir()     # 堵死 2026-02 的写路
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        renamed = ni.fix_citekey_collisions(tmp_path)
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+    assert renamed == 1
+    # 2026-02：三处一处没改（不是「md 已改、refs 还是旧 id」的半改态）
+    assert (tmp_path / "科研札记_2026-02_全文精读.md").read_text(encoding="utf-8") == md2_before
+    assert rp2.read_text(encoding="utf-8") == rp2_before
+    # 汇总说「磁盘未改动」时，磁盘必须真的没动（旧实现在这里自相矛盾）
+    assert "磁盘未改动" in blob and "dup2026Key → dup2026Keyb" in blob
+    assert "半改" not in blob
+    # 2026-03 正常改成 b（2026-02 的键没落盘，后缀本就该让给它）
+    assert _md_key(tmp_path, "2026-03") == "dup2026Keyb"
+    assert _refs_id(tmp_path, "2026-03") == "dup2026Keyb"
+    assert _md_key(tmp_path, "2026-01") == "dup2026Key"
+
+
+def test_fix_citekey_collisions_never_reuses_a_key_left_on_disk(tmp_path):
+    """R2-1 端到端②：半改（回滚也失败）时新键**已在 md 上**，绝不能再发给同组下一条。
+
+    旧实现只在成功时 all_keys.add(new)，于是 2026-02 与 2026-03 会拿到同一个 dup2026Keyb
+    —— 修撞键的工具在磁盘上新造一个撞键，而报告里只说「1 条未能修复、磁盘未改动」。
+    """
+    from loguru import logger as _lg
+    _write_collide_notes(tmp_path)
+    real = ni._atomic_write
+    bad_md = "科研札记_2026-02_全文精读.md"
+    bad_rp = "科研札记_2026-02_全文精读.references.json"
+
+    def flaky(path, content):
+        if path.name == bad_rp:
+            raise OSError("模拟磁盘满")
+        if path.name == bad_md and "[@dup2026Key]" in content:
+            raise OSError("模拟回滚也失败")
+        return real(path, content)
+
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        ni._atomic_write = flaky
+        renamed = ni.fix_citekey_collisions(tmp_path)
+    finally:
+        ni._atomic_write = real
+        _lg.remove(sink)
+    assert renamed == 1                                   # 只有 2026-03 算成功
+    assert _md_key(tmp_path, "2026-02") == "dup2026Keyb"   # 半改：键已落在 md 上
+    assert _refs_id(tmp_path, "2026-02") == "dup2026Key"
+    # 核心断言：下一条不得复用那个已落盘的键，否则磁盘上凭空多出一组撞键
+    assert _md_key(tmp_path, "2026-03") != "dup2026Keyb"
+    assert _md_key(tmp_path, "2026-03") == "dup2026Keyc"
+    assert _refs_id(tmp_path, "2026-03") == "dup2026Keyc"
+    assert len({_md_key(tmp_path, m) for m in _COLLIDE_TITLES}) == 3
+    blob = "\n".join(lines)
+    assert "半改" in blob and bad_md in blob               # 单列成半改清单，不说「磁盘未改动」
+
+
+def test_stale_distinct_key_warns_and_wording_distinguishes_both_missing(tmp_path):
+    """R1-5：distinct 漂键也要告警（原先只有 merge 有）；两侧都缺时不得只说「缺 前者」。"""
+    from loguru import logger as _lg
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        (tmp_path / ni.DEDUP_OVERRIDES_JSON).write_text(json.dumps({
+            "merge": [["title:两边都没有a", "title:两边都没有b"],
+                      ["title:a", "title:merge后者漂走"]],
+            "distinct": [["title:distinct键已漂走", "title:b"]],
+        }), encoding="utf-8")
+        papers = [_pe("2025-01", "Alpha", "title:a"), _pe("2025-02", "Beta", "title:b")]
+        ni._global_pass(papers, notes_dir=tmp_path, review_out=[])
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+    assert "distinct键已漂走" in blob and "非同文" in blob     # distinct 那半不再沉默
+    # 措辞按 (缺前者 / 缺后者 / 两侧都缺) 三分，不再一律写成「缺 前者」
+    def _line(frag):
+        return next(s for s in lines if frag in s)
+    assert "两侧都缺" in _line("title:两边都没有a")
+    assert "缺 后者" in _line("merge后者漂走")
+    assert "缺 前者" in _line("distinct键已漂走")
+
+
+def test_read_override_files_honors_repo_path_constant(tmp_path, monkeypatch):
+    """R1-9：仓库那份裁决文件的路径可被 monkeypatch，测试得以完全隔离。
+
+    生产语义保持不变：仓库 config 与 notes_dir 两处**取并集**。
+    """
+    repo_fake = tmp_path / "repo" / ni.DEDUP_OVERRIDES_JSON
+    repo_fake.parent.mkdir()
+    repo_fake.write_text(json.dumps({"merge": [["title:r1", "title:r2"]]}), encoding="utf-8")
+    monkeypatch.setattr(ni, "REPO_OVERRIDES_PATH", repo_fake)
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    (nd / ni.DEDUP_OVERRIDES_JSON).write_text(
+        json.dumps({"merge": [["title:n1", "title:n2"]]}), encoding="utf-8")
+    pairs = ni._pairs_from(ni._read_override_files(nd), "merge")
+    assert [["title:r1", "title:r2"], ["title:n1", "title:n2"]] == pairs   # 并集，不是择一
+    # 指向不存在的路径 = 仓库那侧完全不参与（本文件 autouse fixture 用的就是这一招）
+    monkeypatch.setattr(ni, "REPO_OVERRIDES_PATH", tmp_path / "nope.json")
+    assert ni._read_override_files(None) == []
+
+
+# ---------------- scripts/ 侧回归（脚本无独立测试文件，收在此处） ----------------
+
+def _load_script(name):
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "scripts" / name
+    spec = importlib.util.spec_from_file_location("script_" + name[:-3], path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_audit_citekey_tail_refuses_unparseable_keys():
+    """R1-1：拆不出「姓+4 位年」的 citekey 必须返回 None（跳过），不能把整串当标题实词拼回去。
+
+    旧写法 re.sub 不命中时原样返回，新键 = 姓+年+整个旧键，产物如
+    torresfuertes2026куксенко2024Аналіз —— 含西里尔字符，pandoc citekey 语法不接受。
+    这类键还必然被判为不一致（citekey_parts 对它们返回 year=None），--apply 一定会去改。
+    """
+    aud = _load_script("audit_citekeys_vs_pmlr.py")
+    assert aud.citekey_tail("thakur2024Federated") == "Federated"
+    assert aud.citekey_tail("guillen-ramirez2025Prediction") == "Prediction"
+    for bad in ["molaeiFederated", "anonProceedings", "", None]:
+        assert aud.citekey_tail(bad) is None
+    # citekey_parts 与 citekey_tail 用同一个正则：连字符姓不再被切
+    assert aud.citekey_parts("guillen-ramirez2025Prediction") == ("guillenramirez", 2025)
+    # 新键合法性闸：西里尔尾巴过不去
+    assert aud.VALID_CITEKEY_RE.match("torresfuertes2026Uncertainty")
+    assert not aud.VALID_CITEKEY_RE.match("torresfuertes2026Аналіз")
+
+
+def test_audit_slug_re_accepts_double_letter_suffix_and_digit_surname():
+    """R1-4：PMLR 真实存在 chen22aa / zhang22ab（双字母后缀），窄正则会让它们漏审无声。"""
+    aud = _load_script("audit_citekeys_vs_pmlr.py")
+    assert aud.slug_parts("pmlr:v287/elsharief25a") == ("elsharief", 2025)
+    assert aud.slug_parts("pmlr:v202/o-neill23a") == ("o-neill", 2023)
+    assert aud.slug_parts("pmlr:v162/chen22aa") == ("chen", 2022)
+    assert aud.slug_parts("pmlr:v139/zhang21ab") == ("zhang", 2021)
+    assert aud.slug_parts("pmlr:v235/3dgs24a") == ("3dgs", 2024)
+    assert aud.slug_parts("doi:10.1/x") is None
+
+
+def test_backfill_volume_of_scans_all_path_segments_and_rejects_ambiguity():
+    """R1-8：批次目录可能不在紧邻文件那一层；同时命中两个已登记关键词时必须拒绝而非任选。"""
+    bf = _load_script("backfill_pmlr_metadata.py")
+    assert bf.volume_of("/x/ML4H2025/ji25a.pdf") == "297"
+    assert bf.volume_of("/x/CHIL2025/sub/ji25a.pdf") == "287"       # 多一层子目录也认得
+    assert bf.volume_of("/x/CHIL2025_CHIL2026/ji25a.pdf") is None   # 歧义 → 拒绝
+    assert bf.volume_candidates("/x/CHIL2025_CHIL2026/ji25a.pdf") == {"287", "333"}
+    assert bf.volume_of("/x/ML4H2025/CHIL2026/ji25a.pdf") is None   # 两段各命中一个 → 拒绝
+    assert bf.volume_of("/x/nothing/ji25a.pdf") is None
+    assert bf.volume_candidates("/x/nothing/ji25a.pdf") == set()
+    # 文件名不参与匹配（免得 ML4H2025.pdf 这种命名误判）
+    assert bf.volume_of("/x/misc/ML4H2025.pdf") is None
+
+
+def _build_audit_sandbox(d):
+    """一份含「citekey 与 PMLR slug 不一致」条目的假札记库，供 audit 脚本 --apply 跑。"""
+    ck, title = "torres2026Uncertaintyaware", "Uncertainty Aware Logistic Regression"
+    url = "https://proceedings.mlr.press/v297/torres-fuertes26a.html"
+    stem = "科研札记_2026-08_全文精读"
+    (d / (stem + ".md")).write_text(
+        "# 论文\n## 🔴 高 1. {} [@{}]\n**优先级**: `0.5`\n**链接**: {}\n".format(title, ck, url),
+        encoding="utf-8")
+    (d / (stem + ".references.json")).write_text(
+        json.dumps([{"id": ck, "title": title}], ensure_ascii=False), encoding="utf-8")
+    (d / (stem + ".index.json")).write_text(json.dumps({"papers": [
+        {"citekey": ck, "title": title, "url": url, "doi": None, "arxiv_id": None,
+         "priority_rank": 1, "highlights": [], "tag_counts": {}}]},
+        ensure_ascii=False), encoding="utf-8")
+    return ck
+
+
+def test_audit_apply_separates_partial_from_refused(tmp_path, monkeypatch, capsys):
+    """R2-1（审计脚本这一侧）：改键返回三态时必须分流，别拿返回值当 bool。
+
+    旧写法 `if _rename_citekey_in_note(...)` 会把 "partial" 这个**真值**当成成功：
+    磁盘半改却打印 🔧、rc=0，运维完全收不到信号。
+    """
+    aud = _load_script("audit_citekeys_vs_pmlr.py")
+    _build_audit_sandbox(tmp_path)
+    argv = ["audit", "--notes-dir", str(tmp_path), "--apply"]
+
+    monkeypatch.setattr(aud, "_rename_citekey_in_note", lambda *a, **k: ni.RENAME_PARTIAL)
+    monkeypatch.setattr(aud.sys, "argv", argv)
+    assert aud.main() == 1                       # 半改必须非零退出
+    out = capsys.readouterr().out
+    assert "半改" in out and "🔧" not in out
+    assert "磁盘未改动" not in out               # 半改绝不能说成「磁盘未改动」
+
+    monkeypatch.setattr(aud, "_rename_citekey_in_note", lambda *a, **k: ni.RENAME_REFUSED)
+    monkeypatch.setattr(aud.sys, "argv", argv)
+    assert aud.main() == 1
+    out = capsys.readouterr().out
+    assert "磁盘未改动" in out and "半改" not in out
+
+
+# ---------------- R3：改键对派生物（向量库 / docx）的告知面 ----------------
+
+def _loguru_lines():
+    """loguru 的 sink 收不进 caplog，临时挂一个 list sink（同 test_stale_override_key_warns）。"""
+    from loguru import logger as _lg
+    lines = []
+    return lines, _lg, _lg.add(lines.append, level="INFO")
+
+
+def test_announce_rekey_side_effects_names_stale_docx_and_vector_rebuild(tmp_path):
+    """R3-1/R3-4：改完 citekey 必须把两个派生物的失效讲出来，否则运维零信号。
+
+    改键只落在 md + references.json + sidecar 三处。向量库的 chunk 上内嵌 citekey/year，
+    已渲染的 docx 正文里也写死了 citekey——两者都不会自己跟上，且原先没有任何一行日志
+    提到它们。缺了这一步的现实后果：notes_search --cite 吐出磁盘上已不存在的键，
+    pandoc 渲染成 (key?)；传阅出去的 docx 里的键读者回查不到。
+    """
+    (tmp_path / "科研札记_2026-08_手动精读.docx").write_bytes(b"PK\x03\x04fake")
+    entry = {"citekey": "fani2026Coefficient", "month": "2026-08",
+             "note_file": "科研札记_2026-08_手动精读.md"}
+
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(tmp_path, [entry])
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+
+    assert len(out["stale_docx"]) == 1
+    assert out["stale_docx"][0]["month"] == "2026-08"
+    assert "科研札记_2026-08_手动精读.docx" in blob      # 点名到具体文件
+    assert "2026-08" in blob                             # 受影响月份
+    assert "notes_embed.py" in blob                      # 向量库重建命令
+    # 库文件不存在 → 只提示不同步，绝不因此报错或连 Ollama
+    assert out["synced"] is False and out["error"] is None
+
+
+def test_announce_rekey_side_effects_is_silent_when_nothing_renamed(tmp_path):
+    """没改任何键就不该刷屏——告警刷成噪音等于没有告警。"""
+    (tmp_path / "科研札记_2026-08_手动精读.docx").write_bytes(b"PK\x03\x04fake")
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(tmp_path, [])
+    finally:
+        _lg.remove(sink)
+    assert out == {"stale_docx": [], "synced": False, "error": None}
+    assert not [s for s in lines if "notes_embed" in s or "docx" in s]
+
+
+def test_fix_citekey_collisions_announces_derived_artifacts(tmp_path):
+    """R3-1/R3-4 端到端：撞键自动改键这条路径也必须走收尾告知（原先改完就静默返回）。"""
+    _write_month(tmp_path, month="2024-01",
+                 citekeys={"pa": "wang2024Same", "pb": "lee2025Graph", "pc": None})
+    _write_month(tmp_path, month="2024-05",
+                 citekeys={"pa": "x2024A", "pb": "x2024B", "pc": None})
+    stem5 = "科研札记_2024-05_全文精读"
+    md5 = tmp_path / (stem5 + ".md")
+    md5.write_text(md5.read_text(encoding="utf-8").replace("[@x2024A]", "[@wang2024Same]"),
+                   encoding="utf-8")
+    rp5 = tmp_path / (stem5 + ".references.json")
+    items = json.loads(rp5.read_text(encoding="utf-8"))
+    for it in items:
+        if it["id"] == "x2024A":
+            it["id"] = "wang2024Same"
+            it["DOI"] = "10.9/other"
+            it["title"] = "Another Different Paper"
+    rp5.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    md5.write_text(md5.read_text(encoding="utf-8").replace(
+        "Deep | EHR [Models] under MNAR", "Another Different Paper"), encoding="utf-8")
+    (tmp_path / (stem5 + ".docx")).write_bytes(b"PK\x03\x04fake")   # 该月已渲染过
+
+    lines, _lg, sink = _loguru_lines()
+    try:
+        renamed = ni.fix_citekey_collisions(tmp_path)
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+
+    assert renamed == 1
+    assert "notes_embed.py" in blob                       # 向量库失效必须讲出来
+    assert stem5 + ".docx" in blob                        # 且点名被改月份的过期 docx
+    # 没被改键的那个月的 docx 不该被拉进清单
+    assert "科研札记_2024-01_全文精读.docx" not in blob
+
+
+def test_audit_apply_announces_derived_artifacts(tmp_path, monkeypatch, capsys):
+    """R3-1：audit --apply 这条改键路径同样要收尾告知（它此前也是改完直接退出）。"""
+    aud = _load_script("audit_citekeys_vs_pmlr.py")
+    _build_audit_sandbox(tmp_path)
+    (tmp_path / "科研札记_2026-08_全文精读.docx").write_bytes(b"PK\x03\x04fake")
+    monkeypatch.setattr(aud, "_rename_citekey_in_note", lambda *a, **k: ni.RENAME_OK)
+    monkeypatch.setattr(aud.sys, "argv", ["audit", "--notes-dir", str(tmp_path), "--apply"])
+
+    lines, _lg, sink = _loguru_lines()
+    try:
+        rc = aud.main()
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+
+    assert rc == 0
+    assert "notes_embed.py" in blob
+    assert "科研札记_2026-08_全文精读.docx" in blob
+    capsys.readouterr()
+
+
+def test_audit_apply_stays_silent_about_derived_artifacts_when_nothing_changed(
+        tmp_path, monkeypatch, capsys):
+    """预检不过、磁盘零改动时不该喊「向量库失效」——那是假警报，会稀释真警报。"""
+    aud = _load_script("audit_citekeys_vs_pmlr.py")
+    _build_audit_sandbox(tmp_path)
+    monkeypatch.setattr(aud, "_rename_citekey_in_note", lambda *a, **k: ni.RENAME_REFUSED)
+    monkeypatch.setattr(aud.sys, "argv", ["audit", "--notes-dir", str(tmp_path), "--apply"])
+
+    lines, _lg, sink = _loguru_lines()
+    try:
+        aud.main()
+    finally:
+        _lg.remove(sink)
+    assert "notes_embed.py" not in "\n".join(lines)
+    capsys.readouterr()

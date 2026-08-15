@@ -1,0 +1,83 @@
+{
+  "_doc": "人工裁决的同文/非同文对。merge=标题相似度层够不着的真重复（改写幅度大、两侧都无 DOI），无条件合并；distinct=已人工确认「不是同一篇」的假阳性，此后不再出现在 INDEX.md「疑似重复」节。键用 literature_index.json 的 dedup_key；候选对见 INDEX.md「疑似重复」节。",
+  "merge": [
+    [
+      "openreview:x4UK4GadLd",
+      "pmlr:v297/fani26a"
+    ],
+    [
+      "doi:10.21203/rs.3.rs-4124710/v1",
+      "title:longcovidincidenceproportioninadultsandchildrenbetween2020and2024"
+    ],
+    [
+      "title:federatedlearningusedforpredictingoutcomesinsarscov2patients",
+      "title:federatedlearningforpredictingclinicaloutcomesinpatientswithcovid19"
+    ]
+  ],
+  "_notes": {
+    "volatility-aware / coefficient-of-variation": "同一篇：arXiv 预印本《Volatility-Aware Masking Improves…》与 ML4H 2025 正刊《Coefficient of Variation Masking…》(PMLR 297:1376-1391, Fani et al.)。2026-08-13 亲读 PDF 核实同文，两侧均无 DOI 故精确键与相似度层(cos=0.50)都判不出。",
+    "mandel long-covid": "同一研究的预印本与正式版：《Long COVID incidence in adults and children between 2020 and 2023(RECOVER Initiative)》与《Long-COVID incidence proportion in adults and children between 2020 and 2024》。前五位作者同序同名（Mandel/Yoo/Allen/Abedian/Verzani），观察窗由 2023 延到 2024，属版本更新非另一项研究。2026-08-14 裁决。",
+    "dayan EXAM federated": "同一研究的预印本与正式版：Research Square rs-126892《Federated Learning used for predicting outcomes in SARS-COV-2 patients》(PMID 33442676) 即 Nature Medicine 2021《Federated learning for predicting clinical outcomes in patients with COVID-19》(PMID 34526699, Dayan/Roth et al. EXAM 研究) 的预印本。2026-08-14 经检索核实。",
+    "distinct 批次 2026-08-14": "其余 14 对经逐对人工判读为不同论文，主要假阳源：标题被解析截断成套话（「Healthcare Analytics」「ICU ADMISSION PREDICTION」「1 Deep Learning Models」「Building the Model」）、同领域高频词共现（federated/differential privacy/sepsis/tensor factorization），以及一对跨语言噪声（乌克兰语 COVID 天气分析 vs 儿童 COVID 预测模型）。题名被截断的那几条是元数据解析残缺，宜后续用 --title 重跑修元数据，而非当重复处理。",
+    "键迁移 2026-08-15": "新增 pmlr:/openreview: 键层后，5 条裁决的键由 title: 迁到场地原生 id。原文件备份在 dedup_overrides.json.bak。",
+    "键大小写修正 2026-08-15": "OpenReview 的 forum id 区分大小写（base62），原先 venue_native_id 一律 .lower() 会把仅大小写不同的两个 id 折成同一个键（静默吞篇）。改为 PMLR 小写归一、OpenReview 原样保留后，本文件里 3 个 openreview: 键同步改回原始大小写（x4UK4GadLd / F3G2udCF3Q / 6r2acwubHf，取自各篇 url）。"
+  },
+  "distinct": [
+    [
+      "title:amodeltodataapproachforbuildingaccuratemachinelearningalgorithmsonehrdata",
+      "title:buildingthemodel"
+    ],
+    [
+      "title:healthcareanalytics",
+      "title:cohortlearningforeffectiveandinterpretablehealthcareanalytics"
+    ],
+    [
+      "doi:10.1016/j.jksuci.2022.07.006",
+      "title:enablingprivacypreservingpredictionforlengthofstayinicuamultimodalfederatedlearningbasedapproach"
+    ],
+    [
+      "openreview:F3G2udCF3Q",
+      "arxiv:2511.02531v5"
+    ],
+    [
+      "title:networkgenerationwithdifferentialprivacy",
+      "doi:10.70675/a3e85b6ezd607z4616zb7f1zdd23c24f937c"
+    ],
+    [
+      "title:earlypredictionofsepsisonsetevaluatingsupervisedmachinelearningtechniques",
+      "doi:10.1007/978-3-032-17216-7_1"
+    ],
+    [
+      "title:dyhealthmakingneuralnetworksdynamicforeffectivehealthcareanalytics",
+      "title:cohortlearningforeffectiveandinterpretablehealthcareanalytics"
+    ],
+    [
+      "title:temporalirregulartensorfactorizationandpredictionforhealthdataanalysis",
+      "pmlr:v225/ren23a"
+    ],
+    [
+      "doi:10.11603/2411-1597.2023.3-4.14543",
+      "title:predictionmodelsforcovid19inchildren"
+    ],
+    [
+      "doi:10.1007/978-3-031-42935-4_15",
+      "openreview:6r2acwubHf"
+    ],
+    [
+      "doi:10.1109/cbms52027.2021.00065",
+      "title:icuadmissionprediction"
+    ],
+    [
+      "title:robustcounterfactuallearningforclinicaldecisionmakingusingelectronichealthrecords",
+      "doi:10.48550/arxiv.2308.01605"
+    ],
+    [
+      "title:networkgenerationwithdifferentialprivacy",
+      "doi:10.1038/s41598-022-05539-7"
+    ],
+    [
+      "title:generalizableriskpredictivedeeplearningmodels",
+      "title:1deeplearningmodels"
+    ]
+  ]
+}

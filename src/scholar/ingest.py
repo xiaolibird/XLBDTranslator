@@ -51,7 +51,8 @@ def week_label(d: Optional[date] = None) -> str:
 def dedup_key(meta: PaperMetadata) -> str:
     """全局去重键（权威实现在 notes_index，与索引同源同规则）。"""
     from ._citekey_utils import dedup_key_fields
-    return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id)
+    return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id,
+                            url=getattr(meta, "url", None))
 
 
 def enrich_segments(segs: Sequence[PaperSegment], email: str,
@@ -218,6 +219,7 @@ def _seg_from_norm(item: Dict[str, Any], sid: int, source: str,
         title=item.get("title", ""),
         authors=authors,
         publication_date=item.get("publication_date") or item.get("published"),
+        date_precision=item.get("date_precision"),
         journal=item.get("journal"),
         doi=item.get("doi"),
         arxiv_id=item.get("arxiv_id"),
@@ -307,7 +309,14 @@ def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
 # ---------------------------------------------------------------- 共用管线
 
 def _existing_note_dedup_keys(out_dir: Path, filename: str) -> Optional[Set[str]]:
-    """读同名周札记的 sidecar 索引，取其已收录论文的 dedup_key 全集。
+    """读同名周札记的 sidecar 索引，取其已收录论文的 dedup_key 全集（按**当前**键梯重算）。
+
+    重算而非直读 papers[].dedup_key：sidecar 是 write_notes 当时写下的快照，键也被冻在
+    那一刻。键梯一升级（2026-08-15 加 pmlr:/openreview: 层），调用方那侧 `dedup_key(seg.metadata)`
+    走新规则、这侧却还是旧键，同一篇论文两边拿到两个键 → existing - new 恒非空 →
+    同 label 重跑被误报「含 N 篇本批未覆盖的论文，拒绝写入」，提示换 --label，而换 label
+    会真的产出重复札记。实测该状态在库内已存在 43 条。重算逻辑与 notes_index.build_month_entries
+    共用 _citekey_utils.recompute_entry_key，杜绝两处再次漂移。
 
     write_notes() 是 `open(path, "w")` 整篇重写：同一 label 第二次跑若 segs 里
     不含上一批论文（跨库去重会把它们过滤掉——它们已经"在库里"），整篇覆盖会
@@ -326,13 +335,16 @@ def _existing_note_dedup_keys(out_dir: Path, filename: str) -> Optional[Set[str]
                    静默当作"没有既有内容"直接放行覆盖。
     """
     from .notes import _slug
+    from ._citekey_utils import recompute_entry_key
     slug = _slug(filename, 80) or "scholar_digest"
     note_path = out_dir / "{}.md".format(slug)
     if not note_path.exists():
         return None
     sidecar_path = out_dir / "{}.index.json".format(slug)
     data = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    return {e.get("dedup_key") for e in data.get("papers", []) if e.get("dedup_key")}
+    # 过滤条件与重算前一致（只认本来就落了键的条目），改的只是「拿哪一版键」
+    return {recompute_entry_key(e) for e in data.get("papers", [])
+            if isinstance(e, dict) and e.get("dedup_key")}
 
 
 def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: str,

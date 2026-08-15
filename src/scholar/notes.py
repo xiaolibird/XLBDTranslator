@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from .schema import PaperSegment, PaperMetadata
-from ._citekey_utils import _fallback_citekey, _priority_tier, _suffix_seq, entry_from_segment
+from ._citekey_utils import (_fallback_citekey, _priority_tier, _suffix_seq,
+                             entry_from_segment, date_parts)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -225,8 +226,10 @@ def build_csl_item(meta: PaperMetadata, citekey: str) -> Dict[str, Any]:
     if meta.pages:
         item["page"] = meta.pages
     if meta.publication_date:
-        d = meta.publication_date
-        item["issued"] = {"date-parts": [[d.year, d.month, d.day]]}
+        # issued = CSL 的**出版日期**（与 issue 期号无关）。按 date_precision 截断，
+        # 别把补出来的占位月日当真——否则参考文献会渲染出论文并不存在的月份。
+        item["issued"] = {"date-parts": date_parts(meta.publication_date,
+                                                   getattr(meta, "date_precision", None))}
     return item
 
 
@@ -243,6 +246,7 @@ def write_notes(
     emit_index_sidecar: bool = True,
     index_series: str = "auto",
     existing_citekeys: Optional[set] = None,
+    explicit_citekey_source: str = "zotero",
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
@@ -252,6 +256,11 @@ def write_notes(
         out_dir: 输出目录
         digest_title: 聚合札记标题
         filename: 输出文件名（不含扩展名）
+        explicit_citekey_source: 显式传入的（非 None）citekey 在 sidecar 里标成哪种来源。
+            默认 "zotero"——自动链路传进来的确实是 Zotero/BBT 权威键。
+            但手动精读的 regen 会把**上一轮自己生成的兜底键**显式传回来沿用（见
+            read_pdf._rebuild_month），那些键并非权威，必须传 "fallback"，
+            否则 sidecar 会把兜底键冒充成 Zotero 键，下游按 citekey_source 判权威时会误判。
     Returns: 摘要 dict（聚合札记路径、references 路径、缺 key 数）
     """
     out_dir = Path(out_dir)
@@ -305,7 +314,7 @@ def write_notes(
                 key = citekeys.get(seg.paper_id) or \
                     "MISSING-KEY-{}".format(seg.metadata.doi or seg.paper_id[:8])
                 # 占位键（未开兜底且无 Zotero key）标 "missing"，消费方据此过滤
-                src = ("zotero" if seg.paper_id in zotero_keyed
+                src = (explicit_citekey_source if seg.paper_id in zotero_keyed
                        else "missing" if key.startswith("MISSING-KEY-") else "fallback")
                 entries.append(entry_from_segment(seg, key, rank=i, total=len(ordered),
                                                   citekey_source=src, series=index_series))

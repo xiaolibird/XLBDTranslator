@@ -41,6 +41,47 @@ from src.utils.notify import notify                          # noqa: E402
 logger = get_logger("ingest_cli")
 
 
+def _refresh_index_and_vectors(settings) -> None:
+    """刷文献索引 + best-effort 同步向量库。**空窗周也必须走一遍**。
+
+    为什么不能挂在「有新论文」分支里：本脚本（周一 09:30 launchd）是向量库唯一的
+    自动同步入口，而向量库会因为**入库之外的原因**变旧——改键（audit_citekeys_vs_pmlr
+    --apply / notes_index --fix-collisions）、改元数据、手工重建索引，都会让 chunk 上的
+    citekey/year 与磁盘对不上。「本批没有新内容要嵌」不蕴含「向量库不需要动」：
+    索引可能因为改键而变了，而入库批次是空的。原先两条「无新论文」早退直接 return 1，
+    跳过这一整段，于是只要连着几周没有新论文，陈旧状态就无限期存续，且日志上只写着
+    「无新论文」——读起来像一切正常。
+
+    向量同步走 best-effort：周一无人值守绝不能因 Ollama 没起而失败。任何异常
+    （Ollama 不可达 / 模型未 pull / 网络问题）只 log warning + 弹系统通知，
+    不改变退出码、不中断脚本——向量库是索引的纯派生物，缺一次同步不影响入库结果。
+    """
+    from src.scholar.notes_index import update_index, write_outputs
+    nd = Path(settings.processing.notes_dir)
+    index_data = update_index(nd)
+    write_outputs(index_data, nd)      # 增量：只重解析新增的周文件
+    logger.info("文献索引已刷新")
+
+    try:
+        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
+        from src.scholar.embed_store import DB_NAME, sync_store
+        client = EmbeddingClient(
+            base_url=resolve_embedding_base_url(settings.llm),
+            model=settings.llm.embedding_model,
+        )
+        try:
+            stats = sync_store(nd / DB_NAME, index_data, client)
+        finally:
+            client.close()
+        logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+            stats.embedded, stats.deleted, stats.meta_refreshed))
+    except Exception as e:
+        logger.warning("向量库同步跳过（不影响入库）：{}".format(e))
+        # launchd 无人值守时 warning 没人看——弹系统通知，向量库静默落后要有人知道
+        # （notify 自身失败静默，不会反过来影响入库退出码）
+        notify("Scholar 周入库", "向量库同步失败（札记已入库）：{}".format(str(e)[:120]))
+
+
 def parse_pick(spec: str, n: int) -> list:
     """`2,3,5` 或 `1-4,7` → 0-based 下标；越界即报错，不静默忽略（少入库比乱入库更难发现）。"""
     out = []
@@ -162,6 +203,10 @@ def main() -> int:
                 before - len(segs), len(seen), len(segs)))
         if not segs:
             print("该窗口的论文都已入库，无新论文。", file=sys.stderr)
+            # 空窗周也要过一遍索引+向量同步（见 _refresh_index_and_vectors 的文档）。
+            # --list / --dry-run 是只看不写的入口，保持零写盘。
+            if not (args.no_index or args.list_only or args.dry_run):
+                _refresh_index_and_vectors(settings)
             return 1
 
     # ---- 挑选 ----
@@ -188,36 +233,13 @@ def main() -> int:
                          close_read=not args.no_close_read, seen=seen)
     if rep["status"] == "empty":
         print("\n去重后无新论文，未写盘。", file=sys.stderr)
+        # 同上：本批为空 ≠ 向量库不用动（改键/改元数据同样会让它变旧）
+        if not args.no_index:
+            _refresh_index_and_vectors(settings)
         return 1
 
     if not args.no_index:
-        from src.scholar.notes_index import update_index, write_outputs
-        nd = Path(settings.processing.notes_dir)
-        index_data = update_index(nd)
-        write_outputs(index_data, nd)      # 增量：只重解析新增的周文件
-        logger.info("文献索引已刷新")
-
-        # best-effort 向量同步：周一 09:30 launchd 自动入库绝不能因 Ollama 没起而失败。
-        # 任何异常（Ollama 不可达/模型未 pull/网络问题）只 log warning，不改变退出码，
-        # 不中断脚本——向量库是索引的纯派生物，缺一次同步不影响本次入库结果。
-        try:
-            from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-            from src.scholar.embed_store import DB_NAME, sync_store
-            client = EmbeddingClient(
-                base_url=resolve_embedding_base_url(settings.llm),
-                model=settings.llm.embedding_model,
-            )
-            try:
-                stats = sync_store(nd / DB_NAME, index_data, client)
-            finally:
-                client.close()
-            logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
-                stats.embedded, stats.deleted, stats.meta_refreshed))
-        except Exception as e:
-            logger.warning("向量库同步跳过（不影响入库）：{}".format(e))
-            # launchd 无人值守时 warning 没人看——弹系统通知，向量库静默落后要有人知道
-            # （notify 自身失败静默，不会反过来影响入库退出码）
-            notify("Scholar 周入库", "向量库同步失败（札记已入库）：{}".format(str(e)[:120]))
+        _refresh_index_and_vectors(settings)
 
     print("\n{}".format("=" * 66))
     print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))

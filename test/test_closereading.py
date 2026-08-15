@@ -571,3 +571,19 @@ def test_deep_budget_reaches_europepmc_branch(monkeypatch):
                                 deep=False)
     assert seen["max_chars"] == 40000
     assert out.source == "europepmc" and out.reading_depth == "single-call"
+
+
+def test_prompts_require_experiment_method_section():
+    """两条精读 prompt 都必须要「实验方法」节，且明确「原文未报告」的写法。
+
+    加这一节是为了让札记直接给出可复现的实验细节（数据集/划分/超参/评估协议/代码），
+    此前这些散落在「方法与数据」里、深浅不一。空值处理沿用全库口径：
+    原文没写就显式写出来，不许省略、更不许推测填补。
+    """
+    from src.scholar.closereading import _CLOSEREAD_PROMPT
+    from src.scholar.pdf_ingest import _SYNTH_PROMPT
+    for name, p in (("单跳版", _CLOSEREAD_PROMPT), ("深读汇总版", _SYNTH_PROMPT)):
+        assert "实验方法" in p, name
+        assert "原文未报告" in p, name
+    # 单跳版会被「只有摘要」的降级篇用到，硬要页码会诱导编造 —— 必须是软化措辞
+    assert "仅在可得文本确有报告时" in _CLOSEREAD_PROMPT

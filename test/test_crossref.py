@@ -94,3 +94,26 @@ def test_crossref_lookup_network_error_returns_none():
         raise httpx.ConnectError("boom")
     client = httpx.Client(transport=httpx.MockTransport(handler))
     assert crossref.crossref_lookup("whatever title here", email="x@y.com", client=client) is None
+
+
+def test_parse_crossref_work_records_true_date_precision():
+    """Crossref 的 date-parts 长度就是真实精度：补出来的月日不能被当成确切出版日。
+
+    date 对象仍补 1（下游 citekey 取年与索引 year 都依赖它非空），
+    精度另存 date_precision，只在 CSL/Zotero 产出层截断。
+    """
+    from src.scholar.crossref import parse_crossref_work
+    def work(dp):
+        return {"title": ["T"], "author": [{"family": "X", "given": "Y"}],
+                "issued": {"date-parts": [dp]}, "DOI": "10.1/x"}
+
+    y = parse_crossref_work(work([2026]))
+    assert y["date_precision"] == "year"
+    assert y["publication_date"].month == 1 and y["publication_date"].day == 1
+
+    m = parse_crossref_work(work([2026, 5]))
+    assert m["date_precision"] == "month"
+    assert m["publication_date"].day == 1          # 占位，但精度已如实记录
+
+    d = parse_crossref_work(work([2026, 5, 5]))
+    assert d["date_precision"] == "day"

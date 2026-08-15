@@ -409,3 +409,144 @@ def test_library_neighbors_happy_path():
     assert hits[0]["one_line"] == "一句话甲"
     assert hits[1]["one_line"] == ""                                   # 无 one_line 不错位
     assert wf._library_neighbors_cache[7] == hits                      # 已入缓存
+
+
+# ---------------- R3：陈旧向量库的告警与降级 ----------------
+
+def _stale_store(src="2026-08-14T20:23:56"):
+    from src.scholar.embed_store import VectorStore
+    return VectorStore({"model": "bge-m3", "dim": "2", "source_generated_at": src},
+                       [{"level": "paper", "citekey": "fani2025Coefficient", "year": 2025,
+                         "text": "T\n一句话"}],
+                       np.array([[1.0, 0.0]], dtype=np.float32))
+
+
+def test_freshness_warning_says_citekeys_may_be_dead_not_just_incomplete():
+    """R3-5：措辞必须点明「检索到的 citekey 可能已注销」，不能只说「可能漏掉最新内容」。
+
+    只说"漏内容"会把危害说轻——读者的合理反应是"那我先用着，反正只是不全"，
+    于是照单全收地把 [@已注销键] 粘进稿子，直到 pandoc 报 not found 才发现。
+    """
+    warn = _stale_store().freshness_warning("2026-08-15T14:47:18")
+    assert warn is not None
+    assert "citekey" in warn
+    assert "改名" in warn or "删除" in warn          # 说清是"键没了"，不是"内容少了"
+    assert "书目" in warn or "pandoc" in warn        # 说清后果落在哪
+    assert "notes_embed.py" in warn                  # 且给得出可执行的补救
+
+
+def test_freshness_warning_silent_when_store_is_current():
+    store = _stale_store(src="2026-08-15T14:47:18")
+    assert store.freshness_warning("2026-08-15T14:47:18") is None
+    assert store.freshness_lag_seconds("2026-08-15T14:47:18") is None
+
+
+def test_freshness_lag_seconds_measures_gap_and_tolerates_junk():
+    """幅度用于「提醒还是降级」的分档；时间戳解析不了要返回 None 交给调用方从严处理。"""
+    store = _stale_store(src="2026-08-14T20:00:00")
+    assert store.freshness_lag_seconds("2026-08-15T20:00:00") == pytest.approx(86400.0)
+    assert store.freshness_lag_seconds("不是时间戳") is None
+    assert store.freshness_lag_seconds(None) is None
+
+
+def test_read_index_generated_at_head_and_fallback(tmp_path):
+    """8MB 索引不值得为一个时间戳整份解析：头部正则命中即可；字段挪到尾部也要能兜住。"""
+    from src.scholar.embed_store import read_index_generated_at
+    import json as _json
+    p = tmp_path / "literature_index.json"
+    p.write_text('{\n "schema_version": 4,\n "generated_at": "2026-08-15T14:47:18",\n'
+                 ' "papers": []\n}', encoding="utf-8")
+    assert read_index_generated_at(p) == "2026-08-15T14:47:18"
+    # 字段被 9KB 的填充挤出头部窗口 → 退回整份解析
+    p.write_text(_json.dumps({"pad": "x" * 9000, "generated_at": "2026-01-01T00:00:00"}),
+                 encoding="utf-8")
+    assert read_index_generated_at(p) == "2026-01-01T00:00:00"
+    assert read_index_generated_at(tmp_path / "nope.json") is None
+    (tmp_path / "broken.json").write_text("{半个 JSON", encoding="utf-8")
+    assert read_index_generated_at(tmp_path / "broken.json") is None
+
+
+def _wf_with_db(tmp_path, index_generated_at, store_src):
+    """造一个「库已建好但快照时间可控」的 workflow，走 _vector_store is None 那条真实分支。"""
+    import sqlite3
+    from types import SimpleNamespace
+    from src.scholar.embed_store import DB_NAME, sync_store
+    from src.scholar.workflow import ScholarWorkflow
+
+    db = tmp_path / DB_NAME
+    sync_store(db, {"papers": [_paper("fani2025Coefficient")]}, _FakeEmbedClient())
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE meta SET value=? WHERE key='source_generated_at'", (store_src,))
+    conn.commit()
+    conn.close()
+    (tmp_path / "literature_index.json").write_text(
+        '{"schema_version": 4, "generated_at": "%s", "papers": []}' % index_generated_at,
+        encoding="utf-8")
+
+    # query 侧直接回放库里那条向量：余弦恒为 1，测的是"降不降级"而非相似度算法
+    stored = VectorStore.load(db).mat[0].copy()
+
+    class _Client:
+        model = "bge-m3"
+        def probe(self):
+            return {"model": "bge-m3", "dim": int(stored.shape[0])}
+        def embed(self, texts, batch_size=64):
+            return np.tile(stored, (len(texts), 1))
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=tmp_path),
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None,
+                            ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = None
+    wf._paper_mask = None
+    wf._embedding_client = _Client()
+    wf._library_neighbors_unavailable = False
+    return wf
+
+
+def test_library_neighbors_degrades_when_vector_store_is_badly_stale(tmp_path):
+    """R3-2：周一 09:00 无人值守的 digest 近邻注入直接吃向量库的 citekey/year。
+
+    库一旧，注入给 LLM 的就是已注销的旧键与旧年份（"你的札记库里已有 fani2025Coefficient
+    (2025)"，而磁盘上这篇现在叫 fani2026Coefficient/2026）。近邻注入的用途正是判"是否与
+    已入库文献重复"，喂错年份直接干扰该判断，LLM 还可能把旧键回写进 reason 固化下去。
+    这条路径此前**根本不调 freshness_warning**——有人盯着的 CLI 会告警，无人值守的定时
+    任务反而静默，恰好反了。落后过阈值时宁可本轮没有近邻。
+    """
+    from loguru import logger as _lg
+    from types import SimpleNamespace
+    wf = _wf_with_db(tmp_path, "2026-08-15T14:47:18", "2026-08-01T00:00:00")   # 落后 14 天
+    seg = SimpleNamespace(segment_id=1, metadata=SimpleNamespace(title="q"), original_abstract="a")
+
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        out = wf._library_neighbors([seg])
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+
+    assert out == {1: []}                              # 走既有的降级分支，不注入陈旧身份
+    assert wf._library_neighbors_unavailable is True
+    assert "落后" in blob and "notes_embed.py" in blob   # 且告警说得出原因与补救
+
+
+def test_library_neighbors_warns_but_still_serves_when_only_slightly_stale(tmp_path):
+    """轻微落后（远小于阈值）只提醒不降级——刚入库那几分钟的正常抖动不该废掉整轮 RAG。"""
+    from loguru import logger as _lg
+    from types import SimpleNamespace
+    wf = _wf_with_db(tmp_path, "2026-08-15T14:47:18", "2026-08-15T14:00:00")   # 落后 47 分钟
+    seg = SimpleNamespace(segment_id=1, metadata=SimpleNamespace(title="q"), original_abstract="a")
+
+    lines = []
+    sink = _lg.add(lines.append, level="WARNING")
+    try:
+        out = wf._library_neighbors([seg], k=3, min_sim=0.5)
+    finally:
+        _lg.remove(sink)
+
+    assert wf._library_neighbors_unavailable is False
+    assert [h["citekey"] for h in out[1]] == ["fani2025Coefficient"]   # 仍然出结果
+    assert any("落后" in s for s in lines)                              # 但提醒照打

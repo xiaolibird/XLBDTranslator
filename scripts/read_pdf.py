@@ -212,6 +212,61 @@ def _sync_embedding_best_effort(notes_dir: Path, index: dict, settings) -> None:
         logger.warning("向量库同步跳过（不影响手动精读结果）：{}".format(e))
 
 
+def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
+    """按 dedup_key 沿用上一轮 sidecar 里的 citekey，返回 {paper_id: citekey|None}。
+
+    为什么必须沿用：finalize/regen 是**整月重建**，此前 citekeys 全传 None，
+    write_notes 会对每篇现算 `_fallback_citekey(metadata)`。于是任何在札记侧做过的
+    改键（如 audit_citekeys_vs_pmlr.py 按 PMLR 官方 slug 修正复姓/年份，实测 22 篇）
+    都会在下一次 regen 被 bundle 里的旧元数据顶回去——bundle 里根本没有 citekey 字段，
+    它不是身份、只是每次现算的派生量。沿用的锚点用 dedup_key（doi/arxiv/场地 id/标题），
+    与索引侧同一套键梯，故 bundle 元数据变动不影响匹配。
+
+    两侧撞键都拒绝沿用（宁可退回 fallback 让 used 集合去消歧，也不能让两篇共用一个键）：
+      - 旧 sidecar 里同一 dedup_key 出现多次（历史撞键态）；
+      - **本批 segments 里同一 dedup_key 出现多次**（同 DOI 的 PDF 改标题重 ingest
+        会产出两个 paper_id、两份 bundle）。此时若都命中映射就会拿到同一个显式键，
+        而 write_notes 对显式键不做查重（notes.py 的消歧循环只处理 None），
+        结果是一份 md 里两篇同 citekey —— 静默撞键。
+    """
+    from src.scholar._citekey_utils import recompute_entry_key
+    from src.scholar.ingest import dedup_key as seg_dedup_key
+
+    out = {seg.paper_id: None for seg in segments}
+    sidecar = notes_dir / "科研札记_{}_手动精读.index.json".format(month)
+    if not sidecar.exists():
+        return out
+    try:
+        rows = (json.loads(sidecar.read_text(encoding="utf-8")) or {}).get("papers") or []
+    except Exception as e:                      # 坏 sidecar 不该挡住重建
+        logger.warning("  ⚠️ 读 sidecar 失败，本次不沿用 citekey（{}）: {}".format(sidecar.name, e))
+        return out
+
+    prev: dict = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("citekey"):
+            continue
+        k = recompute_entry_key(r)
+        prev[k] = None if k in prev else r["citekey"]   # 出现第二次 → 置 None = 拒绝沿用
+
+    seen: dict = {}
+    for seg in segments:
+        seen.setdefault(seg_dedup_key(seg.metadata), []).append(seg.paper_id)
+
+    reused = 0
+    for k, pids in seen.items():
+        if len(pids) > 1:                       # 本批自身撞键 → 全走 fallback
+            logger.warning("  ⚠️ 本批 {} 篇共用 dedup_key {}，均不沿用旧键".format(len(pids), k))
+            continue
+        ck = prev.get(k)
+        if ck:
+            out[pids[0]] = ck
+            reused += 1
+    if reused:
+        logger.info("  沿用上一轮 citekey {} 篇（按 dedup_key 匹配）".format(reused))
+    return out
+
+
 def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     """从当月全部 final bundle 重建手动精读四件套 + 刷索引。"""
     from src.scholar.pdf_ingest import load_bundle, segment_from_bundle, BUNDLE_SUFFIX
@@ -252,7 +307,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         _sync_embedding_best_effort(notes_dir, idx, settings)
         return {"month": month, "papers": 0, "skipped_drafts": skipped, "index": idx}
 
-    citekeys = {seg.paper_id: None for seg in segments}
+    citekeys = _reuse_citekeys(notes_dir, month, segments)
     res = write_notes(
         segments, citekeys, out_dir=notes_dir,
         instruction=proc.notes_instruction,
@@ -260,7 +315,9 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         filename="科研札记_{}_手动精读".format(month),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True, index_series="manual",
-        existing_citekeys=existing_ckeys)
+        existing_citekeys=existing_ckeys,
+        # 沿用的是上一轮的兜底键，不是 Zotero 权威键，别在 sidecar 里冒充
+        explicit_citekey_source="fallback")
     # 这份索引直接带给 _report_final 复用：全量重建要扫全部札记 md，跑两遍纯属白等
     idx = update_index(notes_dir)
     write_outputs(idx, notes_dir)

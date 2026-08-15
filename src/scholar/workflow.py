@@ -708,19 +708,40 @@ class ScholarWorkflow:
         try:
             import numpy as np
 
-            from .embed_store import DB_NAME, VectorStore, model_matches
+            from .embed_store import (
+                DB_NAME, INDEX_NAME, STALE_DEGRADE_SECONDS, VectorStore,
+                model_matches, read_index_generated_at,
+            )
             from .embeddings import EmbeddingClient, EmbeddingError, resolve_embedding_base_url
 
             if self._vector_store is None:
                 # repo_path 自锚定：不依赖调用方（scholar_main 锚了，screen_journal 之类的新
                 # 调用方忘了锚就会指向 <cwd>/output/... 并被下面的 except 吞成静默降级）
-                db_path = repo_path(self.settings.processing.notes_dir) / DB_NAME
+                notes_dir = repo_path(self.settings.processing.notes_dir)
+                db_path = notes_dir / DB_NAME
                 self._vector_store = VectorStore.load(db_path)
                 want_model = getattr(self.settings.llm, "embedding_model", None) or "bge-m3"
                 if not model_matches(self._vector_store.model, want_model):
                     raise EmbeddingError(
                         "向量库 embedding 模型 {} 与配置 {} 不一致，先跑 notes_embed.py --full 重建"
                         .format(self._vector_store.model, want_model))
+                # 新鲜度：注入给 LLM 的 citekey/year 直接取自 chunk 元数据，库一旧就会把
+                # 已注销的旧键与旧年份当成"库里已有这篇"喂进裁决。digest 是周一 09:00 无人
+                # 值守跑的，notes_search 那种"打给人看的 stderr 提醒"在这里等于没有——
+                # 必须自己告警，落后过久还要直接降级（宁可本轮没有近邻，也不用错身份）。
+                index_generated_at = read_index_generated_at(notes_dir / INDEX_NAME)
+                warn = self._vector_store.freshness_warning(index_generated_at)
+                if warn:
+                    logger.warning("  {}".format(warn))
+                    lag = self._vector_store.freshness_lag_seconds(index_generated_at)
+                    # lag is None = 已判定旧但算不出幅度（时间戳格式异常），从严当超阈值处理
+                    if lag is None or lag > STALE_DEGRADE_SECONDS:
+                        raise EmbeddingError(
+                            "向量库快照落后当前索引 {}，超过 {} 小时阈值——本次拒绝用它做近邻"
+                            "（陈旧库会把已改名/已删除的 citekey 与旧年份注入裁决）。"
+                            "先跑 PYTHONPATH=. python scripts/notes_embed.py 增量同步".format(
+                                "{:.1f} 小时".format(lag / 3600.0) if lag else "（幅度未知）",
+                                STALE_DEGRADE_SECONDS // 3600))
                 self._paper_mask = np.array(
                     [rec.get("level") == "paper" for rec in self._vector_store.records], dtype=bool)
             store = self._vector_store

@@ -74,7 +74,11 @@ def paper_to_zotero_item(
     }
 
     if meta.publication_date:
-        item["date"] = meta.publication_date.isoformat()
+        # Zotero 的 date 是自由文本，接受 "2026" / "2026-05" 这类部分日期——
+        # 按真实精度写，别把占位的 1/1 当成确切出版日灌进库里（再经 BBT 回流会固化）。
+        from ._citekey_utils import date_string
+        item["date"] = date_string(meta.publication_date,
+                                   getattr(meta, "date_precision", None))
 
     if is_preprint:
         item["repository"] = "arXiv"

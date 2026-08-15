@@ -11,6 +11,7 @@
 """
 import hashlib
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -32,6 +33,41 @@ logger = get_logger(__name__)
 SCHEMA_VERSION = 2  # v2: highlight chunk id 掺入 role+序号，修复同文本覆盖丢数据（老库需 --full 重建）
 
 DB_NAME = "embeddings.sqlite3"  # notes_dir 下的库文件名，全部调用方从这里取，别再各自硬编码
+
+INDEX_NAME = "literature_index.json"  # 同目录的索引文件名（新鲜度比对的另一端）
+
+# 向量库落后索引超过这个秒数就不再"只是提醒"：无人值守的消费方应直接降级为不用向量库。
+# 24h 的依据：唯一的自动同步入口是周度 ingest（周一 09:30），正常节奏下库最多落后一天；
+# 超过一天说明有一次改键/重建没被跟进，此时库里很可能带着已注销的 citekey——
+# 把死键喂给 LLM 裁决或粘进稿子，比这一轮没有近邻更糟。
+STALE_DEGRADE_SECONDS = 24 * 3600
+
+_GENERATED_AT_RE = re.compile(r'"generated_at"\s*:\s*"([^"]+)"')
+
+
+def read_index_generated_at(index_path) -> Optional[str]:
+    """只取 literature_index.json 的 generated_at（8MB 的索引不值得为一个时间戳整份解析）。
+
+    先在文件头 8KB 里正则找（它是 schema_version 之后的第二个字段，实测在前 100 字节内）；
+    找不到再退回整份 json.load 兜底，字段位置将来挪了也不会静默失效。
+    文件缺失/损坏一律返回 None——新鲜度检查随之跳过，绝不因此阻塞调用方。
+    """
+    p = Path(index_path)
+    try:
+        with open(str(p), "r", encoding="utf-8") as fh:
+            head = fh.read(8192)
+    except Exception:
+        return None
+    m = _GENERATED_AT_RE.search(head)
+    if m:
+        return m.group(1)
+    try:
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    val = data.get("generated_at") if isinstance(data, dict) else None
+    return val if isinstance(val, str) else None
 
 
 def model_matches(store_model: Optional[str], want_model: Optional[str]) -> bool:
@@ -644,13 +680,41 @@ class VectorStore:
         return [(int(i), float(scores[i])) for i in idx if np.isfinite(scores[i])]
 
     def freshness_warning(self, index_generated_at: Optional[str]) -> Optional[str]:
-        """向量库落后当前索引时给一句提醒（不阻塞，stderr 打印用）。"""
+        """向量库落后当前索引时给一句提醒（不阻塞，stderr 打印用）。
+
+        措辞必须点明**两类**后果。只说"可能漏掉最新入库内容"会把危害说轻：读者的
+        合理反应是"那我先用着，反正只是不全"，于是照单全收地把检索结果粘进稿子。
+        而陈旧库更严重的一面是 chunk 上的 citekey 可能是已改名/已删除的旧键——
+        磁盘上根本不存在这个条目，pandoc --citeproc 会报 not found 并渲染成 (key?)。
+        """
         src = self.meta.get("source_generated_at") or ""
         if not src or not index_generated_at:
             return None
         if src < index_generated_at:
             return (
-                "⚠️ 向量库落后于当前索引（库快照 {} vs 索引 {}），"
-                "可能漏掉最新入库内容，建议跑 notes_embed.py 增量同步".format(
+                "⚠️ 向量库落后于当前索引（库快照 {} vs 索引 {}）：可能漏掉最新入库内容，"
+                "且检索结果里的 citekey 可能是已改名/已删除的旧键"
+                "（粘进 pandoc 稿会挂不上书目，渲染成 (key?)）。"
+                "请跑 PYTHONPATH=. python scripts/notes_embed.py 增量同步".format(
                     src, index_generated_at))
         return None
+
+    def freshness_lag_seconds(self, index_generated_at: Optional[str]) -> Optional[float]:
+        """向量库快照比索引旧多少秒；不旧或两端时间戳缺失/解析不了都返回 None。
+
+        与 freshness_warning 分开是因为两者服务的判断不同：warning 只回答"旧不旧"
+        （字符串比较即可，ISO 8601 同长度时字典序等价于时间序），本函数回答"旧多少"，
+        供无人值守的调用方按 STALE_DEGRADE_SECONDS 决定是提醒还是直接降级。
+        注意 None 有歧义（不旧 / 解析不出），调用方要先用 freshness_warning 判定旧不旧，
+        再用本函数取幅度；「已判定旧但取不到幅度」应按"超阈值"从严处理。
+        """
+        src = self.meta.get("source_generated_at") or ""
+        if not src or not index_generated_at:
+            return None
+        try:
+            t_src = datetime.fromisoformat(src)
+            t_idx = datetime.fromisoformat(index_generated_at)
+        except (TypeError, ValueError):
+            return None
+        delta = (t_idx - t_src).total_seconds()
+        return delta if delta > 0 else None

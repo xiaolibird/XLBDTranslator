@@ -54,7 +54,10 @@ def _csl_from_crossref(item, entry):
             out[dst] = item[src]
     d = item.get("publication_date")
     if d is not None:
-        out["issued"] = {"date-parts": [[d.year, d.month, d.day]]}
+        # 与 notes.build_csl_item 同一口径：issued（出版日期）按真实精度截断，
+        # 不把各来源补出来的占位月日当成确切出版日
+        from src.scholar._citekey_utils import date_parts
+        out["issued"] = {"date-parts": date_parts(d, item.get("date_precision"))}
     elif entry.get("year"):
         out["issued"] = {"date-parts": [[entry["year"]]]}
     return out

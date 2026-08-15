@@ -589,3 +589,14 @@ def test_llm_title_retry_survives_crossref_exception(monkeypatch):
     meta, source = pi.resolve_metadata({"doi": None, "arxiv_id": None, "title": "heuristic"},
                                        llm=llm, first_pages_text="front page")
     assert source == "pdf-llm" and meta.title == "LLM Title"
+
+
+def test_repo_dedup_overrides_are_isolated_from_this_file():
+    """R2-3：本文件的 update_index 调用同样不得读仓库那份真 dedup_overrides.json。
+
+    隔离夹具在 test/conftest.py（对整个 test/ 目录生效）；原先只挂在 test_notes_index.py
+    上时，这里与 test_vault.py 会随仓库裁决文件的内容而漂。
+    """
+    from src.scholar import notes_index as ni
+    assert ni._read_override_files(None) == []
+    assert not Path(ni.REPO_OVERRIDES_PATH).exists()
