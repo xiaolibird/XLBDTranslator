@@ -169,6 +169,41 @@ def _citekey_of(notes_dir, paper_title):
     return None
 
 
+def test_finalize_requires_cross_check_report(tmp_path, monkeypatch):
+    """双轨核验门禁：status=final + close_reading_final 都是 agent 自报，不读 PDF 抄草稿
+    也能满足。finalize 必须另验 cross_check_report.verified_count>=1，缺失即拒绝归档；
+    写回有效报告后放行。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    seg = _manual_seg("pfinal01", "Gate Paper", "Ann Lee", "10.9/gate")
+    bf = tmp_path / "manual" / "2026-08" / "pfinal01.bundle.json"
+    bf.parent.mkdir(parents=True)
+    pi.write_bundle(bf, status="final", month="2026-08", pdf_path="x.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+
+    class _Proc:
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    rebuilt = []
+    monkeypatch.setattr(M, "_rebuild_month", lambda *a, **k: rebuilt.append(1) or {"month": "2026-08"})
+    monkeypatch.setattr(M, "_report_final", lambda *a, **k: None)
+    args = SimpleNamespace(config="unused", bundle=str(bf))
+
+    assert M.cmd_finalize(args) == 1        # 无核验报告 → 拒绝
+    assert not rebuilt                       # 且不能已经动了库
+    data = json.loads(bf.read_text(encoding="utf-8"))
+    data["cross_check_report"] = {"verified_count": 0, "corrected": [], "added": []}
+    bf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert M.cmd_finalize(args) == 1        # verified_count=0 同样拒绝（空转核验）
+    data["cross_check_report"]["verified_count"] = 3
+    bf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert M.cmd_finalize(args) == 0 and rebuilt  # 有效核验 → 放行
+
+
 def test_rebuild_month_keeps_existing_citekey_stable_across_reruns(tmp_path):
     """回归 read_pdf.py:266 — 同月第二次 finalize 不能把第一篇的 citekey 抖成 xxxb 再抖回来。
 

@@ -56,47 +56,75 @@ def dedup_key(meta: PaperMetadata) -> str:
 
 
 def enrich_segments(segs: Sequence[PaperSegment], email: str,
-                    ts_url: str) -> Tuple[int, int, int]:
-    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + PubMed 补摘要 + translation-server 权威解析。"""
+                    ts_url: str, max_workers: int = 4) -> Tuple[int, int, int]:
+    """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + PubMed 补摘要 + translation-server 权威解析。
+
+    4-worker 分片并行（同 resolve_citekeys 的模板）：每篇 1-2 次 Crossref 往返全串行时，
+    周批 30-50 篇要纯等 1-3 分钟、按月回填/作者语料批（99 篇）5-10 分钟级。每个 worker
+    持独立 client、只动自己分片里的 seg（各 seg 互不依赖），计数按分片返回后求和。
+    """
     from .crossref import enrich_metadata
     from .academic_search import enrich_from_arxiv, enrich_abstract_from_pubmed
     from .fulltext import ipv4_client
     from .translation_server import resolve_and_apply
-    cr = ax = ts = pm = 0
-    with ipv4_client(timeout=30) as xc:
-        for seg in segs:
-            hit = False
-            try:
-                hit = enrich_metadata(seg.metadata, email=email, client=xc)
-                if hit:
-                    cr += 1
-            except Exception as e:
-                logger.debug("Crossref enrich 失败 [{}]: {}", seg.paper_id, e)
-            if not hit and seg.metadata.arxiv_id:
+
+    seg_list = list(segs)
+    if not seg_list:
+        return 0, 0, 0
+
+    def _enrich_batch(batch) -> Tuple[int, int, int]:
+        cr = ax = pm = 0
+        with ipv4_client(timeout=30) as xc:
+            for seg in batch:
+                hit = False
                 try:
-                    if enrich_from_arxiv(seg.metadata, client=xc):
-                        ax += 1
+                    hit = enrich_metadata(seg.metadata, email=email, client=xc)
+                    if hit:
+                        cr += 1
                 except Exception as e:
-                    logger.debug("arXiv enrich 失败 [{}]: {}", seg.paper_id, e)
-            # 无摘要的论文若拿不到 OA 全文，精读会因空正文整篇落空——先去 PubMed 补一份
-            if not (seg.original_abstract or "").strip():
-                try:
-                    abs_ = enrich_abstract_from_pubmed(
-                        seg.metadata, seg.original_abstract, client=xc, email=email)
-                    if abs_:
-                        seg.original_abstract = abs_
-                        pm += 1
-                except Exception as e:
-                    logger.debug("PubMed 补摘要失败 [{}]: {}", seg.paper_id, e)
+                    logger.debug("Crossref enrich 失败 [{}]: {}", seg.paper_id, e)
+                if not hit and seg.metadata.arxiv_id:
+                    try:
+                        if enrich_from_arxiv(seg.metadata, client=xc):
+                            ax += 1
+                    except Exception as e:
+                        logger.debug("arXiv enrich 失败 [{}]: {}", seg.paper_id, e)
+                # 无摘要的论文若拿不到 OA 全文，精读会因空正文整篇落空——先去 PubMed 补一份
+                if not (seg.original_abstract or "").strip():
+                    try:
+                        abs_ = enrich_abstract_from_pubmed(
+                            seg.metadata, seg.original_abstract, client=xc, email=email)
+                        if abs_:
+                            seg.original_abstract = abs_
+                            pm += 1
+                    except Exception as e:
+                        logger.debug("PubMed 补摘要失败 [{}]: {}", seg.paper_id, e)
+        return cr, ax, pm
+
+    workers = min(max_workers, len(seg_list))
+    chunk_size = max(1, len(seg_list) // workers)
+    chunks = [seg_list[i:i + chunk_size] for i in range(0, len(seg_list), chunk_size)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(_enrich_batch, chunks))
+    cr = sum(r[0] for r in results)
+    ax = sum(r[1] for r in results)
+    pm = sum(r[2] for r in results)
     if pm:
         logger.info("  PubMed 补摘要：{} 篇（原本无摘要，避免精读空转）".format(pm))
+
+    ts = 0
     if ts_url:
-        for seg in segs:
-            try:
-                if resolve_and_apply(seg.metadata, base_url=ts_url):
-                    ts += 1
-            except Exception as e:
-                logger.debug("translation-server 解析失败 [{}]: {}", seg.paper_id, e)
+        def _ts_batch(batch) -> int:
+            n = 0
+            for seg in batch:
+                try:
+                    if resolve_and_apply(seg.metadata, base_url=ts_url):
+                        n += 1
+                except Exception as e:
+                    logger.debug("translation-server 解析失败 [{}]: {}", seg.paper_id, e)
+            return n
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            ts = sum(executor.map(_ts_batch, chunks))
     return cr, ax, ts
 
 
@@ -444,8 +472,10 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
             # --label（或先把上一批一起传进来）。
             raise RuntimeError(
                 "周札记 {} 已存在且含 {} 篇本批未覆盖的论文（[@key] 与索引会被整篇覆盖丢弃）："
-                "拒绝写入以避免数据丢失。请改用不同的 --label 重跑，或把上一批论文与本批"
-                "一起传入后再跑。".format(note_filename, len(missing_dk)))
+                "拒绝写入以避免数据丢失。请把上一批论文与本批一起传入（ingest_notes 已把"
+                "本周文件的键剔出去重集，它们就在候选列表里，--auto 或 --pick 全选上即可）；"
+                "改用不同的 --label 会另起一篇新札记、造成同周重复，仅在确要分篇时使用。"
+                .format(note_filename, len(missing_dk)))
 
     res = write_notes(
         list(segs), citekeys, out_dir=notes_out_dir,

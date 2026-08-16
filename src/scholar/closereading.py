@@ -134,7 +134,7 @@ _CLOSEREAD_PROMPT = """你是一名方法学审稿助手，为一位研究者做
 基于上面的{body_label}，输出结构化中文精读，分为这些小节：
 研究问题、方法与数据、实验方法、关键结论、可质疑点、对我研究的联想。
 「实验方法」节按可复现标准整理：数据集/划分、预处理、模型与超参（优化器/学习率/batch/epoch/种子/硬件）、
-评估协议与指标、基线、代码与数据可得性。**仅在可得文本确有报告时才写，并可标注页码；
+评估协议与指标、基线、代码与数据可得性。**仅在可得文本确有报告时才写，{page_rule}
 可得文本未报告的写「原文未报告：X」，不许推测填补**（只有摘要时本节通常很短，这是正常的）。
 每个小节由若干句子组成。按**对后续工作流的用途**给句子打一个标记 tag：
 - "可引用证据"：该句含具体数字/效应量/可溯源结果，写作时可直接取证
@@ -186,6 +186,35 @@ def parse_closeread(response: str) -> Optional[CloseReading]:
     return CloseReading(sections=sections)
 
 
+_NUM_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def verify_citable_numbers(cr: CloseReading, body_text: str, label: str = "") -> int:
+    """廉价数值幻觉防线：「可引用证据」句里的数字必须在喂入正文中出现过。
+
+    这些句子会进 highlight/向量库/scholar-write 取证链，被当成可溯源事实直接写进
+    论文——一个模型编出来（或自行换算出来）的数字在下游没有任何再核验的机会。
+    校验口径故意保守：数字 token 去千分位逗号后做子串匹配，任一 token 在正文里
+    找不到 → 该句 tag 降级为 None（句子保留、内容不动，只是不再冒充可引用证据），
+    逐句留告警。换算/改写过的数字（0.44→44%）也会被降级——无法逐字溯源的数字
+    本来就不该顶着「可引用」进库。返回降级句数。
+    """
+    body_norm = body_text.replace(",", "")
+    demoted = 0
+    for sec in cr.sections:
+        for s in sec.sentences:
+            if s.tag != "可引用证据":
+                continue
+            missing = [t for t in _NUM_TOKEN_RE.findall(s.text)
+                       if t.replace(",", "") not in body_norm]
+            if missing:
+                s.tag = None
+                demoted += 1
+                logger.warning("  ⚠️ 可引用证据数字回查不中({})，降级为普通句：{}…（未命中: {}）"
+                               .format(label, s.text[:50], " ".join(missing[:5])))
+    return demoted
+
+
 def close_read(seg: PaperSegment, body_text: str, research_interests: str,
                llm, model: Optional[str] = None, from_full_text: bool = True,
                source: Optional[str] = None,
@@ -200,11 +229,18 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
         logger.warning("  ⚠️ 无全文也无摘要，跳过精读({}): {}".format(
             seg.paper_id[:8], (seg.metadata.title or "")[:50]))
         return None
+    # 页码规则按输入定：auto 链路喂的 pdf_to_text/EPMC 正文没有 [p.N] 页锚，模型看不见
+    # 页边界，此时"可标注页码"的邀请只会诱导编页码（backfill 链踩过的同款教训）。
+    # 只有文本里真带页锚时才允许标页码，且必须按锚标。
+    has_page_anchors = "[p." in body_text
+    page_rule = ("并按可得文本中的 [p.N] 页锚标注页码；" if has_page_anchors
+                 else "**可得文本没有页码标记，禁止标注任何页码**（此时写出的页码必然是编造）；")
     prompt = _CLOSEREAD_PROMPT.format(
         research_interests=research_interests or "（未提供研究主线）",
         title=seg.metadata.title or "",
         body_label="全文" if from_full_text else "摘要",
         body=body_text,
+        page_rule=page_rule,
     )
     try:
         resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
@@ -313,9 +349,14 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
             cr.body_chars = len(full_text)
             cr.body_chars_raw = raw_chars
             cr.truncated = (raw_chars is not None and raw_chars > len(full_text))
+            verify_citable_numbers(cr, full_text, seg.paper_id[:8])
             return cr
-    return close_read(seg, full_text, research_interests, llm, model=model,
-                      from_full_text=from_full, source=source, raw_chars=raw_chars)
+    cr = close_read(seg, full_text, research_interests, llm, model=model,
+                    from_full_text=from_full, source=source, raw_chars=raw_chars)
+    if cr is not None:
+        # 数字回查压在唯一出口上：deep 与单跳两条路径的精读都过同一道闸
+        verify_citable_numbers(cr, full_text, seg.paper_id[:8])
+    return cr
 
 
 def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,

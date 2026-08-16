@@ -329,6 +329,12 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
 def _inject_cross_check(seg, report):
     """把 agent 的交叉核验报告摘要注入为精读末节「交叉核验记录」（渲染层零改动）。"""
     if not report or not seg.close_reading:
+        if seg.close_reading and not report:
+            # 静默跳过会让「未经核验的精读」与「核验过的精读」在札记里无法区分。
+            # 新 finalize 已被 cmd_finalize 门禁挡住；这里兜的是 regen 旧 bundle 的路径，
+            # 只告警不中断（历史存量无报告是既成事实，重建不应因此失败）。
+            logger.warning("⚠️ {} 无 cross_check_report：该篇精读未经亲读核验（legacy bundle）"
+                           .format((seg.metadata.title or seg.paper_id or "?")[:60]))
         return
     from src.scholar.schema import CloseReadSection, CloseReadSentence
     corrected = report.get("corrected") or []
@@ -365,6 +371,18 @@ def cmd_finalize(args):
     if data.get("status") != "final" or not data.get("close_reading_final"):
         logger.error("❌ bundle 未 final（需 agent 先写回 close_reading_final + status=final）: {}"
                      .format(bundle.name))
+        return 1
+    # 双轨核验不能只是君子协定：status=final + close_reading_final 非空全是 agent 自报，
+    # 不读 PDF 直接把脚本草稿抄成 final 也能通过——而脚本草稿的系统性偏差（把研究画像
+    # 写成原文观点、虚构章节）正是要靠亲读核验挡的。机器门禁至少要求核验报告存在且
+    # verified_count>=1；伪造报告仍可能，但「忘了核验/偷懒跳过」这类最常见的失败被挡死。
+    ccr = data.get("cross_check_report") or {}
+    vc = ccr.get("verified_count")
+    if not isinstance(vc, int) or vc < 1:
+        logger.error("❌ bundle 缺有效 cross_check_report（需 verified_count>=1，当前: {!r}）：\n"
+                     "   亲读 PDF 交叉核验是归档硬前提，不可省。请 agent 完成核验并写回\n"
+                     "   cross_check_report（含 verified_count/corrected/added）后再 finalize: {}"
+                     .format(vc, bundle.name))
         return 1
     month = data["month"]
     r = _rebuild_month(notes_dir, month, settings)

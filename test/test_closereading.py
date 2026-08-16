@@ -134,6 +134,36 @@ class _FakeLLM:
         return self.resp
 
 
+def test_verify_citable_numbers_demotes_unsupported():
+    """数值幻觉防线：「可引用证据」句的数字必须能在喂入正文中逐字找到（去千分位逗号），
+    找不到的句子降级 tag=None——不再进 citable highlight/取证链，句子本身保留。"""
+    out = cr.parse_closeread(
+        '{"sections":[{"heading":"关键结论","sentences":['
+        '{"text":"AUPRC 0.44，样本 1,234 例。","tag":"可引用证据"},'
+        '{"text":"错误率下降 99.9%。","tag":"可引用证据"},'
+        '{"text":"背景提到 777。","tag":null}]}]}')
+    body = "实验结果 AUPRC 0.44，队列共 1,234 例患者。"
+    demoted = cr.verify_citable_numbers(out, body)
+    s = out.sections[0].sentences
+    assert demoted == 1
+    assert s[0].tag == "可引用证据"    # 0.44 与 1234（正文写作 1,234）都可溯源
+    assert s[1].tag is None            # 99.9 在正文无处溯源 → 降级
+    assert s[2].tag is None            # 非可引用句不参与回查（原本就是 None）
+
+
+def test_close_read_page_rule_follows_anchor_presence():
+    """页码锚防线：喂入文本没有 [p.N] 锚时，prompt 必须禁止标页码（模型看不见页边界，
+    标出的页码必然是编造）；带锚时才允许并要求按锚标注。"""
+    resp = '{"sections":[{"heading":"关键结论","sentences":[{"text":"x","tag":null}]}]}'
+    llm = _FakeLLM(resp)
+    cr.close_read(_seg(), "无页锚的全文正文……", "ri", llm)
+    assert "禁止标注任何页码" in llm.calls[0]["prompt"]
+    llm2 = _FakeLLM(resp)
+    cr.close_read(_seg(), "[p.3] 带页锚的正文……", "ri", llm2)
+    assert "[p.N] 页锚标注页码" in llm2.calls[0]["prompt"]
+    assert "禁止标注任何页码" not in llm2.calls[0]["prompt"]
+
+
 def test_close_read_builds_closereading():
     llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":[{"text":"发现X。","tag":"可引用证据"}]}]}')
     out = cr.close_read(_seg(), "全文正文……", "我的研究主线 MNAR/MA-GCT", llm,
