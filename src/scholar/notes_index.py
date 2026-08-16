@@ -747,7 +747,12 @@ def update_index(notes_dir: Path, *, full: bool = False,
     reparsed = kept = 0
     range_mode = since is not None or until is not None
     for stem, (month, series, md_path) in sorted(files.items()):
-        in_range = (since is None or month >= since) and (until is None or month <= until)
+        # month 允许比边界更细的粒度（周札记 "2026-07-17"、专题批次 "2026-07-27-Xxx"）。
+        # 直接字典序比较会把它们排除在 --since/--until 2026-07 之外（"2026-07-17" <= "2026-07"
+        # 为假），且区间模式下区间外文件即使变了也不重解析——改动永远进不了索引。
+        # 比较前把 month 截到边界自身的粒度：月边界只看 YYYY-MM，日边界看 YYYY-MM-DD。
+        in_range = ((since is None or month[:len(since)] >= since)
+                    and (until is None or month[:len(until)] <= until))
         st = md_path.stat()
         prev = old_months.get(stem)
         unchanged = (prev and prev.get("md_mtime") == st.st_mtime
@@ -1055,6 +1060,39 @@ RENAME_REFUSED = "refused"    # 一处都没改，磁盘与调用前逐字节相
 RENAME_PARTIAL = "partial"    # 写盘中途失败且回滚也失败——磁盘处于半改状态
 
 
+def _pick_rename_row(cand: List[Dict[str, Any]], entry: Dict[str, Any], *,
+                     doi_field: str, title_field: str,
+                     key_field: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """同文件同 id/citekey 多行时挑出 entry 真正对应的那一行；无法唯一定位返回 None。
+
+    撞键修复场景下「同文件同 id 多行」不是罕见防御而是常态：两篇不同论文共享同一
+    citekey 才需要修。此时退到 cand[0] 会命中 rank 靠前的 **keeper** 那行——md 侧按
+    note_line 改的是 dup 的节，sidecar/references 侧却改了 keeper 的行，两侧身份互换，
+    下次重建索引后两条 entry 互指对方小节、CSL 条目挂错键。故按 dedup_key → DOI →
+    标题三级精确消歧，全部失配就返回 None 让调用方拒绝改键（宁可不修，不能修错）。
+    """
+    if len(cand) == 1:
+        return cand[0]
+    if not cand:
+        return None
+    if key_field:
+        dk = entry.get("dedup_key") or ""
+        hits = [c for c in cand if dk and c.get(key_field) == dk]
+        if len(hits) == 1:
+            return hits[0]
+    doi = (entry.get("doi") or "").lower()
+    if doi:
+        hits = [c for c in cand if (c.get(doi_field) or "").lower() == doi]
+        if len(hits) == 1:
+            return hits[0]
+    tn = _norm_title(entry.get("title"))
+    if tn:
+        hits = [c for c in cand if _norm_title(c.get(title_field)) == tn]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
 def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
                             old: str, new: str) -> str:
     """把 entry 所在札记里的 [@old] 改为 [@new]，并同步 references.json 与 sidecar。
@@ -1106,7 +1144,6 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
     lines[hit_line] = lines[hit_line].replace(tag_old, tag_new)
     # (路径, 新内容, 原内容)：原内容留着给写盘失败时逆序回滚用
     pending: List[Any] = [(md, "\n".join(lines) + "\n", md_old_text)]
-    doi = (entry.get("doi") or "").lower()
 
     # ---- 预检 references.json ----
     ref_name = entry.get("references_json")
@@ -1120,9 +1157,14 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
             rp_old_text = rp.read_text(encoding="utf-8")
             items = json.loads(rp_old_text)
             cand = [it for it in items if isinstance(it, dict) and it.get("id") == old]
-            # 按 DOI 精确挑（同文件同 id 极罕见，防御一下）
-            tgt = next((it for it in cand if doi and (it.get("DOI") or "").lower() == doi),
-                       cand[0] if cand else None)
+            # 撞键场景下同文件同 id 多行是常态，须精确消歧（见 _pick_rename_row）
+            tgt = _pick_rename_row(cand, entry, doi_field="DOI", title_field="title")
+            if cand and tgt is None:
+                logger.warning(
+                    "  ⚠️ references.json 中 id={} 有 {} 行且 DOI/标题均无法唯一定位，"
+                    "拒绝改键（md 未动；改错行会把 keeper 的 CSL 条目挂到新键上）"
+                    .format(old, len(cand)))
+                return RENAME_REFUSED
             if tgt is not None:
                 tgt["id"] = new
                 pending.append((rp, json.dumps(items, ensure_ascii=False, indent=2),
@@ -1140,11 +1182,13 @@ def _rename_citekey_in_note(notes_dir: Path, entry: Dict[str, Any],
             data = json.loads(sc_old_text)
             rows = data if isinstance(data, list) else data.get("papers", [])
             cand = [r for r in rows if isinstance(r, dict) and r.get("citekey") == old]
-            tgt = next((r for r in cand if doi and (r.get("doi") or "").lower() == doi),
-                       cand[0] if cand else None)
+            tgt = _pick_rename_row(cand, entry, doi_field="doi", title_field="title",
+                                   key_field="dedup_key")
             if tgt is None:
-                logger.warning("  ⚠️ sidecar {} 中未找到 {}，拒绝改键（否则下次重建会把 md "
-                               "改回旧值）".format(sc.name, old))
+                logger.warning("  ⚠️ sidecar {} 中未找到 {}（或多行且 dedup_key/DOI/标题均"
+                               "无法唯一定位），拒绝改键（否则下次重建会把 md 改回旧值，"
+                               "或把 keeper 行改成新键造成两侧身份互换）"
+                               .format(sc.name, old))
                 return RENAME_REFUSED
             tgt["citekey"] = new
             pending.append((sc, json.dumps(data, ensure_ascii=False, indent=2), sc_old_text))

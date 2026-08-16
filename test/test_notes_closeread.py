@@ -70,6 +70,17 @@ def test_fallback_citekeys_replace_missing(tmp_path):
     assert res["csl_count"] == 1  # 临时键也进 references，pandoc 可渲染
 
 
+def test_fallback_citekey_survives_empty_surname():
+    """回归 _citekey_utils._fallback_citekey — 邮件解析残缺作者形如 ",John"（姓缺失）时
+    split(",")[0] 是空串，再取 [-1] 曾 IndexError 崩掉整次 write_notes（整月札记不落盘）。
+    空姓应按无作者处理，键退到 年+标题词。"""
+    from datetime import date
+    from src.scholar._citekey_utils import _fallback_citekey
+    meta = PaperMetadata(paper_id="p1", title="Missing Data Mechanisms in EHR",
+                         authors=[",John"], publication_date=date(2025, 3, 1))
+    assert _fallback_citekey(meta) == "anon2025Missing"   # 不崩溃，空姓走 anon 兜底
+
+
 def test_no_fallback_keeps_missing_placeholder(tmp_path):
     """默认（Zotero 权威模式）不启用兜底键：保持占位，不污染 Zotero 依赖流程。"""
     from src.scholar.notes import write_notes

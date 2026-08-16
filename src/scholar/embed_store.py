@@ -159,15 +159,18 @@ def chunks_from_index(index: dict) -> List[Chunk]:
         one_line = (e.get("one_line") or "").replace("\n", " ").strip()
         paper_text = "{}\n{}".format(title, one_line) if one_line else title
         if not paper_text:
-            # title 与 one_line 都空：嵌空串只会得到无意义向量占据检索名额，跳过
-            logger.warning("citekey '{}' 的 title/one_line 均为空，跳过 paper 级 chunk", citekey)
-            continue
-        out.append(Chunk(
-            id="p:{}".format(citekey), level="paper", citekey=citekey, text=paper_text,
-            role=None, tag=None, section=None, month=month, series=series, tier=tier,
-            bucket=bucket, year=year, has_full_text=has_full_text,
-            note_file=note_file, note_line=note_line,
-        ))
+            # title 与 one_line 都空：嵌空串只会得到无意义向量占据检索名额。
+            # 只跳过 paper 级——下面的 highlight 循环照常跑，否则该篇的句级证据
+            # 会连带静默退出语义检索（md 解析残条但精读句仍在的存量条目踩过）。
+            logger.warning("citekey '{}' 的 title/one_line 均为空，跳过 paper 级 chunk"
+                           "（highlight 照常入库）", citekey)
+        else:
+            out.append(Chunk(
+                id="p:{}".format(citekey), level="paper", citekey=citekey, text=paper_text,
+                role=None, tag=None, section=None, month=month, series=series, tier=tier,
+                bucket=bucket, year=year, has_full_text=has_full_text,
+                note_file=note_file, note_line=note_line,
+            ))
 
         seen_hl: Dict[str, int] = {}
         for h in (e.get("highlights") or []):

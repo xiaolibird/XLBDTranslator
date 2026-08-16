@@ -118,6 +118,26 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
 
     email = proc.zotero_email or proc.external_email or ""
     cr, ax, ts = enrich_segments(fresh, email, proc.zotero_translation_server_url)
+
+    # 增强后再去一次重（同 run_ingest 的补丁）：上面那轮去重算键时多数条目还没有
+    # DOI，dedup_key 退到标题；Crossref 补上 DOI 后键会变，可能撞上早前月已收录的
+    # DOI 键——漏掉这一轮，同一篇会跨月二次精读、二次入库。month_keys 里是本月
+    # 自己刚占的键（含增强前的标题键），不能当"早前月已有"误杀。
+    kept, late = [], 0
+    for seg in fresh:
+        k = dedup_key(seg.metadata)
+        if k in seen and k not in month_keys:
+            late += 1
+            continue
+        month_keys.add(k)
+        kept.append(seg)
+    if late:
+        logger.info("  增强后补去重：{} 篇补到 DOI 后发现早前月已收录".format(late))
+    fresh = kept
+    if not fresh:
+        logger.info("  {} 增强后无新论文，不出札记".format(label))
+        return {"month": label, "status": "empty", "included": len(segs), "fresh": 0}
+
     citekeys = resolve_citekeys(fresh, proc.zotero_base_url)
 
     full_text = 0

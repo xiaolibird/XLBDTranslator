@@ -255,6 +255,52 @@ def test_rename_citekey_in_note_skips_on_note_line_mismatch(tmp_path):
     assert text.count("[@shared2025Key]") == 2   # 两条都原样保留，谁也没被误改
 
 
+def test_rename_citekey_targets_own_row_when_dup_has_no_doi(tmp_path):
+    """回归 _pick_rename_row — 撞键修复场景：同文件两篇论文共享 citekey，被改的 dup
+    （rank 靠后）无 DOI。旧实现 refs/sidecar 侧退到 cand[0]，命中的是 keeper 那行 →
+    md 改 dup、sidecar 改 keeper，两侧身份互换。修复后须按 dedup_key/标题精确定位
+    dup 自己的行，keeper 的行一个字节不动。"""
+    _write_month(tmp_path, citekeys={"pa": "shared2025Key", "pb": "shared2025Key", "pc": None},
+                 sidecar=True)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    # dup = 无 DOI 的 pb（Graph Transformers），keeper = 有 DOI 的 pa
+    dup = next(e for e in entries if e["title"] == "Graph Transformers for Missingness")
+    assert not dup.get("doi")
+    dup = dict(dup, references_json=stem + ".references.json", note_file=stem + ".md")
+    ok = ni._rename_citekey_in_note(tmp_path, dup, "shared2025Key", "shared2025Keyb")
+    assert ok == ni.RENAME_OK
+    # sidecar：dup 行改新键，keeper 行保持旧键（身份不互换）
+    rows = json.loads((tmp_path / (stem + ".index.json")).read_text(encoding="utf-8"))["papers"]
+    by_title = {r["title"]: r for r in rows}
+    assert by_title["Graph Transformers for Missingness"]["citekey"] == "shared2025Keyb"
+    assert by_title["Deep | EHR [Models] under MNAR"]["citekey"] == "shared2025Key"
+    # references.json：同样只有 dup 的 CSL 条目换 id
+    items = json.loads((tmp_path / (stem + ".references.json")).read_text(encoding="utf-8"))
+    ids = {it.get("title"): it["id"] for it in items if isinstance(it, dict)}
+    assert ids.get("Graph Transformers for Missingness") == "shared2025Keyb"
+    assert ids.get("Deep | EHR [Models] under MNAR") == "shared2025Key"
+
+
+def test_update_index_range_covers_finer_granularity_months(tmp_path):
+    """回归 update_index 区间比较 — month 可比边界更细（周札记 "2025-03-17"）。
+    旧实现按字典序整串比较，"2025-03-17" <= "2025-03" 为假 → 周札记被当区间外，
+    且区间模式下区间外文件改了也不重扫，改动永远进不了索引。"""
+    _write_month(tmp_path, month="2025-03")
+    _write_month(tmp_path, month="2025-03-17",
+                 citekeys={"pa": "weekly2025A", "pb": "weekly2025B", "pc": None})
+    weekly = "科研札记_2025-03-17_全文精读"
+    idx1 = ni.update_index(tmp_path, full=True)
+    assert weekly in idx1["months"]
+    # 改动周札记后按月区间重扫：周札记必须落在 2025-03 区间内被强制重解析
+    md = tmp_path / (weekly + ".md")
+    md.write_text(md.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    idx2 = ni.update_index(tmp_path, since="2025-03", until="2025-03")
+    assert idx2["months"][weekly]["md_size"] != idx1["months"][weekly]["md_size"]
+
+
 def test_citekey_collision_detected():
     papers = [
         {"month": "2024-01", "citekey": "wang2024Missing", "dedup_key": "doi:10.1/a",

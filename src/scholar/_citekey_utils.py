@@ -35,7 +35,10 @@ def _fallback_citekey(meta) -> str:
     author = ""
     if meta.authors:
         first = (meta.authors[0] or "").strip()
-        surname = first.split(",")[0].split()[-1] if first else ""
+        # 邮件解析残缺产物可能形如 ",John"（姓缺失）：split(",")[0] 是空串，
+        # 再 split()[-1] 会 IndexError 崩掉整次 write_notes——空姓按无作者处理
+        parts = first.split(",")[0].split()
+        surname = parts[-1] if parts else ""
         author = "".join(c for c in surname if c.isalpha()).lower()
     year = ""
     if getattr(meta, "publication_date", None):

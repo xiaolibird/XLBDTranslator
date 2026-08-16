@@ -247,10 +247,13 @@ def test_sync_store_full_rebuild(tmp_path):
 
 
 def test_empty_paper_text_skipped():
-    """title 与 one_line 都空 → 整条跳过（不嵌空串占检索名额）。"""
+    """title 与 one_line 都空 → 只跳过 paper 级（不嵌空串占检索名额），
+    highlight 照常入库——md 解析残条但精读句仍在时，句级证据不得连带静默退出检索。"""
     idx = {"papers": [_paper("g2025Empty", title="", one_line="",
-                             highlights=[_hl("citable", "有句子也不进")])]}
-    assert chunks_from_index(idx) == []
+                             highlights=[_hl("citable", "句子照常入库")])]}
+    chunks = chunks_from_index(idx)
+    assert [c.level for c in chunks] == ["highlight"]
+    assert chunks[0].text == "句子照常入库"
 
 
 def test_model_matches_base_name():
