@@ -351,7 +351,9 @@ def cmd_scan(args):
     return 0
 
 
-_PAGE_CITE_RE = re.compile(r"[pP]\.\s*(\d{1,3})")
+# 4 位：期刊印刷页码可以到四位（如 JCST 的 p.1499）。只捕 3 位会把 p.1499 截成 149，
+# 反而误报成「超出 PDF 页数」——实测踩过。
+_PAGE_CITE_RE = re.compile(r"[pP]\.\s*(\d{1,4})")
 
 
 def cmd_verify(args):
