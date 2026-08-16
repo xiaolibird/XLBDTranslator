@@ -319,6 +319,47 @@ def test_parse_llm_response_null_keywords_does_not_crash_later_papers(tmp_path):
     assert after.status == DigestStatus.COMPLETED   # 未被前一条连累成 FAILED
 
 
+def test_parse_llm_response_clamps_out_of_range_scores(tmp_path):
+    """LLM 自报的 priority_score/relevance_score 必须钳制到 [0,1]——json_mode 只保证
+    合法 JSON 不校验范围，模型按 0-10/0-100 标度打出的 9.5 若不钳制会在精读 top-N
+    选篇里确定性霸榜，并直通 deep_research 的 min_priority=0.5 阈值。负分同理钳到 0。"""
+    import json as _json
+
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    inflated = make_segment(1, "Paper with inflated scores", datetime(2026, 3, 1))
+    negative = make_segment(2, "Paper with negative scores", datetime(2026, 3, 1))
+    normal = make_segment(3, "Paper with in-range scores", datetime(2026, 3, 1))
+    batch = [inflated, negative, normal]
+    response = _json.dumps({"papers": [
+        {"id": 1, "translated_title": "标题1", "relevance_score": 9.5, "priority_score": 9.5},
+        {"id": 2, "translated_title": "标题2", "relevance_score": -0.3, "priority_score": -2},
+        {"id": 3, "translated_title": "标题3", "relevance_score": 0.8, "priority_score": 0.7},
+    ]}, ensure_ascii=False)
+
+    wf._parse_llm_response(response, batch)
+
+    assert inflated.metadata.relevance_score == 1.0
+    assert inflated.priority_score == 1.0           # 9.5 钳到上界，不再必然霸榜
+    assert negative.metadata.relevance_score == 0.0
+    assert negative.priority_score == 0.0
+    assert normal.metadata.relevance_score == 0.8   # 合规值原样保留
+    assert normal.priority_score == 0.7
+    assert all(s.status == DigestStatus.COMPLETED for s in batch)
+
+
+def test_clamp_unit_score_edge_values(tmp_path):
+    """_clamp_unit_score 边界语义：None 兜 0、NaN 归 0（NaN 不参与比较，max/min
+    钳不住，会把 NaN 漏成 1.0）、脏字符串仍抛异常交由单篇 try 打 FAILED。"""
+    wf = ScholarWorkflow(make_settings(tmp_path, "deepseek"))
+    assert wf._clamp_unit_score(None) == 0.0
+    assert wf._clamp_unit_score(float("nan")) == 0.0
+    assert wf._clamp_unit_score("0.6") == 0.6       # 数字字符串照常解析
+    assert wf._clamp_unit_score(0.0) == 0.0
+    assert wf._clamp_unit_score(1.0) == 1.0
+    with pytest.raises(ValueError):
+        wf._clamp_unit_score("不是数字")
+
+
 def test_parse_llm_response_field_error_isolated_per_paper(tmp_path):
     """priority_breakdown 形状意外（如返回字符串而非 dict）触发的异常也必须只废
     这一篇——不能冒出单篇 try 之外把同批其它论文一并错杀。"""

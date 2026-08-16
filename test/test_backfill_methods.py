@@ -117,6 +117,68 @@ def test_validate_认_methods_p12_这种写法():
     assert M.validate(sents) == ""
 
 
+# ---------------- fact_check（结构之外的事实回查） ----------------
+#
+# 缺口实锤：validate() 只看结构，页码不超界的编造（p.6 的「lr 3e-4」、伪造 GitHub URL）
+# 全部放行，带「可引用证据」tag 直通 scholar-write 取证链；auto 链路的
+# verify_citable_numbers 防线没盖到回填这条路。
+
+_FACT_BODY = ("[p.8]\n训练集 52,695 例，验证集 13,174 例。\n"
+              "[p.10]\nAdam, 20 epochs, batch 256, lr 1e-2.\n"
+              "[p.11]\nCode: https://github.com/real/repo  Data: zenodo.org/record/123\n")
+
+
+def test_fact_check_数字与URL均可溯源时放行():
+    sents = [
+        _sent("【队列与划分】训练集 52,695 例(p.8)。", "可引用证据"),
+        _sent("【代码与数据可得性】代码见 https://github.com/real/repo (p.11)。", "可引用证据"),
+        _sent("【原文未报告】随机种子、硬件。"),
+    ]
+    bad, demoted = M.fact_check(sents, _FACT_BODY)
+    assert bad == "" and demoted == 0
+    assert sents[0]["tag"] == "可引用证据"    # 合格句的 tag 不许被误摘
+
+
+def test_fact_check_编造数字降级不拦截():
+    """口径同 auto 链路 verify_citable_numbers：句子保留、tag 摘掉，不整批打回。
+    3e-4 按科学计数法整体回查——拆成裸的 3 和 4 去查必然全中、等于没查。"""
+    sents = [_sent("【模型与超参】lr 3e-4，batch 999(p.10)。", "可引用证据"),
+             _sent("【原文未报告】其余各项。")]
+    bad, demoted = M.fact_check(sents, _FACT_BODY)
+    assert bad == ""
+    assert demoted == 1 and sents[0]["tag"] is None
+
+
+def test_fact_check_非可引用证据句的数字不查():
+    """降级只管冒充「可引用证据」的句子；方法论借鉴句里的数字本就不进取证链。"""
+    sents = [_sent("【评估协议】大约 9999 次重复实验（转述）。", "方法论借鉴")]
+    bad, demoted = M.fact_check(sents, _FACT_BODY)
+    assert bad == "" and demoted == 0 and sents[0]["tag"] == "方法论借鉴"
+
+
+def test_fact_check_编造URL整批不合格():
+    """伪造的仓库地址会被可得性设卡当成「代码可得」写进札记，必须硬拦走重试。"""
+    sents = [_sent("【代码与数据可得性】代码见 https://github.com/fake/nope (p.11)。", "可引用证据")]
+    bad, _ = M.fact_check(sents, _FACT_BODY)
+    assert "URL" in bad and "github.com/fake/nope" in bad
+
+
+def test_fact_check_折行URL去空白后仍认():
+    """PDF 抽取常把长 URL 折行；去空白对照，别把真链接误杀成编造。"""
+    body = "[p.11]\nCode at https://github.com/real/very-\nlong-repo-name here"
+    sents = [_sent("【代码与数据可得性】代码见 https://github.com/real/very-long-repo-name (p.11)。", None)]
+    bad, _ = M.fact_check(sents, body)
+    assert bad == ""
+
+
+def test_fact_check_模型补scheme的裸域名放行():
+    """原文只写裸 zenodo.org/record/123，模型按 prompt「完整 URL」要求补了 https://——
+    去 scheme 再试一次才算不中，别把照抄判成编造。"""
+    sents = [_sent("【代码与数据可得性】数据见 https://zenodo.org/record/123 (p.11)。", "可引用证据")]
+    bad, _ = M.fact_check(sents, _FACT_BODY)
+    assert bad == ""
+
+
 # ---------------- insert_section ----------------
 
 def _bundle(headings):
@@ -198,6 +260,70 @@ def test_账本损坏时从空账本继续而不是炸掉(tmp_path):
     (tmp_path / "manual").mkdir()
     M._ledger_path(tmp_path).write_text("{坏掉的 json", encoding="utf-8")
     assert M.load_ledger(tmp_path)["papers"] == {}
+
+
+# ---------------- run 收尾强制页码对账 ----------------
+
+def test_run_收尾强制页码对账且超界非零上抛(tmp_path, monkeypatch):
+    """verify 原是独立子命令，run 收尾只打印 regen 命令、既不自动跑也不提示——回填句
+    插在亲读核验之后、regen 归档无人再看，编造检测全靠人记得。现在 run 必须对本轮
+    写过盘的月份自动对账，且发现超界要以非零退出把 regen 挡下来。"""
+    import argparse
+    import types
+    fitz = pytest.importorskip("fitz")
+
+    mdir = tmp_path / "notes" / "manual" / "2026-07"
+    mdir.mkdir(parents=True)
+    pdf = tmp_path / "a.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    for i in range(20):                       # 凑过 500 字符的扫描件门槛
+        page.insert_text((40, 60 + i * 14),
+                         "cohort 52695 cases; code https://github.com/real/repo line {}".format(i))
+    doc.save(str(pdf))
+    doc.close()
+
+    bf = mdir / "a.paper.json"
+    bf.write_text(json.dumps({
+        "status": "final", "month": "2026-07", "paper_id": "pid1", "pdf_path": str(pdf),
+        "segment": {"metadata": {"title": "T"}},
+        "close_reading_final": {"sections": [
+            {"heading": "研究问题", "sentences": [_sent("占位句，够长够长。")]}]},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    resp = json.dumps({"sentences": [
+        {"text": "【队列与划分】共 52695 例(p.1)。", "tag": "可引用证据"},
+        {"text": "【代码与数据可得性】代码见 https://github.com/real/repo (p.1)。", "tag": "可引用证据"},
+        {"text": "【原文未报告】随机种子、硬件。", "tag": None},
+    ]}, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self, cfg):
+            pass
+
+        def call(self, *a, **k):
+            return resp
+
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: types.SimpleNamespace(
+        llm=types.SimpleNamespace(closeread_model="m", model="m"),
+        processing=types.SimpleNamespace(notes_dir=str(tmp_path / "notes"))))
+    monkeypatch.setattr(M, "LLMClient", _LLM)
+
+    verified = []
+
+    def _fake_verify(vargs):
+        verified.append(vargs.month)
+        return 1                              # 模拟对账发现超界
+
+    monkeypatch.setattr(M, "cmd_verify", _fake_verify)
+
+    rc = M.cmd_run(argparse.Namespace(
+        config="cfg", month="", paper=[], limit=0, workers=1, force=False,
+        retry_failed=False, abort_after=5, backup_dir=str(tmp_path / "bak")))
+
+    assert verified == ["2026-07"]            # 自动对账，且只查本轮写过盘的月份
+    assert rc == 1                            # 超界要非零上抛，不能吞掉
+    assert M.has_methods(json.loads(bf.read_text(encoding="utf-8")))  # 回填本身成功写盘
 
 
 # ---------------- 页码锚抽取 ----------------

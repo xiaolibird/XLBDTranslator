@@ -583,6 +583,24 @@ def _write_manual_month(tmp_path, month="2026-07", segs=None):
                        index_series="manual")
 
 
+def test_validate_note_label_accepts_index_visible_shapes():
+    """入口校验的合法集 = NOTE_MD_RE 认得出的月份桶：纯月/周日期/专题批次都是存量在用的形状。"""
+    for lab in ["2026-07", "2026-08-11", "2026-07-28-TFM", "2026-07-27-HuiyingLiang"]:
+        assert ni.validate_note_label(lab) == lab
+
+
+def test_validate_note_label_rejects_index_invisible_labels():
+    """回归：畸形 --month/--label 落盘后 _note_files 会静默跳过（论文对索引/seen/向量库
+    全部不可见，下月被当新论文重读）→ 这些值必须在入口抛 ValueError，而非落盘退出 0。"""
+    for lab in ["2026-7",            # 一位月份——本缺陷的原始触发值
+                "2026-13",           # 正则拦不住的假月份
+                "202607", "2026/07", "test",
+                "2026-07_x",         # 下划线是系列后缀分隔符
+                "2026-07-a/b", "2026-07 ", "2026-07\n", ""]:
+        with pytest.raises(ValueError):
+            ni.validate_note_label(lab)
+
+
 def test_note_md_re_accepts_both_series_rejects_others():
     assert ni.NOTE_MD_RE.match("科研札记_2026-07_全文精读.md")
     assert ni.NOTE_MD_RE.match("科研札记_2026-07_手动精读.md")
@@ -1625,3 +1643,44 @@ def test_audit_apply_stays_silent_about_derived_artifacts_when_nothing_changed(
         _lg.remove(sink)
     assert "notes_embed.py" not in "\n".join(lines)
     capsys.readouterr()
+
+
+# ---------------- write_notes 原子落盘（md 最后落 = 完成标记） ----------------
+
+def test_write_notes_crash_keeps_old_md_intact(tmp_path, monkeypatch):
+    """模拟 md 落盘瞬间崩溃（os.replace 对 .md 目标抛错）：旧 md 必须逐字节保留——
+    裸 open('w') 会先截断出 0 字节/半截 md，骗过 backfill 的 exists() 完成判定，
+    重跑记 skipped 后被截论文永久丢失。references/sidecar 须已按新顺序先落齐，
+    md 是最后的事务提交标记。"""
+    old_content = "# 上一轮完整札记\n"
+    old_md = tmp_path / "科研札记_2025-03_全文精读.md"
+    old_md.write_text(old_content, encoding="utf-8")
+
+    real_replace = os.replace
+
+    def crash_on_md(src, dst):
+        if str(dst).endswith(".md"):
+            raise OSError("模拟写 md 时被杀")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(ni.os, "replace", crash_on_md)
+    with pytest.raises(OSError):
+        _write_month(tmp_path, sidecar=True)
+
+    # 旧 md 未被截断/污染（原子写的全部意义）
+    assert old_md.read_text(encoding="utf-8") == old_content
+    # 配套两件已完整先落盘且可解析
+    refs = json.loads((tmp_path / "科研札记_2025-03_全文精读.references.json")
+                      .read_text(encoding="utf-8"))
+    assert refs
+    side = json.loads((tmp_path / "科研札记_2025-03_全文精读.index.json")
+                      .read_text(encoding="utf-8"))
+    assert side["papers"]
+
+
+def test_write_notes_success_no_tmp_leftover(tmp_path):
+    """正常落盘后三件套齐活，且目录里不残留 .tmp-* 中间文件。"""
+    _write_month(tmp_path, sidecar=True)
+    assert not list(tmp_path.glob("*.tmp-*"))
+    for ext in (".md", ".references.json", ".index.json"):
+        assert (tmp_path / ("科研札记_2025-03_全文精读" + ext)).exists()

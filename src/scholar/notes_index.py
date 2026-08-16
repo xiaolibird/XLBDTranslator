@@ -61,6 +61,34 @@ REPO_OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "config" / DEDUP_OVE
 NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?(?:-[^_]+)?)_(全文精读|手动精读)\.md$")
 _SERIES_MAP = {"全文精读": "auto", "手动精读": "manual"}
 
+
+def validate_note_label(label: str) -> str:
+    """校验札记标签（月份桶/周标签/专题批次）能被 NOTE_MD_RE 认出；合法返回原值，否则抛 ValueError。
+
+    为什么必须在 CLI 入口拦（read_pdf --month / ingest_notes --label）：畸形值
+    （如 "2026-7"）会照常拼进文件名，md/references/sidecar 全部落盘、退出 0，
+    但 _note_files 按 NOTE_MD_RE 静默跳过——这篇札记从此对 literature_index/
+    seen/向量库/vault 全部不可见，且 seen 缺键会让自动链路下月把同批论文当
+    新论文重复精读（静默数据丢失 + 重复烧 LLM）。落盘前一次校验换掉这一整类坑。
+
+    合法形状与 NOTE_MD_RE 的月份桶注释一致：YYYY-MM、YYYY-MM-DD、YYYY-MM[-DD]-批次名
+    （manual 的 2026-07-28-TFM、周札记的 2026-08-11 都是存量在用的形状，不能收紧成纯月份）。
+    """
+    # 以「拼出的文件名能被 NOTE_MD_RE 认出」为准——不另抄一份正则，保证校验口径
+    # 与索引口径永不漂移。group 比对 + 空白检查挡住换行/斜杠等正则字符类（[^_]）
+    # 拦不住、却会破坏文件名的字符。
+    m = NOTE_MD_RE.match("科研札记_{}_全文精读.md".format(label))
+    if (not m or m.group(1) != label
+            or re.search(r"\s", label) or "/" in label or "\\" in label):
+        raise ValueError(
+            "札记标签应为 YYYY-MM[-DD][-批次名]（两位月份；批次名不含下划线/斜杠/空白，"
+            "如 2026-07-28-TFM），收到 {!r}".format(label))
+    try:
+        datetime.strptime(label[:7], "%Y-%m")   # 首段年月还得是真日历月份（挡 2026-13）
+    except ValueError:
+        raise ValueError("札记标签的年月段不合法：{!r}（月份应为 01-12）".format(label))
+    return label
+
 # 每篇论文小节标题行（notes._paper_section 第 92 行的格式契约）：
 #   ## 🔴 高 2. Title ... [@citekey]
 _SECTION_RE = re.compile(

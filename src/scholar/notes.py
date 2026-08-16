@@ -295,13 +295,18 @@ def write_notes(
 
     slug = _slug(filename, 80) or "scholar_digest"
     note_path = out_dir / "{}.md".format(slug)
-    with open(note_path, "w", encoding="utf-8") as f:
-        f.write(build_digest_note(segments, citekeys, title=digest_title, instruction=instruction))
+    # 三件套逐文件原子落盘（复用 notes_index._atomic_write 的 tmp+os.replace，勿另写第二套），
+    # 并把顺序调成 references → sidecar → md：裸 open(path, "w") 先截断再写，过夜回填中途
+    # 被 SIGKILL 会留下 0 字节/半截 md——md 仍 exists()，backfill 重跑判「该月已完成」永久
+    # 跳过，被截论文既不进索引/seen 也不会再被捞回（静默丢失）。md 是各调用方的完成判定锚
+    # （backfill/ingest 都看它 exists()），放最后落 = 事务提交标记：中断后要么整月旧态完整、
+    # 要么配套先到位而 md 未落，重跑都能完整恢复。
+    from .notes_index import _atomic_write
+    md_content = build_digest_note(segments, citekeys, title=digest_title, instruction=instruction)
 
     # 每篇札记配套独立的 references.json（按文件名区分），避免按月回填时互相覆盖
     ref_path = out_dir / "{}.references.json".format(slug)
-    with open(ref_path, "w", encoding="utf-8") as f:
-        json.dump(csl_items, f, ensure_ascii=False, indent=2)
+    _atomic_write(ref_path, json.dumps(csl_items, ensure_ascii=False, indent=2))
 
     # 索引 sidecar：从内存对象无损导出结构化条目（含 arxiv_id/priority_score/三色计数），
     # 供 notes_index 聚合——新札记不再依赖 md 反向解析。排序与 build_digest_note 一致。
@@ -319,12 +324,14 @@ def write_notes(
                 entries.append(entry_from_segment(seg, key, rank=i, total=len(ordered),
                                                   citekey_source=src, series=index_series))
             sidecar_path = out_dir / "{}.index.json".format(slug)
-            with open(sidecar_path, "w", encoding="utf-8") as f:
-                json.dump({"schema_version": 1, "papers": entries}, f,
-                          ensure_ascii=False, indent=2)
+            _atomic_write(sidecar_path, json.dumps(
+                {"schema_version": 1, "papers": entries}, ensure_ascii=False, indent=2))
         except Exception as e:
             sidecar_path = None
             logger.warning("  ⚠️ 写索引 sidecar 失败（不影响札记）: {}".format(e))
+
+    # md 最后落盘（见上）：此行成功 = 本次 write_notes 事务提交
+    _atomic_write(note_path, md_content)
 
     logger.info("  📝 聚合札记（{} 篇）→ {}".format(len(segments), note_path))
     logger.info("  📚 references.json（CSL-JSON）{} 条".format(len(csl_items)))

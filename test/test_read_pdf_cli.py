@@ -141,13 +141,19 @@ def _manual_seg(paper_id, title, author, doi, year=2026):
         filter_decision=fd, close_reading=cr)
 
 
-def _write_final_bundle(notes_dir, month, seg, pdf_path):
+def _write_final_bundle(notes_dir, month, seg, pdf_path,
+                        cross_check_report="default"):
+    """写一份 status=final 的 bundle。默认带合规核验报告（重建纳入的硬前提）；
+    传 cross_check_report=None 模拟「agent 自报 final 但没核验」的搭车 bundle。"""
     from src.scholar import pdf_ingest as pi
+    if cross_check_report == "default":
+        cross_check_report = {"verified_count": 3, "corrected": [], "added": []}
     bf = pi.bundle_path(notes_dir, month, seg.paper_id)
     pi.write_bundle(bf, status="final", month=month, pdf_path=pdf_path,
                     metadata_source="crossref-doi", segment=seg,
                     close_reading_script=seg.close_reading,
-                    close_reading_final=seg.close_reading.model_dump(mode="json"))
+                    close_reading_final=seg.close_reading.model_dump(mode="json"),
+                    cross_check_report=cross_check_report)
     return bf
 
 
@@ -204,6 +210,60 @@ def test_finalize_requires_cross_check_report(tmp_path, monkeypatch):
     assert M.cmd_finalize(args) == 0 and rebuilt  # 有效核验 → 放行
 
 
+# ---------------- --month 入口校验 ----------------
+
+def test_month_arg_accepts_index_visible_shapes():
+    """纯月/专题批次都是存量在用的合法形状（manual/2026-07-28-TFM 等），校验不能收紧误伤。"""
+    for v in ["2026-07", "2026-07-17", "2026-07-28-TFM"]:
+        assert M._month_arg(v) == v
+
+
+def test_month_arg_rejects_index_invisible_month():
+    """回归：--month 2026-7 此前 md/sidecar 照常落盘、退出 0，但 NOTE_MD_RE 认不出文件名，
+    该篇对索引/seen/向量库全部不可见、下月被当新论文重读 → 必须在 argparse 层直接拒收。"""
+    import argparse
+    for bad in ["2026-7", "2026-13", "202607", "test"]:
+        with pytest.raises(argparse.ArgumentTypeError):
+            M._month_arg(bad)
+
+
+def test_cli_malformed_month_exits_2_before_ingest(monkeypatch, capsys):
+    """全链路：畸形 --month 在参数解析期就退 2，根本走不到 ingest（更不会落盘）。"""
+    monkeypatch.setattr(sys, "argv",
+                        ["read_pdf.py", "ingest", "x.pdf", "--month", "2026-7"])
+    with pytest.raises(SystemExit) as ei:
+        M.main()
+    assert ei.value.code == 2
+
+
+def test_finalize_rejects_legacy_bundle_with_bad_month(tmp_path, monkeypatch):
+    """修复前用畸形 --month ingest 出的存量 bundle：finalize 是落盘前最后一道闸，
+    必须拒绝并给出改法，而不是写出一份索引认不出的札记。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    seg = _manual_seg("pbadm01", "Bad Month Paper", "Ann Lee", "10.9/badm")
+    bf = tmp_path / "manual" / "2026-7" / "pbadm01.bundle.json"
+    bf.parent.mkdir(parents=True)
+    pi.write_bundle(bf, status="final", month="2026-7", pdf_path="x.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"),
+                    cross_check_report={"verified_count": 3, "corrected": [], "added": []})
+
+    class _Proc:
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    rebuilt = []
+    monkeypatch.setattr(M, "_rebuild_month",
+                        lambda *a, **k: rebuilt.append(1) or {"month": "2026-7"})
+    monkeypatch.setattr(M, "_report_final", lambda *a, **k: None)
+    args = SimpleNamespace(config="unused", bundle=str(bf))
+    assert M.cmd_finalize(args) == 1        # 非法月份 → 拒绝归档
+    assert not rebuilt                       # 且不能已经动了库
+
+
 def test_rebuild_month_keeps_existing_citekey_stable_across_reruns(tmp_path):
     """回归 read_pdf.py:266 — 同月第二次 finalize 不能把第一篇的 citekey 抖成 xxxb 再抖回来。
 
@@ -239,6 +299,52 @@ def test_rebuild_month_keeps_existing_citekey_stable_across_reruns(tmp_path):
     assert r3["papers"] == 3
     assert _citekey_of(tmp_path, "Missing Data Structures Paper") == key_a_first
     assert _citekey_of(tmp_path, "Second Independent Paper") == key_b
+
+
+# ---------------- _rebuild_month 核验门禁（防未核验 bundle 搭车入库） ----------------
+
+def test_rebuild_month_excludes_final_bundle_without_cross_check(tmp_path):
+    """回归：cmd_finalize 门禁只查被点名的 bundle，同月「status=final 但无
+    cross_check_report」的兄弟 bundle 此前会随整月重建搭车写进 md/索引——
+    脚本草稿的系统性偏差正是靠亲读核验挡的，_rebuild_month 必须在纳入时拒绝。"""
+    month = "2026-08"
+    segA = _manual_seg("pa", "Verified Paper", "Zhang", "10.1/a")
+    _write_final_bundle(tmp_path, month, segA, "/a.pdf")
+    # B：agent 自报 final、有 close_reading_final，但从未写核验报告
+    segB = _manual_seg("pb", "Unverified Freeloader Paper", "Wang", "10.1/b")
+    bf_b = _write_final_bundle(tmp_path, month, segB, "/b.pdf", cross_check_report=None)
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1
+    assert bf_b.name in r["skipped_drafts"]
+    assert _citekey_of(tmp_path, "Verified Paper")
+    assert _citekey_of(tmp_path, "Unverified Freeloader Paper") is None
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Unverified Freeloader Paper" not in md
+
+
+def test_rebuild_month_all_unverified_finals_rebuild_nothing(tmp_path):
+    """regen 直调 _rebuild_month 零门禁的路径：整月只有未核验 final 时不得产出札记。"""
+    month = "2026-08"
+    seg = _manual_seg("pa", "Only Unverified Paper", "Li", "10.1/a")
+    bf = _write_final_bundle(tmp_path, month, seg, "/a.pdf", cross_check_report=None)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 0 and bf.name in r["skipped_drafts"]
+    assert not (tmp_path / "科研札记_{}_手动精读.md".format(month)).exists()
+
+
+def test_rebuild_month_keeps_legacy_heterogeneous_report(tmp_path):
+    """门禁只查「报告存在」不卡 verified_count>=1：存量已核验 bundle 的报告是
+    异构 schema（verified_count 为 None / 用 verified 键，实测 7 份），
+    硬卡计数会把真核验过的旧篇挤出当月重建。"""
+    month = "2026-07"
+    seg = _manual_seg("pa", "Legacy Verified Paper", "Chen", "10.1/legacy")
+    _write_final_bundle(tmp_path, month, seg, "/a.pdf",
+                        cross_check_report={"verified_count": None, "corrected": [],
+                                            "added": [], "notes": "旧 schema 核验记录"})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1 and not r["skipped_drafts"]
+    assert _citekey_of(tmp_path, "Legacy Verified Paper")
 
 
 # ---------------- _rebuild_month 沿用札记侧改过的 citekey ----------------

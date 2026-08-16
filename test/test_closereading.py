@@ -314,6 +314,48 @@ def test_close_read_segment_degrades_to_abstract_when_no_source(monkeypatch):
     assert out.from_full_text is False and out.source == "abstract"
 
 
+def _degrade_to_abstract(monkeypatch):
+    """把 PDF 与 EPMC 两条全文来源都断掉，逼 close_read_segment 走摘要降级。"""
+    monkeypatch.setattr(cr, "resolve_oa_pdf", lambda meta, email="": None)
+    monkeypatch.setattr(
+        cr, "europepmc_fulltext",
+        lambda doi=None, pmid=None, max_chars=40000, return_stats=False, **kw:
+            ((None, 0) if return_stats else None))
+
+
+def test_verify_on_abstract_route_checks_original_not_translation(monkeypatch):
+    """回归：摘要降级篇的数字回查必须对照英文原摘要，不能拿 digest 译文自证闭环。
+
+    translated_abstract 是批量翻译 LLM 的输出、无数字保真校验：原文 AUC 0.87 被译丢成
+    0.78 时，旧逻辑在译文里回查命中 0.78 → 错数顶着「可引用证据」进取证链。数字是语言
+    不变量，对照原摘要后 0.78 必须降级，译对的 0.91 仍应通过。"""
+    seg = _seg(doi="10.1/closed")
+    seg.original_abstract = "The model achieved AUC 0.87 and sensitivity 0.91."
+    seg.translated_abstract = "该模型 AUC 达 0.78，敏感度 0.91。"   # 译文把 0.87 抄错成 0.78
+    _degrade_to_abstract(monkeypatch)
+    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":['
+                   '{"text":"AUC 0.78。","tag":"可引用证据"},'
+                   '{"text":"敏感度 0.91。","tag":"可引用证据"}]}]}')
+    out = cr.close_read_segment(seg, "ri", llm)
+    s = out.sections[0].sentences
+    assert s[0].tag is None            # 0.78 只存在于译文，原摘要无处溯源 → 降级
+    assert s[1].tag == "可引用证据"    # 0.91 语言不变，原摘要可溯源 → 保留
+    # 喂读正文仍是中文译文（精读体验不变），换的只是回查对照源
+    assert "该模型 AUC 达 0.78" in llm.calls[0]["prompt"]
+
+
+def test_verify_on_abstract_route_falls_back_to_translation_when_no_original(monkeypatch):
+    """原摘要缺失时对照源退回译文：此时喂读与对照本就同源，不能因缺原文把数字全数误杀。"""
+    seg = _seg(doi="10.1/closed")
+    seg.original_abstract = ""
+    seg.translated_abstract = "该模型 AUC 达 0.78。"
+    _degrade_to_abstract(monkeypatch)
+    llm = _FakeLLM('{"sections":[{"heading":"关键结论","sentences":['
+                   '{"text":"AUC 0.78。","tag":"可引用证据"}]}]}')
+    out = cr.close_read_segment(seg, "ri", llm)
+    assert out.sections[0].sentences[0].tag == "可引用证据"
+
+
 # ---------------- 阅读深度量尺（新字段） ----------------
 
 def test_pdf_text_with_stats_raw_ignores_page_cap(tmp_path):

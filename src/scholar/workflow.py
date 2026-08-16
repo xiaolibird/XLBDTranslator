@@ -1060,7 +1060,24 @@ class ScholarWorkflow:
             return 0.7
         else:
             return 0.5
-    
+
+    @staticmethod
+    def _clamp_unit_score(value) -> float:
+        """把 LLM 自报的 0-1 分数钳制回 [0,1]（None 兜 0，NaN 归 0）。
+
+        json_mode 只保证合法 JSON、不校验数值范围，prompt 里的"(0-1)"是唯一软防线；
+        模型偶发按 0-10/0-100 标度整批打分时，9.5 这类越界值会在 _sort_by_priority
+        与精读 top-N 选篇里确定性霸榜（THREAT 加成 +1.0 也压不过），还会直通
+        deep_research 的 min_priority=0.5 阈值。规则计算路径处处有 clamp
+        （_coerce_confidence/_get_recency_score 等），唯独 LLM 覆盖路径此前缺失，
+        在此补齐。脏类型（如非数字字符串）仍让 float() 抛异常，交由
+        _parse_llm_response 的单篇 try 按既有语义打成 FAILED，不在这里吞。
+        """
+        f = float(value or 0)
+        if f != f:  # NaN 不参与比较运算，max/min 钳不住，显式归 0
+            return 0.0
+        return max(0.0, min(1.0, f))
+
     def _sort_by_priority(self):
         """按优先级对论文排序（排序前统一应用一次过滤裁决加成）
 
@@ -1270,14 +1287,17 @@ __PAPERS_JSON__
                     if 'keywords' in result:
                         seg.metadata.keywords = result['keywords'] or []
                     if 'relevance_score' in result:
-                        seg.metadata.relevance_score = float(result['relevance_score'] or 0)
+                        # 钳制到 [0,1]：越界值（模型按 0-10/0-100 标度打分）不能直接
+                        # 决定排序与选篇，理由见 _clamp_unit_score 的说明
+                        seg.metadata.relevance_score = self._clamp_unit_score(result['relevance_score'])
                     if 'source_type' in result:
                         seg.metadata.source_type = result['source_type'] or seg.metadata.source_type
                     if 'paper_type' in result:
                         seg.metadata.paper_type = result['paper_type'] or seg.metadata.paper_type
                     if 'priority_score' in result:
-                        # 使用 LLM 返回的优先级覆盖规则计算的值
-                        seg.priority_score = float(result['priority_score'] or 0)
+                        # 使用 LLM 返回的优先级覆盖规则计算的值；同样钳制到 [0,1]，
+                        # 否则 9.5 这类幻觉分会挤掉全部合规分数进精读 top-N/thesis 证据池
+                        seg.priority_score = self._clamp_unit_score(result['priority_score'])
                     if 'priority_breakdown' in result:
                         breakdown = result['priority_breakdown'] or {}
                         seg.metadata.priority_reason = "source={:.1f}, field={:.1f}, recency={:.1f}, type={:.1f}".format(

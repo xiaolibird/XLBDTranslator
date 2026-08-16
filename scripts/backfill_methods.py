@@ -18,6 +18,8 @@
 
 回填**只动** bundle 的 `close_reading_final.sections`（插一节），其余字段一律不碰。
 写完须对涉及的每个月跑 `read_pdf.py regen --month <M>` 才会进 md/docx/索引/向量库。
+`run` 会在收尾对本轮写过盘的月份**强制**跑 `verify` 页码对账（超界即非零退出）；
+页内的数字/URL 编造由写盘前的 `fact_check` 拦——两道闸都过了才轮到 regen。
 """
 import argparse
 import json
@@ -251,6 +253,49 @@ def validate(sents: list) -> str:
     return ""
 
 
+# 数字 token 口径与 closereading.verify_citable_numbers 一致（去千分位后子串回查），
+# 额外认科学计数法（3e-4）：超参最常这么写，拆成裸的 3 和 4 去回查必然全中、等于没查。
+_NUM_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?")
+_URL_RE = re.compile(r"https?://[^\s）】，。；、'\"()\[\]<>]+")
+
+
+def fact_check(sents: list, body: str) -> tuple:
+    """结构之外的事实回查。返回 (不合格原因或空串, 数字降级句数)，就地改 sents 的 tag。
+
+    validate() 只看结构（句数/收尾句/页锚/可得性卡），对内容零回查；而调用方手里
+    就握着喂给模型的带页锚全文，做子串回查是零成本的。auto 链路在 close_read 出口
+    有 verify_citable_numbers 挡同类编造——「模型编出来的数字在下游没有任何再核验
+    的机会」——回填句同样带「可引用证据」tag 直通 highlight/向量库/scholar-write
+    取证链，这道防线必须盖到回填这条路。两种口径：
+    · 数字（软）：「可引用证据」句里任一数字 token 在原文找不到 → tag 降级为 None
+      （句子保留、内容不动，只是不再冒充可引用证据），与 auto 链路同款处置；
+    · URL（硬）：编出来的仓库地址会被可得性设卡当成「代码可得」写进札记，比错数字
+      更毒——任一 URL 在原文里找不到，整批判不合格，走 backfill_one 的重试路径。
+      对照用去空白的原文（PDF 抽取常把长 URL 折行）；模型偶尔会按 prompt 的
+      「完整 URL」要求给裸域名补 https:// 前缀，去 scheme 再试一次才算不中。
+    """
+    body_nospace = re.sub(r"\s+", "", body)
+    for s in sents:
+        for url in _URL_RE.findall(s["text"]):
+            url = url.rstrip(".,;:。；，")
+            if url in body_nospace or url.split("://", 1)[-1] in body_nospace:
+                continue
+            return "URL 在原文中找不到（疑似编造）：{}".format(url), 0
+    body_num = body.replace(",", "")
+    demoted = 0
+    for s in sents:
+        if s.get("tag") != "可引用证据":
+            continue
+        missing = [t for t in _NUM_TOKEN_RE.findall(s["text"])
+                   if t.replace(",", "") not in body_num]
+        if missing:
+            s["tag"] = None
+            demoted += 1
+            logger.warning("⚠️ 可引用证据数字回查不中，降级为普通句：{}…（未命中: {}）".format(
+                s["text"][:50], " ".join(missing[:5])))
+    return "", demoted
+
+
 def insert_section(data: dict, sents: list) -> None:
     """把「实验方法」插进 close_reading_final.sections（就地改 data）。
 
@@ -288,7 +333,7 @@ def backfill_one(bf: Path, data: dict, llm, model: str, backup_dir: Path) -> dic
     prompt = _METHODS_PROMPT.format(title=title, body=body)
     # 试点实测：同一 prompt 同一篇，第一次回了空、重跑一次就是 29 句合格产出——
     # 偶发的坏回复（JSON 没闭合/回了解释文字）不该让这篇进失败名单等人工重跑。
-    sents, bad, last_err = [], "", ""
+    sents, bad, last_err, n_demoted = [], "", "", 0
     for attempt in (1, 2):
         try:
             resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
@@ -297,6 +342,9 @@ def backfill_one(bf: Path, data: dict, llm, model: str, backup_dir: Path) -> dic
             continue
         sents = parse_sentences(resp)
         bad = validate(sents)
+        if not bad:
+            # 结构过关再做事实回查：URL 编造整批重来，数字回查不中只摘 tag 不拦（见 fact_check）
+            bad, n_demoted = fact_check(sents, body)
         if not bad:
             break
         last_err = "产出不合格：{}".format(bad)
@@ -307,7 +355,8 @@ def backfill_one(bf: Path, data: dict, llm, model: str, backup_dir: Path) -> dic
     shutil.copy2(bf, backup_dir / bf.name)
     insert_section(data, sents)
     bf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"status": "ok", "n": len(sents), "pages": n_pages, "chars": raw, "model": model}
+    return {"status": "ok", "n": len(sents), "demoted": n_demoted,
+            "pages": n_pages, "chars": raw, "model": model}
 
 
 # ---------------- 子命令 ----------------
@@ -514,6 +563,7 @@ def cmd_run(args):
     # 主 provider 整体不可用（欠费/限流）时，别闷头跑完几十篇。
     streak = 0
     aborted = False
+    ok_months = set()                         # 本轮真正写过盘的月份 → 收尾强制页码对账
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(_one, it): it for it in pending}
@@ -524,6 +574,8 @@ def cmd_run(args):
                 continue
             ledger["papers"][pid] = r
             done[r["status"]] = done.get(r["status"], 0) + 1
+            if r["status"] == "ok":
+                ok_months.add(r["month"])
             icon = {"ok": "✅", "failed": "❌", "no_pdf": "⏭"}.get(r["status"], "?")
             print("{} [{}/{}] {} {}".format(
                 icon, i, len(pending), r["title"][:50],
@@ -542,12 +594,24 @@ def cmd_run(args):
     print("\n" + "=" * 66)
     print("本轮：成功 {} | 失败 {} | 无 PDF {}".format(
         done.get("ok", 0), done.get("failed", 0), done.get("no_pdf", 0)))
+
+    # 页码对账不再等人手动跑：写盘 ≠ 可以 regen。verify 原是独立子命令，run 收尾只
+    # 打印 regen 命令，编造检测全靠人记得——回填句是插在亲读核验**之后**的，regen 归档
+    # 无人再看，这里是它进取证链前最后一道有人值守的闸。对本轮真正写过盘的月份逐月
+    # 对账，任一超界就以非零退出，把 regen 挡在人工处置之后。
+    verify_rc = 0
+    for m in sorted(ok_months):
+        print("\n▶ 页码对账（本轮写入月份）{}".format(m))
+        verify_rc |= cmd_verify(argparse.Namespace(config=args.config, month=m))
+
     months = sorted({r["month"] for r in ledger["papers"].values() if r.get("status") == "ok"})
     print("涉及月份 {}，逐个跑以下命令才会进 md/docx/索引/向量库：".format(len(months)))
     for m in months:
         print("  PYTHONPATH=. python scripts/read_pdf.py regen --month {}".format(m))
+    if verify_rc:
+        print("⚠️ 页码对账发现超界引用（见上），先人工处置再 regen。")
     print("=" * 66)
-    return 0
+    return verify_rc
 
 
 def main():

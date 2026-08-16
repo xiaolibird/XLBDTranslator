@@ -41,6 +41,22 @@ from src.utils.notify import notify                          # noqa: E402
 logger = get_logger("ingest_cli")
 
 
+def _label_arg(v):
+    """--label 的 argparse type：入口拦下 NOTE_MD_RE 认不出的畸形标签。
+
+    不拦的话札记照常落盘、退出 0，但文件名进不了 literature_index——对 seen/
+    向量库/vault 全部不可见，下月 digest 把同批论文当新论文重复精读（详见
+    notes_index.validate_note_label 的注释）。空串放行 = 用默认（所属周的周一）。
+    """
+    if not v:
+        return v
+    from src.scholar.notes_index import validate_note_label
+    try:
+        return validate_note_label(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def _refresh_index_and_vectors(settings) -> None:
     """刷文献索引 + best-effort 同步向量库。**空窗周也必须走一遍**。
 
@@ -126,7 +142,8 @@ def main() -> int:
     ap.add_argument("--no-close-read", action="store_true", help="跳过全文精读（快，只出摘要级）")
     ap.add_argument("--no-index", action="store_true", help="收尾不刷新文献索引")
     ap.add_argument("--no-dedup", action="store_true", help="不跨库去重（调试用；会产生重复条目）")
-    ap.add_argument("--label", default="", help="覆盖札记标签（默认所属周的周一日期）")
+    ap.add_argument("--label", default="", type=_label_arg,
+                    help="覆盖札记标签 YYYY-MM[-DD][-批次名]（默认所属周的周一日期）")
     ap.add_argument("--dry-run", action="store_true", help="走到写盘前停下")
     args = ap.parse_args()
 

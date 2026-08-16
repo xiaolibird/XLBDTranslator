@@ -236,6 +236,24 @@ def test_cli_empty_window_exits_1(tmp_path):
     assert r.returncode == 1
 
 
+def test_cli_malformed_label_exits_2():
+    """回归：--label 2026-7 会写出 NOTE_MD_RE 认不出的札记文件——md 落盘、退出 0，
+    但对索引/seen/向量库全部不可见，下月 digest 把同批论文当新论文重复精读。
+    必须在 argparse 层退 2（配置/输入错误），根本走不到写盘。"""
+    for bad in ["2026-7", "2026-13", "test", "2026-07_x"]:
+        r = _run("--label", bad, "--list")
+        assert r.returncode == 2, bad
+        assert "札记标签" in (r.stderr + r.stdout), bad
+
+
+def test_cli_batch_label_passes_arg_parsing(tmp_path):
+    """专题批次标签（如作者语料通读的 2026-07-27-HuiyingLiang）是存量在用的合法形状，
+    校验不能收紧误伤——应穿过参数解析走到空窗早退（1），而不是参数错误（2）。"""
+    r = _run("--label", "2026-07-27-HuiyingLiang",
+             "--digest-dir", str(tmp_path), "--list")
+    assert r.returncode == 1
+
+
 # ---------------- F. 精读故障批门控 ----------------
 
 def _settings(tmp_path):
@@ -420,6 +438,112 @@ def test_run_ingest_excludes_own_week_note_citekeys_from_existing_ckeys(tmp_path
     assert rep["status"] == "ok"
     assert "wang2024Missing" not in captured["existing_citekeys"]
     assert "other2023Key" in captured["existing_citekeys"]
+
+
+def _seed_note_with_close_reading(notes_dir: Path, label: str, citekey: str,
+                                  doi: str, title: str):
+    """伪造一份带全文精读节的既有周札记 md + sidecar（格式按 notes._paper_section 契约）。"""
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    stem = "科研札记_{}_全文精读".format(label)
+    md = "\n".join([
+        "# 科研札记 · {}".format(label), "",
+        "## 🔴 高 1. {} [@{}]".format(title, citekey), "",
+        "**DOI**: [{0}](https://doi.org/{0})".format(doi), "",
+        "### 摘要", "", "abs", "",
+        "### 全文精读 · 来源 `arxiv`", "",
+        "**【关键结论】**",
+        "- 〔可引用证据〕效应量 0.42。",
+        "- 普通句子。", "",
+        "# 参考文献", ""])
+    (notes_dir / "{}.md".format(stem)).write_text(md, encoding="utf-8")
+    sidecar = {"schema_version": 3, "papers": [
+        {"citekey": citekey, "doi": doi, "title": title,
+         "dedup_key": "doi:{}".format(doi)}]}
+    (notes_dir / "{}.index.json".format(stem)).write_text(
+        json.dumps(sidecar, ensure_ascii=False), encoding="utf-8")
+
+
+def _mock_enrich_and_citekeys(monkeypatch):
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "resolve_citekeys",
+                        lambda segs, base: {s.paper_id: None for s in segs})
+    import src.scholar.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "LLMClient",
+                        lambda cfg: type('Mock', (), {'close': lambda self: None})())
+
+
+def test_merged_rerun_restores_previous_close_reading(tmp_path, monkeypatch):
+    """回归（静默数据丢失）：同 label 合并重跑（本批为既有批的超集）通过覆盖守卫后，
+    上一批已写盘的全文精读必须从既有 md 回读进本批——否则 top-N 重挑把旧论文挤出时
+    close_reading=None，write_notes 整篇覆盖会把精读节/highlights 静默抹掉、还报成功，
+    随后向量库增量同步连 chunk 一起删。这正是守卫报错文案推荐的补救路径。"""
+    from src.scholar.schema import CloseReading, CloseReadSection, CloseReadSentence
+    settings = _settings(tmp_path)
+    notes_dir = tmp_path / "notes"
+    old_seg = _seg(1, "上批论文", doi="10.1/old", score=0.9)
+    _seed_note_with_close_reading(notes_dir, "2026-07-27", "old2024Key",
+                                  "10.1/old", "上批论文")
+    _mock_enrich_and_citekeys(monkeypatch)
+
+    import src.scholar.closereading as closereading
+    picked = {}
+
+    def fake_close_read_segments(segments, *a, **k):
+        picked["segs"] = list(segments)
+        for s in segments:      # 新论文本轮拿到精读（模拟新论文挤占 top-N 名额）
+            s.close_reading = CloseReading(from_full_text=True, sections=[
+                CloseReadSection(heading="研究问题",
+                                 sentences=[CloseReadSentence(text="新")])])
+        return len(segments)
+
+    monkeypatch.setattr(closereading, "close_read_segments", fake_close_read_segments)
+
+    import src.scholar.notes as notes
+    captured = {}
+
+    def fake_write_notes(segs2, citekeys, **k):
+        captured["segs"] = list(segs2)
+        return {"note_path": str(notes_dir / "n.md"), "docx_path": None}
+
+    monkeypatch.setattr(notes, "write_notes", fake_write_notes)
+
+    new_seg = _seg(2, "本批新论文", doi="10.1/new", score=0.95)
+    rep = ING.run_ingest([old_seg, new_seg], settings, "2026-07-27",
+                         top_n=1, close_read=True, seen=set())
+    assert rep["status"] == "ok"
+    # 旧论文的精读从既有 md 无损回读（分节/句级 tag/普通句/来源）
+    cr = old_seg.close_reading
+    assert cr is not None and cr.from_full_text and cr.source == "arxiv"
+    assert [sec.heading for sec in cr.sections] == ["关键结论"]
+    assert [(s.tag, s.text) for s in cr.sections[0].sentences] == [
+        ("可引用证据", "效应量 0.42。"), (None, "普通句子。")]
+    # 已回读的旧论文不再占精读重挑名额：本轮预算全部给尚无精读的新论文
+    assert picked["segs"] == [new_seg]
+    # 写盘的本批两篇都带精读，整篇覆盖不再造成丢失
+    assert all(s.close_reading is not None for s in captured["segs"])
+
+
+def test_merged_rerun_with_all_readings_restored_skips_llm_gate(tmp_path, monkeypatch):
+    """回归：合并批全部靠回读补齐精读（pending 为空）时，close_read_segments 没有
+    可跑的论文、done=0 是正常态，不得误触发「全文精读 0/N」的 LLM 故障批拦截。"""
+    settings = _settings(tmp_path)
+    notes_dir = tmp_path / "notes"
+    old_seg = _seg(1, "上批论文", doi="10.1/old")
+    _seed_note_with_close_reading(notes_dir, "2026-07-27", "old2024Key",
+                                  "10.1/old", "上批论文")
+    _mock_enrich_and_citekeys(monkeypatch)
+
+    import src.scholar.closereading as closereading
+    monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: 0)
+    import src.scholar.notes as notes
+    monkeypatch.setattr(
+        notes, "write_notes",
+        lambda *a, **k: {"note_path": str(notes_dir / "n.md"), "docx_path": None})
+
+    rep = ING.run_ingest([old_seg], settings, "2026-07-27",
+                         top_n=5, close_read=True, seen=set())
+    assert rep["status"] == "ok" and rep["count"] == 1
+    assert old_seg.close_reading is not None
 
 
 # ---------------- R3-3：空窗周也必须刷索引 + 同步向量库 ----------------

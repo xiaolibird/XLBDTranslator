@@ -38,6 +38,21 @@ def _cur_month():
     return "{:04d}-{:02d}".format(d.year, d.month)
 
 
+def _month_arg(v):
+    """--month 的 argparse type：入口拦下 "2026-7" 这类畸形月份。
+
+    不拦的话文件照常落盘、退出 0，但 notes_index 的 NOTE_MD_RE 认不出文件名，
+    这篇精读对索引/seen/向量库全部不可见，下月还会被当新论文重读（详见
+    notes_index.validate_note_label 的注释）。专题批次（2026-07-28-TFM 等）
+    是存量在用的合法形状，校验口径与 NOTE_MD_RE 同构、不额外收紧。
+    """
+    from src.scholar.notes_index import validate_note_label
+    try:
+        return validate_note_label(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+
+
 def _load_settings(config):
     settings = ScholarSettings.from_env_file(repo_path(config))
     # 与既有 pipeline 一致：gemini 模型名走 deepseek provider
@@ -294,6 +309,19 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         if data.get("status") != "final" or not data.get("close_reading_final"):
             skipped.append(bf.name)
             continue
+        # 门禁下沉：cmd_finalize 的核验门禁只挡命令行点名的那一份 bundle，而这里是
+        # **整月**重建——同月里 agent 自报 status=final 却没写 cross_check_report 的
+        # bundle 会随合规 bundle 搭车写进 md/docx/索引/向量库（regen 更是零门禁直达）。
+        # 脚本草稿的系统性偏差正是靠亲读核验挡的，故无报告一律拒绝纳入。
+        # 只查「报告存在」、不硬卡 verified_count>=1：存量已核验 bundle 的报告是
+        # 异构 schema（verified_count 为 None / 用 verified 键，实测 7 份），卡计数
+        # 会把真核验过的旧篇挤出当月重建——严格计数门禁留给 cmd_finalize 管新增。
+        if not data.get("cross_check_report"):
+            logger.warning("  ⛔ {} 无 cross_check_report（status=final 系 agent 自报，"
+                           "未经亲读核验），不纳入本月重建；补核验报告后重跑 finalize"
+                           .format(bf.name))
+            skipped.append(bf.name)
+            continue
         seg = segment_from_bundle(data)
         _inject_cross_check(seg, data.get("cross_check_report"))
         segments.append(seg)
@@ -331,8 +359,8 @@ def _inject_cross_check(seg, report):
     if not report or not seg.close_reading:
         if seg.close_reading and not report:
             # 静默跳过会让「未经核验的精读」与「核验过的精读」在札记里无法区分。
-            # 新 finalize 已被 cmd_finalize 门禁挡住；这里兜的是 regen 旧 bundle 的路径，
-            # 只告警不中断（历史存量无报告是既成事实，重建不应因此失败）。
+            # _rebuild_month 纳入时已拒绝无报告的 bundle，此分支正常不可达——
+            # 留作纵深防御：将来若有调用方绕过门禁直接注入，至少在日志里留痕。
             logger.warning("⚠️ {} 无 cross_check_report：该篇精读未经亲读核验（legacy bundle）"
                            .format((seg.metadata.title or seg.paper_id or "?")[:60]))
         return
@@ -385,6 +413,15 @@ def cmd_finalize(args):
                      .format(vc, bundle.name))
         return 1
     month = data["month"]
+    # bundle 里的 month 可能是修复前用畸形 --month ingest 出来的遗留值——finalize 是
+    # 落盘前最后一道闸，这里不拦就会写出索引认不出的札记文件（与入口校验同一坑）。
+    from src.scholar.notes_index import validate_note_label
+    try:
+        validate_note_label(month)
+    except ValueError as e:
+        logger.error("❌ bundle 的归档月份非法（{}）：请把 {} 的 month 改成合法值"
+                     "并挪到对应的 manual/<月份>/ 目录后再 finalize".format(e, bundle.name))
+        return 1
     r = _rebuild_month(notes_dir, month, settings)
     _report_final(r, notes_dir)
     return 0
@@ -431,7 +468,8 @@ def main():
     p_ing.add_argument("pdf", nargs="+", help="PDF 路径或目录（目录展开为其中全部 *.pdf）")
     p_ing.add_argument("-r", "--recursive", action="store_true",
                        help="目录递归下钻子目录（默认只取该目录一层）")
-    p_ing.add_argument("--month", default=None, help="归档月份 YYYY-MM（默认当月）")
+    p_ing.add_argument("--month", default=None, type=_month_arg,
+                       help="归档月份桶 YYYY-MM[-DD][-批次名]（默认当月）")
     p_ing.add_argument("--title", default=None, help="手动覆盖标题（单篇时；元数据解析用）")
     p_ing.add_argument("--force", action="store_true",
                        help="覆盖已 final 的 bundle（默认跳过——覆盖会丢弃 agent 已写的核验成果）")
@@ -442,7 +480,8 @@ def main():
     p_fin.set_defaults(func=cmd_finalize)
 
     p_reg = sub.add_parser("regen", help="按现有 final bundle 重建某月（不新增论文）")
-    p_reg.add_argument("--month", default=None, help="月份 YYYY-MM（默认当月）")
+    p_reg.add_argument("--month", default=None, type=_month_arg,
+                       help="月份桶 YYYY-MM[-DD][-批次名]（默认当月）")
     p_reg.set_defaults(func=cmd_regen)
 
     args = ap.parse_args()

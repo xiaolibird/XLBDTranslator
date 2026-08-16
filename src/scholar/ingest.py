@@ -375,6 +375,92 @@ def _existing_note_dedup_keys(out_dir: Path, filename: str) -> Optional[Set[str]
             if isinstance(e, dict) and e.get("dedup_key")}
 
 
+def _rehydrate_close_readings(out_dir: Path, filename: str,
+                              segs: Sequence[PaperSegment]) -> int:
+    """同 label 重跑时，把既有周札记 md 里的精读节回读进本批 segs（就地补 close_reading）。
+
+    为什么必须回读：segs 来自 Step 4 固化的 digest JSON（无人值守周流程
+    zotero_enabled=false，精读被关在 workflow 里），close_reading 恒为 None；
+    合并批通过整篇覆盖守卫后，close_read_segments 只按优先级重挑 top-N，
+    上一批已精读的论文一旦被新论文挤出，就带着 None 走到 write_notes 的
+    `open(path, "w")` 整篇重写——精读节/highlights/tag_counts 从 md/sidecar
+    静默消失、还打 ✅ 报成功，随后向量库增量同步把它的 chunk 也删掉。
+    守卫报错文案推荐的补救路径（--auto 全选合并重跑）恰恰就是这条触发链。
+
+    解析复用 notes_index 的同一组行首正则（md 渲染 notes._paper_section 与
+    parse_note_md 之间的既有格式契约），勿在这里另写第二套。heading/句子/
+    句级 tag 在 md 里无损往返；model/read_at/body_chars 等量尺字段 md 没存、
+    回读后为默认值——比起整节丢失这是可接受的损耗。
+
+    只补 close_reading 为 None 的 seg：本轮真跑出的新精读优先于旧文。
+    Returns: 回读成功的篇数（同名 md 不存在时为 0）。
+    """
+    from .notes import _slug
+    from ._citekey_utils import recompute_entry_key
+    from .notes_index import (_CLOSEREAD_RE, _CR_SECTION_RE, _SECTION_RE,
+                              _TAG_LINE_RE)
+    from .schema import CloseReading, CloseReadSection, CloseReadSentence
+    slug = _slug(filename, 80) or "scholar_digest"
+    note_path = out_dir / "{}.md".format(slug)
+    if not note_path.exists():
+        return 0
+    # citekey → 当前键：与覆盖守卫共用 recompute_entry_key，防键梯升级后两侧漂移
+    sidecar = json.loads((out_dir / "{}.index.json".format(slug))
+                         .read_text(encoding="utf-8"))
+    ck2dk = {e["citekey"]: recompute_entry_key(e)
+             for e in sidecar.get("papers", [])
+             if isinstance(e, dict) and e.get("citekey")}
+    # md → 按 citekey 收集精读结构（行首锚定，与 parse_note_md 同一状态机走法）
+    readings: Dict[str, CloseReading] = {}
+    cur_ck: Optional[str] = None
+    cur_cr: Optional[CloseReading] = None
+    cur_sec: Optional[CloseReadSection] = None
+    for line in note_path.read_text(encoding="utf-8").splitlines():
+        m = _SECTION_RE.match(line)
+        if m:
+            cur_ck, cur_cr, cur_sec = m.group(4), None, None
+            continue
+        if line.startswith("# "):          # 参考文献等一级节，论文区结束
+            cur_ck, cur_cr, cur_sec = None, None, None
+            continue
+        if cur_ck is None:
+            continue
+        crm = _CLOSEREAD_RE.match(line)
+        if crm:
+            cur_cr = CloseReading(from_full_text=(crm.group(1) == "全文精读"),
+                                  source=crm.group(2), sections=[])
+            readings[cur_ck] = cur_cr
+            cur_sec = None
+            continue
+        if line.startswith("### "):        # 精读之后的其他三级小节，精读区结束
+            cur_cr, cur_sec = None, None
+            continue
+        if cur_cr is None:
+            continue
+        sm = _CR_SECTION_RE.match(line)
+        if sm:
+            cur_sec = CloseReadSection(heading=sm.group(1).strip(), sentences=[])
+            cur_cr.sections.append(cur_sec)
+            continue
+        if cur_sec is not None and line.startswith("- "):
+            tm = _TAG_LINE_RE.match(line)
+            if tm:
+                cur_sec.sentences.append(
+                    CloseReadSentence(text=tm.group(2).strip(), tag=tm.group(1)))
+            else:
+                cur_sec.sentences.append(CloseReadSentence(text=line[2:].strip()))
+    dk2cr = {ck2dk[ck]: cr for ck, cr in readings.items()
+             if ck in ck2dk and cr.sections}
+    restored = 0
+    for seg in segs:
+        if seg.close_reading is None:
+            cr = dk2cr.get(dedup_key(seg.metadata))
+            if cr is not None:
+                seg.close_reading = cr
+                restored += 1
+    return restored
+
+
 def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: str,
                top_n: int = 5, close_read: bool = True,
                seen: Optional[Set[str]] = None,
@@ -420,29 +506,6 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
 
     citekeys = resolve_citekeys(segs, proc.zotero_base_url)
 
-    full_text = 0
-    if close_read:
-        from .closereading import close_read_segments
-        from .llm_client import LLMClient
-        llm_client = LLMClient(settings.llm)
-        try:
-            done = close_read_segments(
-                segs, proc.research_interests, llm_client,
-                top_n=top_n, email=email,
-                model=(settings.llm.closeread_model or settings.llm.model),
-                scratch_dir=Path("output/scholar_pdfs"),
-                deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-                max_chunks=proc.closeread_max_chunks)
-        finally:
-            llm_client.close()
-        if top_n > 0 and segs and done == 0:
-            # 0/N 成功几乎只出现在 claude-agent 限流/欠费这类通路级故障；照常写盘会让
-            # 降级札记被索引 seen 去重永久固化（周度没有 --force 入口）。宁可本批不写：
-            # digest JSON 还在，进程非零退出后重跑即恢复。done≥1 的部分成功照常写盘。
-            raise RuntimeError("全文精读 0/{}，视为 LLM 故障批，不写终稿".format(
-                min(top_n, len(segs))))
-        full_text = sum(1 for s in segs if s.close_reading and s.close_reading.from_full_text)
-
     from .notes import write_notes
     from .notes_index import existing_citekeys
     notes_out_dir = Path(proc.notes_dir)
@@ -476,6 +539,38 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
                 "本周文件的键剔出去重集，它们就在候选列表里，--auto 或 --pick 全选上即可）；"
                 "改用不同的 --label 会另起一篇新札记、造成同周重复，仅在确要分篇时使用。"
                 .format(note_filename, len(missing_dk)))
+        # 合并批通过守卫≠安全：write_notes 仍是整篇覆盖，先把既有精读回读进内存，
+        # 否则上一批被 top-N 重挑挤出的论文精读会被静默抹掉（见函数 docstring）。
+        restored = _rehydrate_close_readings(notes_out_dir, note_filename, segs)
+        if restored:
+            logger.info("  精读回读：{} 篇沿用既有周札记的精读节".format(restored))
+
+    full_text = 0
+    if close_read:
+        from .closereading import close_read_segments
+        from .llm_client import LLMClient
+        # 只对尚无精读的论文重挑 top-N：已回读的旧精读不重跑（省 LLM 成本），
+        # 更关键的是不让上一批高分论文再次占满名额——合并重跑的诉求本来就是给新论文补精读
+        pending = [s for s in segs if s.close_reading is None]
+        llm_client = LLMClient(settings.llm)
+        try:
+            done = close_read_segments(
+                pending, proc.research_interests, llm_client,
+                top_n=top_n, email=email,
+                model=(settings.llm.closeread_model or settings.llm.model),
+                scratch_dir=Path("output/scholar_pdfs"),
+                deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+                max_chunks=proc.closeread_max_chunks)
+        finally:
+            llm_client.close()
+        if top_n > 0 and pending and done == 0:
+            # 0/N 成功几乎只出现在 claude-agent 限流/欠费这类通路级故障；照常写盘会让
+            # 降级札记被索引 seen 去重永久固化（周度没有 --force 入口）。宁可本批不写：
+            # digest JSON 还在，进程非零退出后重跑即恢复。done≥1 的部分成功照常写盘。
+            # 门控按 pending 计：全批都靠回读补齐（pending 为空）时 done=0 是正常态。
+            raise RuntimeError("全文精读 0/{}，视为 LLM 故障批，不写终稿".format(
+                min(top_n, len(pending))))
+        full_text = sum(1 for s in segs if s.close_reading and s.close_reading.from_full_text)
 
     res = write_notes(
         list(segs), citekeys, out_dir=notes_out_dir,

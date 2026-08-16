@@ -340,6 +340,13 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
         full_text = seg.translated_abstract or seg.original_abstract or ""
         source = "abstract"
         raw_chars = len(full_text)
+    # 数字回查的对照源与喂读正文分开算：全文路径两者是同一份英文正文；摘要降级路径
+    # 必须对照英文原摘要——translated_abstract 是 digest 批量翻译的 LLM 输出，自身没有
+    # 任何数字保真校验，拿它回查等于让一段未校验的 LLM 输出给另一段背书（原文 AUC 0.87
+    # 译丢成 0.78 → 精读引用 0.78 → 在译文里自证命中 → 错数顶着「可引用证据」进
+    # highlight/向量库/scholar-write 取证链）。数字是语言不变量，对照原摘要既挡精读
+    # 幻觉也挡翻译丢位；仅当原摘要缺失才退回译文——此时喂读与对照本就同源，聊胜于无。
+    verify_text = (seg.original_abstract or full_text) if not from_full else full_text
     if deep and from_full:
         # 摘要降级篇一律走单跳：几千字符切块无意义，且这是 from_full_text 被污染的唯一入口
         cr = deep_close_read(seg, full_text, research_interests, llm, model=model,
@@ -349,13 +356,13 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
             cr.body_chars = len(full_text)
             cr.body_chars_raw = raw_chars
             cr.truncated = (raw_chars is not None and raw_chars > len(full_text))
-            verify_citable_numbers(cr, full_text, seg.paper_id[:8])
+            verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
             return cr
     cr = close_read(seg, full_text, research_interests, llm, model=model,
                     from_full_text=from_full, source=source, raw_chars=raw_chars)
     if cr is not None:
         # 数字回查压在唯一出口上：deep 与单跳两条路径的精读都过同一道闸
-        verify_citable_numbers(cr, full_text, seg.paper_id[:8])
+        verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
     return cr
 
 

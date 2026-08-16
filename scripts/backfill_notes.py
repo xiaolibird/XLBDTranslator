@@ -74,6 +74,40 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
     label = "{:04d}-{:02d}".format(y, m)
     note_md = Path(proc.notes_dir) / "科研札记_{}_全文精读.md".format(label)
     if note_md.exists() and not args.force:
+        # 完成判定不能只看 md 存在：旧版 write_notes 用裸 open('w')（先截断再写、
+        # 顺序 md → references → sidecar），写盘中途被杀会留下半态。半态若照旧记
+        # skipped 会 exit 0 且无 notify，被截论文既不进索引/seen、该月又被永久跳过
+        # ——静默丢失且无自愈路径。与周度 ingest 的同型防线（sidecar 不可读即拒绝
+        # 写入）对齐：半态抛错 → main 记 error + notify + 退非零，人工 --force 重跑
+        # 该月即可完整重建（--force 会从 seen/existing_ckeys 剔除本月自己的旧键，
+        # 见 main()）。
+        # 半态签名按旧写序推导：杀在 md → md 空/半截且 references 未落；杀在
+        # references → references 半截；杀在 sidecar → sidecar 半截。注意存量有
+        # 43 个 sidecar 出现之前写成的月份（md+references 齐全、无 sidecar），是
+        # 合法完成态——sidecar 只能「在则必须可读」，缺失本身不算半态，否则范围
+        # 重跑会在每个老月份上误报 error（还诱导用 --force 白白重烧一整月 LLM）。
+        sidecar = note_md.with_name("{}.index.json".format(note_md.stem))
+        refs = note_md.with_name("{}.references.json".format(note_md.stem))
+        half = None
+        if not note_md.read_text(encoding="utf-8").strip():
+            half = "md 为空（0 字节/纯空白）"
+        elif not refs.exists():
+            half = "references.json 缺失"
+        else:
+            try:
+                json.loads(refs.read_text(encoding="utf-8"))
+            except Exception as e:
+                half = "references.json 不可读（{}）".format(e)
+        if half is None and sidecar.exists():
+            try:
+                json.loads(sidecar.read_text(encoding="utf-8"))
+            except Exception as e:
+                half = "索引 sidecar 存在但不可读（{}）".format(e)
+        if half:
+            raise RuntimeError(
+                "{} 札记 md 已存在但{}——疑似上次写盘中断留下的半态，"
+                "不能当「已完成」跳过；请用 --force 重跑该月完整重建。"
+                .format(label, half))
         logger.info("⏭️  {} 已有札记，跳过（--force 可覆盖）".format(label))
         return {"month": label, "status": "skipped"}
 

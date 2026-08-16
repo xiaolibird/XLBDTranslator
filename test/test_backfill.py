@@ -447,3 +447,56 @@ def test_close_read_top_n_follows_priority_score_not_input_order(monkeypatch):
 
     assert read_order == ["threat", "d"]                   # 顺序随 priority_score 变化
     assert read_order != [s.paper_id for s in segs[:2]]    # 不再等于输入顺序前 N 篇
+
+
+def test_run_month_half_state_raises_instead_of_skip(tmp_path):
+    """写盘中途被杀留下的半态不得记 skipped 静默退 0——须抛 RuntimeError 走 error
+    路径（notify + 退非零），提示 --force 重跑完整重建。半态签名按旧写序
+    （md → references → sidecar，裸 open('w') 先截断）推导：md 空、references
+    缺/坏、sidecar 在但坏。但 sidecar「缺失」不算半态——存量有 43 个 sidecar
+    机制出现之前写成的月份（md+references 齐全、无 sidecar）是合法完成态，
+    误报会让范围重跑在每个老月份上炸 error 并诱导 --force 重烧整月 LLM。"""
+    from src.scholar.schema import ScholarSettings
+    import scripts.backfill_notes as bn
+
+    settings = ScholarSettings.from_env_file(_env_file(tmp_path))
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    settings.processing.notes_dir = notes_dir
+    args = argparse.Namespace(force=False, no_close_read=True, top_n=0,
+                              summary=False, batch_size=15)
+
+    md = notes_dir / "科研札记_2026-06_全文精读.md"
+    refs = notes_dir / "科研札记_2026-06_全文精读.references.json"
+    sidecar = notes_dir / "科研札记_2026-06_全文精读.index.json"
+
+    # 半态 1：杀在 md 写盘中——md 空（旧版裸 open('w') 刚截断就被杀）
+    md.write_text("", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="md 为空"):
+        bn.run_month(2026, 6, settings, set(), set(), args)
+
+    # 半态 2：杀在 md 与 references 之间——md 在、references 缺失
+    md.write_text("# 半截札记", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="references"):
+        bn.run_month(2026, 6, settings, set(), set(), args)
+
+    # 半态 3：杀在 references 写盘中——半截 JSON
+    refs.write_text('[{"id": "a2026Key",', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="references"):
+        bn.run_month(2026, 6, settings, set(), set(), args)
+
+    # 合法老月份：md+references 齐全、无 sidecar（sidecar 机制之前的存量）→ 正常跳过，
+    # 绝不能误报半态
+    refs.write_text('[{"id": "a2026Key", "type": "article-journal"}]', encoding="utf-8")
+    res = bn.run_month(2026, 6, settings, set(), set(), args)
+    assert res == {"month": "2026-06", "status": "skipped"}
+
+    # 半态 4：杀在 sidecar 写盘中——sidecar 在但是半截 JSON
+    sidecar.write_text('{"schema_version": 1, "papers": [', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="sidecar"):
+        bn.run_month(2026, 6, settings, set(), set(), args)
+
+    # 三件套完好（sidecar 可读）→ 正常跳过
+    sidecar.write_text('{"schema_version": 1, "papers": []}', encoding="utf-8")
+    res = bn.run_month(2026, 6, settings, set(), set(), args)
+    assert res == {"month": "2026-06", "status": "skipped"}

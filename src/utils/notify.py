@@ -13,10 +13,13 @@ def notify(title: str, text: str):
     """
     try:
         subprocess.run(
-            # 双引号包裹 AppleScript 字符串：json.dumps 已转义双引号与反斜杠，
-            # 不会出现 shell 注入或 osascript 语法错误
+            # 双引号包裹 AppleScript 字符串：json.dumps 转义双引号与反斜杠即可，
+            # 必须 ensure_ascii=False——AppleScript 只认 \" \\ \n \r \t，
+            # 默认的 \uXXXX 转义会让 osascript 报 -2741 语法错误（中文标题必挂）
             ["osascript", "-e",
-             "display notification {} with title {}".format(json.dumps(text), json.dumps(title))],
+             "display notification {} with title {}".format(
+                 json.dumps(text, ensure_ascii=False),
+                 json.dumps(title, ensure_ascii=False))],
             capture_output=True, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         pass
