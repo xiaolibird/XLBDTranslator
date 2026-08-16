@@ -45,6 +45,15 @@ _FATAL_CODE_RE = re.compile(r'\b(401|402|403)\b')
 _FATAL_PHRASES = ('quota', 'resource_exhausted', 'resource exhausted', 'api key',
                    'permission denied', 'payment required', 'insufficient balance')
 
+# 内容层拒答：**这一篇**被过滤器挡了，不代表 provider 坏了。仍然换下家接手
+# （尊重裁决而非绕过），但只对本次调用生效，调用结束后回到原来的链位。
+# 不这么做的后果实测过：221 篇精读回填里，一篇讲医疗 AI 安全的论文（正文含越狱
+# 样例）触发 AUP 拒答，整个 client 被永久推到本地 ollama，后续 28 篇全部陪葬。
+_CONTENT_REFUSAL_PHRASES = (
+    "can't help with this", 'cannot help with this', 'legal/aup',
+    'output blocked', 'content policy', 'safety filter', 'blocked_by_safety',
+)
+
 
 class LLMClient:
     """封装 LLM 连接与调用。只依赖 LLMSettings，无 workflow 状态。
@@ -68,16 +77,34 @@ class LLMClient:
         # 手动精读并发化后，多线程可能同时首访 conn；无锁的懒加载会竞态双建连接
         # （openai-compatible 分支还会泄漏一个 httpx.Client）。单线程调用方零感知。
         self._conn_lock = threading.Lock()
-        # provider 链：主 provider + fallback（去空白、去与主重复项）
+        # provider 链：主 provider + fallback（去空白、去重复项）
+        #
+        # fallback 项支持 `provider:model` 写法指定该棒用哪个模型，于是**同一家换模型**
+        # 也能进链——例如 `claude-agent:opus`：sonnet 被内容过滤挡了就让 opus 接手，
+        # 不必绕道本地 ollama（qwen3.5 做精读类任务必然失败，纯属白烧一轮）。
+        # 去重按 (provider, model) 对，否则 `claude-agent:opus` 会被主链的
+        # claude-agent 判为重复而丢掉。
         primary = (llm_settings.provider or 'deepseek').strip().lower()
         fallback_raw = getattr(llm_settings, 'fallback_providers', '') or ''
-        chain = [primary]
-        for p in fallback_raw.split(','):
-            p = p.strip().lower()
-            if p and p not in chain:
-                chain.append(p)
+        chain, chain_models, seen = [primary], [None], {(primary, None)}
+        for item in fallback_raw.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            name, _, mdl = item.partition(':')
+            name, mdl = name.strip().lower(), mdl.strip() or None
+            if not name or (name, mdl) in seen:
+                continue
+            seen.add((name, mdl))
+            chain.append(name)
+            chain_models.append(mdl)
         self._chain = chain
+        self._chain_models = chain_models
         self._chain_idx = 0
+        # 粘性代际：真·provider 故障（欠费/限流/CLI 缺失）推进链时 +1。内容层拒答
+        # 的临时切换在收尾时靠它判断「期间有没有发生过真故障切换」——有就别把别的
+        # 线程刚做出的合理推进给撤回去。
+        self._sticky_gen = 0
 
     def close(self):
         """关闭内部 HTTP 连接池，避免 fd 泄漏。
@@ -113,17 +140,25 @@ class LLMClient:
             try:
                 conn = self._create(name)
                 conn['name'] = name
+                # `provider:model` 写法指定的模型覆盖该家缺省（如 claude-agent:opus）
+                mdl = self._chain_models[self._chain_idx]
+                if mdl:
+                    conn['model'] = mdl
                 if self._chain_idx > 0:
-                    logger.warning("🛟 LLM 回退链：当前 provider = {} ({}/{})".format(
-                        name, self._chain_idx + 1, len(self._chain)))
+                    logger.warning("🛟 LLM 回退链：当前 provider = {}{} ({}/{})".format(
+                        name, "（{}）".format(mdl) if mdl else "",
+                        self._chain_idx + 1, len(self._chain)))
                 return conn
             except Exception as e:
                 logger.warning("⚠️ LLM provider '{}' 初始化失败，跳过: {}".format(name, e))
                 self._chain_idx += 1
         raise RuntimeError("所有 LLM provider 均不可用（回退链已耗尽: {}）".format(self._chain))
 
-    def _advance_chain(self, failed_conn: dict, reason: str) -> bool:
+    def _advance_chain(self, failed_conn: dict, reason: str, sticky: bool = True) -> bool:
         """切到下一个 provider。返回「是否应该用新 conn 重试」（False=链已耗尽）。
+
+        sticky=False 用于内容层拒答：换下家接手本次调用，但不算「这家坏了」，
+        `call()` 收尾时会把链位拨回去（见 _restore_chain）。
 
         failed_conn 是调用方失败时实际使用的那份 conn（call() 里 self.conn 取到
         的那份）。多线程共享同一个 LLMClient 时，几个线程可能几乎同时对同一个
@@ -141,6 +176,8 @@ class LLMClient:
                 return False
             old = self._chain[self._chain_idx]
             self._chain_idx += 1
+            if sticky:
+                self._sticky_gen += 1
             # 旧 conn 若持有 httpx.Client 须显式关闭，否则 fd 泄漏（Ollama 与
             # openai-compatible 路径各创建一个 Client，gemini/claude-agent 不涉及）。
             if self._conn is not None and isinstance(self._conn, dict):
@@ -151,9 +188,31 @@ class LLMClient:
                     except Exception:
                         pass
             self._conn = None
-            logger.warning("🛟 LLM provider '{}' 判定不可用（{}），切换到 '{}'".format(
-                old, reason[:160], self._chain[self._chain_idx]))
+            logger.warning("🛟 LLM provider '{}' {}（{}），切换到 '{}'".format(
+                old, "判定不可用" if sticky else "拒答本次内容（不判定为故障）",
+                reason[:160], self._chain[self._chain_idx]))
             return True
+
+    def _restore_chain(self, base_idx: int, base_gen: int) -> None:
+        """内容层拒答导致的临时切换收尾：把链位拨回本次调用开始时的位置。
+
+        只在「期间没发生过真·故障切换」时回滚（靠 _sticky_gen 判断）。否则会把
+        别的线程刚做出的合理推进撤销掉——那家是真的欠费/限流，拨回去只会再挂一次。
+        """
+        with self._conn_lock:
+            if self._sticky_gen != base_gen or self._chain_idx <= base_idx:
+                return
+            back_to = self._chain[base_idx]
+            if self._conn is not None and isinstance(self._conn, dict):
+                c = self._conn.get('client')
+                if isinstance(c, httpx.Client):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            self._conn = None
+            self._chain_idx = base_idx
+            logger.info("↩️ 内容拒答只影响本次调用，链位拨回 '{}'".format(back_to))
 
     def _model_for(self, conn: dict, override: Optional[str]) -> str:
         """解析本次调用的模型名。
@@ -236,6 +295,10 @@ class LLMClient:
             'provider': 'openai-compatible',
         }
 
+    def _is_content_refusal(self, e: Exception) -> bool:
+        """是否为内容层拒答（过滤器挡的是这一篇，不是 provider 坏了）。"""
+        return any(k in str(e).lower() for k in _CONTENT_REFUSAL_PHRASES)
+
     def _is_switchable(self, e: Exception) -> bool:
         """该异常是否意味着「当前 provider 不可用，应切换」（而非单次瞬时失败）。"""
         # 重试循环耗尽后抛出的瞬时类错误：该 provider 当前不可用
@@ -258,18 +321,32 @@ class LLMClient:
 
         model/max_tokens/temperature 缺省时用 settings；json_mode=True 请求结构化 JSON。
         对限流(429)/服务端(5xx)/超时/连接错误做指数退避重试（并发多月回填时保证稳健）；
-        致命错误（欠费/认证/CLI 缺失/内容拦截/重试耗尽）沿 fallback 链切换 provider。
+        致命错误（欠费/认证/CLI 缺失/重试耗尽）沿 fallback 链切换 provider，**且是粘性的**
+        （那家是真的坏了，后续调用不该再撞一次）。
+
+        **内容层拒答例外**：换下家接手本次调用，但收尾时把链位拨回来——被过滤器挡住的
+        是「这一篇」而不是 provider。粘性处理的代价实测过：一篇论文触发 AUP 拒答，
+        整个 client 被永久推到本地 ollama，同一批后续 28 篇全部陪葬。
         """
-        while True:
-            conn = self.conn  # 懒建；构造失败会自动沿链推进
-            try:
-                return self._call_once(conn, prompt, model, max_tokens, temperature,
-                                       json_mode, max_retries)
-            except Exception as e:
-                if not self._is_switchable(e):
-                    raise
-                if not self._advance_chain(conn, str(e)):
-                    raise
+        with self._conn_lock:
+            base_idx, base_gen = self._chain_idx, self._sticky_gen
+        soft = False
+        try:
+            while True:
+                conn = self.conn  # 懒建；构造失败会自动沿链推进
+                try:
+                    return self._call_once(conn, prompt, model, max_tokens, temperature,
+                                           json_mode, max_retries)
+                except Exception as e:
+                    if not self._is_switchable(e):
+                        raise
+                    refusal = self._is_content_refusal(e)
+                    soft = soft or refusal
+                    if not self._advance_chain(conn, str(e), sticky=not refusal):
+                        raise
+        finally:
+            if soft:
+                self._restore_chain(base_idx, base_gen)
 
     def _call_once(self, conn: dict, prompt: str, model: Optional[str],
                    max_tokens: Optional[int], temperature: Optional[float],

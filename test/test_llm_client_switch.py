@@ -194,3 +194,108 @@ def test_advance_chain_concurrent_threads_only_advance_once():
 
     assert all(results)  # 每个线程都被告知「可以重试」
     assert client._chain_idx == 1  # 但链指针只前进了一次，未被烧穿
+
+
+# ==================== (e) 内容层拒答不粘性切链 ====================
+#
+# 实测现场：221 篇精读回填里，一篇讲医疗 AI 安全的论文（正文含越狱样例）让
+# claude CLI 回了 AUP 拒答，_advance_chain 把整个 client 永久推到本地 ollama，
+# 同一批后续 28 篇全部陪葬——那 28 篇本身毫无问题，换个进程重跑全过。
+
+_AUP = ("claude CLI 调用失败: API Error: Sonnet 5 can't help with this. "
+        "Start a new session to continue.\n\nLearn more: https://www.anthropic.com/legal/aup")
+
+
+def test_内容拒答被识别为内容层而非故障():
+    client = LLMClient(_settings())
+    assert client._is_content_refusal(RuntimeError(_AUP)) is True
+    # 真·故障不该被误判成内容拒答，否则会把该粘的切换也拨回去
+    assert client._is_content_refusal(Exception("402 payment required")) is False
+    assert client._is_content_refusal(Exception("quota exhausted")) is False
+
+
+def test_内容拒答仍然换下家接手():
+    """拒答不等于放弃——尊重过滤器裁决、换下家读，只是不判定这家坏了。"""
+    client = LLMClient(_settings(provider="claude-agent", fallback_providers="gemini"))
+    assert client._is_switchable(RuntimeError(_AUP)) is True
+
+
+def test_内容拒答切换不计入粘性代际():
+    client = LLMClient(_settings(provider="claude-agent", fallback_providers="gemini"))
+    conn = {'cli_path': '/x/claude', 'model': 'sonnet', 'provider': 'claude-agent',
+            'name': 'claude-agent'}
+    client._conn = conn
+    gen0 = client._sticky_gen
+
+    assert client._advance_chain(conn, _AUP, sticky=False) is True
+    assert client._chain_idx == 1
+    assert client._sticky_gen == gen0          # 关键：没记成「这家坏了」
+
+    client._restore_chain(0, gen0)
+    assert client._chain_idx == 0              # 拨回主 provider
+
+
+def test_真故障切换是粘性的_不会被拨回():
+    """欠费/限流是真坏了，后续调用不该再撞一次。"""
+    client = LLMClient(_settings(provider="claude-agent", fallback_providers="gemini"))
+    conn = {'cli_path': '/x/claude', 'model': 'sonnet', 'provider': 'claude-agent',
+            'name': 'claude-agent'}
+    client._conn = conn
+    gen0 = client._sticky_gen
+
+    assert client._advance_chain(conn, "402 payment required", sticky=True) is True
+    assert client._sticky_gen == gen0 + 1
+
+    client._restore_chain(0, gen0)             # 拿旧代际来拨——应被拒绝
+    assert client._chain_idx == 1
+
+
+def test_期间发生真故障时不撤销别人的合理推进():
+    """线程 A 因内容拒答临时切走，线程 B 期间因 402 合理推进；A 收尾不该把 B 撤销。"""
+    client = LLMClient(_settings(provider="claude-agent",
+                                 fallback_providers="gemini,deepseek"))
+    conn = {'cli_path': '/x/claude', 'model': 'sonnet', 'provider': 'claude-agent',
+            'name': 'claude-agent'}
+    client._conn = conn
+    base_idx, base_gen = client._chain_idx, client._sticky_gen
+
+    client._advance_chain(conn, _AUP, sticky=False)        # A：临时切到 gemini
+    client._conn = {'client': MagicMock(), 'model': 'g', 'provider': 'gemini', 'name': 'gemini'}
+    client._advance_chain(client._conn, "402", sticky=True)  # B：gemini 真欠费
+
+    client._restore_chain(base_idx, base_gen)
+    assert client._chain_idx == 2              # 停在 deepseek，没被拨回 claude-agent
+
+
+# ==================== (f) 回退链的 provider:model 写法 ====================
+
+def test_回退链支持同一家换模型():
+    """`claude-agent:opus` 让 sonnet 挂了由 opus 接手，不必绕道做不了活的 ollama。"""
+    client = LLMClient(_settings(provider="claude-agent",
+                                 fallback_providers="claude-agent:opus,gemini"))
+    assert client._chain == ["claude-agent", "claude-agent", "gemini"]
+    assert client._chain_models == [None, "opus", None]
+
+
+def test_同名不同模型不被去重吃掉():
+    """去重按 (provider, model) 对；否则 claude-agent:opus 会被主链判为重复而丢失。"""
+    client = LLMClient(_settings(provider="claude-agent",
+                                 fallback_providers="claude-agent,claude-agent:opus,claude-agent:opus"))
+    assert client._chain == ["claude-agent", "claude-agent"]
+    assert client._chain_models == [None, "opus"]
+
+
+def test_链上模型覆写真的落到_conn():
+    client = LLMClient(_settings(provider="claude-agent", model="sonnet",
+                                 fallback_providers="claude-agent:opus"))
+    client._chain_idx = 1
+    with patch("shutil.which", return_value="/usr/local/bin/claude"):
+        conn = client._create_from_chain()
+    assert conn['model'] == "opus"
+    assert conn['provider'] == "claude-agent"
+
+
+def test_无冒号写法保持原有行为():
+    client = LLMClient(_settings(provider="deepseek", fallback_providers="claude-agent, gemini"))
+    assert client._chain == ["deepseek", "claude-agent", "gemini"]
+    assert client._chain_models == [None, None, None]

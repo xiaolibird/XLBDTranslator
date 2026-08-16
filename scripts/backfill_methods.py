@@ -490,12 +490,13 @@ def cmd_run(args):
 
     def _one(item):
         bf, data, pid = item
-        # **每篇一个独立 LLMClient**，绝不整轮共用。LLMClient 的回退链切换是**粘性**的：
-        # 某篇论文触发内容过滤（实测「Balancing Safety and Helpfulness in Healthcare AI
-        # Assistants」正文含越狱样例，claude CLI 直接回 AUP 拒答），_advance_chain 就把
-        # 整个 client 永久推到 ollama，后续每一篇都陪葬——一轮里连挂 28 篇就是这么来的。
-        # 切链本身是有意设计（翻译遇版权拦截要换家接手），不该改共享语义；这里让每篇
-        # 各自持有一条链，被拦的那篇自己走完回退、不牵连别人。
+        # **每篇一个独立 LLMClient**，绝不整轮共用。起因是内容过滤污染整条回退链：
+        # 「Balancing Safety and Helpfulness in Healthcare AI Assistants」正文含越狱样例，
+        # claude CLI 回 AUP 拒答 → 整个 client 被永久推到 ollama → 后续 28 篇全部陪葬
+        # （那 28 篇本身毫无问题，换进程重跑全过）。
+        # 那个根因已在 llm_client 修掉（内容拒答只临时换下家、收尾拨回链位），这里仍
+        # 保留每篇独立 client 作纵深防御：**真·故障**的切换是粘性的（本该如此），
+        # 但一篇论文撞上限流也不该让整批几十篇跟着降级。构造开销可忽略。
         try:
             r = backfill_one(bf, data, LLMClient(settings.llm), model, backup_dir)
         except Exception as e:                # 单篇异常不许打断整批
