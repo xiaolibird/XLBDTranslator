@@ -815,7 +815,11 @@ def find_stale_claims(topics_dir, index: dict, *,
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
         fm, _ = split_frontmatter(text)
         if not isinstance(fm, dict) or not fm.get("topic"):
@@ -926,7 +930,11 @@ def cited_by_page(topics_dir) -> Dict[str, List[str]]:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
         fm, _ = split_frontmatter(text)
         if not isinstance(fm, dict) or not fm.get("topic"):
@@ -973,7 +981,11 @@ def cited_citekeys(topics_dir) -> set:
             continue
         try:
             keys.update(_CITE_RE.findall(path.read_text(encoding="utf-8")))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
     return keys
 
@@ -1078,7 +1090,11 @@ def coverage_report(topics_dir, index: dict, *,
             continue
         try:
             fm, _ = split_frontmatter(path.read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
         if not isinstance(fm, dict) or not fm.get("topic"):
             continue

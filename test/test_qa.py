@@ -1890,8 +1890,15 @@ def test_verify_actually_prints_the_slug_mismatch():
     assert "if a.slug_mismatch:" in src, "算出来了就必须印出来"
     i = src.index("if a.slug_mismatch:")
     tail = src[i:i + 500]
-    assert "该叫" in tail or "文件名与问题对不上" in tail
-    assert "mv " in tail, "要给可执行的收编办法，不是只报告"
+    assert "不可达" in tail, "要说清后果：重问会落到另一页"
+    # ⚠️ **不许印 `mv`**：`slug_mismatch` 置位时目标文件必然已存在（两条返回路径给的
+    # 都是磁盘上真实存在的文件），照做就是覆盖掉那页唯一可达的。这条断言是反向的——
+    # 我第一版写的是 `assert "mv " in tail`，把一个破坏性命令锁进了测试里
+    # （"测试跟着实现动"的活标本，第 3 轮审计逮到）。
+    printed = "\n".join(ln for ln in tail.splitlines()
+                        if not ln.lstrip().startswith("#"))
+    assert "mv " not in printed, "目标必然已存在，mv 就是覆盖数据"
+    assert "归并" in tail
 
 
 def test_nearby_papers_carry_titles_too():
@@ -1909,3 +1916,72 @@ def test_gap_hit_lines_survive_missing_titles():
                               Q.GapHit(kind="topic", key="t", score=0.7)])
     joined = "\n".join(lines)
     assert "None" not in joined and "k2024" in joined and "t" in joined
+
+
+# ---------------------------------------------------------------------------
+# 28. 第 3 轮代码审计：剥离器的领域词、编码容错、填充侧的 title/snippet
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "报告偏倚的量化",          # `报告` 既是脚手架动词也是领域词词头
+    "覆盖率的定义",            # `覆盖`
+    "研究设计的三种类型",      # `研究`
+    "包含缺失指示符的模型",    # `包含`
+    "直接效应与间接效应的分解",  # `直接`（裸副词档）
+    "充分统计量在缺失数据下的构造",
+    "具体病种的亚组分析",
+    "任何时点的插补策略",
+])
+def test_verb_and_adverb_tiers_do_not_eat_domain_terms(text):
+    """第 2 轮只给「未」「系统」两个**有已知反例**的词加了动词前瞻，没把它上升成规则。
+    剩下 27 个词是同一个形状——审计用真 bge-m3 + 真库量化：6/6 领域词被啃掉，
+    其中 3/6 让回查 top1 换了一篇论文或跌破 0.65 阈值，**把结论整个翻转**。
+
+    规则现在是两条：裸副词要后接副词或动词；**动词档只在前面已经剥掉过脚手架时才开火，
+    且至多剥一次**（「没有给出覆盖率」里 `给出` 是脚手架、`覆盖` 不是）。"""
+    assert Q.strip_gap_scaffold(text) == text
+
+
+@pytest.mark.parametrize("gap,want", [
+    ("本次证据没有给出覆盖率的定义", "覆盖率的定义"),          # 剥一个动词就停
+    ("本次证据没有专门系统讨论可识别性条件", "可识别性条件"),   # 副词链 + 动词
+    ("未涉及跨中心机制漂移的量化", "跨中心机制漂移的量化"),
+])
+def test_scaffold_still_stripped_after_the_guards(gap, want):
+    """守卫不能把该剥的也挡住——这两条是同一枚硬币的两面。"""
+    assert Q.strip_gap_scaffold(gap) == want
+
+
+def test_a_non_utf8_file_does_not_take_down_the_whole_archive(tmp_path):
+    """`UnicodeDecodeError` 是 `ValueError` 的子类，只捕 `OSError` 挡不住它。
+    目录里内容是中文，有人用 GBK 存回来一个文件，就能让 `--list`/`--verify`/查重/
+    身份扫描/INDEX 重建一起挂——而这几处的 docstring 都写着「绝不抛异常」。"""
+    d = tmp_path / "qa"
+    _archive(d, "qa-good", "正常的问题")
+    (d / "qa-broken.md").write_bytes(b"---\nqa: \xff\xfe\x00broken\n---\n")
+    assert [p.slug for p in Q.list_qa_pages(d)] == ["qa-good"]
+    assert Q.audit_qa_pages(d, {"papers": []})[0].slug == "qa-good"
+    assert Q.find_similar_questions(d, "图神经网络的过平滑怎么缓解").hits == []
+    assert "正常的问题" in Q.render_qa_index(d)
+
+
+def test_recheck_gaps_fills_in_titles_and_snippets(tmp_path):
+    """第 3 轮加的 title/snippet **只在渲染层有测试**（手工构造 GapHit 再喂给
+    render_qa_block），而填充它们的那三行在 `recheck_gaps` 里没有任何断言——
+    把填充整个去掉，页面上标题原句消失，测试全绿（审计变异 N1/N2/N4 全部逃逸）。"""
+    gap = "缺少可识别性的系统讨论"
+    store = FakeStore(
+        [{"id": "c1", "level": "highlight", "citekey": "chen2026Partial",
+          "text": "可识别性判据的原句"}],
+        [[1, 0, 0, 0]])
+    specs = [T.TopicSpec(slug="missingness-causal", title="缺失与因果结构",
+                         question="可识别性在什么条件下成立？", queries=["q"])]
+    emb = FakeEmbed({Q.strip_gap_scaffold(gap): [1, 0, 0, 0],
+                     "可识别性在什么条件下成立？": [0.95, 0.31, 0, 0]})
+    hits = Q.recheck_gaps([gap], store=store, embed_client=emb, topic_specs=specs,
+                          titles={"chen2026Partial": "Partial Identification"})
+    ev = [h for h in hits[gap] if h.kind == "evidence"][0]
+    tp = [h for h in hits[gap] if h.kind == "topic"][0]
+    assert ev.title == "Partial Identification", "证据命中必须带标题"
+    assert ev.snippet == "可识别性判据的原句", "必须带匹配到的那句原文"
+    assert tp.title == "缺失与因果结构", "概念页命中也要带标题"

@@ -118,6 +118,14 @@ def main() -> int:
                     help="只自检已归档页（死键/失锚/正文残留证据编号/可达性/防线版本），"
                          "不调 LLM、不联网、不改文件")
     args = ap.parse_args()
+    # 提前校验：这两个数不合法时 `retrieve_qa_evidence` 会抛 TopicError，而那发生在
+    # **整轮宽召回跑完之后**，而且以裸 traceback + 退出码 1（文档里 1 的含义是
+    # "归档页有冲突"）呈现。与本文件"slug 占用检查放最前：它不花钱、不联网"同一条原则。
+    if args.per_paper_cap <= 0:
+        ap.error("--per-paper-cap 必须 ≥ 1（收到 {}）。想「不限制」就给一个大于 "
+                 "--max-evidence 的数".format(args.per_paper_cap))
+    if args.max_evidence <= 0:
+        ap.error("--max-evidence 必须 ≥ 1（收到 {}）".format(args.max_evidence))
 
     cfg = repo_path(args.config)
     settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
@@ -163,12 +171,16 @@ def main() -> int:
                 print("     ⚠️ 失锚（原句已不在该篇 highlights 里）：{}".format(
                     ", ".join(a.unanchored[:6])))
             if a.slug_mismatch:
-                # F2：这条此前只影响 ok 与退出码、**从不打印**——用户看到的是一行全 0
-                # 配一个 ❌，而给的药方（"重问一次"）会落到另一页上，孤儿页原地不动。
-                print("     ⚠️ 文件名与问题对不上（重问这个问题会落到别处）："
-                      "这一页该叫 {}。收编：mv {}.md {}.md 并把 frontmatter 的 "
-                      "`qa:` 改成新名字".format(
-                          a.slug_mismatch, a.slug, a.slug_mismatch))
+                # 这里**不能印 `mv A.md B.md`**：`slug_mismatch` 只在
+                # `qa_slug(question, qa_dir=)` 返回了别的 slug 时才置位，而那个函数的
+                # 两条返回路径给的都是**磁盘上真实存在的文件**（页面自己一定能匹配
+                # 自己，扫描不会落空）。所以 `want != slug` ⇒ `want.md` 必然已存在 ⇒
+                # `mv` 100% 是覆盖操作，覆盖掉的正是重问时会落到的那一页。
+                # 这是"同身份有两页"，不是"名字起错了"——正确的动作是归并，不是改名。
+                print("     ⚠️ 与另一页同属一个问题：重问会落到 {}，**这一页从此不可达**。"
+                      .format(a.slug_mismatch))
+                print("        核对两页内容后归并（保留想留的那份，删掉另一份）；"
+                      "不要 mv 覆盖——目标文件就是那页可达的。")
             if a.residual_refs:
                 # 归档页是**生成它那一刻的代码**的快照：这些编号是在正文回译防线落地
                 # 之前写下的，页面上留着一个只对当时那次召回有意义的交叉引用。

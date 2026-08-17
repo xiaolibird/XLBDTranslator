@@ -307,7 +307,7 @@ def update_command(slug: str, question: str) -> str:
 
     （`--slug` 唯一能干的事是给一页**全新**问答起个好读的文件名。「换个问法覆盖
     那一页」这件事代码里没有路径，也不该有——那会让 frontmatter 的 `question`
-    与页面内容悄悄脱钩。两份文档里"用 --slug 合并"那条自相矛盾的说法已经删掉。）
+    与页面内容悄悄脱钩。两份文档里那条说法也已改成"印那一页自己的问题"（第 3 轮才真正改到文档，此前只改了代码侧，而 docstring 已经声称改完了——那句话本身就是个假安心）。）
 
     用 `shlex.quote` 而不是手写引号：问题里含 `"` 时打出来的命令直接是坏的，
     含反引号或 `$(…)` 时粘进 shell 还会**命令替换**——这条命令是印给人复制粘贴的。
@@ -912,11 +912,28 @@ _GAP_SCAFFOLD_STAGES = [
     # 同上：裸「系统」会把 `系统性偏差` 啃成 `性偏差`。副词形式无歧义可以直接剥；
     # 裸「系统」用与「未」相同的手法——只在后面紧跟动词时才算脚手架
     # （`系统讨论` 是脚手架，`系统性偏差` 不是）。
-    re.compile(r"^(?:专门|系统性地|系统地|具体|直接|明确|充分|真正|任何|详细)"),
+    # 裸副词同样只在**后面紧跟动词**时才算脚手架。第 2 轮只给「未」「系统」两个
+    # 有已知反例的词打了补丁，没把它上升成规则——剩下的词是同一个形状，实测
+    # `直接效应`→`效应`、`充分统计量`→`统计量`、`具体病种`→`病种` 全被啃掉，
+    # 其中 3/6 让回查 top1 换了一篇论文或跌破阈值（把结论整个翻转）。
+    # 副词形式（`系统性地`/`系统地`）无歧义，不需要前瞻。
+    re.compile(r"^(?:系统性地|系统地)"),
+    # 前瞻里除动词外还要允许**另一个副词**：`专门系统讨论` 是副词链，
+    # 只认动词的话第一个副词就卡住了。
+    re.compile(r"^(?:专门|具体|直接|明确|充分|真正|任何|详细)"
+               r"(?=系统|专门|具体|直接|明确|充分|真正|详细|"
+               r"讨论|涉及|覆盖|给出|提及|提到|包含|回答|说明|评估|报告|"
+               r"考察|分析|检验|探讨|论及|研究|描述|做|作)"),
     re.compile(r"^系统(?=讨论|涉及|覆盖|给出|提及|提到|包含|回答|说明|评估|报告|"
                r"考察|分析|检验|探讨|论及|研究|描述|做|作)"),
-    re.compile(r"^(?:讨论|涉及|覆盖|给出|提及|提到|包含|回答|说明|评估|报告|"
-               r"考察|分析|检验|探讨|论及|研究|描述)(?:到|过|了)?"),
+    # ⚠️ 这一档**只在前面已经剥掉过脚手架时才生效**（见 strip_gap_scaffold 的
+    # `in_scaffold`）。`报告|覆盖|研究|包含` 既是脚手架动词，也是领域词的词头：
+    # 裸着跑会把 `报告偏倚的量化`→`偏倚的量化`、`覆盖率的定义`→`率的定义`、
+    # `研究设计的三种类型`→`设计的三种类型`、`包含缺失指示符的模型`→`缺失指示符的模型`
+    # ——实测这四条里有两条让回查 top1 跌破阈值，真命中直接丢失。
+    # 「没有给出覆盖率」里 `给出` 是脚手架、`覆盖` 不是，所以这一档**至多剥一次**。
+    _VERB_STAGE := re.compile(r"^(?:讨论|涉及|覆盖|给出|提及|提到|包含|回答|说明|评估|报告|"
+                              r"考察|分析|检验|探讨|论及|研究|描述)(?:到|过|了)?"),
     re.compile(r"^(?:关于|对于|针对)"),
     re.compile(r"^[，,、：:；;的\s]+"),
 ]
@@ -938,10 +955,25 @@ def strip_gap_scaffold(gap: str) -> str:
     """
     raw = str(gap or "").strip()
     s = raw
+    in_scaffold = False      # 前面剥掉过东西吗（决定动词档能不能开火）
+    verb_used = False        # 动词档至多剥一次
     for _ in range(12):
         before = s
         for rx in _GAP_SCAFFOLD_STAGES:
-            s = rx.sub("", s, count=1)
+            if rx is _VERB_STAGE:
+                # 裸着开火会啃掉 `报告偏倚`/`覆盖率`/`研究设计`/`包含X` 这类
+                # 以脚手架动词开头的领域词——它们是这个问题**要问的东西本身**。
+                if not in_scaffold or verb_used:
+                    continue
+                nxt = rx.sub("", s, count=1)
+                if nxt != s:
+                    verb_used = True
+                s = nxt
+                continue
+            nxt = rx.sub("", s, count=1)
+            if nxt != s:
+                in_scaffold = True
+            s = nxt
         if s == before:
             break
     s = _GAP_TAIL_RE.sub("", s).strip()
@@ -1206,7 +1238,11 @@ def list_qa_pages(qa_dir) -> List[ArchivedQA]:
             continue
         try:
             fm, _ = split_frontmatter(path.read_text(encoding="utf-8"))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
         if not isinstance(fm, dict) or not fm.get("qa"):
             continue
@@ -1623,7 +1659,11 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它。
+            # 目录里内容是中文，有人用 GBK 存回来一个文件，就能让 --list /
+            # --verify / 查重 / 身份扫描 / INDEX 重建 / lint 覆盖率一起挂——
+            # 而这几处的 docstring 都写着「绝不抛异常」。
             continue
         fm, body = split_frontmatter(text)
         if not isinstance(fm, dict) or not fm.get("qa"):

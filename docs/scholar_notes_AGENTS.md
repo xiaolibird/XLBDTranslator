@@ -254,7 +254,7 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
   零宽字符全部归一化,不掺日期),不会堆出第二份答案。`first_asked_at` 会保留,
   `generated_at` 前进。少打一个问号不会另开一页。
 - **问之前会先查重**:与已归档问题接近的会提示你,附 slug、路径与**直接可粘的更新命令**
-  (`ask_notes.py "<新问法>" --slug <slug>`)。查重走**语义**(embedding),Ollama 不可用时
+  (`ask_notes.py "<那一页自己的问题>" --slug <slug>`（**换个问法覆盖那一页没有路径**：slug 占用检查按问题身份比对，新问法必然被拒退 2）)。查重走**语义**(embedding),Ollama 不可用时
   降级回词面重合**并明说降级了**——词面档实测漏的正是"三个月后换个说法再问一次"那一档
   (0.10~0.17 全漏),纯英文短问题(`AI vs ML?`)分词后为空、永远不响。`--no-dedup-check` 关掉。
 - **`--slug` 不会静默覆盖别人**:那个 slug 上已经躺着另一个问题时直接报错退 2,

@@ -158,7 +158,7 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 - **同一个问题再问一次是原地更新那一页**(空白/标点/全半角/零宽字符都归一化,
   少打一个问号不会另开一页),不会堆出第二份答案;问之前会自动做**语义**查重并给出
-  slug、路径与可直接粘的更新命令 `ask_notes.py "<新问法>" --slug <slug>`。
+  slug、路径与可直接粘的更新命令 `ask_notes.py "<那一页自己的问题>" --slug <slug>`（换问法覆盖那一页没有路径）。
   Ollama 不可用时降级回词面重合,并会明说降级了。
 - **`--slug` 不会静默覆盖别人的问答**:那个 slug 已属于另一个问题时直接报错退 2。
 - 每条论断带 `[@citekey]`,页底证据表给 `note_file:note_line`。**要把具体数字写进稿子,
