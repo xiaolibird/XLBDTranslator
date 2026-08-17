@@ -22,9 +22,13 @@
 跨运行去重：seen 集从 output/scholar_notes/literature_index.json 恢复（收尾自动刷新该索引），
 新月份不会与历史月重复；--force 重跑时自动剔除待跑月份自己的键。
 
-退出码：0 成功 / 1 有月份失败或收尾索引刷新失败 / 3 全部月份正常回填但概念页未全部更新
-成功（不是回填失败，是它的派生产物这一轮没跟上，见 _refresh_topics_for_keys；与
-scripts/ingest_notes.py 的同一语义对齐）。
+退出码：0 成功 / 1 有月份失败或收尾索引刷新失败 / 3 全部月份正常回填但**派生产物**
+未全部跟上（概念页未全部更新成功，见 _refresh_topics_for_keys；或知识层 lint 没跑成，
+见 _run_knowledge_lint）——不是回填失败，与 scripts/ingest_notes.py 的同一语义对齐。
+
+注意「知识层 lint 发现了库里有撤稿论文」**不走退出码**：那是 lint 干活干成了，
+走 notify 弹窗（标题「Scholar 库里有撤稿论文」）。工具故障与工具发现问题必须分开，
+否则调用方只能二选一：要么撤稿不响，要么工具故障被当成撤稿。
 """
 import argparse
 import json
@@ -286,6 +290,76 @@ def _refresh_topics_for_keys(notes_dir, citekeys, timeout=2400) -> bool:
     return outcome.ok
 
 
+def _run_knowledge_lint(notes_dir, timeout=900) -> bool:
+    """回填收尾跑一遍知识层 lint（P3）。**只跑不花钱的三项**（`--skip-contradictions`）。
+
+    为什么这里只挂 lint 而不挂对撞裁决：对撞是这套链路唯一调 LLM 的一项，一次要
+    5 个批次；月度回填自己已经跑完 filter/精读/概念页合成三轮 LLM，再叠一轮很容易
+    把订阅打到限流（W7 的历史事故就是这个形状）。对撞留给人工按需跑
+    `scripts/lint_notes.py`——它不像撤稿那样有时效压力。
+
+    撤稿检查恰恰相反，是**最该无人值守跑**的一项：纯网络、20 秒量级、而且发现的是
+    "库里躺着一篇已被撤销的论文，可能正在给某几页概念页的论断当地基"这种必须当天
+    处理的事。发现时 lint_notes.py 退出码 1，这里 notify 喊人。
+
+    best-effort 的边界与 `_refresh_topics_for_keys` 一致：lint 是索引的派生检查，
+    它自己跑挂了不该带崩回填的退出码；但**发现撤稿要响**，且要与"工具自己挂了"
+    分开（见 L.summarize_lint_run 的 LintOutcome.ok/alert 两个字段）。
+
+    命令行里**不带 `--vault-dir`**：`lint_notes.py` 在 notes_dir 确实是生产库时会自己
+    探测 `~/Documents/ScholarVault`（只读，用来把 vault 副本里的 ack 一起读进来，见
+    lint.read_lint_acks 的 L1/N2）。这里传不传都一样，不传少一个会漂移的常量。
+    这条链路正是 ack 折叠的主场景：它固定跑 `--skip-contradictions`，对撞那一节永远
+    是结转来的，ack 全靠 `lint.fold_acked_blocks` 对结转文本再折一次才生效。
+
+    A5 的「距上次对撞已 N 天」提示**不单独弹通知**（那是噪音，对撞没有时效压力）：
+    lint_notes.py 把它打在 stdout，下面那个逐行 logger.info 循环已经把它带进日志，
+    这就是它该走的音量。
+
+    安全前提同样是 `T.notes_dir_is_production`：子进程用 lint_notes.py 自己的默认
+    配置独立加载**生产** notes_dir，与这里传入的 notes_dir 完全脱钩——测试隔离场景
+    （tmp_path）一律不发子进程，否则单测会打到生产环境（read_pdf.py 的同类触发器
+    实测踩过，挂起 13 分钟）。
+    """
+    import subprocess
+    from src.scholar import topics as T
+    from src.scholar import lint as LT
+    if not T.notes_dir_is_production(notes_dir):
+        return True
+    script = repo_path("scripts/lint_notes.py")
+    if not script.exists():
+        return True
+    cmd = [sys.executable, str(script), "--skip-contradictions"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              cwd=str(repo_path(".")))
+    except subprocess.TimeoutExpired:
+        logger.warning("知识层 lint 超时（{}s），本次回填已完成".format(timeout))
+        notify("Scholar 月度回填", "知识层 lint 超时（回填本身已完成）")
+        return False
+    except Exception as e:
+        logger.warning("知识层 lint 跳过（不影响回填）：{}".format(e))
+        notify("Scholar 月度回填", "知识层 lint 异常（回填已完成）：{}".format(str(e)[:120]))
+        return False
+
+    for line in (proc.stdout or "").strip().splitlines():
+        logger.info("  {}".format(line))
+    outcome = LT.summarize_lint_run(proc.stdout, proc.stderr, proc.returncode)
+    # B2：`alert` 与 `ok` 是两个**独立**字段，这里此前写成 if/elif 互斥分支——
+    # "既发现了撤稿、报告又没写进磁盘"这种组合下，撤稿警报会被工具故障那条分支吃掉
+    # （或反过来）。两件事各说各的，两条通知都发。
+    if outcome.alert:
+        # 这不是失败，是 lint 干活干成了。用最高音量喊——撤稿论文留在库里，
+        # 之后每一次引用它都是在引一篇被撤销的工作。
+        logger.error("🚨 {}".format(outcome.detail))
+        notify("Scholar 库里有撤稿论文", outcome.detail[:300])
+    if not outcome.ok:
+        logger.warning("知识层 lint 未跑成，回填已完成：{}".format(outcome.detail))
+        notify("Scholar 月度回填", "知识层 lint 未跑成（回填已完成）：{}".format(
+            outcome.detail[:300]))
+    return outcome.ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2023-01")
@@ -298,6 +372,10 @@ def main():
     ap.add_argument("--no-topics", action="store_true",
                     help="收尾不更新概念页（概念页可事后单独跑 build_topics.py。注意 --no-index "
                          "会隐式吞掉这个开关的独立语义，见其帮助文本）")
+    ap.add_argument("--no-lint", action="store_true",
+                    help="收尾不跑知识层 lint（撤稿/陈旧论断/覆盖缺口，见 scripts/lint_notes.py）。"
+                         "它是纯只读检查、不调 LLM，所以**不受 --no-topics 控制**——跳过它省不下"
+                         "任何成本，却会让「库里有已撤稿论文」整月无人发现")
     ap.add_argument("--config", default="config/scholar.env")
     ap.add_argument("--top-n", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=15, help="LLM 筛选批量（过夜吞吐）")
@@ -444,6 +522,16 @@ def main():
         else:
             logger.info("概念页收尾：本次回填没有新增 citekey，跳过")
 
+    # 知识层 lint（P3）：撤稿/陈旧论断/覆盖缺口三项纯查不花钱，跑完概念页再跑，
+    # 让它读到本轮最新的页面。**不受 --no-topics 控制**——那个开关的语义是"这轮
+    # 别重合成概念页"，而 lint 是只读检查，跳过它没有省下任何 LLM 成本，却会让
+    # "库里有撤稿论文"这种必须当天处理的事整月无人发现。只被 --no-lint 与
+    # --no-index（索引都没刷新，lint 读到的是旧库，结论没意义）挡住。
+    lint_ok = True
+    if not args.no_index and not args.no_lint and index_err is None:
+        logger.info("知识层 lint：撤稿 / 陈旧论断 / 覆盖缺口（不含对撞，见 _run_knowledge_lint）")
+        lint_ok = _run_knowledge_lint(notes_dir)
+
     ok = [r for r in results if r.get("status") == "ok"]
     # 只统计本次 run_months：progress 文件跨运行续用，历史遗留的陈旧 error 条目
     # 不该让这次全部成功的运行误报非零退出。
@@ -463,11 +551,16 @@ def main():
         notify("Scholar 月度回填失败", msg)
         logger.error("❌ {}".format(msg))
         sys.exit(1)
-    if not topics_ok:
+    if not topics_ok or not lint_ok:
         # X5：回填本身（札记 md/references/索引）已经正常完成，只是概念页这个派生物
         # 没跟上——与 errs/index_err 那种"回填本身失败"的退出码 1 区分开，对齐
         # ingest_notes.py 的退出码 3 语义（"入库成功但概念页未全部更新成功"）。
-        logger.warning("⚠️ 概念页未全部更新成功（回填本身已完成），退出码 3")
+        # 知识层 lint 没跑成走同一档：同样是"派生检查没跟上"，不是回填失败。
+        # 注意 lint **发现撤稿**不会走到这里（那是 lint 干活干成了，走 notify 那条路，
+        # 见 _run_knowledge_lint 与 L.LintOutcome.ok/alert 的分工）。
+        logger.warning("⚠️ {}未全部跟上（回填本身已完成），退出码 3".format(
+            "、".join([s for s, okv in (("概念页", topics_ok), ("知识层 lint", lint_ok))
+                       if not okv])))
         sys.exit(3)
 
 

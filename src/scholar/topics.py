@@ -91,7 +91,7 @@ DEFAULT_BUCKET_BONUS = 0.03
 # 可按页在 topics.yaml 显式覆盖（填 [] 即不排除任何 section）。
 DEFAULT_EXCLUDE_SECTIONS = ["对我研究的联想"]
 
-GEN_BEGIN = ("<!-- BEGIN GENERATED v{} h={} · 由 scripts/build_topics.py 生成 · "
+GEN_BEGIN = ("<!-- BEGIN GENERATED v{} h={} · 由 {} 生成 · "
              "此块会被重建覆盖，请写在下面的「我的批注」里 -->")
 # GEN_END 直接从 vault 导入（不在这里重新声明字面量）：此前两边各自维护一份逐字符相同
 # 的字符串，纯靠人工保持一致、没有测试强制——任何一边单改措辞，extract_user_zone/
@@ -458,6 +458,28 @@ def routing_is_stale(store, index_generated_at: Optional[str]) -> bool:
     return lag is None or lag > ROUTING_STALE_SECONDS
 
 
+def is_topic_page_file(path) -> bool:
+    """topics/ 下这个文件是不是一页概念页（**按文件名判，不读内容**）。
+
+    这个目录下并不是只有概念页：
+      - `INDEX.md` 是目录页（自己就是从各页 frontmatter 汇总出来的）；
+      - `_lint.md` 是知识层 lint 报告（`lint.py` 的产物）；
+      - `.retry_state.json` 是跨触发失败冷却状态（不是 `.md`，天然不进 `glob("*.md")`）。
+
+    约定 `_` 前缀留给「放在 topics/ 里、但不是一页概念页」的派生产物。四处扫描
+    （`stale_topic_slugs`/`audit_topic_pages`/`render_topics_index` 与 lint 侧的
+    `cited_citekeys`）都过这一关。
+
+    这层是**冗余防线**而非唯一防线：前三处本来就还要求 frontmatter 里有 `topic` 键，
+    报告与目录页都没有这个键，本就进不去。但 lint 侧的 `cited_citekeys` 是纯文本
+    扫 `[@key]`、根本不看 frontmatter——若不按文件名先挡一道，`_lint.md` 里逐条列出的
+    撤稿/对撞 citekey 会被算成"已被概念页覆盖"，把覆盖率虚报上去，而且报告越长虚报
+    越多（自己引用自己）。所以这道防线在那一处是**唯一**防线。
+    """
+    name = Path(path).name
+    return name.endswith(".md") and name != "INDEX.md" and not name.startswith("_")
+
+
 def stale_topic_slugs(topics_dir: Path, specs: Sequence[TopicSpec], *,
                       max_age_days: float = 30.0,
                       now: Optional[datetime] = None,
@@ -489,7 +511,7 @@ def stale_topic_slugs(topics_dir: Path, specs: Sequence[TopicSpec], *,
     by_slug = {s.slug for s in specs}
     out: List[Tuple[datetime, str]] = []
     for path in sorted(Path(topics_dir).glob("*.md")):
-        if path.name == "INDEX.md":
+        if not is_topic_page_file(path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -1028,18 +1050,27 @@ def build_frontmatter(spec: TopicSpec, synthesis: dict, evidences: Sequence[Evid
     return _render_frontmatter(items)
 
 
-def assemble(fm: str, gen_block: str, user_zone: str) -> str:
+DEFAULT_GENERATOR = "scripts/build_topics.py"
+
+
+def assemble(fm: str, gen_block: str, user_zone: str, *,
+             generator: str = DEFAULT_GENERATOR) -> str:
+    """`generator` 只影响哨兵注释里那句「由 X 生成」的人话提示，不参与哈希、不影响
+    解析（`vault.GEN_BEGIN_RE` 对脚本名那段是 `.*`）。参数化是因为 topics/ 下现在
+    不止一种产物：概念页由 `build_topics.py` 写，知识层 lint 报告由 `lint_notes.py`
+    写——哨兵里指错脚本，人按提示去重跑会跑到一个根本不生成这份文件的命令上。"""
     body = gen_block.rstrip("\n")
     return "{}\n\n{}\n{}\n{}\n\n{}\n".format(
-        fm, GEN_BEGIN.format(TOPIC_SCHEMA_VERSION, _gen_hash(body)), body,
+        fm, GEN_BEGIN.format(TOPIC_SCHEMA_VERSION, _gen_hash(body), generator), body,
         GEN_END, user_zone.strip("\n"))
 
 
-def merge_topic_page(fm: str, gen_block: str, existing: Optional[str]
+def merge_topic_page(fm: str, gen_block: str, existing: Optional[str], *,
+                     generator: str = DEFAULT_GENERATOR
                      ) -> Tuple[Optional[str], str]:
     """合并生成块与用户批注。conflict 时返回 None，调用方不得覆盖（同 vault 约定）。"""
     if existing is None:
-        return assemble(fm, gen_block, DEFAULT_USER_ZONE), "new"
+        return assemble(fm, gen_block, DEFAULT_USER_ZONE, generator=generator), "new"
     _fm, body = split_frontmatter(existing)
     if _fm is None:
         return None, "conflict"
@@ -1048,7 +1079,7 @@ def merge_topic_page(fm: str, gen_block: str, existing: Optional[str]
         return None, "conflict"
     if generated_block_tampered(body):
         return None, "conflict"
-    return assemble(fm, gen_block, user_zone), "merged"
+    return assemble(fm, gen_block, user_zone, generator=generator), "merged"
 
 
 def read_existing(path: Path) -> Tuple[Optional[str], Optional[Dict[str, Any]], str]:
@@ -1356,7 +1387,7 @@ def audit_topic_pages(topics_dir: Path, index: dict) -> List[PageAudit]:
 
     out: List[PageAudit] = []
     for path in sorted(Path(topics_dir).glob("*.md")):
-        if path.name == "INDEX.md":
+        if not is_topic_page_file(path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -1427,6 +1458,10 @@ def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, 
     vault 侧是独立的一份：有自己的「我的批注」区，走同一套哨兵合并，冲突时不覆盖。
     权威产物仍是 notes_dir 那份（带 `[@citekey]`，pandoc 可直接挂书目）。
 
+    同步范围是「概念页（frontmatter 有 `topic` 键）+ 知识层 lint 报告
+    （`type: lint`）」，见下面循环里的 `is_page`/`is_lint`。`INDEX.md` 与其它没有
+    这两种身份标记的文件一律跳过。
+
     specs（B1，可选）：当前 `topics.yaml` 配置。给了就会给"已不在配置里"的页在 vault
     侧打 frontmatter `retired: true` + tag「札记/概念页-退役」——此前退役页在 vault 里
     与"仍在更新"的页面长得一模一样，唯一的提示只写在 `notes_dir/topics/INDEX.md`，
@@ -1475,7 +1510,15 @@ def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, 
         # 同步进 vault。这里是**明确判定"不是概念页"**（区别于上面两种"读不出/
         # 解析不出"），可以放心不计入 seen——vault 侧同名旧页该走 prune 就走 prune，
         # 不需要让整轮清理陪绑。
-        if not fm.get("topic") or not isinstance(body, str):
+        #
+        # 例外：知识层 lint 报告（`_lint.md`，frontmatter `type: lint`）也要过来。
+        # 它不是概念页（不进 INDEX、不参与日历兜底、不做退役标记），但它是给人读的
+        # 知识产物，而人读东西的地方是 Obsidian——只落在 output/scholar_notes/topics/
+        # 等于没人看，里面逐条列出的 citekey 也点不开。转成 wiki 链接后，"这篇撤稿
+        # 论文正在给哪几页当地基"才真的能一路点过去。
+        is_page = bool(fm.get("topic"))
+        is_lint = str(fm.get("type") or "") == "lint"
+        if not (is_page or is_lint) or not isinstance(body, str):
             report["skipped"].append(src.name)
             continue
         end = body.find(GEN_END)
@@ -1483,9 +1526,9 @@ def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, 
         gen = re.sub(r"^<!-- BEGIN GENERATED.*?-->\s*", "", gen.strip(), flags=re.S)
         slug = str(fm.get("topic") or src.stem)
         if not gen:
-            # topic 键确认存在（这份文件确实是概念页），只是这轮生成块解出来是空——
-            # slug 可信，登记进 seen 保护它自己的 vault 页不被当"已下线"清理掉，
-            # 但没必要因为这一页拖累其它页的 prune。
+            # 身份键确认存在（这份文件确实是概念页 / lint 报告），只是这轮生成块
+            # 解出来是空——slug 可信，登记进 seen 保护它自己的 vault 页不被当
+            # "已下线"清理掉，但没必要因为这一页拖累其它页的 prune。
             report["skipped"].append(src.name)
             seen.add(slug)
             continue
@@ -1494,8 +1537,12 @@ def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, 
         dst = out_dir / "{}.md".format(slug)
         gen_v = to_wiki_links(gen, filenames)
         fm_v = dict(fm)
-        fm_v["cssclasses"] = fm.get("cssclasses") or ["topic-page"]
-        if current_slugs is not None and slug not in current_slugs:
+        fm_v["cssclasses"] = fm.get("cssclasses") or (
+            ["lint-report"] if is_lint else ["topic-page"])
+        # 退役标记只对概念页有意义：lint 报告永远不在 topics.yaml 里，不做这层判断
+        # 会让它每次同步都被打上 `retired: true` + 「已退役」标签，读起来像是一份
+        # 作废文件（实际上它是每轮重新生成的最新报告）。
+        if is_page and current_slugs is not None and slug not in current_slugs:
             # B1：退役页在 vault 侧此前与"仍在更新"的页面长得一模一样，唯一的提示
             # 只写在 notes_dir/topics/INDEX.md——vault 重度用户几乎不会翻那个文件。
             fm_v["retired"] = True
@@ -1556,7 +1603,7 @@ def render_topics_index(topics_dir: Path, specs: Sequence[TopicSpec]) -> str:
     rows: List[Tuple[str, str]] = []
     retired: List[str] = []
     for p in sorted(topics_dir.glob("*.md")):
-        if p.name == "INDEX.md":
+        if not is_topic_page_file(p):
             continue
         try:
             fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))

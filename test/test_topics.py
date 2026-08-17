@@ -939,14 +939,33 @@ def test_gen_end_reused_from_vault():
     assert T.GEN_END is V.GEN_END
 
 
-def test_gen_begin_matches_vault_regex():
-    """G6：GEN_BEGIN 因文案里写了自己的生成脚本名（scripts/build_topics.py），继续
-    独立声明是对的，但格式必须仍能被 vault.GEN_BEGIN_RE 认出——否则 extract_user_zone/
-    generated_block_tampered（本模块从 vault 导入、内部认 vault 自己那份正则）会在
-    topics.py 生成的页面上失效，每次重建都误判成 conflict。"""
+@pytest.mark.parametrize("generator", [T.DEFAULT_GENERATOR, "scripts/lint_notes.py",
+                                       "某个带 · 中点和 -- 破折号的名字"])
+def test_gen_begin_matches_vault_regex(generator):
+    """G6：GEN_BEGIN 因文案里写了自己的生成脚本名，继续独立声明是对的，但格式必须
+    仍能被 vault.GEN_BEGIN_RE 认出——否则 extract_user_zone/generated_block_tampered
+    （本模块从 vault 导入、内部认 vault 自己那份正则）会在 topics.py 生成的页面上
+    失效，每次重建都误判成 conflict。
+
+    脚本名 2026-08-17 起是参数（topics/ 下不止一种产物：概念页由 build_topics.py 写、
+    知识层 lint 报告由 lint_notes.py 写），所以要把"换个脚本名照样认得出"锁住。"""
     from src.scholar.vault import GEN_BEGIN_RE
-    line = T.GEN_BEGIN.format(T.TOPIC_SCHEMA_VERSION, "abcd1234")
+    line = T.GEN_BEGIN.format(T.TOPIC_SCHEMA_VERSION, "abcd1234", generator)
     assert GEN_BEGIN_RE.match(line.strip())
+
+
+def test_assemble_records_generator_and_stays_parseable():
+    """哨兵里的脚本名要如实反映谁写的这份文件（人按提示去重跑时不能被指到一个根本
+    不生成它的命令上），同时不能因此破坏用户区抽取与篡改检测。"""
+    from src.scholar.vault import extract_user_zone, split_frontmatter
+    text = T.assemble("---\ntype: lint\n---", "正文", T.DEFAULT_USER_ZONE,
+                      generator="scripts/lint_notes.py")
+    assert "由 scripts/lint_notes.py 生成" in text
+    assert "build_topics.py" not in text
+    from src.scholar.vault import generated_block_tampered
+    _fm, body = split_frontmatter(text)
+    assert extract_user_zone(body) is not None
+    assert not generated_block_tampered(body)
 
 
 # ---------------- G1：audit_topic_pages 发现已生成页面里残留的裸引用 ----------------
@@ -1847,3 +1866,99 @@ def test_sync_topics_best_effort_skips_notify_when_notes_dir_not_production(monk
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")   # 真实判定：非生产目录
 
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# P3 第 1 轮 B4：sync_topics_to_vault 的 lint 分支（此前零测试）
+#
+# `is_lint` / `cssclasses=["lint-report"]` / 退役豁免 / prune 保护四件事都是人工
+# 验证过的，但没有测试网住——改一次 `is_page or is_lint` 的判断顺序就可能让整份
+# 知识层 lint 报告悄悄从 vault 里消失（Obsidian 才是人真正读它的地方）。
+# ---------------------------------------------------------------------------
+
+def _lint_src(src_dir, body="- `[@a2024Key]` 某篇撤稿论文 与 [@ghost2020Nope]"):
+    (src_dir / "_lint.md").write_text(
+        T.assemble('---\ntitle: "知识层 lint 报告"\ntype: "lint"\n---',
+                   body, T.DEFAULT_USER_ZONE, generator="scripts/lint_notes.py"),
+        encoding="utf-8")
+
+
+def test_sync_carries_the_lint_report_into_vault_with_wiki_links(tmp_path):
+    """报告只落在 output/scholar_notes/topics/ 等于没人看，里面逐条列出的 citekey
+    也点不开。转成 wiki 链接后，"这篇撤稿论文正在给哪几页当地基"才真的能点过去。"""
+    notes_dir, vault_dir = tmp_path / "notes", tmp_path / "vault"
+    src = notes_dir / T.TOPICS_DIRNAME
+    src.mkdir(parents=True)
+    _lint_src(src)
+    rep = T.sync_topics_to_vault(notes_dir, vault_dir, {"a2024Key": "a2024Key"})
+    dst = vault_dir / T.VAULT_TOPICS_DIR / "_lint.md"
+    assert dst.exists() and rep["new"] == 1
+    body = dst.read_text(encoding="utf-8")
+    assert "[[a2024Key]]" in body
+    assert "[@ghost2020Nope]" in body          # 不在 vault 的保持原样，别造死链
+    from src.scholar.vault import split_frontmatter
+    fm, _ = split_frontmatter(body)
+    assert fm["cssclasses"] == ["lint-report"]   # 概念页那边是 ["topic-page"]
+    assert "topic" not in fm                     # 报告不是概念页，别混进概念页身份
+
+
+def test_lint_report_is_never_marked_retired_but_a_real_dropped_page_is(tmp_path):
+    """lint 报告永远不在 topics.yaml 里。不豁免它就会每轮被打上 retired: true +
+    「已退役」标签，读起来像一份作废文件——实际上它是每轮重新生成的最新报告。"""
+    notes_dir, vault_dir = tmp_path / "notes", tmp_path / "vault"
+    src = notes_dir / T.TOPICS_DIRNAME
+    src.mkdir(parents=True)
+    _lint_src(src)
+    (src / "dropped.md").write_text(
+        T.assemble('---\ntopic: "dropped"\ntitle: "已下线"\n---', "正文", T.DEFAULT_USER_ZONE),
+        encoding="utf-8")
+    (src / "current.md").write_text(
+        T.assemble('---\ntopic: "current"\ntitle: "在用"\n---', "正文", T.DEFAULT_USER_ZONE),
+        encoding="utf-8")
+    specs = [T.TopicSpec(slug="current", title="在用", question="q?", queries=["q"])]
+    T.sync_topics_to_vault(notes_dir, vault_dir, {}, specs=specs)
+
+    from src.scholar.vault import split_frontmatter
+    out = vault_dir / T.VAULT_TOPICS_DIR
+
+    def _fm(name):
+        return split_frontmatter((out / name).read_text(encoding="utf-8"))[0]
+
+    assert "retired" not in _fm("_lint.md")                  # 豁免
+    assert "札记/概念页-退役" not in (_fm("_lint.md").get("tags") or [])
+    assert _fm("dropped.md").get("retired") is True          # 对照组：真的退役页要打
+    assert "retired" not in _fm("current.md")
+
+
+def test_vault_lint_copy_is_pruned_after_the_source_is_deleted(tmp_path):
+    notes_dir, vault_dir = tmp_path / "notes", tmp_path / "vault"
+    src = notes_dir / T.TOPICS_DIRNAME
+    src.mkdir(parents=True)
+    _lint_src(src)
+    T.sync_topics_to_vault(notes_dir, vault_dir, {})
+    dst = vault_dir / T.VAULT_TOPICS_DIR / "_lint.md"
+    assert dst.exists()
+
+    (src / "_lint.md").unlink()
+    rep = T.sync_topics_to_vault(notes_dir, vault_dir, {})
+    assert rep["pruned"] == ["_lint.md"]
+    assert not dst.exists()
+
+
+def test_annotated_vault_lint_copy_is_never_deleted(tmp_path):
+    """同落选笔记的既有规矩：写过东西的只报告不删，绝不替用户删。
+    这份报告尤其容易被写批注——"这条我核对过，不是真冲突"正是它的用法。"""
+    notes_dir, vault_dir = tmp_path / "notes", tmp_path / "vault"
+    src = notes_dir / T.TOPICS_DIRNAME
+    src.mkdir(parents=True)
+    _lint_src(src)
+    T.sync_topics_to_vault(notes_dir, vault_dir, {})
+    dst = vault_dir / T.VAULT_TOPICS_DIR / "_lint.md"
+    dst.write_text(dst.read_text(encoding="utf-8").replace(
+        T.USER_HEADING, T.USER_HEADING + "\n\n- ack: ab12cd34 这条我看过了"), encoding="utf-8")
+
+    (src / "_lint.md").unlink()
+    rep = T.sync_topics_to_vault(notes_dir, vault_dir, {})
+    assert rep["pruned"] == []
+    assert dst.exists() and "ack: ab12cd34" in dst.read_text(encoding="utf-8")
+    assert any("_lint.md" in s for s in rep["skipped"])

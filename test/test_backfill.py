@@ -558,3 +558,145 @@ def test_run_month_half_state_raises_instead_of_skip(tmp_path):
     sidecar.write_text('{"schema_version": 1, "papers": []}', encoding="utf-8")
     res = bn.run_month(2026, 6, settings, set(), set(), args)
     assert res == {"month": "2026-06", "status": "skipped"}
+
+
+# ---------------------------------------------------------------------------
+# P3 第 1 轮 B3：知识层 lint 触发器与它在 main() 里的接线
+#
+# 此前唯一不带 --no-index 直调 main() 的用例既没 mock 也没断言过 _run_knowledge_lint，
+# 之所以没出事纯粹是因为 tmp_path 不在 output/ 下、被 notes_dir_is_production 短路了
+# ——**这条接线路径从未被自动化测试真正走过**（与第 5 轮 X7 完全同型的缺口）。
+# ---------------------------------------------------------------------------
+
+class _Proc:
+    def __init__(self, rc, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+
+
+def _fake_lint(monkeypatch, proc, calls):
+    """让 _run_knowledge_lint 真的走完（生产短路解除），但子进程是假的。"""
+    import subprocess
+    import src.scholar.topics as T
+    monkeypatch.setattr(T, "notes_dir_is_production", lambda d: True)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda cmd, *a, **k: (calls.append(cmd), proc)[1])
+
+
+def _capture_notifications(monkeypatch):
+    """直接替 backfill_notes 里的 notify 符号，**不要**去 patch notify 模块的
+    subprocess.run——那和 _fake_lint patch 的是同一个 subprocess.run，两者会互相覆盖。"""
+    import scripts.backfill_notes as bn
+    calls = []
+    monkeypatch.setattr(bn, "notify", lambda title, body="": calls.append((title, body)))
+    return calls
+
+
+def test_lint_retraction_hit_notifies_but_does_not_fail_the_backfill(tmp_path, monkeypatch):
+    """退出码 1 = "lint 干活干成了并且发现了撤稿"，不是失败。要用最高音量喊人，
+    但 lint_ok 仍为 True——回填本身完成了，退出码不该变。"""
+    import scripts.backfill_notes as bn
+    notes = _capture_notifications(monkeypatch)
+    runs = []
+    _fake_lint(monkeypatch, _Proc(1, "🚨 已撤稿仍在库：[@bad2024] 某某"), runs)
+
+    assert bn._run_knowledge_lint(tmp_path / "notes") is True
+    assert runs and "lint_notes.py" in " ".join(runs[0])
+    assert "--skip-contradictions" in runs[0]          # 月度链路不花钱跑对撞
+    assert len(notes) == 1
+    assert "撤稿" in notes[0][0]
+
+
+def test_lint_tool_failure_marks_lint_not_ok(tmp_path, monkeypatch):
+    import scripts.backfill_notes as bn
+    notes = _capture_notifications(monkeypatch)
+    _fake_lint(monkeypatch, _Proc(2, "", "索引损坏"), [])
+    assert bn._run_knowledge_lint(tmp_path / "notes") is False
+    assert len(notes) == 1
+    assert "未跑成" in notes[0][1]
+
+
+def test_lint_finding_and_tool_failure_are_both_reported(tmp_path, monkeypatch):
+    """B2：`alert` 与 `ok` 是两个独立字段，此前那对 if/elif 是互斥的——
+    "既发现了撤稿、报告又没写进磁盘"时，撤稿警报会被工具故障那条分支吃掉。"""
+    import scripts.backfill_notes as bn
+    notes = _capture_notifications(monkeypatch)
+    _fake_lint(monkeypatch,
+               _Proc(2, "🚨 已撤稿仍在库：[@bad2024] 某某\n⚠️ 报告落盘冲突", "落盘冲突"), [])
+    assert bn._run_knowledge_lint(tmp_path / "notes") is False
+    bodies = [t + b for t, b in notes]
+    assert len(notes) == 2
+    assert any("撤稿" in b for b in bodies)
+    assert any("未跑成" in b for b in bodies)
+
+
+def _main_with_index(tmp_path, monkeypatch, extra_argv):
+    """跑一遍 main()（不带 --no-index），把索引刷新/向量同步都换成假的。"""
+    import scripts.backfill_notes as bn
+    import src.scholar.notes_index as ni
+    import src.scholar.embed_store as es
+    import src.scholar.embeddings as emb
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ni, "update_index", lambda d: {"papers": []})
+    monkeypatch.setattr(ni, "write_outputs", lambda data, d: None)
+    monkeypatch.setattr(emb, "resolve_embedding_base_url", lambda cfg: "http://x")
+    monkeypatch.setattr(emb, "EmbeddingClient",
+                        lambda **kw: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(es, "sync_store", lambda *a, **k: es.SyncStats())
+    monkeypatch.setattr(bn, "run_month",
+                        lambda y, m, *a, **k: {"month": "{:04d}-{:02d}".format(y, m),
+                                               "status": "ok"})
+    argv = ["backfill_notes.py", "--since", "2026-06", "--until", "2026-06",
+            "--config", str(_env_file(tmp_path))] + extra_argv
+    monkeypatch.setattr(sys, "argv", argv)
+    return bn
+
+
+def test_main_exits_3_when_the_lint_run_itself_failed(tmp_path, monkeypatch):
+    """派生检查没跟上 → 退出码 3（对齐概念页那一档），不是回填失败的 1。"""
+    _capture_notifications(monkeypatch)
+    runs = []
+    bn = _main_with_index(tmp_path, monkeypatch, [])
+    _fake_lint(monkeypatch, _Proc(2, "", "索引损坏"), runs)
+    with pytest.raises(SystemExit) as ei:
+        bn.main()
+    assert ei.value.code == 3
+    assert len(runs) == 1
+
+
+def test_main_retraction_alert_does_not_change_the_exit_code(tmp_path, monkeypatch):
+    _capture_notifications(monkeypatch)
+    runs = []
+    bn = _main_with_index(tmp_path, monkeypatch, [])
+    _fake_lint(monkeypatch, _Proc(1, "🚨 已撤稿仍在库：[@bad2024] 某某"), runs)
+    bn.main()             # 不抛 SystemExit → 退出码 0
+    assert len(runs) == 1
+
+
+def test_no_lint_flag_never_spawns_the_subprocess(tmp_path, monkeypatch):
+    _capture_notifications(monkeypatch)
+    runs = []
+    bn = _main_with_index(tmp_path, monkeypatch, ["--no-lint"])
+    _fake_lint(monkeypatch, _Proc(1, "🚨 已撤稿仍在库：[@bad2024] 某某"), runs)
+    bn.main()
+    assert runs == []
+
+
+def test_no_index_also_skips_lint(tmp_path, monkeypatch):
+    """索引都没刷新，lint 读到的是旧库，结论没意义。"""
+    _capture_notifications(monkeypatch)
+    runs = []
+    bn = _main_with_index(tmp_path, monkeypatch, ["--no-index"])
+    _fake_lint(monkeypatch, _Proc(1, "🚨 已撤稿仍在库：[@bad2024] 某某"), runs)
+    bn.main()
+    assert runs == []
+
+
+def test_lint_trigger_refuses_to_touch_a_non_production_notes_dir(tmp_path, monkeypatch):
+    """安全前提：tmp_path 不在 output/ 下时一律不发子进程（read_pdf.py 的同类触发器
+    实测踩过，测试套件真的起了一个指向生产 config 的子进程，挂了 13 分钟）。"""
+    import subprocess
+    import scripts.backfill_notes as bn
+    runs = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: runs.append(cmd))
+    assert bn._run_knowledge_lint(tmp_path / "notes") is True
+    assert runs == []
