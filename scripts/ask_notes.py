@@ -115,7 +115,7 @@ def main() -> int:
                     help="只跑召回，看能捞到多少证据，不调 LLM、不落盘")
     ap.add_argument("--list", action="store_true", help="列出已归档的问答后退出")
     ap.add_argument("--verify", action="store_true",
-                    help="只自检已归档页（死键/失锚/正文残留证据编号/防线版本），"
+                    help="只自检已归档页（死键/失锚/正文残留证据编号/可达性/防线版本），"
                          "不调 LLM、不联网、不改文件")
     args = ap.parse_args()
 
@@ -162,6 +162,13 @@ def main() -> int:
             if a.unanchored:
                 print("     ⚠️ 失锚（原句已不在该篇 highlights 里）：{}".format(
                     ", ".join(a.unanchored[:6])))
+            if a.slug_mismatch:
+                # F2：这条此前只影响 ok 与退出码、**从不打印**——用户看到的是一行全 0
+                # 配一个 ❌，而给的药方（"重问一次"）会落到另一页上，孤儿页原地不动。
+                print("     ⚠️ 文件名与问题对不上（重问这个问题会落到别处）："
+                      "这一页该叫 {}。收编：mv {}.md {}.md 并把 frontmatter 的 "
+                      "`qa:` 改成新名字".format(
+                          a.slug_mismatch, a.slug, a.slug_mismatch))
             if a.residual_refs:
                 # 归档页是**生成它那一刻的代码**的快照：这些编号是在正文回译防线落地
                 # 之前写下的，页面上留着一个只对当时那次召回有意义的交叉引用。
@@ -316,6 +323,11 @@ def main() -> int:
                   .format(args.min_sim))
             return 0
         T.attach_titles(evidences, index)
+        # gap 回查命中与「近邻论文」两处都要标题：只印裸 citekey 的话读者无从判断，
+        # 只能一条条点开，而句级通道实测只有约四成相关（见 Q.GapHit 的 docstring）。
+        titles = {p["citekey"]: (p.get("title") or "")
+                  for p in (index.get("papers") or [])
+                  if isinstance(p, dict) and p.get("citekey")}
         n_papers = len({e.citekey for e in evidences})
         print("   证据 {} 条 / {} 篇（相似度 {:.2f}~{:.2f}）".format(
             len(evidences), n_papers, evidences[-1].score, evidences[0].score))
@@ -352,6 +364,7 @@ def main() -> int:
                                         embed_client=embed_client,
                                         topic_specs=topic_specs,
                                         topic_vecs=topic_vecs,
+                                        titles=titles,
                                         exclude_citekeys={e.citekey for e in evidences})
     finally:
         embed_client.close()
@@ -368,7 +381,7 @@ def main() -> int:
 
     path, status = Q.write_qa_page(qa_dir, slug, question, qa, evidences, report,
                                    related_topics=related_topics,
-                                   nearby_papers=nearby)
+                                   nearby_papers=nearby, titles=titles)
     if status == "taken":
         # 理论上前面已经拦过；这里兜住"合成期间别人往这个 slug 上写了另一个问题"。
         print("❌ slug '{}' 在这次合成期间被另一个问题占用了，本次未落盘。".format(slug),

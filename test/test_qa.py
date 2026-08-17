@@ -737,14 +737,22 @@ def test_gap_recheck_is_silent_without_an_embedding_client():
 def test_gap_hits_are_rendered_next_to_the_gap_they_contradict():
     qa = dict(_QA, gaps=["缺少可识别性的系统讨论"],
               gap_hits={"缺少可识别性的系统讨论": [
-                  Q.GapHit(kind="topic", key="missingness-causal", score=0.71),
-                  Q.GapHit(kind="evidence", key="chen2026Partial", score=0.68)]})
+                  Q.GapHit(kind="topic", key="missingness-causal", score=0.71,
+                           title="缺失与因果结构"),
+                  Q.GapHit(kind="evidence", key="chen2026Partial", score=0.68,
+                           title="Partial Identification under Missing Data",
+                           snippet="影子变量区间中点平均绝对误差 0.06")]})
     block = Q.render_qa_block("问题", qa, EVS)
-    assert "⚠️ 但库里可能有" in block
+    assert "但库里可能有" in block
     assert "topics/missingness-causal.md" in block
     assert "[@chen2026Partial]" in block
     # 警告必须贴在那条 gap 后面，不能沉到别处
-    assert block.index("缺少可识别性的系统讨论") < block.index("⚠️ 但库里可能有")
+    assert block.index("缺少可识别性的系统讨论") < block.index("但库里可能有")
+    # **标题与原句必须出现**：只印裸 citekey 时读者无从判断哪条值得点，
+    # 而句级通道实测只有约四成相关，累积下来的结果是整节被跳过。
+    assert "Partial Identification under Missing Data" in block
+    assert "影子变量区间中点平均绝对误差 0.06" in block
+    assert "缺失与因果结构" in block
 
 
 def test_prompt_forbids_library_wide_absence_claims():
@@ -1591,8 +1599,11 @@ def test_gap_evidence_channel_has_its_own_higher_threshold():
 
 
 @pytest.mark.parametrize("cos,should_hit", [
-    (Q.DEFAULT_GAP_EVIDENCE_MIN_SIM + 0.02, True),
-    (Q.DEFAULT_GAP_EVIDENCE_MIN_SIM - 0.02, False),
+    # ⚠️ 写死数字，不许写成 `DEFAULT_… ± 0.02`——余弦会跟着常量一起动，常量改成
+    # 0.95 测试照样绿。另外两个阈值的用例都改过来了，**独独漏了这一个**
+    # （第 3 轮验收逐条查出来的）。三个阈值同一个坑，第三次才补齐。
+    (0.67, True),      # 0.65 之上
+    (0.63, False),     # 0.65 之下
 ])
 def test_gap_evidence_threshold_is_pinned_to_its_calibrated_value(cos, should_hit):
     """剥完脚手架之后重新标定的分界（见常量旁的分档表）。这一对用例锁的是那个数。"""
@@ -1859,3 +1870,42 @@ def test_cli_topic_check_is_not_gated_by_the_dedup_switch():
     line_start = src.rindex("\n", 0, i) + 1
     assert src[line_start:i] == " " * 8, "概念页比对不许缩在 --no-dedup-check 块内"
     assert "topic_vecs = Q.topic_vectors(topic_specs, embed_client)" in src
+
+
+# ---------------------------------------------------------------------------
+# 27. 第 3 轮：把「算出来了但从不打印」这一类堵死
+# ---------------------------------------------------------------------------
+
+def test_verify_actually_prints_the_slug_mismatch():
+    """F2：`slug_mismatch` 影响 `ok`、影响退出码，却**从不出现在输出里**
+    （`grep -rn slug_mismatch scripts/` 曾经返回零行）。用户看到的是一行全 0 配一个 ❌，
+    而给的药方"重问一次"会落到另一页上、孤儿页原地不动——**诊断和药方都是错的**。
+
+    这一类"算了不印"没有任何既有测试能拦：`QAAudit` 的字段有测试，
+    CLI 的输出没有。这条按源码结构锁住那个打印分支。"""
+    import inspect
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import ask_notes                                          # noqa: E402
+    src = inspect.getsource(ask_notes.main)
+    assert "if a.slug_mismatch:" in src, "算出来了就必须印出来"
+    i = src.index("if a.slug_mismatch:")
+    tail = src[i:i + 500]
+    assert "该叫" in tail or "文件名与问题对不上" in tail
+    assert "mv " in tail, "要给可执行的收编办法，不是只报告"
+
+
+def test_nearby_papers_carry_titles_too():
+    """F4：这一行替代的是 v1 里带整句原文的 ○ 行——补偿不能比被牺牲的东西还便宜。
+    三个不认识的裸 citekey 排在那里没有人会去查。"""
+    block = Q.render_qa_block("问题", _QA, EVS, nearby_papers=["little1988Test"],
+                              titles={"little1988Test": "A Test of Missing Completely at Random"})
+    assert "little1988Test" in block
+    assert "A Test of Missing Completely at Random" in block
+
+
+def test_gap_hit_lines_survive_missing_titles():
+    """索引里查不到标题（改过键、或刚入库还没进索引）时不许崩，也不许印出 `None`。"""
+    lines = Q._gap_hit_lines([Q.GapHit(kind="evidence", key="k2024", score=0.7),
+                              Q.GapHit(kind="topic", key="t", score=0.7)])
+    joined = "\n".join(lines)
+    assert "None" not in joined and "k2024" in joined and "t" in joined

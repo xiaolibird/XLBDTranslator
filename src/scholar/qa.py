@@ -692,15 +692,30 @@ def _cite_str(citekeys: Sequence[str]) -> str:
     return " ".join("[@{}]".format(k) for k in citekeys)
 
 
-def _gap_hit_label(hit: "GapHit") -> str:
-    if hit.kind == "topic":
-        return "`topics/{}.md`（{:.2f}）".format(hit.key, hit.score)
-    return "[@{}]（{:.2f}）".format(hit.key, hit.score)
+def _gap_hit_lines(hits: Sequence["GapHit"]) -> List[str]:
+    """gap 命中渲染成**逐条一行**，带标题与原句（见 `GapHit` 的 docstring）。
+
+    首版把它们挤成一行裸 citekey（`[@a]（0.72）、[@b]（0.71）`）。实测那一行里六成
+    是噪音，而读者从 citekey 完全看不出哪条值得点——只能一条条点开，
+    于是一年后整节被跳过。逐条一行 + 标题 + 原句之后，扫过去就能筛。
+    """
+    out: List[str] = []
+    for h in hits:
+        if h.kind == "topic":
+            out.append("    - `topics/{}.md`（{:.2f}）{}".format(
+                h.key, h.score, h.title or ""))
+            continue
+        head = "    - `[@{}]`（{:.2f}）{}".format(h.key, h.score, (h.title or "")[:80])
+        out.append(head)
+        if h.snippet:
+            out.append("      > {}".format(h.snippet[:100]))
+    return out
 
 
 def render_qa_block(question: str, qa: dict, evidences, *,
                     related_topics: Sequence[str] = (),
-                    nearby_papers: Sequence[str] = ()) -> str:
+                    nearby_papers: Sequence[str] = (),
+                    titles: Optional[Dict[str, str]] = None) -> str:
     """哨兵之间的正文：问题 → 相关概念页 → 直接回答 → 论断 → 注意事项 → 没覆盖到的 → 证据表。
 
     「本次召回没覆盖到的」（gaps）**排在证据表之前而不是文末**：它是这一页最容易被
@@ -751,9 +766,10 @@ def render_qa_block(question: str, qa: dict, evidences, *,
             if hits:
                 # 这一行是"回查"的兑现物：拿这条空白**自己的文本**再问一次库，
                 # 命中就当场把反例贴在它旁边，而不是等用户自己去发现。
-                L.append("  - ⚠️ 但库里可能有：{}——回查这条空白的文本时命中的，"
-                         "先看过再决定要不要去补文献。".format(
-                             "、".join(_gap_hit_label(h) for h in hits)))
+                L.append("  - ⚠️ **但库里可能有**（回查这条空白时命中的；"
+                         "概念页那档实测很准，句级那档大约四成相关——**看标题与原句再决定**，"
+                         "尤其注意有些原句本身是否定句，说的是「那篇里没有」）：")
+                L += _gap_hit_lines(hits)
         L.append("")
 
     n_papers = len({e.citekey for e in evidences})
@@ -784,9 +800,13 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         # 而死键检测的语义是"粘进 pandoc 会渲染成 (key?)"，对一条从没被引用过的
         # 建议键报警就是假信号。用反引号包着，`audit_qa_pages` 与 `to_wiki_links`
         # 都自然看不见它们，不需要在任一侧再加一条"跳过这一行"的特判。
+        # 带标题：这一行是给"差一点没进来"的论文补可见性的，而三个不认识的裸 citekey
+        # 排在那里没有人会去查——它替代的是 v1 里带整句原文的 ○ 行，补偿不能比被
+        # 牺牲的东西还便宜。
         L += ["", "**本次未纳入的近邻论文**（分数就差在门槛下，不是引用，"
-                  "想挖深就调大 `--max-evidence`）：{}".format(
-                      " ".join("`{}`".format(k) for k in nearby_papers))]
+                  "想挖深就调大 `--max-evidence`）："]
+        L += ["    - `{}` {}".format(k, (titles or {}).get(k, "")[:80])
+              for k in nearby_papers]
     return "\n".join(L)
 
 
@@ -842,10 +862,25 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
 
 @dataclass
 class GapHit:
-    """一条 gap 被回查时命中的东西。`kind` ∈ `topic`（概念页）/ `evidence`（句级证据）。"""
+    """一条 gap 被回查时命中的东西。`kind` ∈ `topic`（概念页）/ `evidence`（句级证据）。
+
+    `title` 与 `snippet` **不是装饰**。句级通道的精确率实测只有约四成
+    （5 条 gap 的 18 条命中里，明确相关的 4 条、明确无关的 9~11 条：
+    「儿童 ECMO 治疗低氧性呼吸衰竭」「数学肿瘤学的机制学习综述」「隐私保护合成表格数据」
+    这类混在里面）。只印裸 citekey 的话，读者无从判断，只能一条条点开——
+    上千条提示累积下来的结果是整节被跳过，而这一节恰恰是 P4 相对 `notes_search`
+    唯一的增量。带上标题一眼就能筛掉，噪音的代价从"点开一篇论文"降到"扫过一行"。
+
+    `snippet`（匹配到的那句原文）还兼管另一件事：札记库里「局限与可质疑点」那一档
+    highlight 大量是**否定句**（"全文 0 次出现 identifiability…"），而 embedding
+    不编码否定——它们会被"库里有没有 X"的查询系统性捞上来，读起来像"库里有"，
+    实际说的是"那篇里没有"。看到原句才分得清"有"和"没有"。
+    """
     kind: str
     key: str
     score: float
+    title: str = ""
+    snippet: str = ""
 
 
 # gap 的**否定脚手架**。逐级剥掉之后剩下的才是"库里到底有没有 X"里的那个 X。
@@ -995,6 +1030,7 @@ def recheck_gaps(gaps: Sequence[str], *, store=None, embed_client=None,
                  min_sim: float = DEFAULT_GAP_TOPIC_MIN_SIM,
                  evidence_min_sim: float = DEFAULT_GAP_EVIDENCE_MIN_SIM,
                  exclude_citekeys: Optional[set] = None,
+                 titles: Optional[Dict[str, str]] = None,
                  top_n: int = DEFAULT_GAP_TOP_N) -> Dict[str, List[GapHit]]:
     """每条 gap 拿**剥掉否定脚手架之后的正向内容**回查向量库与概念页：这个空白是真的吗？
 
@@ -1049,7 +1085,8 @@ def recheck_gaps(gaps: Sequence[str], *, store=None, embed_client=None,
             for j, spec in enumerate(specs):
                 score = float(tvecs[j] @ v)
                 if score >= min_sim:
-                    topics_hit.append(GapHit("topic", spec.slug, score))
+                    topics_hit.append(GapHit("topic", spec.slug, score,
+                                             title=spec.title))
         ev_hit: List[GapHit] = []
         if mask is not None and bool(mask.any()):
             try:
@@ -1069,7 +1106,13 @@ def recheck_gaps(gaps: Sequence[str], *, store=None, embed_client=None,
                 if not ck or ck in seen or ck in skip:
                     continue
                 seen.add(ck)
-                ev_hit.append(GapHit("evidence", ck, float(score)))
+                rec = store.records[idx]
+                ev_hit.append(GapHit(
+                    "evidence", ck, float(score),
+                    title=(titles or {}).get(ck, ""),
+                    # 匹配到的那句原文：句级通道会系统性地捞上「局限与可质疑点」
+                    # 那一档的否定句，看到原句才分得清"库里有"还是"那篇里没有"。
+                    snippet=(rec.get("text") or "").strip().replace("\n", " ")))
         topics_hit.sort(key=lambda h: -h.score)
         ev_hit.sort(key=lambda h: -h.score)
         # 概念页排在前面：「库里有一整页在讲这件事」比「有一句相关的话」更能改变决定
@@ -1352,6 +1395,7 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
                   report: ValidationReport, *, dry_run: bool = False,
                   related_topics: Sequence[str] = (),
                   nearby_papers: Sequence[str] = (),
+                  titles: Optional[Dict[str, str]] = None,
                   now: Optional[datetime] = None) -> Tuple[Path, str]:
     """落盘 `topics/qa/<slug>.md`，走与概念页同一套哨兵合并。返回 `(路径, 状态)`。
 
@@ -1376,6 +1420,7 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
     if prev_q and question_key(prev_q) != question_key(question):
         return path, "taken"
     gen_block = render_qa_block(question, qa, evidences, related_topics=related_topics,
+                                titles=titles,
                                 nearby_papers=nearby_papers)
     fm = build_qa_frontmatter(question, slug, qa, evidences, report,
                               now.isoformat(timespec="seconds"), preserved=fresh_fm)
