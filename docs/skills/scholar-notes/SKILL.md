@@ -27,6 +27,46 @@ n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),�
 `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault`(加 `--force` 忽略陈旧判定)。
 ⚠️ 该目录含用户手写内容(`## 我的札记` 与自加的 frontmatter 键/tag),**不要直接编辑或覆盖那部分**。
 
+## 先看概念页(topics/)——按概念找答案,往往一步到位
+
+`output/scholar_notes/topics/<slug>.md` 是**按概念横切全库的活综述**(与上面按论文组织的
+视图正交)。用户问「MNAR 诊断有哪些方法」「跨中心迁移的证据怎么说」「库里有哪些反对
+XX 的证据」这类**概念级问题**时,**先读概念页再决定要不要下钻单篇**:它已经把几十篇里
+的相关句子合成好了,比现跑一轮检索再逐篇读快得多。
+
+```bash
+cat output/scholar_notes/topics/INDEX.md          # 有哪些概念页
+cat output/scholar_notes/topics/mnar-diagnosis.md # 读某一页
+```
+
+读法要点:
+- 每条论断后的 `[@citekey]` 由**证据编号回译**产生(合成时 LLM 只能引用召回集合里的编号,
+  越界即剔除;模型自己写出的引用标记——不论带不带方括号——也会被剥离),citekey 因此
+  不是模型现编的,而是来自召回集合。`build_topics.py --verify` 会扫描死键与残留裸引用
+  (`bare_cites`)兜底,看到 ⚠️ 再去核实,没有异常不必逐条复核;
+- 页底「本页证据」给出每条证据的 `note_file:note_line`,要核验原句照着点进去;○ 表示
+  召回了但未被采用;
+- 「⚔️ 分歧与冲突」是**有意保留的矛盾**,写 critique / discussion 时是现成的靶子;
+- **引用率不能单独当质量信号**:○ 多不一定是 `queries` 跑偏,也可能是证据池混进了「对我
+  研究的联想」这类主观批注(已默认排除,见 `config/topics.yaml` 的 `exclude_sections`);
+  ● 多也不代表论断都扎实,可能是无关内容被顺带引用"注水"。判断可信度看论断是否具体、
+  分歧是否来自不同文献,比看这两个比例数字可靠;
+- **它是派生物**,内容全部来自 `highlights[]`。有疑问以月度札记原文为准。
+- ⚠️ **要把具体数字写进稿子,先点开证据表核对原句**。防线保证「citekey 与原句真实存在」,
+  **不保证转述没有失真**——从证据到论断由 LLM 完成,靠 prompt 约束而非程序强制。
+  实测过:一组并列数字里最不利的那个被静默丢掉(66.0/4.4/70.2/64.4 写成范围「64.4–70.2」,
+  真实是 4.4–70.2),且同一页正文写对了、分歧区仍写错。结论性判断可直接读页面,
+  **效应量/百分比一律回证据表看原句**,「⚔️ 分歧与冲突」里的数字尤其要核。
+
+Obsidian 侧同一批内容在 `~/Documents/ScholarVault/02-主题/`,citekey 已转成 `[[wiki 链接]]`,
+可在关系图里看概念↔论文的连边;per-paper 笔记的反向链接会显示「哪些概念页引用了我」。
+
+重建(新论文入库后,或改了 `config/topics.yaml` 的主题定义):
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/build_topics.py [--topic <slug>] [--dry-run]
+```
+⚠️ 概念页同样含用户手写区(`## 我的批注`),**不要直接编辑生成块**——重建时会判冲突并拒绝覆盖。
+
 ## 四步法
 
 1. **查索引**(始终过滤 `duplicate_of == null`):

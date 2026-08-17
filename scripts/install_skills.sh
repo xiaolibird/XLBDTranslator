@@ -6,10 +6,10 @@
 # ~/.claude/skills/ ——两侧曾经各自漂移（安装版多写、docs 版漏同步），全部靠这条脚本纠正。
 #
 # 用法:
-#   bash scripts/install_skills.sh              # 同步全部五个 skill
+#   bash scripts/install_skills.sh              # 同步全部七个 skill
 #   bash scripts/install_skills.sh --dry-run    # 只看会同步什么，不动文件
 #
-# 只同步下面列出的五个目录，不用 --delete 整个 ~/.claude/skills/（那里还装着
+# 只同步下面列出的七个目录，不用 --delete 整个 ~/.claude/skills/（那里还装着
 # 其它与本仓库无关的 skill，删了会误伤）；每个目录内部用 --delete 是安全的，
 # 因为该目录整个由 docs/skills/ 下同名目录定义，装的就该是 docs 版原样。
 # ============================================================
@@ -19,13 +19,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_SKILLS="${REPO_ROOT}/docs/skills"
 INSTALL_SKILLS="${HOME}/.claude/skills"
 
-SKILLS=(read-paper scholar-notes scholar-search scholar-write screen-journal)
+SKILLS=(read-paper scholar-notes scholar-search scholar-write screen-journal paper-audit manuscript-selfcheck)
 
 usage() {
     cat <<'USAGE'
 用法: bash scripts/install_skills.sh [--dry-run] [-h|--help]
 
-把 docs/skills/ 下的五个 SKILL.md 同步到 ~/.claude/skills/ 的安装副本。
+把 docs/skills/ 下的七个 SKILL.md 同步到 ~/.claude/skills/ 的安装副本。
 
 选项:
   --dry-run    只打印会同步的内容，不落盘（透传给 rsync -n）
