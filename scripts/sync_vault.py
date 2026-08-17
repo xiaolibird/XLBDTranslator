@@ -73,15 +73,22 @@ def read_index(index_path, tries, settle):
 
 
 def topics_mtime(notes_dir):
-    """notes_dir/topics/*.md 的最新 mtime；无概念页目录或目录为空返回 None。
+    """notes_dir/topics/ 下所有 `*.md`（**含子目录**）的最新 mtime；目录不存在或为空返回 None。
 
     与 `src.scholar.vault.write_vault` 写进 `_meta.json` 的 `source_topics_mtime`
-    是同一个口径（同样扫 `*.md` 取 max mtime），两边才能直接比对。
+    是同一个口径（同样 `rglob("*.md")` 取 max mtime），两边才能直接比对——
+    **改一处必须改另一处**，口径一旦分叉，陈旧判定会永远为真或永远为假。
+
+    用 rglob 而不是 glob：`topics/qa/` 是 P4 的问答归档子目录。非递归扫描会让
+    「归档一次问答」完全不改变这个时间戳（索引没变、`topics/*.md` 也没变），
+    陈旧判定于是认为"已同步"，新归档的问答**永远到不了 Obsidian**——
+    正是 W5 那个真实事故（vault 侧概念页滞后 2 小时、靠一次无关的索引变动才凑巧自愈）
+    换个目录层级重演一次。
     """
     d = Path(notes_dir) / "topics"
     if not d.exists():
         return None
-    times = [p.stat().st_mtime for p in d.glob("*.md")]
+    times = [p.stat().st_mtime for p in d.rglob("*.md")]
     return max(times) if times else None
 
 

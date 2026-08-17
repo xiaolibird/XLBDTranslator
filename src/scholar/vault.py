@@ -1177,8 +1177,15 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     # TOPICS_DIRNAME 常量：topics.py 反过来导入本模块（vault.py）一堆符号，双向 import
     # 会循环，故这里保留字面量 "topics"（与 topics.TOPICS_DIRNAME 同目录名，两边都
     # 不太会改，人工保持一致的成本可以接受）。
+    # 用 rglob 而不是 glob：topics/ 下现在不止一层（`topics/qa/` 是 P4 的问答归档，
+    # 由 scripts/ask_notes.py 按需写入）。非递归扫描会让「归档一次问答」完全不改变
+    # 这个时间戳——索引没变、topics/*.md 也没变，陈旧判定于是认为"已同步"，
+    # 新归档的问答**永远到不了 Obsidian**。这正是 W5 那个真实事故的形状
+    # （概念页在索引不再变之后才落盘，vault 侧滞后 2 小时靠巧合自愈），
+    # 换了个目录层级重演一次。**与 sync_vault.topics_mtime 必须是同一个口径**，
+    # 改一处记得改另一处（两边都用 rglob，见那边的同款注释）。
     topics_dir = notes_dir / "topics"
-    topics_times = ([p.stat().st_mtime for p in topics_dir.glob("*.md")]
+    topics_times = ([p.stat().st_mtime for p in topics_dir.rglob("*.md")]
                     if topics_dir.exists() else [])
 
     meta = {"vault_schema": VAULT_SCHEMA_VERSION,

@@ -807,6 +807,9 @@ def find_stale_claims(topics_dir, index: dict, *,
     now_year = now_year or datetime.now().year
     years = _year_map(index)
     out: List[StaleClaim] = []
+    # 非递归是**有意的**：`topics/qa/` 里的归档问答不是概念页，不参与陈旧论断分析
+    # （它只在人再问一次时才更新，"这条论断的支撑文献有多老"对它没有可执行含义）。
+    # 覆盖率那一处是唯一放宽的，见 `_coverage_scan_files`。
     for path in sorted(Path(topics_dir).glob("*.md")):
         if not is_topic_page_file(path):
             continue
@@ -916,6 +919,8 @@ def cited_by_page(topics_dir) -> Dict[str, List[str]]:
     只报"库里有一篇撤稿"而不说它渗进了哪里，人还是得自己全库 grep 一遍。
     """
     out: Dict[str, List[str]] = {}
+    # 非递归是**有意的**（同 `stale_claims`）：返回值的键是概念页 slug，
+    # 掺进问答页会让"这篇撤稿正在给哪几页当地基"这句话的主语变成两种东西。
     for path in sorted(Path(topics_dir).glob("*.md")):
         if not is_topic_page_file(path):
             continue
@@ -930,16 +935,40 @@ def cited_by_page(topics_dir) -> Dict[str, List[str]]:
     return out
 
 
+def _coverage_scan_files(topics_dir) -> List[Path]:
+    """覆盖率统计要扫的文件：概念页 + **归档问答**（`topics/qa/*.md`）。
+
+    B2：这是四处 `glob("*.md")` 里**唯一**该放宽到 qa 子目录的一处。其余三处
+    （`stale_claims` / `cited_by_page` / `coverage_report` 的页面统计）**不放宽**——
+    qa 页不是概念页，不进概念页索引、不参与日历兜底、不被概念页审计。
+    `is_topic_page_file` 是按**文件名**判的，而 `qa-xxx.md` 不以 `_` 开头，
+    一旦那三处也改成 rglob，问答页会被当成概念页参与全部三项。
+
+    这里写成"两次显式 glob"而不是一句 `rglob`：rglob 会顺带扫进 `topics/.obsidian/`
+    之类 Obsidian 自己生成的目录，而那不是任何人的产物。
+
+    为什么覆盖率这一处**要**算上：孤儿名单回答的是"哪些论文连概念层的证据池都进不去"。
+    一篇被专门问过一次、还进了某页问答证据表的论文显然已经被看见过了，把它列进
+    "该考虑开新页"的名单是假信号——而问答越多，假信号越多。
+    """
+    root = Path(topics_dir)
+    return sorted(root.glob("*.md")) + sorted((root / "qa").glob("*.md"))
+
+
 def cited_citekeys(topics_dir) -> set:
-    """全部概念页（含证据表）里出现过的 citekey。
+    """全部概念页与归档问答（含证据表）里出现过的 citekey。
 
     **包含证据表**：一篇论文被召回进了某页的证据池，就说明它已经在概念层被"看见"
     过了，只是这一轮没被论断引用——它不是缺口，是候补。缺口分析要找的是**连证据池
     都进不去**的那批论文（说明现有 8 页的 queries 覆盖不到它们所在的问题域，该考虑
     开新页了），把候补混进去会把真信号淹掉。
+
+    `is_topic_page_file` 那道文件名防线在这里仍是**唯一**防线（本函数纯文本扫
+    `[@key]`，不看 frontmatter）：`_lint.md` 自己列出的撤稿/对撞 citekey 不能被算成
+    覆盖，`topics/qa/INDEX.md` 同理。
     """
     keys: set = set()
-    for path in sorted(Path(topics_dir).glob("*.md")):
+    for path in _coverage_scan_files(topics_dir):
         if not is_topic_page_file(path):
             continue
         try:
@@ -1041,6 +1070,9 @@ def coverage_report(topics_dir, index: dict, *,
     # 的杂散 .md 就会让报告写"概念页 2 页覆盖了……"而下面表格只有 1 行。
     thin: List[Tuple[str, int, Optional[int]]] = []
     retired: List[str] = []
+    # 非递归是**有意的**（同上两处）：`n_pages` 与 `thin_pages` 说的是"概念页有几页、
+    # 哪几页太薄"。问答页混进来会让页数虚涨，还会因为不在 topics.yaml 里而被
+    # 一律报成"已退役的概念页"。
     for path in sorted(Path(topics_dir).glob("*.md")):
         if not is_topic_page_file(path):
             continue

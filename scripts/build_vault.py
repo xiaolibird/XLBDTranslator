@@ -21,6 +21,7 @@ from src.scholar.vault import write_vault          # noqa: E402
 from src.scholar.topics import (                   # noqa: E402
     sync_topics_to_vault, VAULT_TOPICS_DIR, load_topic_specs, TopicError, DEFAULT_CONFIG,
 )
+from src.scholar.qa import sync_qa_to_vault, VAULT_QA_DIR   # noqa: E402
 from src.scholar.notes_index import INDEX_JSON     # noqa: E402
 
 
@@ -104,6 +105,19 @@ def main() -> int:
         print("概念页同步写盘失败（{}）：{}".format(type(exc).__name__, exc), file=sys.stderr)
         return 2
 
+    # 问答归档（P4）。独立于 sync_topics_to_vault 而不是塞进它：那个函数已经过多轮加固
+    # （prune 的"读不出 ≠ 已下线"、退役页标记、生成块为空的处理），而 qa 的规则并不相同
+    # ——qa 页没有"退役"概念，也**不做 prune**（一次问答归档之后就是历史，源文件被删
+    # 不代表 vault 那份该跟着消失，那可能正是用户手动整理的结果）。同样复用
+    # rep["filenames"] 把 `[@citekey]` 转成能点开的 wiki 链接。
+    qrep = {}
+    try:
+        qrep = sync_qa_to_vault(notes_dir, vault_dir, rep.get("filenames") or {},
+                                dry_run=args.dry_run)
+    except OSError as exc:
+        print("问答归档同步写盘失败（{}）：{}".format(type(exc).__name__, exc), file=sys.stderr)
+        return 2
+
     print("\n{}".format("=" * 66))
     print("{} vault: {}".format("【dry-run】" if args.dry_run else "✅", vault_dir))
     print("  文献 {} 篇（新建 {} · 更新 {} · 未变 {}）· 索引页 {} 个 · 写盘 {} 个文件".format(
@@ -113,6 +127,13 @@ def main() -> int:
         print("  🧭 概念页 {} 页（新建 {} · 更新 {} · 未变 {}）→ {}/".format(
             trep["new"] + trep["merged"] + trep["unchanged"], trep["new"], trep["merged"],
             trep["unchanged"], VAULT_TOPICS_DIR))
+    if qrep.get("new") or qrep.get("merged") or qrep.get("unchanged"):
+        print("  💬 问答归档 {} 页（新建 {} · 更新 {} · 未变 {}）→ 02-主题/{}/".format(
+            qrep["new"] + qrep["merged"] + qrep["unchanged"], qrep["new"], qrep["merged"],
+            qrep["unchanged"], VAULT_QA_DIR))
+    if qrep.get("conflicts"):
+        print("  ⛔ 问答归档 {} 页有冲突，未覆盖：{}".format(
+            len(qrep["conflicts"]), ", ".join(qrep["conflicts"][:5])))
     if trep.get("conflicts"):
         print("  ⛔ 概念页 {} 页有冲突，未覆盖：{}".format(
             len(trep["conflicts"]), ", ".join(trep["conflicts"][:5])))
@@ -150,7 +171,8 @@ def main() -> int:
             print("     - {}".format(k))
         print("     手工合并后删掉对应 .conflict.md 即可，或加 --force-regen 直接强制覆盖。")
     print("=" * 66)
-    return 1 if (rep["conflicts"] or rep["slice_failures"] or trep.get("conflicts")) else 0
+    return 1 if (rep["conflicts"] or rep["slice_failures"] or trep.get("conflicts")
+                 or qrep.get("conflicts")) else 0
 
 
 if __name__ == "__main__":

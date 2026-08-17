@@ -2654,3 +2654,65 @@ def test_fresh_sections_do_not_ship_double_blank_lines(tmp_path):
     text = _render(coverage=cov, stale_claims=[s],
                    acks={"a2020": "看过了", s.sid: "也看过了"}, params={"now_year": 2026})
     assert "\n\n\n" not in text
+
+
+# ---------------------------------------------------------------------------
+# 归档问答（topics/qa/）与概念页的分界（B2）
+# ---------------------------------------------------------------------------
+
+def _qa_page(qa_dir, slug, body, extra_fm=""):
+    """一页归档问答。**故意也带一个 `topic` 键**：那三处扫描除了文件名还要求
+    frontmatter 有 `topic`，若只放正常的 qa 页，它们即便改成 rglob 也照样是绿的——
+    测试就测不出分界。带上这个键，唯一还挡着它们的就是"扫描不进 qa 子目录"本身。"""
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    fm = ('---\nqa: "{}"\ntopic: "{}"\ntitle: "问答"\nn_evidence: 1\n{}---'
+          ).format(slug, slug, extra_fm)
+    (qa_dir / "{}.md".format(slug)).write_text(
+        T.assemble(fm, body, T.DEFAULT_USER_ZONE), encoding="utf-8")
+
+
+def _topic_page(topics, slug, body):
+    topics.mkdir(parents=True, exist_ok=True)
+    (topics / "{}.md".format(slug)).write_text(
+        T.assemble('---\ntopic: "{}"\ntitle: "概念页"\nn_evidence: 9\n---'.format(slug),
+                   body, T.DEFAULT_USER_ZONE), encoding="utf-8")
+
+
+def test_coverage_counts_qa_citations_but_qa_pages_are_not_concept_pages(tmp_path):
+    """B2 的分界，一条测试钉两头。
+
+    **要算上的**：`cited_citekeys`——只被问答引用过的论文不该被算成孤儿
+    （缺口分析问的是"哪些论文连概念层的证据池都进不去"，被专门问过一次的显然不是）。
+
+    **不许算上的**：陈旧论断 / 撞车归属 / 页数与 thin_pages——qa 页不是概念页，
+    不进概念页索引、不参与日历兜底、不被概念页审计。`is_topic_page_file` 是按
+    **文件名**判的，而 `qa-xxx.md` 不以 `_` 开头：一旦这三处也改成 rglob，
+    问答页会被当成概念页参与全部三项。
+    """
+    topics = tmp_path / "topics"
+    _topic_page(topics, "real", "- 概念页论断 [@covered2024]")
+    _qa_page(topics / "qa", "qa-x", "- 问答论断 [@onlyInQa2024]")
+
+    assert {"covered2024", "onlyInQa2024"} <= L.cited_citekeys(topics)
+
+    index = {"papers": [{"citekey": "covered2024", "year": 2015},
+                        {"citekey": "onlyInQa2024", "year": 2015}]}
+    assert [s.claim.slug for s in L.find_stale_claims(topics, index, now_year=2026)] == ["real"]
+    assert list(L.cited_by_page(topics)) == ["real"]
+    rep = L.coverage_report(topics, index)
+    assert rep.n_pages == 1
+    assert [t[0] for t in rep.thin_pages] == ["real"]
+
+
+def test_qa_index_page_is_not_counted_as_a_citation_source(tmp_path):
+    """`topics/qa/INDEX.md` 是目录页；`_` 前缀留给派生产物（lint 报告自己引用自己
+    那个坑）。放宽到 qa 子目录后这两道防线必须仍然生效。"""
+    topics = tmp_path / "topics"
+    qa = topics / "qa"
+    qa.mkdir(parents=True)
+    (qa / "INDEX.md").write_text("| [@fromIndex2024] |", encoding="utf-8")
+    (qa / "_draft.md").write_text("[@fromDraft2024]", encoding="utf-8")
+    _qa_page(qa, "qa-x", "- 真论断 [@real2024]")
+    keys = L.cited_citekeys(topics)
+    assert "real2024" in keys
+    assert "fromIndex2024" not in keys and "fromDraft2024" not in keys

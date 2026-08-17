@@ -133,6 +133,51 @@ cat "$HOME/Documents/ScholarVault/02-主题/_lint.md"   # vault 里那份副本(
   `sha1(slug + 论断文本)`,重合成会重写论断文本。设计如此(内容变了就是新论断),
   但第一次撞上会以为是 bug。孤儿那节不受影响(ID 就是 citekey)。
 
+## 问答归档(`topics/qa/`)——先看问过没有,再决定要不要重新检索
+
+**先路由,再决定用不用它**:
+
+| 这个问题是…… | 用什么 |
+|---|---|
+| 概念级、会反复用、希望**自动保鲜** | **概念页** `topics/<slug>.md`(新增就往 `config/topics.yaml` 加一条) |
+| 临时的、具体的、一次性的 | **`scripts/ask_notes.py`**(本节) |
+| 只想看有哪些句子、自己判断 | `notes_search.py`(语义) / `notes_query.py`(role 硬门槛);写稿取证走 `scholar-write` |
+
+⚠️ **已有概念页覆盖的问题不要用 ask_notes**:实测同一个 MNAR 诊断问题,问答页 40 条
+证据 / 45% 引用率,而 `mnar-diagnosis.md` 是 70 条 / 100% 且自动重合成——**不值那 90 秒**。
+脚本现在会自动比一遍概念页并提示,但判断权在你。
+
+具体的、临时冒出来的问题用 `scripts/ask_notes.py` 问,
+答案会连同每条论断的句级出处一起归档,下次直接读。
+
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ask_notes.py --list   # 先看问过什么
+cat output/scholar_notes/topics/qa/INDEX.md                                                              # 或读目录页
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/ask_notes.py "<问题>" -q "<英文术语>" -q "<换个说法>"
+```
+
+- **同一个问题再问一次是原地更新那一页**(空白/标点/全半角/零宽字符都归一化,
+  少打一个问号不会另开一页),不会堆出第二份答案;问之前会自动做**语义**查重并给出
+  slug、路径与可直接粘的更新命令 `ask_notes.py "<新问法>" --slug <slug>`。
+  Ollama 不可用时降级回词面重合,并会明说降级了。
+- **`--slug` 不会静默覆盖别人的问答**:那个 slug 已属于另一个问题时直接报错退 2。
+- 每条论断带 `[@citekey]`,页底证据表给 `note_file:note_line`。**要把具体数字写进稿子,
+  先点开原句核对**——防线保证 citekey 与原句真实存在,不保证转述没有失真。
+  证据召回是**窄而深**(28 条 / 单篇最多 3 条),把最相关那几篇挖到第 2、第 3 句。
+- 「⚠️ 用之前要知道的」是限制条件;「**本次召回没覆盖到的**」**不等于"库里没有"**——
+  它只是这一次那几十条证据没能回答的部分。脚本会拿每条空白回查向量库与概念页,
+  命中就标「⚠️ 但库里可能有」。没标记也别当结论,先查 `topics/INDEX.md` 与 `notes_search.py`
+  再决定要不要去补文献。
+- ⚠️ **归档问答不在向量库里**(概念页也不在,是同一笔已知欠账),`notes_search.py` 搜不到。
+  要找旧问答就用 `--list`、读 `topics/qa/INDEX.md`、或在 Obsidian 的 `02-主题/问答/` 里全文搜。
+- ⚠️ **Obsidian 那份要等下一次索引重建才出现**(vault 同步只被 `literature_index.json` 触发,
+  归档问答不动索引)。急用先跑:
+  ```bash
+  PYTHONPATH=. python scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault --force
+  ```
+- ⚠️ 与概念页一样含用户手写区(`## 我的批注`),**不要直接编辑生成块**——会判冲突并拒绝覆盖。
+- `--verify` 还会报**残留证据编号**与**防线版本**(旧版本的页面标 ⚠️ 并给出重跑命令)。
+
 ## 四步法
 
 1. **查索引**(始终过滤 `duplicate_of == null`):
