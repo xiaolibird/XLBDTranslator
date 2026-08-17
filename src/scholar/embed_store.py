@@ -27,6 +27,7 @@ except ImportError:
     fcntl = None  # Windows fallback
 
 from ..utils.logger import get_logger
+from .notes_index import is_retracted
 
 logger = get_logger(__name__)
 
@@ -141,6 +142,14 @@ def chunks_from_index(index: dict) -> List[Chunk]:
         if citekey.startswith("MISSING-KEY-") or e.get("citekey_source") == "missing":
             # MISSING-KEY 占位键不对应真实文献（notes_index.is_missing_citekey 契约），
             # 嵌进向量库会让 notes_search --cite 输出死引用，与 all_references 剔除口径一致。
+            continue
+        if is_retracted(e):
+            # 已撤稿：**札记保留**（读过它、判断过它的记录不该消失），但整篇踢出向量库。
+            # 这一行就是"从 RAG 里删掉"的全部实现——`sync_store` 的期望集不含它，
+            # 下一次同步会把它已有的 chunk 一并删除。于是概念页合成、问答召回、
+            # `notes_search` 三条路都再也召不到它，也就不可能有人照着它写进稿子。
+            # 判据在 md 的 `⚑ RETRACTED`（见 notes_index.RETRACTED_FLAG）。
+            logger.info("citekey '{}' 已标记撤稿，跳过（札记保留，仅踢出向量库）", citekey)
             continue
 
         bucket_raw = e.get("bucket") or []

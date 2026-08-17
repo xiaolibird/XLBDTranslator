@@ -63,17 +63,30 @@
 苦等"恰好有新论文挤进证据集")。**它是派生物**:内容全部来自 `highlights[]`,不构成
 独立事实来源;有疑问时以月度札记原文为准。
 
-⚠️ **撤稿论文的处置要带上概念页**:一篇论文被撤稿后按既有流程移出札记库(md/references/
-docx/索引四处),但它若曾是某概念页的证据来源,那一页在下次重合成之前仍会照旧展示它的
-论断(概念页不知道"撤稿"这件事,证据只会随下一次真正跑过 `build_topics.py` 才刷新)。
-撤稿处置流程(移出索引 + 向量库重新同步)**完成之后**,额外做两步把它清出概念页:
+⚠️ **撤稿论文的处置（2026-08-17 起改口径）**:**保留札记**——读过它、判断过它的记录
+不该消失,删掉等于假装没读过。只做三件事:
+
 ```bash
-grep -lF '[@<被撤稿论文的 citekey>]' output/scholar_notes/topics/*.md   # 找出仍引用它的概念页
-PYTHONPATH=. python scripts/build_topics.py --topic <上一步列出的 slug>...        # 逐页强制重合成
+# 1. 在该条的「裁决」行末尾加标记(md 是唯一真相源,跟着札记进 git)
+#    **裁决**: `MAYBE` · conf 0.30 · ⚑ RETRACTED
+# 2. 刷新索引(解析出 flags,并把它从 all_references.json 剔除)
+PYTHONPATH=. python scripts/notes_index.py
+# 3. 同步向量库(整篇踢出 RAG,概念页/问答/notes_search 从此都召不到它)
+PYTHONPATH=. python scripts/notes_embed.py
 ```
-用 `--topic`(强制全量重合成该页)而不是 `--affected-by <该 citekey>`——后者判的是"这个
-citekey 现在有没有挤进证据集",论文已经从索引/向量库里删掉后必然查无此键,永远判"不受
-影响",反而漏掉真正需要清理的页。
+
+标记之后:札记原样留着、`literature_index.json` 里 `flags: ["RETRACTED"]`、
+**不在向量库、不在全局书目**。有人手打 citekey 想引它,pandoc 会渲染成 `(key?)` 当场炸
+——这正是想要的失败方式。`scripts/lint_notes.py` 认得出"已标记",不再每月报警;
+只有**查出来但还没标记**的才是 🚨 硬信号(退出码 1)。
+
+若它曾是某概念页的证据来源,标记后要重跑那几页:
+```bash
+grep -lF '[@<被撤稿的 citekey>]' output/scholar_notes/topics/*.md
+PYTHONPATH=. python scripts/build_topics.py --topic <上一步列出的 slug>...
+```
+用 `--topic`(强制重合成)而不是 `--affected-by <该 citekey>`——后者判的是"这个 citekey
+有没有挤进证据集",而它已经不在向量库里了,必然查无此键、永远判"不受影响"。
 
 **撤稿现在会自己找上门,不必等你想起来查**:月度回填收尾会跑一遍知识层 lint,
 撤稿命中时弹系统通知(标题「Scholar 库里有撤稿论文」)并在报告里点名"它正在给哪几页

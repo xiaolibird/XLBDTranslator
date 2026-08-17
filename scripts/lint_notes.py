@@ -152,14 +152,21 @@ def main() -> int:
             getattr(proc, "external_email", "") or ""
         print("☣️ 撤稿检查：查 OpenAlex is_retracted……")
         retraction = L.check_retractions(index, mailto=mailto)
-        counts.retracted = len(retraction.hits)
+        # 只数**未处置**的：已打 `⚑ RETRACTED` 的那些按新口径会永远留在库里
+        # （札记保留、只踢出向量库），算进去的话每月都退 1、每月都弹通知。
+        counts.retracted = len(retraction.unhandled)
         counts.scan_failed_dois = retraction.n_failed
         print("   keeper {} 篇 · 有 DOI {} · 解析到 {}（{:.0%}）· 无 DOI {} · 查无 {} · 未查成 {}".format(
             retraction.n_papers, retraction.n_with_doi, retraction.n_resolved,
             retraction.coverage, retraction.n_no_doi, retraction.n_unresolved,
             retraction.n_failed))
+        for h in retraction.unhandled:
+            print("   🚨 已撤稿**且未标记**：[@{}] {}".format(h.citekey, h.title[:80]))
+            print("      处置：在札记的「裁决」行加 `⚑ RETRACTED`，再跑 "
+                  "notes_index.py + notes_embed.py 把它踢出向量库")
         for h in retraction.hits:
-            print("   🚨 已撤稿仍在库：[@{}] {}".format(h.citekey, h.title[:80]))
+            if h.acknowledged:
+                print("   ✅ 已撤稿已标记（札记保留、已不在向量库）：[@{}]".format(h.citekey))
 
     # ---- 对撞（唯一花钱项）----
     candidates = []

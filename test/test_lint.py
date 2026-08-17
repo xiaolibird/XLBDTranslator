@@ -2716,3 +2716,68 @@ def test_qa_index_page_is_not_counted_as_a_citation_source(tmp_path):
     keys = L.cited_citekeys(topics)
     assert "real2024" in keys
     assert "fromIndex2024" not in keys and "fromDraft2024" not in keys
+
+
+# ---------------------------------------------------------------------------
+# 撤稿处置的新口径（2026-08-17）：札记保留 + 标记 + 踢出向量库
+# ---------------------------------------------------------------------------
+
+def test_retracted_papers_are_dropped_from_the_vector_store_but_keep_their_notes():
+    """新口径：撤稿论文**保留札记**（读过它、判断过它的记录不该消失），
+    只做两件事——打 `⚑ RETRACTED`，并据此整篇踢出向量库。
+    此前的口径是"一律移出札记库"，代价是阅读记录从库里消失。"""
+    from src.scholar.embed_store import chunks_from_index
+    index = {"papers": [
+        {"citekey": "good2024", "title": "正常论文", "one_line": "有用",
+         "flags": [], "highlights": [{"role": "citable", "text": "一句证据"}]},
+        {"citekey": "bad2024", "title": "被撤稿的", "one_line": "曾经有用",
+         "flags": ["RETRACTED"], "highlights": [{"role": "citable", "text": "一句证据"}]},
+    ]}
+    keys = {c.citekey for c in chunks_from_index(index)}
+    assert "good2024" in keys
+    assert "bad2024" not in keys, "撤稿论文的 paper 级与 highlight 级 chunk 都不许进库"
+
+
+def test_an_acknowledged_retraction_stops_crying_wolf():
+    """处置完之后它**永远还在库里**——不分已标记/未标记的话，每月的自动 lint 会对着
+    同两篇一直退 1、一直弹通知，几个月后这个警报就没人信了。
+    已标记的仍然列在报告里（"库里有这些、已处置"是事实），但不再是硬信号。"""
+    scan = L.RetractionScan(n_papers=2, n_with_doi=2, n_resolved=2, hits=[
+        L.RetractionHit(citekey="handled2024", doi="10.1/a", title="已标记的",
+                        signal="openalex-flag", acknowledged=True),
+        L.RetractionHit(citekey="fresh2024", doi="10.1/b", title="刚查出来的",
+                        signal="openalex-flag", acknowledged=False),
+    ])
+    assert [h.citekey for h in scan.unhandled] == ["fresh2024"]
+    text = _render(retraction=scan)
+    # 两篇都要出现在报告里
+    assert "handled2024" in text and "fresh2024" in text
+    # 但只有未标记的那篇被算成要动手的
+    assert "1 篇已撤稿论文还没被标记" in text
+    assert "✅ 已标记" in text and "🚨 **未标记**" in text
+
+
+def test_all_acknowledged_means_no_alarm_at_all():
+    scan = L.RetractionScan(n_papers=1, n_with_doi=1, n_resolved=1, hits=[
+        L.RetractionHit(citekey="handled2024", doi="10.1/a", title="已标记的",
+                        signal="openalex-flag", acknowledged=True)])
+    assert scan.unhandled == []
+    text = _render(retraction=scan)
+    assert "还没被标记" not in text, "全部处置完就不该再有 🚨 那一段"
+    assert "handled2024" in text, "但事实仍要列出来"
+
+
+def test_retracted_papers_are_dropped_from_the_global_bibliography(tmp_path):
+    """撤稿论文不进 `all_references.json`：它已经从向量库里踢出去了，正常检索取证
+    碰不到；唯一还能引到它的路径是有人手打 citekey——那种情况恰恰应该当场炸
+    （pandoc 渲染成 `(key?)`），而不是安安静静地把一篇被撤销的工作排进参考文献。"""
+    from src.scholar.notes_index import build_all_references
+    index = {"papers": [
+        {"citekey": "good2024", "title": "正常", "year": 2024, "duplicate_of": None,
+         "flags": [], "authors": ["A"], "references_json": None},
+        {"citekey": "bad2024", "title": "被撤稿的", "year": 2024, "duplicate_of": None,
+         "flags": ["RETRACTED"], "authors": ["B"], "references_json": None},
+    ]}
+    ids = {x["id"] for x in build_all_references(index, tmp_path)}
+    assert "good2024" in ids
+    assert "bad2024" not in ids

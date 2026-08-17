@@ -99,6 +99,23 @@ _BUCKET_RE = re.compile(r"维度 ([A-G](?:/[A-G])*)")
 _ROLE_RE = re.compile(r"角色 (\S+)")
 _CONF_RE = re.compile(r"conf ([\d.]+)")
 _FLAGS_RE = re.compile(r"⚑ (\S+)")
+
+# 撤稿标记。写在札记 md 的「裁决」行上（`⚑ RETRACTED`），由 `_FLAGS_RE` 解析进
+# `flags`，是这件事的**唯一真相源**——md 是人写的、进 git、跟着札记走，索引与向量库
+# 都是它的派生物。
+#
+# 2026-08-17 起的处置口径（**与此前不同**）：撤稿论文**保留札记**（那是读过它、
+# 判断过它的历史记录，删掉等于假装没读过），只做两件事——
+#   1. 打这个标记，页面与索引上一眼可见；
+#   2. `embed_store.chunks_from_index` 据此把它整篇踢出向量库，
+#      于是概念页合成、问答召回、`notes_search` 都再也召不到它。
+# 此前的口径是"一律移出札记库 + 库外独立留档"，代价是那篇论文的阅读记录从库里消失。
+RETRACTED_FLAG = "RETRACTED"
+
+
+def is_retracted(entry: dict) -> bool:
+    """这条是不是已标记撤稿。索引与向量库两侧共用同一个判据，别各写各的。"""
+    return RETRACTED_FLAG in (entry.get("flags") or [])
 _DOI_RE = re.compile(r"^\*\*DOI\*\*: \[([^\]]+)\]")
 _URL_RE = re.compile(r"^\*\*链接\*\*: (\S+)")
 _CLOSEREAD_RE = re.compile(r"^### (全文精读|精读（仅摘要降级）)(?: · 来源 `(.+?)`)?")
@@ -997,11 +1014,19 @@ def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[st
     merged: Dict[str, Dict[str, Any]] = {}
     fallbacks: List[str] = []
     missing: List[str] = []
+    retracted: List[str] = []
     for e in index["papers"]:
         if e.get("duplicate_of") or not e.get("citekey"):
             continue
         if is_missing_citekey(e):
             missing.append("{}@{}".format(e["citekey"], e.get("month") or "?"))
+            continue
+        if is_retracted(e):
+            # 已撤稿：札记保留（阅读记录不该消失），但**不进全局书目**。
+            # 它已经从向量库里踢出去了，正常检索取证根本碰不到；唯一还能引到它的
+            # 路径是有人手打 citekey——而那种情况恰恰应该当场炸（pandoc 渲染成
+            # `(key?)`），而不是安安静静地把一篇被撤销的工作排进参考文献。
+            retracted.append(e["citekey"])
             continue
         key = e["citekey"]
         if key in dropped or key in merged:
@@ -1019,6 +1044,9 @@ def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[st
             item = _fallback_csl(e)
             fallbacks.append("{}@{}".format(key, e.get("month") or "?"))
         merged[key] = item
+    if retracted:
+        logger.info("  all_references：{} 条已标记撤稿，已剔除（札记保留）：{}".format(
+            len(retracted), ", ".join(sorted(retracted)[:8])))
     if fallbacks:
         logger.warning("  all_references：{} 条未匹配到月度 CSL 条目，已按索引字段兜底"
                        "（缺卷期页、作者可能被 md 的 et al. 截断）：{}{}".format(

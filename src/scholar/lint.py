@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
+from .notes_index import is_retracted
 from .topics import (
     DEFAULT_EXCLUDE_SECTIONS, GEN_END, TopicError,
     _CITE_RE, _clean_text, is_topic_page_file, parse_synthesis, ValidationReport,
@@ -528,6 +529,12 @@ class RetractionHit:
     title: str
     signal: str          # openalex-flag / title-marker
     openalex_id: str = ""
+    # 札记里已经打了 `⚑ RETRACTED` 吗（见 notes_index.RETRACTED_FLAG）。
+    # **这一位决定要不要喊人**：撤稿论文按新口径是"保留札记 + 标记 + 踢出向量库"，
+    # 处置完之后它**永远还在库里**——不分已标记/未标记的话，
+    # 每月的自动 lint 会对着同两篇一直退 1、一直弹通知，几个月后这个警报就没人信了。
+    # 已标记的仍然列在报告里（是"库里有这些、已处置"的事实），但不再是硬信号。
+    acknowledged: bool = False
 
 
 @dataclass
@@ -548,6 +555,16 @@ class RetractionScan:
     @property
     def coverage(self) -> float:
         return (self.n_resolved / self.n_papers) if self.n_papers else 0.0
+
+    @property
+    def unhandled(self) -> List[RetractionHit]:
+        """**还没在札记里打 `⚑ RETRACTED` 的**那些——只有这些才是要人动手的。
+
+        退出码、`🚨` 行、月度 notify 全都只看这一个列表。已标记的仍然出现在报告里
+        （"库里有这两篇、已处置"是事实，不该消失），但不再触发警报——
+        否则处置完之后每月照样退 1，几个月后这个信号就没人信了。
+        """
+        return [h for h in self.hits if not h.acknowledged]
 
 
 def _scan_targets(index: dict) -> List[dict]:
@@ -644,6 +661,7 @@ def check_retractions(index: dict, *, client=None, mailto: str = "",
                     continue
                 for e in entries:
                     scan.hits.append(RetractionHit(
+                        acknowledged=is_retracted(e),
                         citekey=str(e.get("citekey")), doi=doi,
                         title=str(e.get("title") or title),
                         signal="openalex-flag" if flagged else "title-marker",
@@ -1978,22 +1996,30 @@ def _retraction_section(retraction: RetractionScan,
               retraction.n_papers, retraction.n_with_doi, retraction.n_resolved,
               retraction.coverage, retraction.n_no_doi, retraction.n_unresolved,
               retraction.n_failed), ""]
+    if retraction.unhandled:
+        L += ["🚨 **{} 篇已撤稿论文还没被标记**。处置（2026-08-17 起的新口径："
+              "**札记保留**，只标记 + 踢出向量库）：在该条的「裁决」行加 `⚑ RETRACTED`，"
+              "然后跑 `notes_index.py` + `notes_embed.py`。".format(
+                  len(retraction.unhandled)), ""]
+    for h in retraction.hits:
+        pages = [slug for slug, keys in cited_by_page.items() if h.citekey in keys]
+        L.append("- {} `[@{}]` **{}**".format(
+            "✅ 已标记" if h.acknowledged else "🚨 **未标记**", h.citekey, h.title[:110]))
+        L.append("  - 信号：{}{}".format(
+            "OpenAlex `is_retracted`" if h.signal == "openalex-flag" else "标题撤稿标记",
+            " · <{}>".format(h.openalex_id) if h.openalex_id else ""))
+        L.append("  - DOI：`{}`".format(h.doi))
+        if h.acknowledged:
+            # 已标记的仍然列出来：「库里有这一篇、已处置」是事实，不该从报告里消失。
+            # 但它不再触发退出码与通知——处置完还每月喊人的话，几个月后没人信这个警报。
+            L.append("  - 札记保留（已打 `⚑ RETRACTED`），已不在向量库，"
+                     "概念页/问答/`notes_search` 都召不到它")
+        if pages:
+            L.append("  - ⚠️ **已被概念页引用**：{}——这几页的论断可能建立在被撤销的"
+                     "结论上，标记后必须重跑这几页".format("、".join(sorted(pages))))
+        elif not h.acknowledged:
+            L.append("  - 未被任何概念页引用")
     if retraction.hits:
-        L += ["🚨 **{} 篇已撤稿论文仍在库中**。处置见 `docs/scholar_notes_AGENTS.md`"
-              "「撤稿论文处置」：移出札记库 + 库外独立留档，md/references/sidecar/docx "
-              "四处都要动。".format(len(retraction.hits)), ""]
-        for h in retraction.hits:
-            pages = [slug for slug, keys in cited_by_page.items() if h.citekey in keys]
-            L.append("- `[@{}]` **{}**".format(h.citekey, h.title[:110]))
-            L.append("  - 信号：{}{}".format(
-                "OpenAlex `is_retracted`" if h.signal == "openalex-flag" else "标题撤稿标记",
-                " · <{}>".format(h.openalex_id) if h.openalex_id else ""))
-            L.append("  - DOI：`{}`".format(h.doi))
-            if pages:
-                L.append("  - ⚠️ **已被概念页引用**：{}——这几页的论断可能建立在被撤销的"
-                         "结论上，删条目后必须重跑这几页".format("、".join(sorted(pages))))
-            else:
-                L.append("  - 未被任何概念页引用")
         L.append("")
     else:
         L += ["✅ 已解析的 {} 篇里没有撤稿记录。".format(retraction.n_resolved), ""]
