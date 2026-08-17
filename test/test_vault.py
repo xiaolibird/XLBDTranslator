@@ -12,6 +12,7 @@
 3. kNN 邻居不得指向入选集之外（否则 Obsidian 图上出现幽灵节点）。
 """
 import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -932,3 +933,131 @@ def test_repo_dedup_overrides_are_isolated_from_this_file():
     """
     assert ni._read_override_files(None) == []
     assert not Path(ni.REPO_OVERRIDES_PATH).exists()
+
+
+# ---------------------------------------------------------------------------
+# 第 5 轮对抗审核回归：X4——W5（vault 双时间戳陈旧判定）此前零覆盖
+# ---------------------------------------------------------------------------
+#
+# W5 的陈旧判定（scripts/sync_vault.py::topics_mtime/vault_stamp + main() 里的双戳
+# 比对）是这批改动里改得最保守、复审验证最充分的一块（六个函数级场景 + 两次真实 CLI
+# 端到端复现），但 sync_vault.py 与 src/scholar/vault.py 本身不在本轮改动的白名单内
+# ——一个字都不动。这里只借道已有的子进程 CLI 测试模式（见上面 `_cli`），像黑盒一样
+# 从外部驱动 sync_vault.py 走一遍五个场景，全程 --notes-dir/--vault-dir 都钉死在
+# tmp_path 下，不会碰真实生产 notes_dir/vault；sync_vault.py 内部只是又 subprocess
+# 一次 build_vault.py（同样只读写 tmp_path，不涉及 LLM），没有第三层子进程。
+
+def _sync_cli(*args, cwd=None):
+    return subprocess.run(
+        [_sys.executable, "scripts/sync_vault.py", *args],
+        cwd=cwd or _REPO, capture_output=True, text=True)
+
+
+def test_sync_skips_when_index_and_topics_both_unchanged(notes_dir_on_disk, tmp_path):
+    """场景 1：索引与 topics 都没变 → 秒退，不重建、_meta.json 一字节都不该动。"""
+    nd = notes_dir_on_disk
+    vd = tmp_path / "v"
+    r1 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r1.returncode == 0 and (vd / V.META_JSON).exists()
+    before = (vd / V.META_JSON).read_text(encoding="utf-8")
+
+    r2 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r2.returncode == 0
+    assert "已是最新" in r2.stdout
+    after = (vd / V.META_JSON).read_text(encoding="utf-8")
+    assert before == after, "第二次运行不该重建，_meta.json 不该变"
+
+
+def test_sync_rebuilds_when_only_topics_mtime_changed(notes_dir_on_disk, tmp_path):
+    """场景 2（真实事故时序，最重要）：索引 generated_at 不变，但 topics/*.md 落盘更晚
+    ——build_topics.py 是在索引写盘之后才异步生成概念页，经常在索引已经不再变之后才
+    落盘完成。若陈旧判定只看索引快照，这个窗口期会被误判成"已完全同步"，vault 侧
+    概念页因此可能无限期停在旧版本，这正是 W5 要修的真实事故（复审记录：滞后 2 小时，
+    靠"凑巧后来有一次无关的索引变动"才顺带同步过去）。"""
+    nd = notes_dir_on_disk
+    vd = tmp_path / "v"
+    topics_dir = nd / "topics"
+    topics_dir.mkdir()
+    (topics_dir / "shadow-variable.md").write_text("占位概念页", encoding="utf-8")
+
+    r1 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r1.returncode == 0
+    meta1 = json.loads((vd / V.META_JSON).read_text(encoding="utf-8"))
+    assert meta1["source_topics_mtime"] is not None
+
+    # 索引 generated_at 原封不动，只让 topics 目录变新——模拟"索引已经不再变，
+    # 概念页才姗姗来迟落盘完成"这个真实窗口期。用 os.utime 精确前移，不依赖
+    # "自然跑得够慢、mtime 自动往后走"这种在快机器/粗粒度文件系统上会抖动的假设。
+    new_mtime = meta1["source_topics_mtime"] + 5
+    os.utime(topics_dir / "shadow-variable.md", (new_mtime, new_mtime))
+
+    r2 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r2.returncode == 0
+    assert "已是最新" not in r2.stdout, "只看索引快照会误判成已同步——这正是 W5 修的事故"
+    meta2 = json.loads((vd / V.META_JSON).read_text(encoding="utf-8"))
+    assert meta2["source_topics_mtime"] > meta1["source_topics_mtime"]
+
+
+def test_sync_heals_legacy_meta_json_exactly_once(notes_dir_on_disk, tmp_path):
+    """场景 3：旧版 vault（_meta.json 里没有 source_topics_mtime 字段，W5 上线前的
+    产物）第一次运行必须触发一次"愈合性"重建；重建后字段补齐，第二次运行必须秒退
+    ——不能因为"字段曾经缺失过"就每次都重建（那样 W5 会从"陈旧判定"退化成"每次
+    触发都全量重建"，定时任务的空转优化整个失效）。"""
+    nd = notes_dir_on_disk
+    vd = tmp_path / "v"
+    topics_dir = nd / "topics"
+    topics_dir.mkdir()
+    (topics_dir / "mnar-diagnosis.md").write_text("占位概念页", encoding="utf-8")
+
+    r1 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r1.returncode == 0
+
+    # 模拟 W5 上线前的旧版 _meta.json：手工删掉 source_topics_mtime 字段。
+    meta_path = vd / V.META_JSON
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["source_topics_mtime"]
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    r2 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r2.returncode == 0
+    assert "已是最新" not in r2.stdout, "字段缺失必须触发一次愈合性重建"
+    healed = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert healed["source_topics_mtime"] is not None
+
+    r3 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r3.returncode == 0
+    assert "已是最新" in r3.stdout, "字段补齐后不能无限重建"
+
+
+def test_sync_matches_pre_p1_behavior_without_topics_dir(notes_dir_on_disk, tmp_path):
+    """场景 4：notes_dir 下压根没有 topics/ 目录（概念页 P1 功能引入前的库，或尚未
+    生成过任何概念页）——topics_mtime 恒为 None，双戳比对退化为只看索引快照，行为
+    与引入概念页陈旧判定之前一致（不会因为"没有 topics 这回事"而永远判陈旧）。"""
+    nd = notes_dir_on_disk
+    assert not (nd / "topics").exists()
+    vd = tmp_path / "v"
+
+    r1 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r1.returncode == 0
+    meta = json.loads((vd / V.META_JSON).read_text(encoding="utf-8"))
+    assert meta["source_topics_mtime"] is None
+
+    r2 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r2.returncode == 0
+    assert "已是最新" in r2.stdout
+
+
+def test_sync_treats_corrupt_meta_json_as_stale(notes_dir_on_disk, tmp_path):
+    """场景 5：_meta.json 损坏（JSON 解析失败，如磁盘抖动/人为改坏）→ vault_stamp 兜底
+    成 (None, None)，与真实索引快照必然不相等 → 判陈旧、强制重建，而不是让一份损坏的
+    状态文件卡死同步（重建后 _meta.json 必须恢复成合法 JSON，不能越修越坏）。"""
+    nd = notes_dir_on_disk
+    vd = tmp_path / "v"
+    r1 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r1.returncode == 0
+
+    (vd / V.META_JSON).write_text("{not valid json", encoding="utf-8")
+    r2 = _sync_cli("--vault-dir", str(vd), "--notes-dir", str(nd), "--no-commit")
+    assert r2.returncode == 0
+    assert "已是最新" not in r2.stdout
+    json.loads((vd / V.META_JSON).read_text(encoding="utf-8"))   # 必须恢复成合法 JSON

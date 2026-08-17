@@ -17,6 +17,9 @@
    真的本地（Ollama）不再依赖主 provider 设置，而由自己的 base_url 检测结果
    决定，与 ClaudeAgentTranslator 的 force_simple 用法对称。
 """
+import atexit
+import os
+import tempfile
 from types import SimpleNamespace
 
 from src.core.schema import Settings
@@ -36,10 +39,38 @@ def _simple_system_instruction() -> str:
     return path.read_text(encoding="utf-8")
 
 
+_FAKE_DOC: str = ""
+
+
+def _fake_document_path() -> str:
+    """给 Settings 一个**当前存在**的 .epub 占位路径，切断对用户工作配置的依赖。
+
+    不这么做的后果实际踩过：传 files={} 时 pydantic-settings 会从 config/config.env
+    读 FILES__DOCUMENT_PATH，而那里指向的是用户当下在翻的那本书。2026-08-17 那本
+    Žižek 的 epub 被归档进「哲学」子目录，schema 的 validate_existing_paths 当场
+    抛 FileNotFoundError，本文件三个用例集体变红——全量测试从 863 passed 掉到
+    3 failed，排查半天才确认与被测代码无关。本测试测的是 PromptManager 选完整版
+    还是简化版 prompt，与待翻译的文档是哪一本毫无关系。
+
+    schema 只校验「存在」与「扩展名属于 pdf/epub」，不读内容，故空文件足够。
+    """
+    global _FAKE_DOC
+    if not _FAKE_DOC:
+        fd, path = tempfile.mkstemp(suffix=".epub")
+        os.close(fd)
+        _FAKE_DOC = path
+        # 吹毛求疵项：此前没有任何清理（无 atexit/fixture teardown），每跑一次测试
+        # 就在系统临时目录留一个空 .epub。注册 atexit 兜底删除；用默认参数绑定 path
+        # 避免闭包晚绑定问题，文件已被删也不报错。
+        atexit.register(lambda p=path: os.path.exists(p) and os.remove(p))
+    return _FAKE_DOC
+
+
 def _make_settings(translator_provider: str, **api_overrides) -> Settings:
     api = {"TRANSLATOR_PROVIDER": translator_provider}
     api.update(api_overrides)
-    return Settings(api=api, files={}, processing={}, logging={})
+    return Settings(api=api, files={"DOCUMENT_PATH": _fake_document_path()},
+                    processing={}, logging={})
 
 
 # ==================== 1. PromptManager 单元级：主 provider=ollama 也算"云端默认" ====================

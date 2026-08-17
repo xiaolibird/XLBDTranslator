@@ -1,0 +1,123 @@
+# 概念页（topic pages）种子配置
+# ------------------------------------------------------------------
+# 札记库原本是 paper-centric 的：每篇论文说了什么，一次写成不再改。这份配置定义
+# 另一个轴——concept-centric：关于某个概念，**全库现在的共识、分歧与缺口是什么**。
+# 每个 topic 产出 output/scholar_notes/topics/<slug>.md 一页活综述，由
+# scripts/build_topics.py 从句级证据（literature_index.json 的 highlights）合成。
+#
+# 策展在人、bookkeeping 在机器：加/删/改 topic 只动这个文件，证据召回与综述改写
+# 由脚本负责。新论文入库后重跑即可让相关页跟着长。
+#
+# 每个 topic 的字段：
+#   slug              必填，文件名与 wiki 内部链接用（kebab-case，ASCII）
+#   title             必填，页面标题（中文）
+#   question          必填，这一页要回答的核心问题；直接注入合成 prompt，决定综述的取材角度
+#   queries           必填，证据召回的检索词（中英混排；每个词各检索一次后合并去重）
+#   buckets           可选，偏好维度（A-G），**不是过滤条件**：命中的证据排序时加分靠前，
+#                     bucket 为空或不匹配都不受罚；留空=不偏好任何维度。2026-08-16 前这里
+#                     是硬过滤，审计发现全库 37% 的句级证据 bucket 为空（manual 系列 220 篇
+#                     100% 全空），硬过滤会把这批最细致的证据整体排除，遂改软加权
+#                     （见 src/scholar/topics.py 的 DEFAULT_BUCKET_BONUS）
+#   roles             可选，限定证据角色（citable/refutable/method）；留空=三者都要。
+#                     这个仍是硬过滤——角色是证据本身的性质分类，不是排序偏好
+#   max_evidence      可选，喂给 LLM 的证据上限（默认 60）。太大反而稀释重点，也更贵
+#   exclude_sections  可选，覆盖默认排除的精读分节（默认排除「对我研究的联想」——那是
+#                     精读者自己的推测性批注，不是文献内容，混进证据池会被综述误当
+#                     "已验证结论"引用；见 DEFAULT_EXCLUDE_SECTIONS）。某页确实想纳入
+#                     这类联想式内容时可显式填 []
+#
+# ⚠️ queries 直接决定这一页看得见什么。中文查询能命中英文原文（bge-m3 跨语言），
+# 但概念换述的召回率实测只有 ~30%，所以关键术语的中英两种写法都要给。
+
+topics:
+  - slug: mnar-diagnosis
+    title: MNAR 与缺失机制诊断
+    question: 判断 EHR 数据的缺失是否属于 MNAR，现有方法有哪些？各自的前提假设、可检验性与已知失效场景是什么？
+    queries:
+      - MNAR missing not at random 诊断
+      - missingness mechanism diagnosis test
+      - Little's MCAR test 检验
+      - informative missingness 信息性缺失
+      - 缺失机制不可忽略 identifiability
+    buckets: [A, C]
+    max_evidence: 70
+
+  - slug: missingness-aware-modeling
+    title: 缺失感知建模：掩码表征与架构
+    question: 把"缺失本身"当信号建模的架构有哪些路线？掩码嵌入、注意力约束、图传播各自的效果证据与代价是什么？
+    queries:
+      - missingness-aware architecture mask embedding
+      - learnable mask token 掩码嵌入
+      - attention with missing input 注意力 缺失
+      - graph learning attribute missing feature propagation
+      - 无插补建模 imputation-free
+    buckets: [A, B]
+    max_evidence: 70
+
+  - slug: missingness-causal
+    title: 缺失与因果结构（m-graph 与可识别性）
+    question: 把缺失指示符纳入因果图后，哪些量在 MNAR 下仍可识别？测序/测量混杂如何处理？
+    queries:
+      - missingness graph m-graph causal
+      - MNAR identifiability 可识别性
+      - causal discovery under missing data
+      - test-order measurement confounding 测量混杂
+      - missingness indicator DAG node
+    buckets: [A, C]
+    max_evidence: 60
+
+  - slug: cross-site-transportability
+    title: 跨中心迁移与外部验证
+    question: 模型跨医院/跨数据库迁移时性能如何衰减？缺失模式的跨站异质性在其中占多大份额？哪些迁移策略被实证支持？
+    queries:
+      - transportability cross-site external validation
+      - domain shift dataset shift EHR 分布偏移
+      - LODO leave-one-dataset-out 多中心
+      - site heterogeneity 站点异质性
+      - 外部验证 性能衰减 generalization gap
+    buckets: [D, F]
+    max_evidence: 70
+
+  - slug: imputation-pitfalls
+    title: 插补的失真与陷阱
+    question: 插补在什么条件下会引入偏倚而非减少偏倚？下游任务上"更低 RMSE"与"更好决策"何时分道扬镳？
+    queries:
+      - imputation distortion bias 插补偏倚
+      - imputation downstream task performance 下游
+      - multiple imputation assumption violation
+      - RMSE 重建误差 误导 evaluation metric
+    buckets: [A, B]
+    max_evidence: 60
+
+  - slug: adversarial-evidence
+    title: 对抗性证据：与本文假设相反的实证
+    question: 库里哪些证据直接挑战"缺失结构可迁移""因果特征更泛化""注意力权重可解释"这几个前提？它们的实验条件是什么？
+    queries:
+      - causal features do not improve generalization
+      - attention is not explanation 注意力 不等于 因果
+      - 可解释性权重 可靠性质疑 saturation
+      - negative result 反例 未能复现
+    roles: [refutable, citable]
+    max_evidence: 60
+
+  - slug: icu-benchmarks
+    title: 多库 ICU 基准与数据集特性
+    question: MIMIC-IV / eICU / AmsterdamUMCdb / HiRID 各自的缺失特性与可比性如何？跨库实验的常见口径陷阱是什么？
+    queries:
+      - MIMIC-IV eICU AmsterdamUMCdb HiRID benchmark
+      - ICU 数据集 缺失率 采样频率
+      - cohort definition harmonization 队列口径
+      - multi-database validation ICU mortality
+    buckets: [F, D, G]
+    max_evidence: 60
+
+  - slug: shadow-variable
+    title: 影子变量与 MNAR 辅助识别
+    question: 影子变量（shadow variable）在 MNAR 识别中承担什么角色？临床数据里哪些量可充当弱影子变量，其前提如何被检验？
+    queries:
+      - shadow variable MNAR identification
+      - instrumental variable missing data 工具变量 缺失
+      - auxiliary variable nonignorable missingness
+      - 放射报告 检查开单 弱影子变量
+    buckets: [A, C]
+    max_evidence: 60

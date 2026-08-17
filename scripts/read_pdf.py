@@ -227,6 +227,64 @@ def _sync_embedding_best_effort(notes_dir: Path, index: dict, settings) -> None:
         logger.warning("向量库同步跳过（不影响手动精读结果）：{}".format(e))
 
 
+def _sync_topics_best_effort(notes_dir: Path, note_md: str) -> None:
+    """best-effort 触发概念页路由 + 合成（P2：让概念页跟着新论文长）。
+
+    W6：`grep -rln "build_topics\\|_refresh_topics\\|affected_topics\\|new_citekeys_from_note"
+    src/ scripts/` 此前只命中 topics.py / build_topics.py / ingest_notes.py /
+    backfill_notes.py——三条真实入库路径只接了两条，本脚本（手动 PDF 深度精读）没接。
+    而手动精读入的恰是全库标注最细、质量最高的那批（220 篇 manual 系列），它们入库后
+    概念页永远不会跟着更新，除非有人事后想起来手跑一遍 build_topics.py。
+
+    与 ingest_notes.py._refresh_topics 同一套子进程调用方式（不 import，路由/熔断/
+    索引页重建只在 build_topics.py 一处维护，这里不复制一份）。同样 best-effort：
+    手动精读主流程已经落盘成功，概念页失败绝不能倒过来影响这次精读的结果。
+
+    Y3（2026-08-17 运行时复审现场证伪）：此前这里不 notify，理由写的是"本脚本是人
+    亲自在终端跑的交互式命令（finalize/regen），warning 已经在眼前，不需要再弹系统
+    通知"——复审期间 `ps aux` 现场看到真正在跑这条路径的是**自动权限模式的 Claude
+    Code 会话**（`--permission-mode auto`），不是人盯着终端；docs/skills/read-paper/
+    SKILL.md 的"批量协议"还写明多篇 PDF 会在同一会话内连续跑，warning 级日志完全
+    可能被会话自己的输出吞掉、没人看见。现在接成与 ingest_notes.py/backfill_notes.py
+    同一套：不会多打扰人——只在概念页合成真失败（超时/异常/有页面未成功）时才弹一次。
+
+    安全前提（事故实测）：子进程用 build_topics.py 自己的默认配置独立加载**生产**
+    notes_dir，与这里传入的 notes_dir 完全脱钩——test_read_pdf_cli.py 直调
+    `_rebuild_month(tmp_path, ...)` 时，子进程曾拿 tmp 目录里的 note 文件名去匹配
+    生产索引，撞上生产库里同名的当月文件，真的起了一个指向生产环境的子进程并挂起
+    13 分钟。notes_dir 不在仓库 output/ 下（测试用的 tmp_path 等）一律跳过，见
+    `T.notes_dir_is_production`。
+    """
+    import subprocess
+    from src.scholar import topics as T
+    from src.utils.notify import notify
+    if not T.notes_dir_is_production(notes_dir):
+        return
+    script = repo_path("scripts/build_topics.py")
+    if not script.exists():
+        return
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--affected-by-note", str(note_md)],
+            capture_output=True, text=True, timeout=2400,
+            cwd=str(repo_path(".")))
+    except subprocess.TimeoutExpired:
+        logger.warning("概念页更新超时，本次精读跳过（不影响归档结果）")
+        notify("Scholar 手动精读", "概念页更新超时，精读已正常归档")
+        return
+    except Exception as e:
+        logger.warning("概念页更新跳过（不影响归档结果）：{}".format(e))
+        notify("Scholar 手动精读", "概念页更新异常（精读已正常归档）：{}".format(str(e)[:120]))
+        return
+    for line in (proc.stdout or "").strip().splitlines():
+        logger.info("  {}".format(line))
+    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
+    if not outcome.ok:
+        logger.warning("概念页更新未全部成功，归档已完成：{}".format(outcome.detail))
+        notify("Scholar 手动精读", "概念页有页面未更新成功（精读已归档）：{}".format(
+            outcome.detail[:300]))
+
+
 def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
     """按 dedup_key 沿用上一轮 sidecar 里的 citekey，返回 {paper_id: citekey|None}。
 
@@ -350,6 +408,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     idx = update_index(notes_dir)
     write_outputs(idx, notes_dir)
     _sync_embedding_best_effort(notes_dir, idx, settings)
+    _sync_topics_best_effort(notes_dir, res["note_path"])   # W6：接入 P2，见函数文档
     return {"month": month, "papers": len(segments), "skipped_drafts": skipped,
             "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
 

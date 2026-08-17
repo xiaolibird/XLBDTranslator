@@ -21,6 +21,10 @@
 
 跨运行去重：seen 集从 output/scholar_notes/literature_index.json 恢复（收尾自动刷新该索引），
 新月份不会与历史月重复；--force 重跑时自动剔除待跑月份自己的键。
+
+退出码：0 成功 / 1 有月份失败或收尾索引刷新失败 / 3 全部月份正常回填但概念页未全部更新
+成功（不是回填失败，是它的派生产物这一轮没跟上，见 _refresh_topics_for_keys；与
+scripts/ingest_notes.py 的同一语义对齐）。
 """
 import argparse
 import json
@@ -227,13 +231,73 @@ def prev_month_label(today=None):
     return "{:04d}-{:02d}".format(y, m)
 
 
+def _refresh_topics_for_keys(notes_dir, citekeys, timeout=2400) -> bool:
+    """回填收尾：一次性路由 + 合成被本次新增 citekey 影响的概念页（P2）。
+
+    W7：此前是 `for r in results` 里逐月各起一次 build_topics.py 子进程（每月一份
+    `--affected-by-note`），`--since 2023-01 --until 2026-05` 实测 41 个月 = 41 次
+    独立召回 + 合成，连续几个月命中同一页时该页被反复合成 N 次（只有最后一次有效），
+    一次全量回填就撞了 Claude 订阅限流（实测 8 页触顶，回退链推到当时地区不可用的
+    gemini）。改成：main() 把全部成功月份的新 citekey 收集成并集后只调这一次，用
+    `--affected-by`（本就支持 `action="append"` 多值）逐个传入，不再需要
+    `--affected-by-note` 那种"一份 note 一次调用"的形状。
+
+    best-effort：每月 1 日 launchd 无人值守，概念页是索引的派生物，失败不该带崩
+    回填本身的退出码——但也不能像 W3 之前那样被三重吞掉（返回值不读/stderr 不读/
+    日志截尾）。W4：此前月度对同类失败只 logger.warning、从不 notify（周度
+    ingest_notes.py 早就两者都做了）；这里补上 notify——多月合并成一次调用后天然
+    也只有一条汇总通知，不会像"每月一条"那样刷屏。
+
+    安全前提：子进程用 build_topics.py 自己的默认配置独立加载**生产** notes_dir，
+    与这里传入的 notes_dir 完全脱钩——notes_dir 不在仓库 output/ 下（测试隔离场景）
+    一律跳过，不发子进程，见 T.notes_dir_is_production（read_pdf.py 的同类触发器
+    实测因为漏了这层判断，被单测意外打到过生产环境并挂起 13 分钟）。
+    """
+    import subprocess
+    from src.scholar import topics as T
+    if not T.notes_dir_is_production(notes_dir):
+        return True
+    script = repo_path("scripts/build_topics.py")
+    if not script.exists():
+        return True
+    cmd = [sys.executable, str(script)]
+    for k in citekeys:
+        cmd += ["--affected-by", k]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              cwd=str(repo_path(".")))
+    except subprocess.TimeoutExpired:
+        logger.warning("概念页更新超时（{}s），本次回填已完成".format(timeout))
+        notify("Scholar 月度回填", "概念页更新超时，回填本身已完成")
+        return False
+    except Exception as e:
+        logger.warning("概念页更新跳过（不影响回填）：{}".format(e))
+        notify("Scholar 月度回填", "概念页更新异常（回填已完成）：{}".format(str(e)[:120]))
+        return False
+
+    # 全量入日志，不再只截尾部 4 行——与周度 ingest_notes.py 同一个坑（W3）。
+    for line in (proc.stdout or "").strip().splitlines():
+        logger.info("  {}".format(line))
+    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
+    if not outcome.ok:
+        logger.warning("概念页更新未全部成功，回填已完成：{}".format(outcome.detail))
+        notify("Scholar 月度回填", "概念页有页面未更新成功（回填已完成）：{}".format(
+            outcome.detail[:300]))
+    return outcome.ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2023-01")
     ap.add_argument("--until", default="2026-05")
     ap.add_argument("--prev-month", action="store_true",
                     help="只跑上一个自然月（覆盖 --since/--until，供 launchd 月度 job 静态调用）")
-    ap.add_argument("--no-index", action="store_true", help="收尾不刷新文献索引")
+    ap.add_argument("--no-index", action="store_true",
+                    help="收尾不刷新文献索引（B3：会隐式一并跳过概念页更新——概念页路由依赖"
+                         "刚刷新的索引/向量库，即使不加 --no-topics 也不会更新）")
+    ap.add_argument("--no-topics", action="store_true",
+                    help="收尾不更新概念页（概念页可事后单独跑 build_topics.py。注意 --no-index "
+                         "会隐式吞掉这个开关的独立语义，见其帮助文本）")
     ap.add_argument("--config", default="config/scholar.env")
     ap.add_argument("--top-n", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=15, help="LLM 筛选批量（过夜吞吐）")
@@ -359,6 +423,27 @@ def main():
             index_err = e
             logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))
 
+    # 概念页跟着新论文长（P2）：收尾只跑一次路由 + 合成（W7），不再逐月各起一次子进程。
+    # 与周度入库同一套机制，best-effort：每月 1 日 launchd 无人值守，概念页是索引的
+    # 派生物，合成失败不该影响回填结果本身（不回滚已写盘的札记）——但退出码要如实
+    # 反映这一轮有没有完全跟上，见下面 X5。
+    topics_ok = True    # 默认"没什么好担心的"——no_index/no_topics/无新 citekey 都是主动跳过，不是失败
+    if not args.no_index and not getattr(args, "no_topics", False) and index_err is None:
+        from src.scholar import topics as T
+        md_files = [r["md"] for r in results if r.get("status") == "ok" and r.get("md")]
+        new_keys = sorted(T.new_citekeys_from_notes(index_data, md_files))
+        if new_keys:
+            logger.info("概念页收尾：{} 个成功月份新增 {} 个 citekey，一次性路由 + 合成".format(
+                len(md_files), len(new_keys)))
+            # X5：此前是裸语句调用，返回值被丢弃——_refresh_topics_for_keys 子进程超时/
+            # 异常/概念页未全部成功时，main() 仍正常走完、sys.exit 从未被调用，隐式退出码 0
+            # （编排者实测：强制返回 False 时 main() 正常走完）。notify() 已经会响（W4），
+            # 但只看退出码的监控/launchd 日志会漏看这一类失败。这里补上捕获，退出码语义
+            # 对齐周度 ingest_notes.py 的先例（topics_ok=False → 退出码 3）。
+            topics_ok = _refresh_topics_for_keys(notes_dir, new_keys)
+        else:
+            logger.info("概念页收尾：本次回填没有新增 citekey，跳过")
+
     ok = [r for r in results if r.get("status") == "ok"]
     # 只统计本次 run_months：progress 文件跨运行续用，历史遗留的陈旧 error 条目
     # 不该让这次全部成功的运行误报非零退出。
@@ -378,6 +463,12 @@ def main():
         notify("Scholar 月度回填失败", msg)
         logger.error("❌ {}".format(msg))
         sys.exit(1)
+    if not topics_ok:
+        # X5：回填本身（札记 md/references/索引）已经正常完成，只是概念页这个派生物
+        # 没跟上——与 errs/index_err 那种"回填本身失败"的退出码 1 区分开，对齐
+        # ingest_notes.py 的退出码 3 语义（"入库成功但概念页未全部更新成功"）。
+        logger.warning("⚠️ 概念页未全部更新成功（回填本身已完成），退出码 3")
+        sys.exit(3)
 
 
 if __name__ == "__main__":

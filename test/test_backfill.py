@@ -409,6 +409,64 @@ def test_sidecar_citekeys_merged_into_existing_ckeys_across_months(tmp_path, mon
     assert "wang2026Deep" in captured[1][1]         # 7 月开跑前已并回，避免撞名
 
 
+def test_refresh_topics_called_once_with_merged_citekeys_across_months(tmp_path, monkeypatch):
+    """Y5（第 6 轮运行时复审）：backfill_notes.py::main() 收尾"多月 citekey 合并 ->
+    单次调用 _refresh_topics_for_keys"这段是 W7 的成果（--since 2023-01 --until
+    2026-05 的 41 个月此前逐月各起一次 build_topics.py 子进程，撞了订阅限流）。
+    但现有测试里 5 个直调 bn.main() 的用例全部带 --no-index（main() 里
+    `if not args.no_index:` 直接把这整段收尾跳过，见 backfill_notes.py），没有一个
+    真正跑到这段代码——本用例不带 --no-index，验证 _refresh_topics_for_keys 只被
+    调用一次，且收到的是两个月 citekey 的并集，不是逐月各调一次。"""
+    import scripts.backfill_notes as bn
+    import src.scholar.notes_index as notes_index_mod
+    import src.scholar.embed_store as embed_store_mod
+
+    monkeypatch.chdir(tmp_path)
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir(parents=True)
+    md_june = notes_dir / "科研札记_2026-06_全文精读.md"
+    md_july = notes_dir / "科研札记_2026-07_全文精读.md"
+
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+        label = "{:04d}-{:02d}".format(y, m)
+        md = {"2026-06": md_june, "2026-07": md_july}[label]
+        return {"month": label, "status": "ok", "md": str(md)}
+
+    monkeypatch.setattr(bn, "run_month", fake_run_month)
+
+    # 收尾索引刷新（update_index/write_outputs）与向量库同步（sync_store）都是本用例
+    # 要验证的"citekey 合并"逻辑之外的独立 best-effort 分支——短路掉避免真的解析
+    # md/去连 Ollama，同时喂给下游一份可控的 index_data，让 new_citekeys_from_notes
+    # 能按 note_file 精确匹配到两个月各自的新 citekey。
+    fake_index = {
+        "generated_at": "2026-08-17T00:00:00",
+        "papers": [
+            {"citekey": "june2026Key", "note_file": md_june.name},
+            {"citekey": "july2026Key", "note_file": md_july.name},
+        ],
+    }
+    monkeypatch.setattr(notes_index_mod, "update_index", lambda nd: fake_index)
+    monkeypatch.setattr(notes_index_mod, "write_outputs", lambda idx, nd: None)
+    monkeypatch.setattr(
+        embed_store_mod, "sync_store",
+        lambda db_path, idx, client: type(
+            "S", (), {"embedded": 0, "deleted": 0, "meta_refreshed": 0})())
+
+    calls = []
+    monkeypatch.setattr(
+        bn, "_refresh_topics_for_keys",
+        lambda notes_dir, citekeys, **kw: calls.append(list(citekeys)) or True)
+
+    monkeypatch.setattr(sys, "argv",
+                        ["backfill_notes.py", "--since", "2026-06", "--until", "2026-07",
+                         "--config", str(_env_file(tmp_path))])   # 不带 --no-index/--no-topics
+
+    bn.main()   # topics_ok=True（fake 返回 True）→ 不抛 SystemExit
+
+    assert len(calls) == 1, "必须只调用一次，不是逐月各调一次（W7 修复前的行为）"
+    assert sorted(calls[0]) == ["july2026Key", "june2026Key"]
+
+
 # ---------------- top-N 精读候选随 priority_score 变化（R2 回归） ----------------
 
 

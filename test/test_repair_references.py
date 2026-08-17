@@ -8,6 +8,7 @@
    映错一个字段，pandoc 渲染出的参考文献就缺信息且不报错。
 """
 import importlib.util
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -130,14 +131,35 @@ def _run(*args):
 
 
 def test_cli_refuses_to_clobber_existing_csl(tmp_path):
-    """已有的月度 CSL 由 write_notes 在有 PaperSegment 上下文时产出，信息更全，不得被覆盖。"""
-    r = _run("--month", "2026-05", "--dry-run")
+    """已有的月度 CSL 由 write_notes 在有 PaperSegment 上下文时产出，信息更全，不得被覆盖。
+
+    Y6（第 6 轮运行时复审）：此前未传 --notes-dir，落到默认值 output/scholar_notes
+    （真实生产目录）——不出事纯属数据巧合（2026-05 的 CSL 真的已存在，触发"拒绝
+    覆盖"提前 return）。这里显式建一份最小 tmp_path 索引 + 占位 md/CSL，不再依赖
+    生产库当前状态。"""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    (notes_dir / "literature_index.json").write_text(json.dumps({
+        "papers": [{"citekey": "x2026Key", "month": "2026-05", "series": "auto"}],
+    }, ensure_ascii=False), encoding="utf-8")
+    stem = "科研札记_2026-05_全文精读"
+    (notes_dir / "{}.md".format(stem)).write_text("占位", encoding="utf-8")
+    (notes_dir / "{}.references.json".format(stem)).write_text("[]", encoding="utf-8")
+
+    r = _run("--month", "2026-05", "--notes-dir", str(notes_dir), "--dry-run")
     assert r.returncode == 2
     assert "拒绝覆盖" in (r.stdout + r.stderr)
 
 
-def test_cli_unknown_month_exits_1():
-    r = _run("--month", "1999-01", "--dry-run")
+def test_cli_unknown_month_exits_1(tmp_path):
+    """Y6：同上，此前未传 --notes-dir，落到生产目录，靠"1999-01 在真实索引里查无
+    条目"这个数据巧合提前 return 1。这里显式建一份不含 1999-01 条目的 tmp_path 索引。"""
+    notes_dir = tmp_path / "notes"
+    notes_dir.mkdir()
+    (notes_dir / "literature_index.json").write_text(
+        json.dumps({"papers": []}, ensure_ascii=False), encoding="utf-8")
+
+    r = _run("--month", "1999-01", "--notes-dir", str(notes_dir), "--dry-run")
     assert r.returncode == 1
 
 

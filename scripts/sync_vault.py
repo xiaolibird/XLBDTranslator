@@ -8,7 +8,10 @@
 与直接跑 `build_vault.py` 的三个差别，也就是「能挂进定时任务」所需的三件事：
 
 1. **陈旧判定**：索引的 `generated_at` 与 vault `_meta.json` 的 `source_index_generated_at`
-   相同就立刻退出，不重建、不提交。定时/监视触发因此可以随便空转。
+   相同、且 notes_dir/topics/ 的最新 mtime 与 `_meta.json` 的 `source_topics_mtime` 也相同，
+   才判定"已是最新"退出，不重建、不提交（W5：概念页由 `_refresh_topics` 在索引写盘**之后**
+   才异步生成，经常在索引不再变之后才落盘完成，只看 `source_index_generated_at` 会让 vault
+   侧概念页无限期停在旧版本——见 `vault_stamp`/`topics_mtime`）。定时/监视触发因此可以随便空转。
 2. **git 提交**：vault 是用户资产且不受仓库 git 管辖（在 ~/Documents 下自成一库）。
    自动写盘必须留回滚点，否则一次静默重建把手写内容写坏就找不回来了。
    只在真有改动时提交；无改动不留空提交。
@@ -69,12 +72,34 @@ def read_index(index_path, tries, settle):
     return None
 
 
+def topics_mtime(notes_dir):
+    """notes_dir/topics/*.md 的最新 mtime；无概念页目录或目录为空返回 None。
+
+    与 `src.scholar.vault.write_vault` 写进 `_meta.json` 的 `source_topics_mtime`
+    是同一个口径（同样扫 `*.md` 取 max mtime），两边才能直接比对。
+    """
+    d = Path(notes_dir) / "topics"
+    if not d.exists():
+        return None
+    times = [p.stat().st_mtime for p in d.glob("*.md")]
+    return max(times) if times else None
+
+
 def vault_stamp(vault_dir):
+    """返回 (index_generated_at, topics_mtime)。vault 全新或 `_meta.json` 坏了则
+    两者都是 None → 当作陈旧，重建即修。
+
+    W5：此前只返回 `source_index_generated_at` 一个值。概念页（topics/*.md）由
+    `_refresh_topics` 在索引写盘**之后**才另起子进程异步生成，经常在索引"已经不再
+    变"之后才落盘完成——WatchPaths 不会为它再触发一次，只看索引快照的陈旧判定会
+    误判"已完全同步"，vault 侧概念页因此可能无限期停在旧版本（实测过靠"凑巧后来
+    有一次无关的索引变动"才顺带同步过去，滞后 2 小时）。
+    """
     try:
         meta = json.loads((vault_dir / "_meta.json").read_text(encoding="utf-8"))
-        return meta.get("source_index_generated_at")
+        return meta.get("source_index_generated_at"), meta.get("source_topics_mtime")
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-        return None   # vault 全新或 _meta 坏了 → 当作陈旧，重建即修
+        return None, None   # vault 全新或 _meta 坏了 → 当作陈旧，重建即修
 
 
 def git(vault_dir, *argv):
@@ -145,11 +170,16 @@ def main():
         return 2
 
     stamp = index.get("generated_at")
-    have = vault_stamp(vault_dir)
-    if have == stamp and not args.force:
-        log("vault 已是最新（索引快照 {}），跳过".format(stamp))
+    cur_topics_mtime = topics_mtime(repo_path(args.notes_dir))
+    have_stamp, have_topics_mtime = vault_stamp(vault_dir)
+    # W5：索引快照与概念页 mtime 任一落后即重建——只看索引快照会让 vault 侧概念页
+    # 在索引"已经不再变但概念页刚落盘"的窗口里被误判成"已完全同步"，见 vault_stamp。
+    if have_stamp == stamp and have_topics_mtime == cur_topics_mtime and not args.force:
+        log("vault 已是最新（索引快照 {}，概念页 mtime {}），跳过".format(
+            stamp, cur_topics_mtime))
         return 0
-    log("索引 {} → vault {}，开始重建".format(stamp, have or "（无）"))
+    log("索引 {} → vault {}，开始重建（概念页 mtime {} → {}）".format(
+        stamp, have_stamp or "（无）", have_topics_mtime, cur_topics_mtime))
 
     cmd = [sys.executable, str(BUILD_VAULT), "--vault-dir", str(vault_dir),
            "--notes-dir", args.notes_dir, *args.build_arg]

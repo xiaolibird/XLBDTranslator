@@ -1010,6 +1010,11 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
                                      neighbors.get(e["citekey"]) or [], one_lines)
         files.append((path, gen, e))
 
+    # citekey -> 实际落盘的文件名（含撞名时的 X-2 后缀）。概念页同步器据此把
+    # `[@citekey]` 转成能点开的 `[[文件名]]`——重算一遍 safe_filename 会因为
+    # used_lower 是空集而算出不同的后缀，生成一批死链。
+    report["filenames"] = {e["citekey"]: p.stem for p, _, e in files}
+
     pages = build_moc_pages(entries)
     pages.update(build_evidence_pages(entries))
     pages[OVERVIEW] = build_overview(entries, index, pages)
@@ -1163,9 +1168,23 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     if not gi.exists():
         gi.write_text("{}\n.obsidian/workspace*.json\n".format(META_JSON), encoding="utf-8")
 
+    # W5：陈旧判定（sync_vault.py::vault_stamp）此前只比对 source_index_generated_at，
+    # 而概念页（topics/*.md）由 _refresh_topics 在索引写盘**之后**才另起一个子进程异步
+    # 生成，经常在索引"已经不再变"之后才落盘完成——WatchPaths 不会为它再触发一次，
+    # vault 侧概念页因此可能无限期停在旧版本，实测过靠"凑巧later 有一次无关的 index
+    # 变动"才顺带同步过去（今天真实滞后 2 小时）。这里只负责记下"源侧 topics/ 目录
+    # 现在的最新 mtime"，交给 sync_vault.py 的陈旧判定去比对——不从 topics.py 导入
+    # TOPICS_DIRNAME 常量：topics.py 反过来导入本模块（vault.py）一堆符号，双向 import
+    # 会循环，故这里保留字面量 "topics"（与 topics.TOPICS_DIRNAME 同目录名，两边都
+    # 不太会改，人工保持一致的成本可以接受）。
+    topics_dir = notes_dir / "topics"
+    topics_times = ([p.stat().st_mtime for p in topics_dir.glob("*.md")]
+                    if topics_dir.exists() else [])
+
     meta = {"vault_schema": VAULT_SCHEMA_VERSION,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "source_index_generated_at": index.get("generated_at"),
+            "source_topics_mtime": max(topics_times) if topics_times else None,
             "counts": {k2: v for k2, v in report.items() if isinstance(v, int)},
             "conflicts": report["conflicts"], "slice_failures": slice_failures}
     (vault_dir / META_JSON).write_text(

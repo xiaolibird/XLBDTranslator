@@ -21,7 +21,8 @@
 本地 PDF 走另一条链路（三段式 agent 交叉核验）：
   PYTHONPATH=. python scripts/read_pdf.py ingest <目录或 PDF 路径>
 
-退出码：0 成功 / 1 无论文可入 / 2 配置或输入错误。
+退出码：0 成功 / 1 无论文可入 / 2 配置或输入错误 / 3 札记已正常入库但概念页未全部
+更新成功（不是入库失败，是它的派生产物这一轮没跟上，见 _refresh_topics）。
 """
 import argparse
 import json
@@ -98,6 +99,68 @@ def _refresh_index_and_vectors(settings) -> None:
         notify("Scholar 周入库", "向量库同步失败（札记已入库）：{}".format(str(e)[:120]))
 
 
+def _refresh_topics(notes_dir, note_md: str, timeout: int = 2400) -> bool:
+    """新论文入库后，重新合成**被它们影响的**概念页（P2：让概念页成为活文档）。
+
+    札记库原本是一次写成不再改的：某篇论文进来之后，"关于 MNAR 诊断全库的共识是什么"
+    这类结论不会跟着更新。这一步补上那一环——但只重合成新论文真正挤进了证据集的页
+    （build_topics.py --affected-by-note 内部先跑一遍召回做路由），而不是每周把 8 页
+    全量重跑：一轮全量要 20+ 分钟，且实测会撞 Claude 订阅限流，把回退链一路推到底。
+
+    走 subprocess 而不是 import：与 sync_vault.py 调 build_vault.py 同理，让路由、
+    熔断、索引页重建这些逻辑只在 build_topics.py 一处维护，这里不复制一份。
+
+    best-effort：周一 09:30 无人值守，概念页是索引的派生物，合成失败绝不能影响入库
+    结果本身——但"不影响入库结果"不等于"外面看不见"。
+
+    W3（生产实测：某周概念页 2 页失败，launchctl 显示退出码 0，无人知道）：此前是三重
+    吞掉——(1) 这里裸语句调用，返回值从不被读，main() 无论内部发生什么都 return 0；
+    (2) 只读 proc.stdout，proc.stderr 从未被引用，而 build_topics.py 唯一的向量库陈旧
+    警告（W2）正是打到 stderr 的；(3) 日志只截 stdout 尾部 6 行，失败页的身份可能恰好
+    落在被截掉的部分，事后只能靠重放 --dry-run 反推。现在返回一个 bool 供 main() 决定
+    退出码（True=完全成功或确认无需更新；False=任何超时/异常/非零退出——这不代表本批
+    入库失败，只代表概念页这个派生产物这一轮没跟上），stdout 全量入日志，stderr 非空
+    即 warning，失败详情（含哪几页失败、退出码对应什么故障）走 T.summarize_build_topics_run
+    统一解读——与 backfill_notes.py / read_pdf.py 的同类集成共用同一份解读逻辑。
+
+    安全前提：子进程用 build_topics.py 自己的默认配置独立加载**生产** notes_dir，
+    与这里传入的 notes_dir 完全脱钩——notes_dir 不在仓库 output/ 下（测试隔离场景）
+    一律跳过，不发子进程，见 T.notes_dir_is_production（read_pdf.py 的同类触发器
+    实测因为漏了这层判断，被单测意外打到过生产环境并挂起 13 分钟）。
+    """
+    import subprocess
+    from src.scholar import topics as T
+    if not T.notes_dir_is_production(notes_dir):
+        return True
+    script = repo_path("scripts/build_topics.py")
+    if not script.exists():
+        return True
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--affected-by-note", str(note_md)],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=str(repo_path(".")),
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("概念页更新超时（{}s），本批跳过（不影响入库）".format(timeout))
+        notify("Scholar 周入库", "概念页更新超时，札记已正常入库")
+        return False
+    except Exception as e:
+        logger.warning("概念页更新跳过（不影响入库）：{}".format(e))
+        notify("Scholar 周入库", "概念页更新异常（札记已正常入库）：{}".format(str(e)[:120]))
+        return False
+
+    # 全量入日志，不再只截尾部 6 行——今天生产事故里第二个失败页恰好被截在保留窗口
+    # 之外，运行时只能靠重放 --dry-run 路由反推身份。
+    for line in (proc.stdout or "").strip().splitlines():
+        logger.info("  {}".format(line))
+    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
+    if not outcome.ok:
+        logger.warning("概念页更新未全部成功，札记已正常入库：{}".format(outcome.detail))
+        notify("Scholar 周入库", "概念页有页面未更新成功（札记已入库）：{}".format(outcome.detail[:300]))
+    return outcome.ok
+
+
 def parse_pick(spec: str, n: int) -> list:
     """`2,3,5` 或 `1-4,7` → 0-based 下标；越界即报错，不静默忽略（少入库比乱入库更难发现）。"""
     out = []
@@ -140,7 +203,12 @@ def main() -> int:
     ap.add_argument("--digest-dir", default="output/scholar_digest")
     ap.add_argument("--top-n", type=int, default=5, help="全文精读篇数（默认 5）")
     ap.add_argument("--no-close-read", action="store_true", help="跳过全文精读（快，只出摘要级）")
-    ap.add_argument("--no-index", action="store_true", help="收尾不刷新文献索引")
+    ap.add_argument("--no-index", action="store_true",
+                    help="收尾不刷新文献索引（B3：会隐式一并跳过概念页更新——概念页路由依赖"
+                         "刚刷新的索引/向量库，即使不加 --no-topics 也不会更新）")
+    ap.add_argument("--no-topics", action="store_true",
+                    help="收尾不更新概念页（只入库不重合成；概念页可事后单独跑 build_topics.py。"
+                         "注意 --no-index 会隐式吞掉这个开关的独立语义，见其帮助文本）")
     ap.add_argument("--no-dedup", action="store_true", help="不跨库去重（调试用；会产生重复条目）")
     ap.add_argument("--label", default="", type=_label_arg,
                     help="覆盖札记标签 YYYY-MM[-DD][-批次名]（默认所属周的周一日期）")
@@ -261,15 +329,22 @@ def main() -> int:
             _refresh_index_and_vectors(settings)
         return 1
 
+    topics_ok = True    # W3：默认"没什么好担心的"——no_index/no_topics 都是主动跳过，不是失败
     if not args.no_index:
         _refresh_index_and_vectors(settings)
+        # 概念页跟着新论文长（P2）。放在索引+向量库之后：路由要靠向量库跑召回，
+        # 而向量库刚在上一步同步过，这时才看得见本批新入库的句子。
+        if not args.no_topics:
+            topics_ok = _refresh_topics(settings.processing.notes_dir, rep["md"])
 
     print("\n{}".format("=" * 66))
     print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))
     print("   全文精读 {} 篇 · citekey 命中 {}/{}".format(
         rep["full_text"], rep["citekey"], rep["count"]))
+    if not topics_ok:
+        print("   ⚠️ 概念页未全部更新成功，详见上方日志（不影响本次入库结果）")
     print("=" * 66)
-    return 0
+    return 0 if topics_ok else 3
 
 
 if __name__ == "__main__":
