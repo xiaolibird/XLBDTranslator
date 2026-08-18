@@ -112,5 +112,6 @@ docs/*
 !docs/paper_agent_prompt.md
 !docs/closeread_deep_rollout.md
 !docs/skills/
+!docs/decisions/
 .ruff_cache/
 .claude/

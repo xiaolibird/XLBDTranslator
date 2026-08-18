@@ -24,6 +24,7 @@ from .gmail_client import GmailClient
 from .paths import repo_path
 from .paper_extractor import ScholarEmailParser
 from .research_profile import get_exclusion_dims, get_inclusion_dims
+from ._citekey_utils import _norm_title
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -761,9 +762,11 @@ class ScholarWorkflow:
             ]
             vecs = client.embed(texts)
 
+            n_self = 0
             for paper, vec in zip(to_query, vecs):
                 hits = store.search(vec, mask=mask, top_k=k)
                 neighbors = []
+                self_key = _norm_title(paper.metadata.title)
                 for idx, sim in hits:
                     if sim < min_sim:
                         continue
@@ -771,6 +774,16 @@ class ScholarWorkflow:
                     # paper chunk 文本 = title + "\n" + one_line（one_line 为空则只有 title）
                     text_parts = (rec.get("text") or "").split("\n", 1)
                     one_line = text_parts[1] if len(text_parts) > 1 else ""
+                    # 自命中：Google Scholar 邮件臂每周会重复推送已入库论文，而 seen 去重发生在
+                    # filter 之后，所以这里必然会检索到论文自己。**保留这条近邻**——prompt 要靠它
+                    # 判「与已收文献重复 → MAYBE」，journal_screen 的 in_library 列也只读 sim；
+                    # 但必须掐掉 one_line：那是当初人工写的裁决判词，喂回给裁决者等于自我背书
+                    # （实测 medina2026Aligning 的新判词几乎是自己 one_line 的复述）。
+                    # 用标题而非 DOI 比对：Scholar 臂的 doi/arxiv_id 均为 None，且 paper chunk
+                    # 文本首行就是标题，无需额外查询。
+                    if self_key and _norm_title(text_parts[0]) == self_key:
+                        one_line = "（本篇自身的在库记录，仅可用于判定重复，不是独立佐证）"
+                        n_self += 1
                     neighbors.append({
                         "citekey": rec.get("citekey"),
                         "year": rec.get("year"),
@@ -779,6 +792,8 @@ class ScholarWorkflow:
                     })
                 self._library_neighbors_cache[paper.segment_id] = neighbors
                 result[paper.segment_id] = neighbors
+            if n_self:
+                logger.info("  ↻ 近邻自命中 {} 条（已入库论文被重复推送），其 one_line 不作为佐证注入", n_self)
         except Exception as e:
             logger.warning(
                 "  ⚠️ 札记库语义近邻检索不可用（本次 run 降级为无 RAG 近邻，不影响裁决主流程）: {}".format(e))

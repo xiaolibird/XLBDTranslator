@@ -414,6 +414,69 @@ def test_library_neighbors_happy_path():
     assert wf._library_neighbors_cache[7] == hits                      # 已入缓存
 
 
+def test_library_neighbors_self_hit_strips_one_line():
+    """自命中：保留近邻本体（sim/citekey/year），只把 one_line 换成标记。
+
+    Scholar 邮件臂每周重复推送已入库论文，而 seen 去重在 filter 之后，所以裁决时必然
+    检索到论文自己。这条近邻**不能剔除**——prompt 靠它判「与已收文献重复 → MAYBE」，
+    journal_screen 的 in_library 列也只读 sim；但 one_line 是当初人工写的裁决判词，
+    喂回给裁决者就是自我背书，必须掐掉。
+    """
+    from types import SimpleNamespace
+    from src.scholar.workflow import ScholarWorkflow
+
+    meta = {"model": "bge-m3", "dim": "2"}
+    records = [
+        # 与被裁决论文同题（大小写/标点不同，_norm_title 后相等）→ 自命中
+        {"level": "paper", "citekey": "self2025X", "year": 2025,
+         "text": "Deep Learning for EHR!\n人工写的判词，不该被当独立佐证"},
+        # 真·他篇，one_line 必须原样保留
+        {"level": "paper", "citekey": "other2024Y", "year": 2024, "text": "别的题目\n他篇一句话"},
+    ]
+    v = np.array([[1, 0], [0.9, np.sqrt(1 - 0.81)]], dtype=np.float32)
+    store = VectorStore(meta, records, v)
+
+    class _Client:
+        model = "bge-m3"
+        def probe(self):
+            return {"model": "bge-m3", "dim": 2}
+        def embed(self, texts, batch_size=64):
+            return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (len(texts), 1))
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=Path(".")),
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None, ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = store
+    wf._paper_mask = np.array([True, True])
+    wf._embedding_client = _Client()
+    wf._library_neighbors_unavailable = False
+
+    seg = SimpleNamespace(segment_id=3,
+                          metadata=SimpleNamespace(title="deep learning for ehr"),
+                          original_abstract="a")
+    hits = wf._library_neighbors([seg], k=3, min_sim=0.65)[3]
+
+    assert [h["citekey"] for h in hits] == ["self2025X", "other2024Y"]  # 自命中未被剔除
+    assert hits[0]["one_line"].startswith("（本篇自身")                  # 判词被掐掉
+    assert "人工写的判词" not in hits[0]["one_line"]
+    assert hits[0]["sim"] == 1.0 and hits[0]["year"] == 2025            # sim/year 原样
+    assert hits[1]["one_line"] == "他篇一句话"                           # 他篇不受影响
+
+
+def test_library_neighbors_self_hit_keeps_in_library_signal():
+    """journal_screen 的 in_library 只读 sim，掐 one_line 不得影响它。"""
+    from src.scholar.journal_screen import IN_LIBRARY_SIM_THRESHOLD
+
+    neighbors = [{"citekey": "self2025X", "year": 2025,
+                  "one_line": "（本篇自身的在库记录，仅可用于判定重复，不是独立佐证）",
+                  "sim": 0.93}]
+    in_library = bool(neighbors and any(n.get("sim", 0) >= IN_LIBRARY_SIM_THRESHOLD
+                                        for n in neighbors))
+    assert in_library is True
+
+
 # ---------------- R3：陈旧向量库的告警与降级 ----------------
 
 def _stale_store(src="2026-08-14T20:23:56"):
