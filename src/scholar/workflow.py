@@ -25,6 +25,7 @@ from .paths import repo_path
 from .paper_extractor import ScholarEmailParser
 from .research_profile import get_exclusion_dims, get_inclusion_dims
 from ._citekey_utils import _norm_title
+from ..utils.json_tools import loads_lenient
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -127,6 +128,10 @@ class ScholarWorkflow:
         self._filter_prompt_template: Optional[str] = None
         self._filter_prompt_version: Optional[str] = None
         self._filter_fallback_count = 0
+        # 抢救计数：两类抢救损坏都不进 processed/failed/fallback 任何一个计数器，
+        # 不单列就等于「下次发生时连靠 failed_papers 反推都做不到」。
+        self._salvage_batches = 0     # 触发过前缀抢救的批次数
+        self._salvage_dropped = 0     # 抢救后因字段残缺被丢弃/降级的条目数
 
         # RAG phase 3：札记库语义近邻（懒加载缓存，同一次 run 内 filter 与落盘复用）。
         # segment_id -> [{citekey, year, one_line, sim}, ...]；向量库/Ollama 不可用时值为 []。
@@ -840,6 +845,21 @@ class ScholarWorkflow:
         prompt = prompt.replace("{{PAPERS_JSON}}", json.dumps(papers_data, ensure_ascii=False, indent=2))
         return prompt
 
+    @staticmethod
+    def _verdict_is_complete(item: Dict[str, Any]) -> bool:
+        """抢救出的裁决是否字段完整。
+
+        `whitelist_filter_prompt.md` 的输出契约里字段顺序是
+        id → decision → bucket → exclude_reason → flags → role → one_line → confidence，
+        抢救总在畸形点前停，**最先被削掉的就是末尾的 one_line 与 confidence**。
+        只查 id+decision 会放行这种残缺条目：它 stage 仍是 llm_judge、不计入
+        filter_fallback_count，与正常裁决无法区分；而空 one_line 会一路流到
+        embed_store（`paper_text = title + "\n" + one_line if one_line else title`），
+        让该论文的库向量退化成纯标题，此后每轮近邻召回长期失真且无自动重建。
+        故抢救模式下要求 one_line 与 confidence 至少有一个在。
+        """
+        return bool((item.get("one_line") or "").strip()) or item.get("confidence") is not None
+
     def _parse_filter_response(self, response: str,
                                 valid_ids: Optional[Set[int]] = None) -> Dict[int, Dict[str, Any]]:
         """解析方法学审稿裁决响应为 {id: item} 映射（item 含 decision/bucket/flags/role/one_line/confidence）；
@@ -850,13 +870,27 @@ class ScholarWorkflow:
         变成代码强制：不在集合内的 id 直接丢弃该条，不让脏 id 污染 verdict 映射（调用方按 segment_id
         查不到时会走单篇回退，行为等价于"这条没被裁决"，安全）。留空（None/未传）时不做过滤，
         兼容测试与其它未传批次上下文的调用方。"""
+        salvaged_mode = False
         json_text = response
         if '```json' in response:
             json_text = response.split('```json')[1].split('```')[0]
         elif '```' in response:
             json_text = response.split('```')[1].split('```')[0]
 
-        verdicts = json.loads(json_text.strip())
+        try:
+            verdicts = json.loads(json_text.strip())
+        except json.JSONDecodeError as je:
+            # 一次截断的响应曾让整批 20 篇一起降级成关键词裁决（08-17 那轮 40 篇 =
+            # 2×20，正是两个整批）。抢救畸形点之前的前缀：
+            # 救回来的走 LLM 裁决，没救回的由调用方 `verdict is None` 分支逐篇回退，
+            # 严格优于整批降级。抢救不出任何东西时仍抛，走原有的批级回退。
+            salvaged = loads_lenient(json_text)
+            if salvaged is None:
+                raise
+            logger.warning("  ⚠️ 裁决 JSON 畸形，已抢救前缀（本批部分条目将走单篇回退）: {}".format(je))
+            verdicts = salvaged
+            salvaged_mode = True
+            self._salvage_batches += 1
         if isinstance(verdicts, dict):
             # verdicts: filter-v3 契约（DeepSeek json_object 要求顶层对象）；
             # papers: 旧顶层数组格式的历史包装，宽容兼容
@@ -879,6 +913,13 @@ class ScholarWorkflow:
                 continue
             if valid_ids is not None and item_id not in valid_ids:
                 logger.warning("  裁决响应 id={} 不在本批合法 id 集合内，丢弃该条（示例回显/幻觉 id）".format(item_id))
+                continue
+            if salvaged_mode and not self._verdict_is_complete(item):
+                # 抢救模式专属：丢弃残缺条目 → 调用方 `verdict is None` 分支逐篇回退关键词，
+                # 计入 filter_fallback_count、可观测；而放行它则是一条伪装成正常 llm_judge
+                # 的残缺裁决，任何计数器都抓不到。
+                logger.warning("  抢救出的裁决 id={} 字段残缺（缺 one_line/confidence），丢弃改走单篇回退".format(item_id))
+                self._salvage_dropped += 1
                 continue
             result[item_id] = item
         return result
@@ -1233,6 +1274,7 @@ __PAPERS_JSON__
         空间内，回显内容（示例的"中文标题"/"中文摘要"等占位文本）会静默覆盖同 id 的真实论文。
         传入本批 valid_ids 后不在集合内的条目直接丢弃，不让示例回显或幻觉 id 污染结果。
         留空（None/未传）时不做过滤，兼容测试与未传批次上下文的调用方。"""
+        salvaged_mode = False
         try:
             # 尝试提取 JSON
             json_match = response
@@ -1241,7 +1283,23 @@ __PAPERS_JSON__
             elif '```' in response:
                 json_match = response.split('```')[1].split('```')[0]
             
-            papers = json.loads(json_match.strip())
+            try:
+                papers = json.loads(json_match.strip())
+            except json.JSONDecodeError as je:
+                # 2026-08-17 那轮三个独立批次各废 5 篇（batch=5），报错全在文末——
+                # 是**响应被截断**，不是漏逗号（详见 json_tools.loads_lenient 的 docstring）。
+                # 抢救前缀后，未覆盖到的论文走下方既有的 "Not found in LLM response"
+                # 分支标 FAILED，与原行为一致，但前缀里的论文得以保住。
+                # **这是第四道防线**：根因修复应在 _call_agent（接 --json-schema、查
+                # stop_reason、真正传 max_tokens），其次是解析失败重试一次
+                # （topics.py:synthesize_topic / qa.py 已有该范式，digest 是唯一漏掉的主链路）。
+                salvaged = loads_lenient(json_match)
+                if salvaged is None:
+                    raise
+                logger.warning("  ⚠️ 翻译 JSON 畸形，已抢救前缀（本批部分论文将标 FAILED）: {}".format(je))
+                papers = salvaged
+                salvaged_mode = True
+                self._salvage_batches += 1
 
             # 支持两种格式：直接数组或 {papers: [...]}
             if isinstance(papers, dict):
@@ -1279,6 +1337,17 @@ __PAPERS_JSON__
                     logger.warning("    [MISS] ID {} not in response".format(seg.segment_id))
                     continue
                 result = results_map[seg.segment_id]
+                if salvaged_mode and not (result.get('translated_abstract') or '').strip():
+                    # 漏逗号也可能落在**同一篇的字段之间**，抢救退到该篇内部的上一个逗号，
+                    # 产出 {"id":N} 这种只剩 id 的残骸。此前唯一门槛是「id 在不在」，
+                    # 于是它一路走到无条件 status=COMPLETED，计进 processed_papers、
+                    # 不计进 failed_papers，札记再按 `translated_abstract or original_abstract`
+                    # 静默回退成英文——一篇假成功比三篇诚实失败更难查。
+                    seg.status = DigestStatus.FAILED
+                    seg.error_message = "salvaged-incomplete: 抢救出的条目缺 translated_abstract"
+                    self._salvage_dropped += 1
+                    logger.warning("    [SALVAGE-INCOMPLETE] id={} 抢救残缺，标 FAILED".format(seg.segment_id))
+                    continue
                 try:
                     # 更新翻译内容。
                     # translated_abstract 先落地再算默认值（而非把 [:200] 塞进 .get 的默认实参）——
@@ -1410,6 +1479,8 @@ __PAPERS_JSON__
             'excluded_by_stage': stage_counts,
             'filter_fallback_count': self._filter_fallback_count,
             'undecided_count': len(self.undecided_segments),
+            'salvage_batches': self._salvage_batches,
+            'salvage_dropped_items': self._salvage_dropped,
             'excluded_file': str(excluded_path) if excluded_path else None,
         }
         with open(stats_path, 'w', encoding='utf-8') as f:

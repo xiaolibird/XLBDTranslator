@@ -28,6 +28,9 @@ from .closereading import pdf_to_text, parse_closeread
 from .research_profile import get_contamination_example_terms
 from ..utils.logger import get_logger
 from ..utils.json_tools import strip_code_fences as _strip_json
+# 容错解析收敛到 json_tools（此前本文件自持一份，而同文件的 extract_abstract 却没用上，
+# 2026-08-17 Qiao 那篇的摘要就是这么丢的）。保留 _loads_lenient 别名不动既有调用与测试。
+from ..utils.json_tools import loads_lenient as _loads_lenient
 
 logger = get_logger(__name__)
 
@@ -294,53 +297,6 @@ def path_hint(ids: Dict[str, Optional[str]]) -> str:
 
 
 
-def _close_suffix(head: str) -> Optional[str]:
-    """给一段 JSON 前缀算出闭合后缀（按真实的括号栈，忽略字符串内与转义）。栈非法返回 None。"""
-    stack = []
-    in_str = False
-    esc = False
-    for c in head:
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c in "{[":
-            stack.append(c)
-        elif c in "}]":
-            if not stack or {"}": "{", "]": "["}[c] != stack.pop():
-                return None
-    if in_str:
-        return None
-    return "".join("}" if b == "{" else "]" for b in reversed(stack))
-
-
-def _loads_lenient(text: str):
-    """解析 LLM JSON；被 max_tokens 截断时抢救：回退到最后一个完整元素边界，按括号栈闭合后重试。"""
-    s = _strip_json(text)
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    for cut in range(len(s) - 1, 0, -1):
-        if s[cut] not in ",]}":
-            continue
-        head = s[:cut] if s[cut] == "," else s[:cut + 1]
-        suffix = _close_suffix(head)
-        if suffix is None:
-            continue
-        try:
-            return json.loads(head + suffix)
-        except Exception:
-            continue
-    return None
-
-
 # ---------------- 摘要抽取 + 翻译 ----------------
 
 _ABSTRACT_PROMPT = """下面是一篇论文的全文前段。抽取它的英文摘要（Abstract），并给出准确的中文翻译。
@@ -358,8 +314,24 @@ def extract_abstract(full_text: str, llm) -> Tuple[str, str]:
     try:
         resp = llm.call(_ABSTRACT_PROMPT.format(text=full_text[:6000]),
                         max_tokens=2048, json_mode=True)
-        data = json.loads(_strip_json(resp))
-        return (data.get("abstract_en") or "").strip(), (data.get("abstract_zh") or "").strip()
+        try:
+            data = json.loads(_strip_json(resp))
+        except json.JSONDecodeError as je:
+            data = _loads_lenient(resp)
+            if data is None:
+                raise
+            # 抢救是有损的：畸形点之后被丢弃，abstract_zh 可能是半截。必须出声，
+            # 否则札记里会静默出现一段截断的中文摘要而无人知道它为何截断。
+            logger.warning("  ⚠️ 摘要 JSON 畸形，已抢救前缀（内容可能不完整）: {}".format(je))
+        en = (data.get("abstract_en") or "").strip()
+        zh = (data.get("abstract_zh") or "").strip()
+        if en and not zh:
+            # abstract_zh 排在 abstract_en 之后，抢救时最先被削掉。只查 en 会让
+            # 「中文摘要静默消失」一路滑到札记渲染层的 `zh or en` 回退，读者看到英文
+            # 却不知道为什么。出声，并把这一篇当抽取失败处理。
+            logger.warning("  ⚠️ 摘要抽取只拿到英文、中文为空（多半是抢救削掉了 abstract_zh），按失败处理")
+            return "", ""
+        return en, zh
     except Exception as e:
         logger.warning("  ⚠️ 摘要抽取失败: {}".format(e))
         return "", ""

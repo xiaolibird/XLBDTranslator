@@ -468,6 +468,21 @@ class LLMClient:
                 raise _RetryableHTTP("claude CLI 可重试错误: {}".format(msg))
             raise RuntimeError("claude CLI 调用失败: {}".format(msg))
 
+        # 截断可观测性（2026-08-19 加）：08-17 那轮 digest 有 15 篇因**响应被截断**而
+        # JSON 解析失败（三个独立批次各 5 篇，报错全在文末），但当时无从判断——
+        # gemini 分支查 finish_reason、openai 分支查 finish_reason，**只有这条不查**，
+        # 而截断信号一直就在信封里。先把它打出来（不改行为），下一轮跑完即可确认
+        # 静默截断时 CLI 到底报什么 stop_reason，再决定要不要据此抛 _RetryableHTTP。
+        stop = envelope.get('stop_reason')
+        term = envelope.get('terminal_reason')
+        out_tok = (envelope.get('usage') or {}).get('output_tokens')
+        if stop not in (None, 'end_turn') or term not in (None, 'completed'):
+            logger.warning(
+                "  ⚠️ claude CLI 非正常结束：stop_reason={} terminal_reason={} output_tokens={}"
+                "（响应可能是半截的，下游 JSON 解析若失败请先看这一行）".format(stop, term, out_tok))
+        else:
+            logger.debug("  claude CLI ok: stop={} term={} out_tok={}".format(stop, term, out_tok))
+
         text = (envelope.get('result') or '').strip()
         if json_mode and text.startswith('```'):
             text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.S).strip()
