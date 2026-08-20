@@ -18,12 +18,19 @@ from typing import Optional
 import httpx
 
 from ..utils.logger import get_logger
+from ..utils.json_tools import looks_like_complete_json, loads_lenient
 
 logger = get_logger(__name__)
 
 
 class _RetryableHTTP(Exception):
-    """内部：可重试的 HTTP 状态（429/5xx）。"""
+    """内部：可重试的 HTTP 状态（429/5xx）。
+
+    `partial` 属性（可选）挂着本次拿到的**半截正文**。重试全部耗尽时，
+    `_call_once` 会把它交还给调用方，让下游 `loads_lenient` 抢救层还有活干；
+    没有残料时该属性为空串，行为与普通异常一致。
+    """
+    partial: str = ''
 
 
 # claude CLI headless（走 Claude 订阅，不需要 API key）。DeepSeek 欠费时的主力路径。
@@ -36,11 +43,49 @@ _AGENT_SEMAPHORE = threading.Semaphore(4)
 # 起子进程，历史落到独立桶里。注意：不能改用 CLAUDE_CONFIG_DIR 隔离——那会连登录态
 # 一起隔离，headless 直接报 "Not logged in"。
 _AGENT_CWD = Path.home() / '.claude-pipeline-cwd'
+# claude CLI 信封的 terminal_reason 枚举（对齐 CLI 2.1.221）。分两类是因为重试代价很高：
+# 一次 claude -p 的成本几乎全是与 prompt 无关的 system prompt 建仓税（实测单次
+# total_cost_usd 0.11~0.27，烧订阅额度），重试摊薄不了；而重试耗尽还会粘性切链，
+# 把下家也照样烧一遍。所以只有**瞬时**故障配重试，确定性故障必须一次即抛。
+_AGENT_TERM_OK = frozenset({
+    'completed',
+    # 这两个是 CLI 显式以 is_error=false 产出的成功变体，不是故障
+    'tool_deferred', 'background_requested',
+})
+_AGENT_TERM_TRANSIENT = frozenset({
+    'api_error', 'model_error', 'aborted_streaming', 'aborted_tools',
+})
+# 其余（prompt_too_long / blocking_limit / rapid_refill_breaker / image_error /
+# malformed_tool_use_exhausted / max_turns / hook_stopped / stop_hook_prevented /
+# budget_exhausted / structured_output_retry_exhausted / tool_deferred_unavailable /
+# turn_setup_failed）都是确定性的：同一个 prompt 重试多少次都会重演。
+#
+# 特别点名两个看着像瞬时、实则不是的：
+#   blocking_limit —— CLI 里 ptl = prompt too long，文案逐字是 "Prompt is too long"，
+#     error kind 是 invalid_request。它就是 prompt_too_long 的另一条出口。
+#   rapid_refill_breaker —— "rapid-refill breaker tripped"，上下文过大导致反复
+#     autocompact 触发的熔断，同一 prompt 必然重演。
+# 这两个若判成瞬时，实测代价是 8 次完整生成（4 sonnet + 4 opus）；而
+# claude-agent:opus 与 sonnet **共用同一个订阅额度池，不是独立故障域**，
+# 额度类故障下 opus 那 4 次必然同样失败，纯属在空账号上再烧 8 份建仓税。
+
+# terminal_reason 是个混合桶：CLI 把鉴权、额度、prompt 过大也一并标成 api_error。
+# 这些文案是 CLI 自己的常量，命中即确定性，重试无意义。
+_AGENT_FATAL_MSGS = (
+    'prompt is too long', 'credit balance is too low',
+    'not logged in', 'invalid api key',
+)
+
+# 连续多少次「只拿到半截正文」就判定该 provider 已降级、改走回退链。
+_MAX_DEGRADED_STREAK = 3
 
 # 数字状态码须整词匹配：避免命中 request id（如 req-a402fb99）或计数
 # （如 "4021 tokens"）里恰好出现的数字子串。语义对齐 translator/fallback.py
 # 的 classify_fatal 里的 _HARD_CODE_RE（该文件独立实现，禁止跨模块 import——
 # 两边的异常类型体系不同，fallback.py 走 APIError.message，这里是裸 str(e)）。
+# CLI 把上游 HTTP 错误原样透传成 `API Error: <code> <detail>`。4xx 是确定性的请求
+# 错误（schema 非法、prompt 超长…），重试无意义；408/429 除外，那两个是瞬时的。
+_AGENT_API_ERR_RE = re.compile(r'api error:\s*(4\d\d)\b', re.I)
 _FATAL_CODE_RE = re.compile(r'\b(401|402|403)\b')
 _FATAL_PHRASES = ('quota', 'resource_exhausted', 'resource exhausted', 'api key',
                    'permission denied', 'payment required', 'insufficient balance')
@@ -105,6 +150,21 @@ class LLMClient:
         # 的临时切换在收尾时靠它判断「期间有没有发生过真故障切换」——有就别把别的
         # 线程刚做出的合理推进给撤回去。
         self._sticky_gen = 0
+        # 连续「重试耗尽只拿到半截正文」的次数。降级返回会绕过 call() 的切链
+        # 逻辑，没有这个计数器，持续吐半截的 provider 就永远切不掉。
+        self._degraded_lock = threading.Lock()
+        self._degraded_streak = 0
+
+    def _note_degraded(self) -> int:
+        """记一次「降级返回半截正文」，返回当前连续次数。"""
+        with self._degraded_lock:
+            self._degraded_streak += 1
+            return self._degraded_streak
+
+    def _reset_degraded(self):
+        """拿到完整响应即清零（只有真正返回完整正文的路径才该调）。"""
+        with self._degraded_lock:
+            self._degraded_streak = 0
 
     def close(self):
         """关闭内部 HTTP 连接池，避免 fd 泄漏。
@@ -178,6 +238,10 @@ class LLMClient:
             self._chain_idx += 1
             if sticky:
                 self._sticky_gen += 1
+            # 降级连击是**这一家**的案底，不是这个 client 的。不清零的话下一棒
+            # （如 claude-agent:opus）一上任就带着前一棒的记录、降级额度为 0，
+            # 哪怕它吐的残料完全可用也会立刻被判死，一次故障直接烧到链尾。
+            self._reset_degraded()
             # 旧 conn 若持有 httpx.Client 须显式关闭，否则 fd 泄漏（Ollama 与
             # openai-compatible 路径各创建一个 Client，gemini/claude-agent 不涉及）。
             if self._conn is not None and isinstance(self._conn, dict):
@@ -425,9 +489,40 @@ class LLMClient:
             except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
                     subprocess.TimeoutExpired) as e:
                 last_exc = e
-                if attempt < max_retries - 1:
+                # 「正文不完整」这一类只给 1 次重试，不吃满 max_retries。一次
+                # claude -p 的成本几乎全是与 prompt 无关的 system prompt 建仓税
+                # （实测单次 0.11~0.27 USD，烧订阅额度），重试摊薄不了；而
+                # topics/qa 在**它们那一层**还各有一次「追加格式指令再试」——那次
+                # 才带新信息，是真正有效的一次。这里吃满 4 次只会把它挤到第 5 次。
+                budget = 2 if getattr(e, 'json_incomplete', False) else max_retries
+                if attempt < min(max_retries, budget) - 1:
                     time.sleep(2.0 * (2 ** attempt))  # 2s,4s,8s 退避
                     continue
+                # 重试耗尽：若手里有半截正文，交还调用方而不是抛掉。下游三处
+                # （workflow 的 filter/翻译、pdf_ingest 的通读块）都建了 loads_lenient
+                # 抢救层，专吃这种半截 JSON——在这里抛就等于把它们饿死，filter 会从
+                # 「20 篇救回 13 篇真裁决」退化成整批 0 篇，严格劣于抢救。
+                #
+                # 但交还的门槛必须是「抢救层真的救得出东西」，不能只看非空：实测
+                # 模型会用一整段散文反问（"这个请求缺少主题——请告知后我再输出
+                # JSON"），那玩意儿非空却一个字段都救不出，交下去只是把失败伪装成
+                # 成功。用 loads_lenient 当判据，它救不出就老实抛。
+                partial = getattr(e, 'partial', '') or ''
+                if partial and loads_lenient(partial) is not None:
+                    # 降级成功 ≠ 免除健康记账。`return` 会绕过 call() 里的
+                    # `except → _is_switchable → _advance_chain` 整段，于是一个持续
+                    # 只吐半截的 provider **永远切不掉**：每次都"成功"，链位纹丝不动，
+                    # 下家一次请求都发不出去，而它本来能给出完整响应。
+                    streak = self._note_degraded()
+                    if streak >= _MAX_DEGRADED_STREAK:
+                        logger.error(
+                            "  连续 {} 次只拿到半截响应，判定当前 provider 已降级，"
+                            "放弃本次残料改走回退链".format(streak))
+                        raise
+                    logger.error(
+                        "  重试后仍未拿到完整响应，降级把半截正文交给下游抢救层"
+                        "（连续第 {} 次）: {}".format(streak, e))
+                    return partial
                 raise
         if last_exc:
             raise last_exc
@@ -461,29 +556,100 @@ class LLMClient:
             raise _RetryableHTTP(
                 "claude CLI 输出非 JSON（rc={}）: {}".format(proc.returncode, (proc.stderr or proc.stdout)[:200]))
 
-        if proc.returncode != 0 or envelope.get('is_error'):
-            msg = str(envelope.get('result') or proc.stderr or '')[:300]
-            # 用量上限/限流可重试；其余（如内容被拒）直接抛，避免空转
-            if any(k in msg.lower() for k in ('rate limit', 'usage limit', 'overloaded', 'timeout', '529')):
-                raise _RetryableHTTP("claude CLI 可重试错误: {}".format(msg))
-            raise RuntimeError("claude CLI 调用失败: {}".format(msg))
-
-        # 截断可观测性（2026-08-19 加）：08-17 那轮 digest 有 15 篇因**响应被截断**而
-        # JSON 解析失败（三个独立批次各 5 篇，报错全在文末），但当时无从判断——
-        # gemini 分支查 finish_reason、openai 分支查 finish_reason，**只有这条不查**，
-        # 而截断信号一直就在信封里。先把它打出来（不改行为），下一轮跑完即可确认
-        # 静默截断时 CLI 到底报什么 stop_reason，再决定要不要据此抛 _RetryableHTTP。
         stop = envelope.get('stop_reason')
         term = envelope.get('terminal_reason')
         out_tok = (envelope.get('usage') or {}).get('output_tokens')
-        if stop not in (None, 'end_turn') or term not in (None, 'completed'):
-            logger.warning(
-                "  ⚠️ claude CLI 非正常结束：stop_reason={} terminal_reason={} output_tokens={}"
-                "（响应可能是半截的，下游 JSON 解析若失败请先看这一行）".format(stop, term, out_tok))
-        else:
-            logger.debug("  claude CLI ok: stop={} term={} out_tok={}".format(stop, term, out_tok))
+        # 错误类信封（subtype=error_*）**没有 result 字段，只有 errors[]**；
+        # 只取 result 会让 msg 恒为空串，关键词分类与 _is_content_refusal 全部落空。
+        raw_msg = (envelope.get('result')
+                   or '; '.join(str(x) for x in (envelope.get('errors') or []))
+                   or proc.stderr or '')
+
+        if proc.returncode != 0 or envelope.get('is_error'):
+            msg = str(raw_msg)[:300]
+            # 只有**瞬时**故障配重试。确定性故障（prompt_too_long / max_turns /
+            # budget_exhausted / structured_output_retry_exhausted / hook 拦截 …）
+            # 重试 4 次必然 4 次重演，而每次都要重付一整份 system prompt 建仓税
+            # （实测单次 total_cost_usd 0.11~0.27，且烧的是订阅额度），耗尽后还要
+            # 再切链把下家也烧一遍——一次失败 = 8 次完整生成。
+            #
+            # 但 terminal_reason 本身不够判：CLI 把上游的 4xx 也一律标成 api_error。
+            # 实测 `--json-schema` 传了非对象根 schema 时拿到
+            # `is_error=true / terminal_reason=api_error /
+            #  result="API Error: 400 tools.8.custom.input_schema.type: ..."`
+            # ——这是**确定性**的请求错误，重试多少次都一样。故 4xx（除 408/429）
+            # 一律不重试；401/403 交给 _is_switchable 走它原有的切链语义。
+            low = msg.lower()
+            m = _AGENT_API_ERR_RE.search(msg)
+            deterministic = (bool(m) and m.group(1) not in ('408', '429')) or any(
+                k in low for k in _AGENT_FATAL_MSGS)
+            if not deterministic and (term in _AGENT_TERM_TRANSIENT or any(
+                    k in low for k in ('rate limit', 'usage limit', 'overloaded', 'timeout', '529'))):
+                raise _RetryableHTTP(
+                    "claude CLI 可重试错误（terminal_reason={}）: {}".format(term, msg))
+            raise RuntimeError(
+                "claude CLI 调用失败（terminal_reason={}）: {}".format(term, msg))
 
         text = (envelope.get('result') or '').strip()
         if json_mode and text.startswith('```'):
             text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.S).strip()
+
+        # 空正文：gemini 分支（finish_reason）与 openai 分支（finish_reason）都有
+        # 「内容为空 → 抛带原因的异常」，**只有这条链路一直没有**，直接返回空串。
+        # 实测可达：挂一个 block 型 Stop hook 跑 headless，CLI 会空转到 10 轮后以
+        # `is_error=false / terminal_reason=completed / result=''` 收尾。受害者是
+        # `deep_research`（json_mode=False 的自由文本综述，无条件把返回值当报告落盘）
+        # ——它会把空串写成一份"成功"的报告。抢救层对空串无能为力，故不挂 partial。
+        if not text:
+            raise _RetryableHTTP(
+                "claude CLI 正文为空（stop_reason={} terminal_reason={} output_tokens={}）".format(
+                    stop, term, out_tok))
+
+        # 防御性：is_error=false 但 terminal_reason 落在已知正常集之外。
+        # 实测 CLI 2.1.221 的成功信封恒为 completed；tool_deferred/background_requested
+        # 是显式的 is_error=false 成功变体，不能当故障。
+        # 注意这一段目前**没有已知触发路径**（实测各类异常收尾都带 is_error=true，
+        # 在上面那个分支就被截住了），留着是因为 terminal_reason 是 CLI 侧的枚举、
+        # 不受本仓库控制，新增值默认走"不当成功"更安全。别拿 max_turns 当它的例子：
+        # 那个恒配 is_error=true / subtype=error_max_turns，走不到这里。
+        if term is not None and term not in _AGENT_TERM_OK:
+            if term in _AGENT_TERM_TRANSIENT:
+                exc = _RetryableHTTP("claude CLI 非正常结束（terminal_reason={}）".format(term))
+                exc.partial = text
+                raise exc
+            # 确定性收尾：重试拿不到更好的正文，**这是这段正文唯一的机会**，
+            # 正文可用就直接用，整份丢弃再粘性切链是纯亏。
+            if not json_mode or looks_like_complete_json(text):
+                logger.warning(
+                    "  ⚠️ claude CLI 以 terminal_reason={} 收尾，但正文可用，照常采用".format(term))
+                self._reset_degraded()
+                return text
+            raise RuntimeError("claude CLI 非正常结束（terminal_reason={}）: {}".format(term, str(raw_msg)[:300]))
+
+        # **正文完整性校验**——这才是 08-17 那 15+40 篇的唯一有效判据。
+        # 实测：那种截断的信封是干净的（is_error=false / terminal_reason=completed /
+        # api_error_status=null / stop_reason=end_turn），只有正文是半截的。光看信封
+        # 一条都够不着，必须校验正文本身。
+        # 截断是随机的（同 prompt 重试常能过），所以走可重试；把半截正文挂在异常上
+        # 带出去，`_call_once` 在重试耗尽时会把它交还给下游的 loads_lenient 抢救层
+        # ——否则这里一抛，上一版专为半截 JSON 建的抢救层就被饿死了
+        # （filter 会从「20 篇救回 13 篇真裁决」退化成整批 0 篇）。
+        if json_mode and not looks_like_complete_json(text):
+            exc = _RetryableHTTP(
+                "claude CLI 响应不是完整 JSON，多半被截断"
+                "（stop_reason={} terminal_reason={} 正文 {} 字符）".format(stop, term, len(text)))
+            exc.partial = text
+            exc.json_incomplete = True
+            raise exc
+
+        # 少见 stop_reason 只记录不拦：'tool_use' 是**成功**值（结构化输出走强制
+        # 工具调用实现），拦它会把每次成功都判成失败。
+        if stop not in (None, 'end_turn', 'tool_use'):
+            logger.warning(
+                "  ⚠️ claude CLI 少见 stop_reason={} terminal_reason={} output_tokens={}"
+                "（响应可能不完整）".format(stop, term, out_tok))
+        else:
+            logger.debug("  claude CLI ok: stop={} term={} out_tok={}".format(stop, term, out_tok))
+        # 拿到完整响应 → 降级连击清零。只有这一条路径算「provider 是健康的」。
+        self._reset_degraded()
         return text

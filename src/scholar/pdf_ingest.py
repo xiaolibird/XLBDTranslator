@@ -378,12 +378,21 @@ _CHUNK_PROMPT = """你在逐块通读一篇论文（这是第 {idx}/{total} 块�
 {chunk}"""
 
 
+_CREDIT_CODE_RE = re.compile(r"\b(401|402)\b")
+
+
 def is_credit_error(exc) -> bool:
     """判断异常是否为 API 额度/鉴权类（402 余额不足 / 401 / quota）——这类重试无用，应回退。"""
     s = str(exc).lower()
+    # 状态码必须整词匹配。裸子串会被任何含该数字的诊断信息误触——例如
+    # "正文 4021 字符" 里的 402 —— 一旦误判就 fatal_evt.set()、cancel 掉整篇
+    # 论文剩余的块，还会让 read_pdf 向 agent 打「LLM 无额度」的假警报。
+    # （llm_client 的 _FATAL_CODE_RE 早就是 \b 整词匹配，这里一直漏了。）
+    if _CREDIT_CODE_RE.search(s):
+        return True
     return any(k in s for k in (
-        "402", "payment required", "insufficient", "balance", "quota",
-        "401", "unauthorized", "invalid api key", "no api key"))
+        "payment required", "insufficient", "balance", "quota",
+        "unauthorized", "invalid api key", "no api key"))
 
 
 def deep_read_chunks(chunks: List[str], llm, model: Optional[str],

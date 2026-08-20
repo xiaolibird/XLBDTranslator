@@ -1290,9 +1290,11 @@ __PAPERS_JSON__
                 # 是**响应被截断**，不是漏逗号（详见 json_tools.loads_lenient 的 docstring）。
                 # 抢救前缀后，未覆盖到的论文走下方既有的 "Not found in LLM response"
                 # 分支标 FAILED，与原行为一致，但前缀里的论文得以保住。
-                # **这是第四道防线**：根因修复应在 _call_agent（接 --json-schema、查
-                # stop_reason、真正传 max_tokens），其次是解析失败重试一次
-                # （topics.py:synthesize_topic / qa.py 已有该范式，digest 是唯一漏掉的主链路）。
+                # **这是最后一道防线**：上游 `_call_agent` 已在 2026-08-20 补上正文
+                # 完整性校验 + 重试（`looks_like_complete_json`），重试耗尽才把残料
+                # 交到这里。能走到这一行说明重试也没救回来。
+                # 注意：`stop_reason` 与 `max_tokens` 两条曾经的"根因"猜测都已被实测
+                # 推翻，别再顺着它们排查（原委见 json_tools.loads_lenient 的 docstring）。
                 salvaged = loads_lenient(json_match)
                 if salvaged is None:
                     raise

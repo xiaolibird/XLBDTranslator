@@ -299,3 +299,325 @@ def test_无冒号写法保持原有行为():
     client = LLMClient(_settings(provider="deepseek", fallback_providers="claude-agent, gemini"))
     assert client._chain == ["deepseek", "claude-agent", "gemini"]
     assert client._chain_models == [None, None, None]
+
+
+# ==================== (e) claude CLI 截断检测 ====================
+# 2026-08-20：08-17 那轮 digest 有 15 篇（翻译，3 批 × 5）与 40 篇（filter，2 批 × 20）
+# 因响应被截断而 JSON 解析失败。关键事实（实测 CLI 2.1.221 + 反推）：
+# **那种截断的信封是干净的** —— is_error=false / terminal_reason=completed /
+# api_error_status=null / stop_reason=end_turn，只有正文是半截的。所以判据必须
+# 校验**正文**；只看信封字段一条都够不着。
+# 反证：若信封当时带 is_error=true，第一批就会切链走掉（链非空），不可能出现
+# 5 个批次全部重演同一形状、且 digest 正常收尾。
+
+_AGENT_CONN = {'cli_path': '/usr/bin/claude', 'model': 'sonnet', 'provider': 'claude-agent'}
+
+# 生产真实形状：干净信封 + 半截正文
+_TRUNCATED = '[{"id": 1, "decision": "INCLUDE", "one_line": "可用"}, {"id": 2, "decis'
+_CLEAN_ENVELOPE = {
+    "is_error": False, "stop_reason": "end_turn", "terminal_reason": "completed",
+    "api_error_status": None, "usage": {"output_tokens": 1503},
+}
+
+
+def _envelope(**over):
+    e = dict(_CLEAN_ENVELOPE)
+    e.update(over)
+    return e
+
+
+def _agent_run(client, envelope: dict, returncode: int = 0, json_mode: bool = True):
+    import json as _json
+    fake_proc = MagicMock(returncode=returncode, stdout=_json.dumps(envelope), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=fake_proc):
+        return client._call_agent(_AGENT_CONN, "prompt", "sonnet", json_mode)
+
+
+def test_生产真实形状_干净信封加半截正文_必须判截断():
+    """最要命也最容易漏的一种：CLI 退出 0、信封每个字段都正常，只有 result 是半截。
+    旧代码原样返回，下游 json.loads 在文末报 Expecting ','，错因在这里就丢了。"""
+    from src.scholar.llm_client import _RetryableHTTP
+    client = LLMClient(_settings(provider="claude-agent"))
+    with pytest.raises(_RetryableHTTP) as exc_info:
+        _agent_run(client, _envelope(result=_TRUNCATED))
+    assert "截断" in str(exc_info.value)
+    # 残料必须挂在异常上带出去，否则下游 loads_lenient 抢救层被饿死
+    assert exc_info.value.partial == _TRUNCATED
+
+
+def test_重试耗尽后把半截正文交还调用方而不是抛掉():
+    """抢救层（workflow 的 filter/翻译、pdf_ingest 的通读块）只有拿到半截正文才有活干。
+    在 llm_client 层抛掉 = filter 从「20 篇救回 13 篇真裁决」退化成整批 0 篇。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    fake_proc = MagicMock(returncode=0, stdout=_json.dumps(_envelope(result=_TRUNCATED)), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=fake_proc) as run, \
+         patch('src.scholar.llm_client.time.sleep') as slp, \
+         patch('shutil.which', return_value='/usr/bin/claude'):
+        out = client._call_once(_AGENT_CONN, "p", "sonnet", None, None, True, max_retries=4)
+    assert out == _TRUNCATED          # 交还残料，供下游抢救
+    # 只重试 1 次，不吃满 max_retries=4：一次 claude -p 的成本几乎全是与 prompt
+    # 无关的建仓税，重试摊薄不了；而 topics/qa 在它们那层还各有一次「追加格式
+    # 指令再试」——那次才带新信息，吃满 4 次只会把它挤到第 5 次。
+    assert run.call_count == 2
+    assert slp.call_count == 1
+    # 注意别在这里断言 _chain_idx：切链发生在 call() 里，_call_once 根本不碰链位，
+    # 在这一层断言链位不变是空转。真正的 failover 行为见下面走 call() 的两条。
+
+
+def test_截断重试成功后不返回残料():
+    """第 2 次拿到完整 JSON 就该正常返回，不能把第 1 次的残料漏出去。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    good = '[{"id": 1, "decision": "INCLUDE"}]'
+    procs = [MagicMock(returncode=0, stdout=_json.dumps(_envelope(result=_TRUNCATED)), stderr=''),
+             MagicMock(returncode=0, stdout=_json.dumps(_envelope(result=good)), stderr='')]
+    with patch('src.scholar.llm_client.subprocess.run', side_effect=procs) as run, \
+         patch('src.scholar.llm_client.time.sleep'):
+        out = client._call_once(_AGENT_CONN, "p", "sonnet", None, None, True, max_retries=4)
+    assert out == good
+    assert run.call_count == 2
+
+
+def test_非json模式不校验正文():
+    """json_mode=False 的调用方（如自由文本综述）拿到的本来就不是 JSON，
+    对它做完整性校验会把每一次正常调用都判成截断。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    assert _agent_run(client, _envelope(result="这是一段自由文本，没有括号。"),
+                      json_mode=False) == "这是一段自由文本，没有括号。"
+
+
+def test_模型加了开场白但json完好_不得误判():
+    """topics.py 的解析会从解释文字里抠出 JSON。若这里严格判定，
+    这类响应会被误判成截断、白白重试 4 次并烧 4 份订阅额度。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    body = '好的，结果如下：\n[{"id": 1, "decision": "INCLUDE"}]\n以上。'
+    assert _agent_run(client, _envelope(result=body)) == body
+
+
+def test_确定性故障一次即抛不重试():
+    """prompt_too_long / max_turns / budget_exhausted 这类重试 4 次必然 4 次重演。
+    每次都要重付一整份 system prompt 建仓税（烧订阅额度），耗尽后还要切链把
+    下家也照样烧一遍 —— 一次失败 = 8 次完整生成。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    env = {"is_error": True, "result": None, "errors": ["Prompt is too long"],
+           "terminal_reason": "prompt_too_long", "subtype": "error_during_execution"}
+    fake_proc = MagicMock(returncode=1, stdout=_json.dumps(env), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=fake_proc) as run, \
+         patch('src.scholar.llm_client.time.sleep') as slp:
+        with pytest.raises(RuntimeError):
+            client._call_once(_AGENT_CONN, "p", "sonnet", None, None, True, max_retries=4)
+    assert run.call_count == 1, "确定性故障不该重试"
+    assert slp.call_count == 0
+
+
+def test_错误信封没有result字段时改用errors数组():
+    """subtype=error_* 的信封只有 errors[]、没有 result。只取 result 会让 msg
+    恒为空串，关键词分类与 _is_content_refusal 全部落空，错因彻底丢失。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    env = {"is_error": True, "result": None, "errors": ["Usage limit reached"],
+           "terminal_reason": "blocking_limit"}
+    fake_proc = MagicMock(returncode=1, stdout=_json.dumps(env), stderr='')
+    from src.scholar.llm_client import _RetryableHTTP
+    with patch('src.scholar.llm_client.subprocess.run', return_value=fake_proc):
+        with pytest.raises(_RetryableHTTP) as exc_info:
+            client._call_agent(_AGENT_CONN, "p", "sonnet", True)
+    assert "Usage limit reached" in str(exc_info.value)
+
+
+def test_瞬时故障走可重试():
+    from src.scholar.llm_client import _RetryableHTTP
+    client = LLMClient(_settings(provider="claude-agent"))
+    with pytest.raises(_RetryableHTTP):
+        _agent_run(client, {"is_error": True, "result": "Connection closed mid-response",
+                            "terminal_reason": "api_error"}, returncode=1)
+
+
+def test_tool_use是成功值不得当成失败():
+    """--json-schema 走强制工具调用实现，成功时 stop_reason 恰是 'tool_use'（实测信封）。
+    拦它会把每一次成功的结构化调用都判成失败。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    assert _agent_run(client, _envelope(result='{"a": 1}', stop_reason="tool_use")) == '{"a": 1}'
+
+
+def test_tool_deferred是is_error为假的成功变体():
+    """CLI 显式以 is_error=false 产出这两个变体，当故障处理会误伤。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    assert _agent_run(client, _envelope(result='{"a": 1}',
+                                        terminal_reason="tool_deferred")) == '{"a": 1}'
+
+
+def test_老信封无这些字段时行为不变():
+    """历史/精简信封不带 stop_reason/terminal_reason，不得因缺字段被判故障。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    assert _agent_run(client, {"is_error": False, "result": "ok"}, json_mode=False) == "ok"
+
+
+def test_确定性4xx不重试():
+    """CLI 把上游 4xx 也标成 terminal_reason=api_error。实测 --json-schema 传了
+    非对象根 schema 时就是这个形状——确定性请求错误，重试多少次都一样。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    env = {"is_error": True, "terminal_reason": "api_error", "subtype": "success",
+           "result": "API Error: 400 tools.8.custom.input_schema.type: Input should be 'object'"}
+    fake_proc = MagicMock(returncode=0, stdout=_json.dumps(env), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=fake_proc) as run, \
+         patch('src.scholar.llm_client.time.sleep') as slp:
+        with pytest.raises(RuntimeError):
+            client._call_once(_AGENT_CONN, "p", "sonnet", None, None, True, max_retries=4)
+    assert run.call_count == 1
+    assert slp.call_count == 0
+
+
+def test_429仍走重试():
+    """限流是瞬时的，不能被 4xx 规则一刀切掉。"""
+    from src.scholar.llm_client import _RetryableHTTP
+    client = LLMClient(_settings(provider="claude-agent"))
+    with pytest.raises(_RetryableHTTP):
+        _agent_run(client, {"is_error": True, "terminal_reason": "api_error",
+                            "result": "API Error: 429 rate limit exceeded"}, returncode=0)
+
+
+# ==================== (f) 降级返回的健康记账（走 call()，不是 _call_once） ====================
+# 切链只发生在 call() 里；_call_once 不碰链位，在那一层断言 failover 是空转。
+
+def _call_with(client, envelope, n=1):
+    """走完整 call() 路径跑 n 次，返回 (结果列表, subprocess 调用次数)。"""
+    import json as _json
+    proc = MagicMock(returncode=0, stdout=_json.dumps(envelope), stderr='')
+    outs = []
+    with patch('src.scholar.llm_client.subprocess.run', return_value=proc) as run, \
+         patch('src.scholar.llm_client.time.sleep'), \
+         patch('shutil.which', return_value='/usr/bin/claude'):
+        for _ in range(n):
+            try:
+                outs.append(('OK', client.call("p", json_mode=True)))
+            except Exception as e:
+                outs.append(('RAISE', type(e).__name__))
+    return outs, run.call_count
+
+
+def test_持续吐半截的provider最终必须被切走():
+    """`return partial` 会绕过 call() 里的 except → _is_switchable → _advance_chain
+    整段。没有连击记账，一个持续只吐半截的 provider **永远切不掉**：每次都"成功"、
+    链位纹丝不动，下家一次请求都发不出去——而它本来能给出完整响应。"""
+    client = LLMClient(_settings(provider="claude-agent",
+                                 fallback_providers="claude-agent:opus"))
+    outs, _ = _call_with(client, _envelope(result=_TRUNCATED), n=4)
+    kinds = [k for k, _ in outs]
+    # 前 N-1 次降级返回残料（下游抢救层照常有活干），第 N 次判定 provider 降级并切链
+    assert kinds[:2] == ['OK', 'OK'], kinds
+    assert client._chain_idx > 0, "连续降级后必须切链，否则下家永远拿不到请求"
+
+
+def test_拿到完整响应后降级连击清零():
+    """偶发一次半截不该累积成"provider 已降级"。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    good = '[{"id": 1, "decision": "INCLUDE"}]'
+    seq = [_envelope(result=_TRUNCATED), _envelope(result=_TRUNCATED),  # 一次调用=2 次子进程
+           _envelope(result=good)]
+    procs = [MagicMock(returncode=0, stdout=_json.dumps(e), stderr='') for e in seq]
+    with patch('src.scholar.llm_client.subprocess.run', side_effect=procs), \
+         patch('src.scholar.llm_client.time.sleep'), \
+         patch('shutil.which', return_value='/usr/bin/claude'):
+        client.call("p", json_mode=True)      # 降级一次 → streak=1
+        assert client._degraded_streak == 1
+        client.call("p", json_mode=True)      # 完整 → 清零
+    assert client._degraded_streak == 0
+
+
+def test_纯散文反问不得冒充半截正文交给抢救层():
+    """实测形状：模型没输出 JSON，而是反问「这个请求缺少主题——请告知后我再输出
+    JSON」。它非空却一个字段都救不出，交下去只是把失败伪装成成功，而且因为走了
+    `return` 路径，provider 永远不会被切走。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    prose = '这个请求缺少主题——40 条 title/one_line 需要围绕什么内容？请告知主题，我再按格式仅输出 JSON。'
+    outs, _ = _call_with(client, _envelope(result=prose), n=1)
+    assert outs[0][0] == 'RAISE', "散文反问必须抛，不能当残料返回"
+
+
+# ==================== (g) 判据倒挂回归 ====================
+
+def test_无开场白的完好json加尾随说明_不得判成截断():
+    """判据曾经倒挂：`'[{...}]\\n以上是 2 条裁决。'` 判成截断（白重试 + 打假警报），
+    而同样内容**加一句开场白**反而判成完整——加句废话就能让成本减半。
+    现在判的是「括号栈闭没闭合」，两者都该是完整。"""
+    client = LLMClient(_settings(provider="claude-agent"))
+    body = '[{"id": 1, "decision": "INCLUDE"}]\n\n以上是 1 条裁决。'
+    import json as _json
+    proc = MagicMock(returncode=0, stdout=_json.dumps(_envelope(result=body)), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=proc) as run, \
+         patch('shutil.which', return_value='/usr/bin/claude'):
+        assert client.call("p", json_mode=True) == body
+    assert run.call_count == 1, "不该重试"
+
+
+# ==================== (h) 确定性故障分类 ====================
+
+@pytest.mark.parametrize("term,msg", [
+    ("blocking_limit", "Prompt is too long"),        # ptl = prompt too long 的另一条出口
+    ("rapid_refill_breaker", "rapid-refill breaker tripped"),
+    ("api_error", "Credit balance is too low"),      # api_error 是混合桶
+    ("api_error", "Not logged in · Please run /login"),
+    ("api_error", "Invalid API key · Please run /login"),
+])
+def test_确定性故障只调一次(term, msg):
+    """这些重试 4 次必然 4 次重演。更要命的是 claude-agent:opus 与 sonnet
+    **共用同一个订阅额度池，不是独立故障域**——额度撞墙时 opus 那 4 次必然
+    同样失败，等于在空账号上再烧 8 份建仓税。"""
+    import json as _json
+    client = LLMClient(_settings(provider="claude-agent"))
+    env = {"is_error": True, "result": msg, "terminal_reason": term}
+    proc = MagicMock(returncode=1, stdout=_json.dumps(env), stderr='')
+    with patch('src.scholar.llm_client.subprocess.run', return_value=proc) as run, \
+         patch('src.scholar.llm_client.time.sleep') as slp:
+        with pytest.raises(RuntimeError):
+            client._call_once(_AGENT_CONN, "p", "sonnet", None, None, True, max_retries=4)
+    assert run.call_count == 1
+    assert slp.call_count == 0
+
+
+def test_确定性收尾但正文完整时照常采用():
+    """确定性收尾时重试拿不到更好的正文，这是它唯一的机会，整份丢弃再切链是纯亏。
+
+    必须断言那行 warning：只断言返回值是**非鉴别性**的——把整个分支删掉，正文会
+    直接落到下面的完整性校验、照样返回同一个 body，测试仍然全绿。
+    （另：别拿 max_turns 当例子，它恒配 is_error=true，走不到这个分支。）
+    """
+    client = LLMClient(_settings(provider="claude-agent"))
+    body = '{"a": 1}'
+    with patch('src.scholar.llm_client.logger.warning') as warn:
+        assert _agent_run(client, _envelope(result=body,
+                                            terminal_reason="hook_stopped")) == body
+    assert any("hook_stopped" in str(c) for c in warn.call_args_list), \
+        "确定性收尾分支必须留下痕迹，否则这条测试测不到分支在不在"
+
+
+def test_空正文必须抛而不是静默返回空串():
+    """gemini/openai 两条分支都有「内容为空 → 抛带 finish_reason 的异常」，
+    只有这条链路一直没有。实测可达：挂 block 型 Stop hook 跑 headless，CLI 会
+    空转到 10 轮后以 is_error=false / terminal_reason=completed / result='' 收尾。
+    受害者是 deep_research（json_mode=False，无条件把返回值当报告落盘）。"""
+    from src.scholar.llm_client import _RetryableHTTP
+    client = LLMClient(_settings(provider="claude-agent"))
+    with pytest.raises(_RetryableHTTP) as exc_info:
+        _agent_run(client, _envelope(result=''), json_mode=False)
+    assert "为空" in str(exc_info.value)
+    # 空串抢救层救不出东西，不该挂 partial 冒充残料
+    assert not getattr(exc_info.value, 'partial', '')
+
+
+def test_切链时降级连击必须清零():
+    """降级连击是**这一家**的案底。不清零的话下一棒（claude-agent:opus）一上任
+    就带着前一棒的记录、降级额度为 0，一次故障直接烧到链尾。"""
+    client = LLMClient(_settings(provider="claude-agent",
+                                 fallback_providers="claude-agent:opus"))
+    client._degraded_streak = 2
+    with patch('shutil.which', return_value='/usr/bin/claude'):
+        conn = client.conn
+        assert client._advance_chain(conn, "模拟故障") is True
+    assert client._chain_idx == 1
+    assert client._degraded_streak == 0
