@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.scholar.schema import ScholarSettings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
 from src.scholar.paths import repo_path  # noqa: E402
+from src.scholar.notes_index import INDEX_JSON  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 logger = get_logger("read_pdf")
@@ -118,7 +119,7 @@ def cmd_ingest(args):
                 model=model, email=email,
                 research_interests=proc.research_interests,
                 title_override=(args.title or "") if len(pdfs) == 1 else "",
-                index_path=notes_dir / "literature_index.json",
+                index_path=notes_dir / INDEX_JSON,
                 force=args.force)
             outs.append(r)
         except Exception as e:
@@ -351,7 +352,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     # 本月 md 时，本月论文的上一轮 citekey 会被当成「库内已占用」，被迫加消歧后缀，
     # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
     own_note_file = "科研札记_{}_手动精读.md".format(month)
-    idx_path = notes_dir / "literature_index.json"
+    idx_path = notes_dir / INDEX_JSON
     existing_ckeys = existing_citekeys(idx_path, exclude_note_files={own_note_file})
 
     mdir = notes_dir / "manual" / month

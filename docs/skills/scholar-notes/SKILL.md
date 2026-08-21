@@ -228,7 +228,7 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 `sparse` 查询时不需要 Ollama，但仍要求向量库已构建）。分工：确切术语/citekey/role 硬门槛
 用 `notes_query`；中文找英文文献、换述同义词、或 `notes_query` 空手时用 `notes_search`。
 
-⚠️ **覆盖面警告**：有句级证据（highlights）的条目约 508 篇（截至 2026-08，占 keeper 的 24%），
+⚠️ **覆盖面警告**：有句级证据（highlights）的条目约三成（精确数见 output/scholar_notes/AGENTS.md，实时数以 literature_index.json 为准），
 语义检索的向量库同理。命中若标注"该篇无精读句级证据"，是真的没有，不是这次没搜到——别当成
 "库里没有这方面内容"。
 

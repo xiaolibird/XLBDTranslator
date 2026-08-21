@@ -23,9 +23,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from src.scholar.notes_index import is_missing_citekey  # noqa: E402
+from src.scholar.notes_index import INDEX_JSON, is_missing_citekey, load_index_file  # noqa: E402
 
-INDEX_PATH = REPO / "output" / "scholar_notes" / "literature_index.json"  # 模块级常量，向后兼容
+INDEX_PATH = REPO / "output" / "scholar_notes" / INDEX_JSON  # 模块级常量，向后兼容
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
@@ -35,21 +35,10 @@ MAX_SHOWN_HITS = 4          # 人读模式每条最多展示几句（--json 不�
 
 
 def _load_index(path: Path):
-    """读索引；缺失/损坏/结构诡异一律给可操作提示后退出 2（不把 traceback 抛给用户）。"""
-    if not path.exists():
-        print("找不到索引：{}\n先在仓库根跑：PYTHONPATH=. python scripts/notes_index.py".format(path),
-              file=sys.stderr)
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print("索引解析失败（{}）：{}\n可重建：PYTHONPATH=. python scripts/notes_index.py --full".format(
-            type(exc).__name__, path), file=sys.stderr)
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("papers"), list):
-        print("索引结构异常（缺 papers 数组）：{}\n可重建：PYTHONPATH=. python scripts/notes_index.py --full".format(path),
-              file=sys.stderr)
-        return None
+    """读索引；缺失/损坏/结构诡异给可操作提示（单点实现在 notes_index.load_index_file）。"""
+    data, err = load_index_file(path)
+    if err:
+        print(err, file=sys.stderr)
     return data
 
 
@@ -110,7 +99,7 @@ def main() -> int:
     if args.index:
         index_path = Path(args.index)
     elif notes_dir:
-        index_path = notes_dir / "literature_index.json"
+        index_path = notes_dir / INDEX_JSON
     else:
         index_path = INDEX_PATH  # 模块级常量，允许测试 monkeypatch
     index = _load_index(index_path)

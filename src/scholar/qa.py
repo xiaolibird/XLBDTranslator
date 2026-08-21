@@ -472,8 +472,14 @@ def retrieve_qa_evidence(spec: TopicSpec, store, embed_client, *,
     渲染成页面上那一行「本次未纳入的近邻论文」。**它不是引用**，见 `nearby_papers`。
     """
     wide = replace(spec, max_evidence=_WIDE_MAX_EVIDENCE)
+    # relative_alpha=0：QA 侧维持纯绝对阈值。相对判据 α=0.85 只在 config/topics.yaml
+    # 的 36 条概念页短 query 上标定过（docs/decisions/topics_threshold_calibration_2026-08.md），
+    # QA 的 query 是整句问题 + extra_queries，top1 分布未验证——强问题（top1≈0.75）下
+    # 0.55~0.6375 段的证据会被整段误砍，nearby_papers 也跟着缩水。用真实归档问题集
+    # 标定出 QA 侧的 α 之前不启用。
     candidates = retrieve_evidence(wide, store, embed_client, min_sim=min_sim,
-                                   per_paper_cap=_WIDE_PER_PAPER_CAP)
+                                   per_paper_cap=_WIDE_PER_PAPER_CAP,
+                                   relative_alpha=0.0)
     picked = select_qa_evidence(candidates, max_evidence=spec.max_evidence,
                                 per_paper_cap=per_paper_cap)
     return picked, nearby_papers(candidates, picked)

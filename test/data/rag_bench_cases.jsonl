@@ -1,0 +1,75 @@
+{"id": "title-001", "type": "en_title", "query": "Comparing ascertainment of chronic condition status with problem lists versus encounter diagnoses from electronic health records", "gold": ["voss2012Comparing"]}
+{"id": "title-002", "type": "en_title", "query": "A Survey of Geometric Optimization for Deep Learning: From Euclidean Space to Riemannian Manifold", "gold": ["fei2025Survey"]}
+{"id": "title-003", "type": "en_title", "query": "Towards cross-application model-agnostic federated cohort discovery", "gold": ["dobbins2024Crossapplication"]}
+{"id": "title-004", "type": "en_title", "query": "Graph Adversarial Training: Dynamically Regularizing Based on Graph Structure", "gold": ["feng2021Graph"]}
+{"id": "title-005", "type": "en_title", "query": "Federated generative event models for tokenized electronic health records", "gold": ["solo2026Federated"]}
+{"id": "title-006", "type": "en_title", "query": "Detecting critical diseases associated with higher mortality in electronic health records using a hybrid attention-based transformer", "gold": ["kodati2025Detecting"]}
+{"id": "title-007", "type": "en_title", "query": "A novel clinical prediction model for in-hospital mortality in sepsis patients complicated by ARDS: A MIMIC IV database and external validation study.", "gold": ["chen2024Clinical"]}
+{"id": "title-008", "type": "en_title", "query": "PseudoCal: A Source-Free Approach to Unsupervised Uncertainty Calibration in Domain Adaptation", "gold": ["hu2023Pseudocal"]}
+{"id": "title-009", "type": "en_title", "query": "Harnessing EHR data for health research", "gold": ["tang2024Harnessing"]}
+{"id": "title-010", "type": "en_title", "query": "Clinically-guided models or foundation models? predicting cervical spondylotic myelopathy from electronic health records", "gold": ["yakdan2026Clinicallyguided"]}
+{"id": "title-011", "type": "en_title", "query": "Explainable AI-driven heterogeneity using coagulation–inflammatory markers improves prognosis prediction, risk stratification, and anticoagulant treatment effects for …", "gold": ["niu2025Explainable"]}
+{"id": "title-012", "type": "en_title", "query": "Géométrie de l'auto-attention en classification: quand la géométrie remplace l'attention", "gold": ["fosse2023Géométrie"]}
+{"id": "title-013", "type": "en_title", "query": "Prediction of adolescent suicide attempt by integrating clinical, neurocognitive and geocoded neighborhood environment data", "gold": ["visoki2025Prediction"]}
+{"id": "title-014", "type": "en_title", "query": "Algorithm Selection for Combinatorial Search Problems: A Survey", "gold": ["kotthoff2014Algorithm"]}
+{"id": "title-015", "type": "en_title", "query": "Machine learning model for daily prediction of pediatric sepsis using Phoenix criteria", "gold": ["zhang2024ardsc"]}
+{"id": "oneline-001", "type": "zh_oneline", "query": "AKI预测中MICE处理缺失，临床场景", "gold": ["pierri2026Predicting"]}
+{"id": "oneline-002", "type": "zh_oneline", "query": "外部验证FH风险模型，支持跨中心迁移", "gold": ["mckay2022Assessing"]}
+{"id": "oneline-003", "type": "zh_oneline", "query": "成业导师陆国平(PICU)团队52例儿童VA-ECMO死亡预测:P/F截断77.9(AUC0.766/HR5.459),传统logistic+bootstrap单中心;是李润泽重症预警三角第三节点与方法升级接口", "gold": ["ying2026Evaluation"]}
+{"id": "oneline-004", "type": "zh_oneline", "query": "EHR纵向缺失数据插补与缺失指示符研究", "gold": ["ehrig2025Imputation"]}
+{"id": "oneline-005", "type": "zh_oneline", "query": "伪动态XGBoost+时间分辨SHAP，方法学骨架扎实；但Fig5b的MIMIC-IV训练划分与「从未训练」声明直接矛盾，表格错误密度已是DynaGraph前兆", "gold": ["mesinovic2025Explainable"]}
+{"id": "oneline-006", "type": "zh_oneline", "query": "RWD亚组分析用于临床试验", "gold": ["xu2023Machine"]}
+{"id": "oneline-007", "type": "zh_oneline", "query": "MetaBu:用FGW最优传输把135维手工元特征(含缺失率)对齐到好超参配置的Wasserstein拓扑,免冷启动选方法并估内在维数6-14——李润泽缺失指纹的可学习/拓扑化上位框架", "gold": ["rakotoarison2022Learning"]}
+{"id": "oneline-008", "type": "zh_oneline", "query": "文本反推检查前概率：胸片模型在高风险层与匹配集上性能大跌", "gold": ["wang2026Revisiting"]}
+{"id": "oneline-009", "type": "zh_oneline", "query": "联邦医疗关系提取，处理跨客户端标签异质性", "gold": ["du2023Contrast"]}
+{"id": "oneline-010", "type": "zh_oneline", "query": "联邦/群学习解决跨中心数据异构性", "gold": ["liu2025Division"]}
+{"id": "oneline-011", "type": "zh_oneline", "query": "EHR关联建模处理缺失问题", "gold": ["anon2022Relational"]}
+{"id": "oneline-012", "type": "zh_oneline", "query": "联邦学习异构任务跨中心", "gold": ["zhang2022Pmfl"]}
+{"id": "oneline-013", "type": "zh_oneline", "query": "批评XAI在医疗中的本质，威胁本文方法", "gold": ["ghassemi2021False"]}
+{"id": "oneline-014", "type": "zh_oneline", "query": "自动诊断患者图，可用于临床落地背景", "gold": ["li2024Knowledgerouted"]}
+{"id": "oneline-015", "type": "zh_oneline", "query": "预测高利用率患者，临床落地", "gold": ["jr2021Machine"]}
+{"id": "para-001", "type": "paraphrase", "query": "采样间隔不固定的临床时间序列用门控循环网络处理的综述", "gold": ["weerakody2021Review"]}
+{"id": "para-002", "type": "paraphrase", "query": "病历里性少数身份信息记录不全对健康公平研究的影响", "gold": ["cruz2021Capturing"]}
+{"id": "para-003", "type": "paraphrase", "query": "用图卷积网络统一不同来源的出生登记数据", "gold": ["yu2022Deep"]}
+{"id": "para-004", "type": "paraphrase", "query": "表格模型在特征分布漂移下的鲁棒性基准", "gold": ["cheng2025Tabfsbench", "gardner2023Benchmarking"]}
+{"id": "para-005", "type": "paraphrase", "query": "用大模型生成的反事实标注改进离线策略评估", "gold": ["mandyam2026Candor", "mandyam2026April"]}
+{"id": "para-006", "type": "paraphrase", "query": "自动分析组织病理切片并产出发现的智能体框架", "gold": ["vaidya2026Nova"]}
+{"id": "para-007", "type": "paraphrase", "query": "多家医院重症数据统一成通用数据模型的端到端处理管道", "gold": ["luo2026Critical"]}
+{"id": "para-008", "type": "paraphrase", "query": "用最优传输把手工元特征对齐到超参配置的自动机器学习方法", "gold": ["rakotoarison2022Learning"]}
+{"id": "para-009", "type": "paraphrase", "query": "知识图谱嵌入结合元学习做流水线性能预测", "gold": ["klironomos2026Integrating"]}
+{"id": "para-010", "type": "paraphrase", "query": "直肠癌术前放化疗疗效预测模型的系统评价", "gold": ["boldrini2025Response"]}
+{"id": "para-011", "type": "paraphrase", "query": "儿童癌症幸存者用AI心电图做心脏随访监测", "gold": ["asztalos2025Cardiac"]}
+{"id": "para-012", "type": "paraphrase", "query": "蜇伤患者早期风险分层的多中心机器学习", "gold": ["han2025Machine"]}
+{"id": "para-013", "type": "paraphrase", "query": "传感器数据缺失下阿尔茨海默病进展建模的特征选择", "gold": ["dalessandro2026Feature"]}
+{"id": "para-014", "type": "paraphrase", "query": "数据驱动的因果图发现用于神经退行性疾病个体化预测", "gold": ["zheng2022Datadriven"]}
+{"id": "para-015", "type": "paraphrase", "query": "区域病历研究结论在全国数据库复制检验其外推性", "gold": ["williams2025Replicating"]}
+{"id": "para-016", "type": "paraphrase", "query": "真实世界数据亚组分析辅助临床试验入排标准设计", "gold": ["xu2023Machine"]}
+{"id": "para-017", "type": "paraphrase", "query": "把验前概率和临床语境纳入影像模型性能评估", "gold": ["wang2026Revisiting"]}
+{"id": "para-018", "type": "paraphrase", "query": "对医疗可解释AI过度承诺的批判", "gold": ["ghassemi2021False"]}
+{"id": "para-019", "type": "paraphrase", "query": "纵向随访数据该不该加缺失哑变量的模拟比较", "gold": ["ehrig2025Imputation"]}
+{"id": "para-020", "type": "paraphrase", "query": "整合居住环境与神经认知测评预测青少年自伤风险", "gold": ["visoki2025Prediction"]}
+{"id": "para-021", "type": "paraphrase", "query": "注意力权重的几何结构能否替代注意力机制本身", "gold": ["fosse2023Géométrie"]}
+{"id": "para-022", "type": "paraphrase", "query": "组合优化问题自动选择求解器的方法综述", "gold": ["kotthoff2014Algorithm"]}
+{"id": "para-023", "type": "paraphrase", "query": "识别医疗服务高频使用人群的预测模型", "gold": ["jr2021Machine"]}
+{"id": "para-024", "type": "paraphrase", "query": "拿不到源域数据的黑盒域自适应对抗训练", "gold": ["shi2023Sourcefree"]}
+{"id": "para-025", "type": "paraphrase", "query": "不同病历系统之间的医学概念自动映射", "gold": ["dam2023Augmented", "wu2023Automap"]}
+{"id": "para-026", "type": "paraphrase", "query": "按疾病史给多中心异质患者人群分层的纵向框架", "gold": ["maurits2022Framework"]}
+{"id": "para-027", "type": "paraphrase", "query": "心力衰竭国际结局标准集在医院数据中的完整度评估", "gold": ["aerts2021Quality"]}
+{"id": "para-028", "type": "paraphrase", "query": "心内科结构化报告实施中的挑战与应对", "gold": ["kindermann2021Preliminary"]}
+{"id": "para-029", "type": "paraphrase", "query": "点对点联邦随机森林兼顾可解释性与性能", "gold": ["gao2024Balancing"]}
+{"id": "para-030", "type": "paraphrase", "query": "让智能体端到端完成观察性数据库研究并检验可靠性", "gold": ["li2026Agents"]}
+{"id": "legacy-001", "type": "legacy_5case", "query": "缺失指示符 插补", "gold": ["ehrig2025Imputation", "sisk2023Imputation", "ness2022Missing"]}
+{"id": "legacy-002", "type": "legacy_5case", "query": "不规则采样 时间序列", "gold": ["weerakody2021Review", "weerakody2022Cyclic", "jhin2021Attentive", "itzhak2025Temporal"]}
+{"id": "legacy-003", "type": "legacy_5case", "query": "联邦队列发现", "gold": ["dobbins2024Crossapplication"]}
+{"id": "legacy-004", "type": "legacy_5case", "query": "缺失记录模式 缺失机制诊断", "gold": ["voss2012Comparing", "ruddle2026Visual"]}
+{"id": "legacy-005", "type": "legacy_5case", "query": "算法选择 综述", "gold": ["kotthoff2014Algorithm", "kerschke2019Automated"]}
+{"id": "enpara-001", "type": "en_paraphrase", "query": "review of gated recurrent networks for unevenly sampled clinical time series", "gold": ["weerakody2021Review"]}
+{"id": "enpara-002", "type": "en_paraphrase", "query": "incomplete records of sexual minority identity hinder health equity research", "gold": ["cruz2021Capturing"]}
+{"id": "enpara-003", "type": "en_paraphrase", "query": "harmonizing birth registry data from different sources with graph convolution", "gold": ["yu2022Deep"]}
+{"id": "enpara-004", "type": "en_paraphrase", "query": "benchmark for tabular model robustness under feature shift", "gold": ["cheng2025Tabfsbench", "gardner2023Benchmarking"]}
+{"id": "enpara-005", "type": "en_paraphrase", "query": "criticism of overpromising interpretability methods in clinical AI", "gold": ["ghassemi2021False"]}
+{"id": "enpara-006", "type": "en_paraphrase", "query": "adolescent self-harm risk from neighborhood environment and neurocognitive testing", "gold": ["visoki2025Prediction"]}
+{"id": "enpara-007", "type": "en_paraphrase", "query": "forecasting frequent users of healthcare services", "gold": ["jr2021Machine"]}
+{"id": "enpara-008", "type": "en_paraphrase", "query": "challenges implementing structured reporting in cardiology", "gold": ["kindermann2021Preliminary"]}
+{"id": "enpara-009", "type": "en_paraphrase", "query": "improving off-policy evaluation with LLM counterfactual annotations", "gold": ["mandyam2026Candor", "mandyam2026April"]}
+{"id": "enpara-010", "type": "en_paraphrase", "query": "completeness of heart failure outcome standard sets in hospital records", "gold": ["aerts2021Quality"]}

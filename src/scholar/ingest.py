@@ -507,7 +507,7 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     citekeys = resolve_citekeys(segs, proc.zotero_base_url)
 
     from .notes import write_notes
-    from .notes_index import existing_citekeys
+    from .notes_index import INDEX_JSON, existing_citekeys
     notes_out_dir = Path(proc.notes_dir)
     note_filename = "科研札记_{}_全文精读".format(label)
     # 排除本次要重写的周札记自己的旧条目——否则本批重算出同样的兜底键会被判「库内
@@ -515,7 +515,7 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     # （citekey 抖动，同 backfill_notes.run_month / read_pdf._rebuild_month 同源坑）。
     # 正常路径已被 _existing_note_dedup_keys 的整篇覆盖检查挡住，但 --no-dedup 或
     # 本批覆盖既有全集时仍会走到这里，防御一下不额外增加成本。
-    idx_path = Path(proc.notes_dir) / "literature_index.json"
+    idx_path = Path(proc.notes_dir) / INDEX_JSON
     existing_ckeys = existing_citekeys(
         idx_path, exclude_note_files={"{}.md".format(note_filename)})
     try:

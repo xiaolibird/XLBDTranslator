@@ -307,7 +307,8 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
 `jq`/`notes_query.py` 是精确子串匹配；查不到换述表达（如中文"缺失机制不可忽略"查不到英文
 "informative missingness"）时改用 `PYTHONPATH=. python scripts/notes_search.py <查询...>
 [--role ...] [--json]`(默认 `--mode hybrid`=向量+BM25 关键词融合)。句级证据同样只覆盖库内
-480 篇精读文献,语义命中若标注"该篇无精读句级证据"是真的没有,不是没搜到。
+约三成精读文献(668/2254,截至 2026-08-21;实时数以 literature_index.json 为准),语义命中若
+标注"该篇无精读句级证据"是真的没有,不是没搜到。
 
 ## 检索流程(四步法)
 
@@ -433,7 +434,8 @@ sidecar 里的 `dedup_key` 是落盘时的快照,**磁盘上的值永不回写**
    预检阶段挪到了写盘阶段,故补了回滚与三态。)
 
 ⚠️ **改键还有两个不会自己跟上的派生物**——三处写完不等于全库一致:
-- **向量库 `embeddings.sqlite3`**:chunk id 内嵌 citekey(`p:<citekey>`),`chunks` 表另有
+- **向量库 `embeddings.sqlite3`**:三级 chunk 的 id 都内嵌 citekey(`p:<citekey>` /
+  `ab:<citekey>` / `h:<citekey>:<role>:<hash12>`),`chunks` 表另有
   `citekey` / `year` 两列,是语义检索结果回传给写作侧的**唯一身份来源**。库一旧,
   `notes_search --cite` 就输出磁盘上已不存在的键(pandoc 渲染成 `(key?)`),而索引驱动的
   `notes_query` 输出的是新键——同一篇论文,两条取证 CLI 互相矛盾,粘进同一篇稿子就有一半
@@ -452,8 +454,11 @@ sidecar 里的 `dedup_key` 是落盘时的快照,**磁盘上的值永不回写**
   「本批没有新内容要嵌」不蕴含「向量库不需要动」,改键/改元数据同样让它变旧
   (只有 `--list` / `--dry-run` / `--no-index` 这三个只读入口才跳过);
 - `config/launchd/com.xlbd.scholar-embed.plist`(需人工装:`bash scripts/install_embed_sync.sh`)
-  照抄 vault sync 的思路,`WatchPaths` 盯住 `literature_index.json`,索引一变就跑增量同步——
-  索引是所有改动的公共下游,盯住它就一网打尽。
+  照抄 vault sync 的思路,`WatchPaths` 盯 `literature_index.json` 与 `abstracts.json`
+  **两个**文件,任一变动就跑增量同步。必须两个都盯:`abstracts.json` 由
+  `backfill_abstracts.py` 直写 sidecar、**完全不经过索引**,只盯索引的话摘要回填完
+  `ab:` 厚 chunk 要悬空到下一次无关的索引变动才生效。反过来也一样——回填摘要后
+  **不需要**手动刷索引来触发重嵌,sidecar 一落盘 watcher 自己就跑。
 
 落在 **0.45–0.70** 的对**不合并**,列进 `title_near_duplicates[]` 等人工确认——该区间实测混有
 大量不同论文(短标题/截断标题尤其容易假阳性),而**误合并会静默吞掉一篇**(下游一律按

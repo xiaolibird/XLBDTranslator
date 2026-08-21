@@ -442,6 +442,35 @@ def test_retrieve_evidence_bucket_is_soft_not_hard_filter():
     assert evs[0].score == pytest.approx(0.58)              # 展示分数仍是原始余弦
 
 
+def test_retrieve_evidence_relative_threshold_trims_strong_query_tail():
+    """P1a 相对判据：eff_min = max(floor, α×top1)。强 query（top1 高）时边缘尾巴
+    被抬高的门槛剪掉；α=0 关闭后退回纯绝对阈值（尾巴保留）——floor 语义不变。"""
+    rec_hi = _fake_highlight_record("strongKey", 0.90)
+    rec_lo = _fake_highlight_record("tailKey", 0.56)     # 过 floor 0.55，但 0.85×0.90=0.765 之下
+    store = _fake_store([rec_hi, rec_lo])
+    spec = T.TopicSpec(slug="t", title="t", question="q?", queries=["query"],
+                       buckets=[], exclude_sections=[])
+
+    evs = T.retrieve_evidence(spec, store, _FakeEmbedClient(), min_sim=0.55)
+    assert [e.citekey for e in evs] == ["strongKey"]      # 尾巴被相对门槛剪掉
+
+    evs_off = T.retrieve_evidence(spec, store, _FakeEmbedClient(), min_sim=0.55,
+                                  relative_alpha=0.0)
+    assert {e.citekey for e in evs_off} == {"strongKey", "tailKey"}   # 关闭后保留
+
+
+def test_retrieve_evidence_relative_threshold_keeps_cold_query_floor():
+    """冷门 query（top1 低）：α×top1 < floor 时门槛退回 floor，个位数召回是诚实的
+    库覆盖信号，不得被相对判据进一步收紧。"""
+    rec_a = _fake_highlight_record("coldA", 0.60)
+    rec_b = _fake_highlight_record("coldB", 0.56)         # 0.85×0.60=0.51 < floor
+    store = _fake_store([rec_a, rec_b])
+    spec = T.TopicSpec(slug="t", title="t", question="q?", queries=["query"],
+                       buckets=[], exclude_sections=[])
+    evs = T.retrieve_evidence(spec, store, _FakeEmbedClient(), min_sim=0.55)
+    assert {e.citekey for e in evs} == {"coldA", "coldB"}
+
+
 def test_retrieve_evidence_bucket_bonus_does_not_affect_min_sim_gate():
     """加成只用于排序，不改变 min_sim 判定——一条 bucket 命中但原始相似度不足的证据，
     不能靠加成"买"到过门槛的资格（回归 F1 修法里"先按原始余弦过 min_sim，再加成排序"）。

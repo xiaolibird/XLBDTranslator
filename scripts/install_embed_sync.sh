@@ -6,7 +6,9 @@
 #   bash scripts/install_embed_sync.sh              # 装
 #   bash scripts/install_embed_sync.sh --uninstall  # 卸
 #
-# 触发方式：监视 output/scholar_notes/literature_index.json，一变就增量同步（非定时）。
+# 触发方式：监视 output/scholar_notes/ 下的 literature_index.json 与 abstracts.json，
+# 一变就增量同步（非定时）。abstracts.json 由 backfill_abstracts.py 产出且不碰索引，
+# 不盯它的话摘要回填完 ab: 厚向量要等下一次无关索引变动才生效。
 # 装它是为了堵住一个真实缺口：向量库会因为**入库之外**的原因变旧（改 citekey、改元数据、
 # 手工重建索引），而在此之前唯一的自动同步入口是周度入库，且只在「本周有新论文」时才走到
 # 同步——空窗周整段跳过。库一旧，notes_search --cite 就会吐出磁盘上已不存在的 citekey。

@@ -26,10 +26,17 @@ from ..utils.logger import get_logger
 
 logger = get_logger("journal_screen")
 
-# 近邻相似度 ≥ 此值视为"疑似已在札记库"（in_library 标记）。bge-m3 短文本余弦分布窄：
-# 库内真实近邻 0.63-0.74、同篇自身 >0.9，0.85 取"几乎同文"档；与 workflow._library_neighbors
-# 的召回门槛 min_sim=0.65 是两回事——那是"值得展示"，这是"疑似重复"。
-IN_LIBRARY_SIM_THRESHOLD = 0.85
+# 近邻相似度 ≥ 此值视为"疑似已在札记库"（in_library 标记）。与 workflow._library_neighbors
+# 的召回门槛 min_sim=0.62 是两回事——那是"值得展示"，这是"疑似重复"。
+# 0.82 是 2026-08-21 摘要喂厚（双 chunk，sim 多来自 ab: 厚向量）后的重标定值，此前 0.85
+# 的依据（"真近邻 0.63-0.74、同篇自身 >0.9"）是瘦库口径实测，喂厚后已作废：
+# 1804 篇全量自回找（query=title+abstract[:800]，paper+abstract 掩码，按 citekey 取最高分）
+# 实测同篇自身 p1=0.903、中位 0.983，但尾部有 6 篇 <0.85（长中文判词稀释 ab: 向量所致），
+# 0.85 会漏标；异篇真近邻实测上界 0.74，0.82 仍有 8pt 边际。0.74-0.82 是缓冲区勿再调低。
+# 残余假阴性两类，阈值救不了：摘要在 abstracts.json 里本就是垃圾串（如 "International
+# audience"）的库内篇，以及个别判词极长的篇（实测最低 0.798）——兜底靠 ingest 的
+# dedup_key 去重。定案依据见 docs/decisions/digest_neighbors_calibration_2026-08.md 方法三。
+IN_LIBRARY_SIM_THRESHOLD = 0.82
 
 # ---------------------------------------------------------------- 黑名单词表
 # 分类组织，每类有一个前缀注释说明口径。

@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import httpx  # noqa: E402
 
 from src.scholar.paths import repo_path  # noqa: E402
+from src.scholar.notes_index import INDEX_JSON  # noqa: E402
 from src.scholar._citekey_utils import infer_date_precision  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
@@ -210,7 +211,7 @@ def main():
 
 def _sync_bundles(nd: Path, per_file) -> int:
     """把归一后的精度写回 manual bundle 的 segment.metadata（按 citekey→DOI/标题 匹配）。"""
-    idx_path = nd / "literature_index.json"
+    idx_path = nd / INDEX_JSON
     if not idx_path.exists():
         return 0
     idx = json.loads(idx_path.read_text(encoding="utf-8"))

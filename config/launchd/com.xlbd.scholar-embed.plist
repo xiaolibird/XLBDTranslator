@@ -3,8 +3,9 @@
 <!--
   札记库 → 语义向量库（embeddings.sqlite3）自动增量同步（launchd 用户代理）。
 
-  和 com.xlbd.scholar-vault 是同一套思路，监视同一个文件：literature_index.json 一变
-  就跑一次增量同步。为什么必须是 WatchPaths 而不是定时：
+  和 com.xlbd.scholar-vault 是同一套思路：literature_index.json（+ 摘要 sidecar
+  abstracts.json，理由见下方 WatchPaths 注释）一变就跑一次增量同步。
+  为什么必须是 WatchPaths 而不是定时：
 
     向量库的 chunk 上带着 citekey 与 year 两列，是语义检索结果回传给写作侧的**唯一
     身份来源**。它会因为「入库」之外的原因变旧——改键（audit_citekeys_vs_pmlr.py
@@ -69,10 +70,18 @@
         <string>localhost,127.0.0.1,::1</string>
     </dict>
 
-    <!-- 索引一变就跑增量同步 -->
+    <!-- 索引或摘要 sidecar 一变就跑增量同步。
+         abstracts.json 必须单独列上（2026-08-21）：backfill_abstracts.py 只写这个
+         sidecar、从不碰索引，只盯索引的话回填跑完 ab: 厚 chunk 不会出现，要等到下一次
+         无关的索引变动才顺带生效——P0 喂厚在无人值守场景可静默悬空整周。
+         该文件在首次回填前不存在：launchd 对不存在的 WatchPaths 项按「创建即触发」处理，
+         不影响装载。回填运行中每 ~100 条 flush 一次也会触发，600s 节流下最多多跑一两次
+         增量——每轮都是真实的部分嵌入（flush 新增约 100 键，不是空跑），配合
+         embed_store 的 ab: 骤缩/删除双闸不会误删已有厚向量，可接受。 -->
     <key>WatchPaths</key>
     <array>
         <string>__REPO_ROOT__/output/scholar_notes/literature_index.json</string>
+        <string>__REPO_ROOT__/output/scholar_notes/abstracts.json</string>
     </array>
 
     <key>RunAtLoad</key>

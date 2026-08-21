@@ -421,10 +421,10 @@ def main():
             results = []
     # 全局去重集：从文献索引恢复（跨运行持久化——跑新月份不与历史月重复）。
     # --force 重跑历史月时剔除待跑月份自己的键，否则本月论文全在 seen 里会被 dedup 成空札记。
-    from src.scholar.notes_index import load_seen_keys, existing_citekeys
+    from src.scholar.notes_index import INDEX_JSON, load_seen_keys, existing_citekeys
     run_months = {"{:04d}-{:02d}".format(y, m) for y, m in months}
     seen: set = load_seen_keys(
-        Path(settings.processing.notes_dir) / "literature_index.json",
+        Path(settings.processing.notes_dir) / INDEX_JSON,
         exclude_months=run_months if args.force else None)
     logger.info("跨运行去重集：从索引恢复 {} 个键".format(len(seen)))
     # 与 seen 同源一次性计算 existing_ckeys，避免 41 个月每轮重复读 literature_index.json。
@@ -433,7 +433,7 @@ def main():
     # 改回原键，来回改名（citekey 抖动，同 read_pdf._rebuild_month 已修过的坑）。
     own_note_files = ({"科研札记_{}_全文精读.md".format(label) for label in run_months}
                       if args.force else set())
-    idx_path = Path(settings.processing.notes_dir) / "literature_index.json"
+    idx_path = Path(settings.processing.notes_dir) / INDEX_JSON
     existing_ckeys: set = existing_citekeys(idx_path, exclude_note_files=own_note_files)
 
     for i, (y, m) in enumerate(months, 1):

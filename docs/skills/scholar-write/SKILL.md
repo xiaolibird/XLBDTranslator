@@ -53,8 +53,8 @@ description: 用本机科研札记文献库支撑论文写作：按 role 轴(可
 /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py <中文或英文查询...> --role citable|refutable|method [--cite] [--json]
 ```
 `--mode` 默认 `hybrid`（dense 向量 + BM25 关键词 RRF 融合），也可 `--mode dense`/`--mode sparse`。
-两路都跑过、结果按 citekey 去重合并即可。**注意覆盖面**：句级证据（highlights）只覆盖库内精读
-文献（截至 2026-08 约 508 篇，占 keeper 的 24%）——`notes_search` 命中若标注"该篇无精读句级证据"，
+两路都跑过、结果按 citekey 去重合并即可。**注意覆盖面**：句级证据（highlights）只覆盖库内约三成
+条目（精确数见 output/scholar_notes/AGENTS.md，实时数以 literature_index.json 为准）——`notes_search` 命中若标注"该篇无精读句级证据"，
 只是语义命中了标题/一句话用处，不能当句级可引证据用；真要引用还得回 `notes_query`/原文核实有没有
 对应句子。
 

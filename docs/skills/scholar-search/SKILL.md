@@ -81,7 +81,9 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 判断"库里是否已有类似文献"（比自动的 📚 标注更模糊的相似判断）可用语义检索：
 `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py "<标题或摘要句>" --level paper --limit 5`
-（XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。
+（XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。`--level paper` 默认走
+瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——加 `--json` 后每条结果的
+`match_source` 会标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇/近邻"更可信）。
 
 ## 边界
 

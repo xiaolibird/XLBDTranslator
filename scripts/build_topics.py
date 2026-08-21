@@ -35,6 +35,7 @@ from src.scholar.embed_store import (                                     # noqa
     read_index_generated_at,
 )
 from src.scholar.llm_client import LLMClient                              # noqa: E402
+from src.scholar.notes_index import load_index_file                       # noqa: E402
 from src.scholar.research_profile import get_default_research_interests   # noqa: E402
 from src.scholar import topics as T                                       # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
@@ -43,15 +44,11 @@ logger = get_logger("build_topics")
 
 
 def _load_index(index_path: Path):
-    if not index_path.exists():
-        print("找不到索引：{}\n先跑：PYTHONPATH=. python scripts/notes_index.py".format(index_path),
-              file=sys.stderr)
-        return None
-    try:
-        return json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print("索引解析失败（{}）：{}".format(index_path, exc), file=sys.stderr)
-        return None
+    """读索引（单点实现在 notes_index.load_index_file，别再各写各的）。"""
+    data, err = load_index_file(index_path)
+    if err:
+        print(err, file=sys.stderr)
+    return data
 
 
 def _fmt(r: T.TopicResult) -> str:

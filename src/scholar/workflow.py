@@ -677,14 +677,21 @@ class ScholarWorkflow:
         return self._filter_prompt_version
 
     def _library_neighbors(self, papers: List[PaperSegment], k: int = 3,
-                            min_sim: float = 0.65) -> Dict[int, List[dict]]:
+                            min_sim: float = 0.62) -> Dict[int, List[dict]]:
         """查札记库（本地已收文献）语义近邻：segment_id -> [{citekey, year, one_line, sim}, ...]。
 
         查询文本口径与 _build_filter_prompt 送审文本一致：title + "\\n" + abstract[:800]（截断
         长度对齐现有裁决 prompt，避免两条截断口径打架）。一次性批量 embed 所有候选论文（不是
-        逐篇请求 Ollama），查 paper 级向量（level=='paper' 掩码）取 top-k，sim < min_sim 丢弃。
-        min_sim=0.65 是实测分界：bge-m3 短文本相似度分布窄，库内真实近邻落在 0.63-0.74，
-        完全离题论文（含共享 ML 词汇者）最高 0.61——0.5 挡不住离题项，勿轻易调低。
+        逐篇请求 Ollama），查 paper+abstract 级向量（双 chunk 掩码，2026-08-21 起摘要独立
+        成 ab: chunk）取 top-k，按 citekey 归并去重，sim < min_sim 丢弃。
+        min_sim=0.62 是 2026-08-21 摘要喂厚后的标定值（此前 0.65 是瘦库口径，已过时）：
+        30 条真实形状查询 × top-3 共 90 对逐对人工判定，≥0.62 注入精度 100%、
+        0.62-0.65 区间有 ~7/90 真近邻被旧值误杀；6 条硬离题探针（量子纠错/小麦施肥/
+        弱引力透镜等）max sim 0.575，与 0.62 有 4.5pt 安全边际。0.60-0.62 是弱相关与
+        离题的混杂区，留作缓冲勿再调低。定案依据是逐对人工判定档案
+        docs/decisions/digest_neighbors_calibration_2026-08.md（方法二；裁决未落脚本，
+        不可脚本复现）。scripts/calibrate_digest_neighbors.py 实现的是同档案判失败的
+        方法一（topics 共现法，正负不可分），仅作分布监控用，复跑不会得出 0.62。
 
         结果按 segment_id 缓存在 self._library_neighbors_cache，同一次 run 内 filter 阶段
         （_build_filter_prompt 注入）与裁决落盘（_build_filter_decision/_fallback_partition
@@ -748,8 +755,11 @@ class ScholarWorkflow:
                             "先跑 PYTHONPATH=. python scripts/notes_embed.py 增量同步".format(
                                 "{:.1f} 小时".format(lag / 3600.0) if lag else "（幅度未知）",
                                 STALE_DEGRADE_SECONDS // 3600))
+                # abstract 级一并检索：概念相近但判词/标题措辞不同的库内论文靠摘要向量
+                # 命中（embed_store 双 chunk 设计）。命中后按 citekey 归并回该篇。
                 self._paper_mask = np.array(
-                    [rec.get("level") == "paper" for rec in self._vector_store.records], dtype=bool)
+                    [rec.get("level") in ("paper", "abstract")
+                     for rec in self._vector_store.records], dtype=bool)
             store = self._vector_store
             mask = self._paper_mask
 
@@ -767,17 +777,31 @@ class ScholarWorkflow:
             ]
             vecs = client.embed(texts)
 
+            # abstract 命中要反查该篇 paper 记录取 title/one_line（摘要文本绝不能进
+            # 裁决 prompt：一是每候选 ×k 近邻各膨胀 800 字，二是 prompt 把该字段定义
+            # 为人工判词，整段摘要冒充判词会改变裁决语义）。映射每次调用重建（万条
+            # dict 毫秒级，批量 embed 才是本函数的成本大头，不值得为它加缓存状态）。
+            paper_rec_by_ck = {rec.get("citekey"): rec for rec in store.records
+                               if rec.get("level") == "paper"}
+
             n_self = 0
             for paper, vec in zip(to_query, vecs):
-                hits = store.search(vec, mask=mask, top_k=k)
-                neighbors = []
+                hits = store.search(vec, mask=mask, top_k=k * 2)
+                by_ck = {}
                 self_key = _norm_title(paper.metadata.title)
                 for idx, sim in hits:
                     if sim < min_sim:
                         continue
                     rec = store.records[idx]
-                    # paper chunk 文本 = title + "\n" + one_line（one_line 为空则只有 title）
-                    text_parts = (rec.get("text") or "").split("\n", 1)
+                    ck = rec.get("citekey")
+                    if ck in by_ck:      # paper/abstract 双 chunk 同篇命中：保留首个（分数更高）
+                        continue
+                    prec = paper_rec_by_ck.get(ck)
+                    if prec is None:
+                        continue         # 摘要在库但 paper 级残缺（title/one_line 全空），没法展示
+                    # paper chunk 文本 = title + "\n" + one_line（split 取第 2 段；
+                    # 摘要独立成 ab: chunk，永远不在这份文本里）
+                    text_parts = (prec.get("text") or "").split("\n")
                     one_line = text_parts[1] if len(text_parts) > 1 else ""
                     # 自命中：Google Scholar 邮件臂每周会重复推送已入库论文，而 seen 去重发生在
                     # filter 之后，所以这里必然会检索到论文自己。**保留这条近邻**——prompt 要靠它
@@ -789,12 +813,15 @@ class ScholarWorkflow:
                     if self_key and _norm_title(text_parts[0]) == self_key:
                         one_line = "（本篇自身的在库记录，仅可用于判定重复，不是独立佐证）"
                         n_self += 1
-                    neighbors.append({
-                        "citekey": rec.get("citekey"),
-                        "year": rec.get("year"),
+                    by_ck[ck] = {
+                        "citekey": ck,
+                        "year": prec.get("year"),
                         "one_line": one_line,
                         "sim": round(float(sim), 3),
-                    })
+                    }
+                    if len(by_ck) >= k:
+                        break
+                neighbors = list(by_ck.values())
                 self._library_neighbors_cache[paper.segment_id] = neighbors
                 result[paper.segment_id] = neighbors
             if n_self:

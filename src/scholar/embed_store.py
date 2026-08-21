@@ -27,7 +27,7 @@ except ImportError:
     fcntl = None  # Windows fallback
 
 from ..utils.logger import get_logger
-from .notes_index import is_retracted
+from .notes_index import INDEX_JSON, is_retracted
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,26 @@ SCHEMA_VERSION = 2  # v2: highlight chunk id 掺入 role+序号，修复同文�
 
 DB_NAME = "embeddings.sqlite3"  # notes_dir 下的库文件名，全部调用方从这里取，别再各自硬编码
 
-INDEX_NAME = "literature_index.json"  # 同目录的索引文件名（新鲜度比对的另一端）
+# 同目录索引文件名（新鲜度比对的另一端）。权威常量是 notes_index.INDEX_JSON——
+# 这里保留旧名 re-export（既有调用方 from embed_store import INDEX_NAME 不动）。
+# 2026-08-21 收敛前该文件名字面量散在 12 个文件 16 处、外加 4 个各自为政的常量。
+INDEX_NAME = INDEX_JSON
+
+# 摘要 sidecar（scripts/backfill_abstracts.py 的产物，dedup_key -> {abstract, ...}）。
+# 加载责任收在 sync_store 单点：5 个生产入口（notes_embed/ingest_notes/read_pdf/
+# backfill_notes/notes_index 改键）零改动、期望集天然一致——任何一个入口漏接
+# abstracts 都会把 2200+ 条 paper 级向量在厚/瘦文本间反复震荡重嵌（本批审核 high）。
+ABSTRACTS_NAME = "abstracts.json"
+ABSTRACT_CLIP = 800  # ab: 厚 chunk 拼入的摘要截断长度，与 digest 查询侧 abstract[:800] 对齐
+
+# 增量路径 ab: 删除量独立上限（2026-08-21 第3轮：0.5 比例闸只挡 <50% 阶段——删 sidecar
+# 从头重跑 backfill 时每 ~100 键 flush 一次，一旦某次 watcher 采样落在 50%-99% 窗口，
+# 比例闸放行、增量会把未抓完的几百条 ab: 厚向量当场删掉再随后续 flush 分批重嵌）。
+# 按"本次要删多少条 ab:"设独立闸：超过 max(FLOOR, old_ab*RATIO) 即拒绝。
+# FLOOR 容忍零星合法删减（撤稿踢库/个别摘要修订/少量改键）；RATIO 兜大库比例。
+# 残余放行窗口只剩最后 ~RATIO（1804 条约 90 条），震荡规模从上千条压到一次 flush 量级。
+_AB_DELETE_FLOOR = 20
+_AB_DELETE_RATIO = 0.05
 
 # 向量库落后索引超过这个秒数就不再"只是提醒"：无人值守的消费方应直接降级为不用向量库。
 # 24h 的依据：唯一的自动同步入口是周度 ingest（周一 09:30），正常节奏下库最多落后一天；
@@ -93,11 +112,48 @@ _CHUNK_COLUMNS = (
     "tier", "bucket", "year", "has_full_text", "note_file", "note_line",
     "text", "text_hash", "vec",
 )
+# 元数据列 = 除主键/文本/哈希/向量外的全部列。增量 diff 的 SELECT、meta UPDATE 语句
+# 与 _meta_tuple 都由它生成（2026-08-21 收敛前三处各写一遍列名清单，加列必漂移）。
+# 列名与 Chunk 的字段名一一同名——_meta_tuple 的 getattr 依赖这一点。
+_META_COLUMNS = tuple(c for c in _CHUNK_COLUMNS if c not in ("id", "text", "text_hash", "vec"))
 
 
 class VectorStoreError(RuntimeError):
     """库文件缺失 / schema 版本不兼容 / 结构异常。调用方（notes_search.py 等）
     据此退出码 2 并给可操作提示，不把 traceback 抛给用户。"""
+
+
+def load_abstracts(dir_path) -> Dict[str, str]:
+    """读 <dir>/abstracts.json 的 abstracts 段 -> {dedup_key: 摘要文本}。
+
+    文件缺失返回空 dict（喂厚未回填时行为与历史完全一致）；文件**存在但读不出/
+    结构不对**则 raise VectorStoreError——"按无摘要处理"会让 sync_store 的期望集
+    一条 ab: 都不含，增量 diff 随之把库内全部 abstract 级向量静默删光（骤缩闸
+    比值约 0.92 拦不住），digest 的 min_sim=0.62 是厚库标定值，删光即阈值失配；
+    sidecar 修好后又整批重嵌，正是文件头注释标 high 的厚/瘦震荡。同款宁缺毋滥。
+    单条 entry 结构不对仍只跳过：局部脏数据不该整文件连坐。
+    """
+    p = Path(dir_path) / ABSTRACTS_NAME
+    if not p.exists():
+        return {}
+    try:
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise VectorStoreError(
+            "{} 存在但读不出（{}）。拒绝同步：按无摘要继续会删光库内全部 abstract 级"
+            "向量。请修复该文件后重跑；确认回退瘦库请删除该文件并删除库文件后 --full 重建（增量路径的 ab: 骤缩闸会拦下 new_ab=0，防误删事故——有意回退必须走 --full）。".format(p, e))
+    raw = data.get("abstracts") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        raise VectorStoreError(
+            "{} 缺少 abstracts 段或结构不对。拒绝同步：按无摘要继续会删光库内全部"
+            " abstract 级向量。请修复该文件后重跑；确认回退瘦库请删除该文件并删除库文件后 --full 重建（增量路径的 ab: 骤缩闸会拦下 new_ab=0，防误删事故——有意回退必须走 --full）。".format(p))
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        text = v.get("abstract") if isinstance(v, dict) else None
+        if isinstance(text, str) and text.strip():
+            out[k] = text
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +179,19 @@ class Chunk:
     note_line: Optional[int]
 
 
-def chunks_from_index(index: dict) -> List[Chunk]:
-    """literature_index.json -> 两级 chunk 列表。
+def chunks_from_index(index: dict, abstracts: Optional[Dict[str, str]] = None) -> List[Chunk]:
+    """literature_index.json -> 三级 chunk 列表（paper / abstract / highlight）。
 
     只取 duplicate_of 为空且有 citekey 的 keeper（与 notes_query.py 的入选口径一致）。
-    paper 级：id=`p:<citekey>`，文本=title+"\\n"+one_line（one_line 空则仅 title）。
+    paper 级：id=`p:<citekey>`，文本=title+"\\n"+one_line（one_line 空则仅 title）——瘦精准向量。
+    abstract 级：id=`ab:<citekey>`，文本=title+"\\n"+one_line+"\\n"+摘要[:ABSTRACT_CLIP]——厚召回向量。
+      **一篇双向量，而不是把摘要拼进 paper 文本**（2026-08-21 三轮 bench A/B 实测）：
+      - 只有混合文本（拼进 paper）：概念换述 @5 63%→73% 但中文判词 @1 87%→73%（稀释）；
+      - 摘要单独成 chunk（纯英文摘要文本）：判词恢复，但中文换述查询跨语命中弱，@5 掉回 63%；
+      - 现方案：瘦 paper 向量保判词精准，厚 ab: 向量（判词+摘要同文，中文判词当跨语桥）保召回，
+        检索侧按 citekey 聚组取最优（notes_search / workflow._library_neighbors）。
+      附带好处：回填/更新摘要只动 ab: chunk，paper 向量与其 text_hash 纹丝不动。
+    abstracts 参数由 sync_store 单点加载注入（load_abstracts），保持本函数纯函数契约。
     highlight 级：id=`h:<citekey>:<role>:<sha1(text)[:12]>:<seq>`——内容寻址（句子编辑/citekey
     改名会自然让旧 id 消失、新 id 出现，sync_store 的 diff 据此"删旧嵌新"）；掺入 role+序号避免
     同篇同文本不同 role（如一句同时标 citable/refutable）碰撞覆盖丢数据。
@@ -162,10 +226,13 @@ def chunks_from_index(index: dict) -> List[Chunk]:
         note_file = e.get("note_file")
         note_line = e.get("note_line")
 
-        # 压掉内嵌换行：paper 文本用 "\n" 分隔 title/one_line，下游 split("\n",1) 还原，
+        # 压掉内嵌换行：paper 文本用 "\n" 分隔 title/one_line，下游 split("\n") 还原，
         # 多行标题（邮件解析产物）会把标题后半误当 one_line
         title = (e.get("title") or "").replace("\n", " ").strip()
         one_line = (e.get("one_line") or "").replace("\n", " ").strip()
+        abstract = ""
+        if abstracts:
+            abstract = (abstracts.get(e.get("dedup_key") or "") or "").replace("\n", " ").strip()
         paper_text = "{}\n{}".format(title, one_line) if one_line else title
         if not paper_text:
             # title 与 one_line 都空：嵌空串只会得到无意义向量占据检索名额。
@@ -176,6 +243,17 @@ def chunks_from_index(index: dict) -> List[Chunk]:
         else:
             out.append(Chunk(
                 id="p:{}".format(citekey), level="paper", citekey=citekey, text=paper_text,
+                role=None, tag=None, section=None, month=month, series=series, tier=tier,
+                bucket=bucket, year=year, has_full_text=has_full_text,
+                note_file=note_file, note_line=note_line,
+            ))
+        if abstract:
+            # 厚召回 chunk（见 docstring：title/one_line 与摘要同文，判词作跨语桥）。
+            # paper 级被跳过（title/one_line 全空）时它照样入库——citekey 聚组的消费方
+            # 会因缺 paper 元数据而跳过展示，但这类残条极少，不为它们丢摘要向量。
+            out.append(Chunk(
+                id="ab:{}".format(citekey), level="abstract", citekey=citekey,
+                text="{}\n{}\n{}".format(title, one_line, abstract[:ABSTRACT_CLIP]),
                 role=None, tag=None, section=None, month=month, series=series, tier=tier,
                 bucket=bucket, year=year, has_full_text=has_full_text,
                 note_file=note_file, note_line=note_line,
@@ -221,11 +299,18 @@ class SyncStats:
     total: int = 0
     embedded: int = 0
     embedded_paper: int = 0
+    embedded_abstract: int = 0
     embedded_highlight: int = 0
     deleted: int = 0
     deleted_paper: int = 0
+    deleted_abstract: int = 0
     deleted_highlight: int = 0
+    # meta_refreshed：text_hash 未变（无需重嵌）的行数——历史语义保持不变（消费方按
+    # "total - embedded" 理解它）。真正执行 UPDATE 的行数在 meta_updated：
+    # 只有元数据列真的变了才 UPDATE。零变化的重复同步 meta_updated 必须为 0
+    # （此前 hash 相同的 2 万行每次全量 UPDATE 刷一遍，纯 churn）。
     meta_refreshed: int = 0
+    meta_updated: int = 0
     model: str = ""
     dry_run: bool = False
     full: bool = False
@@ -272,7 +357,9 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
     - progress_cb(done, total)：每嵌完一批（batch_size 条）回调一次，供 CLI 打进度行。
     """
     db_path = Path(db_path)
-    chunks = chunks_from_index(index)
+    # abstracts 单点加载：按库文件同目录自动发现，5 个生产入口零改动。
+    # 若改成调用方传参，任一入口漏传都会让期望集在厚/瘦文本间震荡（全体 paper 级重嵌）。
+    chunks = chunks_from_index(index, abstracts=load_abstracts(db_path.parent))
     if not chunks:
         # 索引为空（重建中途产物/误配置）时 --full 会把现有库整体替换成 0 行，不可逆丢失。
         # 宁缺毋滥：空期望集一律拒绝落库，提示先核对索引。
@@ -343,6 +430,7 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     "索引 chunk 数 {} 不到现有库 {} 的一半，疑似索引过期/部分生成。"
                     "拒绝 --full 替换，避免好库被缩水。确认无误请手动处理。".format(
                         len(chunks), old_count))
+        existing_meta: Dict[str, Tuple] = {}
         if db_exists and not full:
             # connect() 在 try 外：它自己抛错时直接向上传播，不存在 close 未定义对象的问题
             conn = sqlite3.connect(str(db_path))
@@ -357,9 +445,12 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                         "向量库 embedding 模型是 '{}'，配置改为 '{}'：增量同步会重嵌全部 {} 条。"
                         "建议先 `notes_embed.py --full` 一次性重建（迁移命令）。"
                         .format(old_model, model, len(chunks)))
-                for cid, h, lvl in conn.execute("SELECT id, text_hash, level FROM chunks"):
+                for row in conn.execute(
+                        "SELECT id, text_hash, {} FROM chunks".format(", ".join(_META_COLUMNS))):
+                    cid, h, lvl = row[0], row[1], row[2]
                     existing_hash[cid] = h
                     existing_level[cid] = lvl
+                    existing_meta[cid] = row[2:]     # 与 _META_COLUMNS 逐位对齐（首列是 level）
             finally:
                 conn.close()
 
@@ -373,25 +464,64 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     len(chunks), len(existing_hash),
                     sum(1 for cid in existing_hash if cid not in expected)))
 
+        if not full:
+            # abstracts.json 误删/截半专项闸（load_abstracts 只拦"存在但坏"，文件整个
+            # 没了或键只剩半截是合法内容路径，会走到这里）。两道并联条件：
+            # 1) ab: 级期望数不到库内一半——与 0.5 总量闸同款口径（总量闸按全部 chunk
+            #    计，ab: 占比小、删光也拉不动比值），拦住 sidecar 整体消失（new_ab=0）
+            #    与部分重建产物的前半程；
+            # 2) 本次要删的 ab: 数超过 max(_AB_DELETE_FLOOR, old_ab*_AB_DELETE_RATIO)
+            #    ——只有条件 1 时，删掉 sidecar 从头重跑 backfill_abstracts.py（每 ~100
+            #    键 flush 一次，watcher 盯 abstracts.json 随即增量同步）的中途产物一旦
+            #    越过半数即被放行，未抓完的几百条 ab: 厚向量仍会被当场删掉再随后续
+            #    flush 分批重嵌（2026-08-21 第3轮确认：50%-99% 窗口长达十几分钟，
+            #    600s 节流的 watcher 必有采样落入）。删除量闸把放行窗口压到最后
+            #    ~_AB_DELETE_RATIO，残余震荡至多一次 flush 量级。
+            # 有意回退瘦库/大批改键的出口是删库后 --full 重建（full 路径不经此闸）。
+            old_ab = sum(1 for lvl in existing_level.values() if lvl == "abstract")
+            new_ab = sum(1 for c, _ in expected.values() if c.level == "abstract")
+            if old_ab:
+                ab_delete = sum(1 for cid, lvl in existing_level.items()
+                                if lvl == "abstract" and cid not in expected)
+                ab_delete_cap = max(_AB_DELETE_FLOOR, old_ab * _AB_DELETE_RATIO)
+                if new_ab < old_ab * 0.5 or ab_delete > ab_delete_cap:
+                    raise VectorStoreError(
+                        "期望集 abstract 级 chunk {} 条（库内 {} 条），本次将删除 {} 条厚向量"
+                        "（增量上限 {:g}）——疑似 {} 被误删/截半，或 backfill 从头重抓的中途"
+                        "产物。拒绝增量同步（批删后再分批重嵌会造成厚向量震荡并让 digest "
+                        "阈值失配）。请核对该文件或等 backfill 抓完；确认回退瘦库或大批改键，"
+                        "请删除库文件后 --full 重建。".format(
+                            new_ab, old_ab, ab_delete, ab_delete_cap, ABSTRACTS_NAME))
+
+        def _meta_tuple(c: Chunk) -> Tuple:
+            """与增量读库 SELECT 的 row[2:] 逐位对齐（列序由 _META_COLUMNS 单点定义）。"""
+            return tuple(getattr(c, col) for col in _META_COLUMNS)
+
         to_embed_ids: List[str] = []
-        meta_refresh_ids: List[str] = []
+        meta_refresh_ids: List[str] = []   # hash 未变（不重嵌）——含元数据也没变的行
+        meta_update_ids: List[str] = []    # 其中元数据真变了、需要 UPDATE 的子集
         for cid, (c, h) in expected.items():
             old = existing_hash.get(cid)
             if old is None or old != h:
                 to_embed_ids.append(cid)
             else:
                 meta_refresh_ids.append(cid)
+                if existing_meta.get(cid) != _meta_tuple(c):
+                    meta_update_ids.append(cid)
         to_delete_ids = [] if full else [cid for cid in existing_hash if cid not in expected]
 
         stats = SyncStats(
             total=len(expected),
             embedded=len(to_embed_ids),
             embedded_paper=sum(1 for cid in to_embed_ids if expected[cid][0].level == "paper"),
+            embedded_abstract=sum(1 for cid in to_embed_ids if expected[cid][0].level == "abstract"),
             embedded_highlight=sum(1 for cid in to_embed_ids if expected[cid][0].level == "highlight"),
             deleted=len(to_delete_ids),
             deleted_paper=sum(1 for cid in to_delete_ids if existing_level.get(cid) == "paper"),
+            deleted_abstract=sum(1 for cid in to_delete_ids if existing_level.get(cid) == "abstract"),
             deleted_highlight=sum(1 for cid in to_delete_ids if existing_level.get(cid) == "highlight"),
             meta_refreshed=len(meta_refresh_ids),
+            meta_updated=len(meta_update_ids),
             model=model, dry_run=dry_run, full=full,
         )
         if dry_run:
@@ -477,15 +607,15 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     for cid, (c, h) in ((cid, expected[cid]) for cid in to_embed_ids)
                 ))
 
-            if meta_refresh_ids:
+            if meta_update_ids:
+                # 只刷元数据真变了的行：hash 相同且元数据相同的 2 万行不再每次全量
+                # UPDATE（零变化同步的 churn 会放大 WAL/磁盘写且掩盖真实变更量）。
                 cur.executemany(
-                    "UPDATE chunks SET level=?, citekey=?, role=?, tag=?, section=?, month=?, "
-                    "series=?, tier=?, bucket=?, year=?, has_full_text=?, note_file=?, note_line=? "
-                    "WHERE id=?",
+                    "UPDATE chunks SET {} WHERE id=?".format(
+                        ", ".join("{}=?".format(col) for col in _META_COLUMNS)),
                     [
-                        (c.level, c.citekey, c.role, c.tag, c.section, c.month, c.series,
-                         c.tier, c.bucket, c.year, c.has_full_text, c.note_file, c.note_line, c.id)
-                        for c, _ in (expected[cid] for cid in meta_refresh_ids)
+                        _meta_tuple(c) + (c.id,)
+                        for c, _ in (expected[cid] for cid in meta_update_ids)
                     ],
                 )
 

@@ -181,7 +181,8 @@ def _db_citekeys(db):
 
 
 def test_sync_store_initial_then_noop(tmp_path):
-    """首次同步全量嵌入；索引不变的第二次同步 0 嵌入、全部 meta_refreshed。"""
+    """首次同步全量嵌入；索引不变的第二次同步 0 嵌入、全部 meta_refreshed，
+    且 meta_updated == 0——零变化同步不许发任何 UPDATE（churn 验收判据）。"""
     db = tmp_path / "e.sqlite3"
     idx = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1")]),
                       _paper("b2024B")],
@@ -190,6 +191,28 @@ def test_sync_store_initial_then_noop(tmp_path):
     assert (stats.total, stats.embedded, stats.deleted) == (3, 3, 0)
     stats2 = sync_store(db, idx, _FakeEmbedClient())
     assert (stats2.embedded, stats2.deleted, stats2.meta_refreshed) == (0, 0, 3)
+    assert stats2.meta_updated == 0
+
+
+def test_sync_store_meta_change_updates_only_changed_rows(tmp_path):
+    """文本没动、元数据变了（如 tier 调级）→ 不重嵌但 UPDATE，且只 UPDATE 变了的行。"""
+    import sqlite3 as _sq
+    db = tmp_path / "e.sqlite3"
+    idx1 = {"papers": [_paper("a2024A", highlights=[_hl("citable", "s1")]),
+                       _paper("b2024B")]}
+    sync_store(db, idx1, _FakeEmbedClient())
+    idx2 = {"papers": [_paper("a2024A", priority_tier="low", highlights=[_hl("citable", "s1")]),
+                       _paper("b2024B")]}
+    stats = sync_store(db, idx2, _FakeEmbedClient())
+    assert stats.embedded == 0
+    assert stats.meta_refreshed == 3          # 三条 hash 都没变
+    assert stats.meta_updated == 2            # 只有 a 的 paper+highlight 元数据变了
+    conn = _sq.connect(str(db))
+    try:
+        tiers = dict(conn.execute("SELECT citekey, tier FROM chunks WHERE level='paper'"))
+    finally:
+        conn.close()
+    assert tiers == {"a2024A": "low", "b2024B": "high"}   # 变更真的落了库
 
 
 def test_sync_store_incremental_add_change_delete(tmp_path):
@@ -254,6 +277,41 @@ def test_empty_paper_text_skipped():
     chunks = chunks_from_index(idx)
     assert [c.level for c in chunks] == ["highlight"]
     assert chunks[0].text == "句子照常入库"
+
+
+def test_chunk_columns_match_create_table_and_dataclass():
+    """③ 列名单点：CREATE TABLE 的列、_CHUNK_COLUMNS、Chunk 字段三方必须一致——
+    SELECT/UPDATE/INSERT 语句都由 _CHUNK_COLUMNS/_META_COLUMNS 生成，
+    加列时改漏任何一方这条测试就红。"""
+    import re as _re
+    from dataclasses import fields
+    from src.scholar.embed_store import _CREATE_CHUNKS_SQL, _CHUNK_COLUMNS, _META_COLUMNS, Chunk
+    body = _CREATE_CHUNKS_SQL.split("(", 1)[1].rsplit(")", 1)[0]
+    create_cols = [ln.strip().split()[0] for ln in body.replace("\n", ",").split(",")
+                   if ln.strip()]
+    assert tuple(create_cols) == _CHUNK_COLUMNS
+    # Chunk 字段（顺序无关）必须覆盖除 text_hash/vec 外的全部列，且与 _META_COLUMNS 同名
+    chunk_fields = {f.name for f in fields(Chunk)}
+    assert set(_META_COLUMNS) <= chunk_fields
+    assert set(_CHUNK_COLUMNS) - {"text_hash", "vec"} == chunk_fields
+
+
+def test_load_index_file_single_point(tmp_path):
+    """② 读索引单点：缺失/损坏/缺 papers 三态给可操作 err，正常返回 (data, None)。"""
+    from src.scholar.notes_index import load_index_file
+    import json as _json
+    p = tmp_path / "literature_index.json"
+    data, err = load_index_file(p)
+    assert data is None and "找不到索引" in err
+    p.write_text("{broken", encoding="utf-8")
+    data, err = load_index_file(p)
+    assert data is None and "解析失败" in err
+    p.write_text('{"papers": "not-a-list"}', encoding="utf-8")
+    data, err = load_index_file(p)
+    assert data is None and "结构异常" in err
+    p.write_text(_json.dumps({"papers": [], "generated_at": "x"}), encoding="utf-8")
+    data, err = load_index_file(p)
+    assert err is None and data["papers"] == []
 
 
 def test_model_matches_base_name():
@@ -362,13 +420,233 @@ def test_embedding_client_l2_normalizes(monkeypatch):
 
 
 def test_multiline_title_keeps_one_line_alignment():
-    """title 含内嵌换行时，paper 文本仍只有一个分隔换行——split('\\n',1) 还原不错位。"""
+    """title 含内嵌换行时压成一段——按段 split('\\n') 还原不错位。"""
     idx = {"papers": [_paper("h2025NL", title="Line1\nLine2", one_line="一句话")]}
     cks = [c for c in chunks_from_index(idx) if c.level == "paper"]
     assert len(cks) == 1
-    parts = cks[0].text.split("\n", 1)
-    assert parts[0] == "Line1 Line2"
-    assert parts[1] == "一句话"
+    parts = cks[0].text.split("\n")
+    assert parts == ["Line1 Line2", "一句话"]
+
+
+# ---------------- abstracts 喂厚：独立 abstract chunk + sidecar 单点加载 ----------------
+
+from src.scholar.embed_store import load_abstracts, ABSTRACTS_NAME, ABSTRACT_CLIP  # noqa: E402
+
+
+def test_abstract_becomes_separate_chunk():
+    """有摘要 → 独立 ab:<citekey> 厚召回 chunk（title+one_line+摘要三段同文），
+    paper 文本保持两段式纹丝不动——摘要拼进 paper 会稀释中文判词信号
+    （实测 zh_oneline @1 87%→73%），纯英文摘要 chunk 又接不住中文换述查询。"""
+    idx = {"papers": [_paper("i2025Abs", one_line="判词", dedup_key="doi:10.1/x")]}
+    abstracts = {"doi:10.1/x": "First line.\nSecond line. " + "长" * 900}
+    cks = chunks_from_index(idx, abstracts=abstracts)
+    by_level = {c.level: c for c in cks}
+    assert by_level["paper"].text == "T\n判词"                 # 瘦向量不变
+    ab = by_level["abstract"]
+    assert ab.id == "ab:i2025Abs" and ab.citekey == "i2025Abs"
+    parts = ab.text.split("\n")
+    assert parts[0] == "T" and parts[1] == "判词"              # 判词随摘要同文（跨语桥）
+    assert parts[2].startswith("First line. Second line.")     # 摘要换行压平
+    assert len(parts[2]) == ABSTRACT_CLIP                      # 摘要段截断
+    assert ab.role is None and ab.month == by_level["paper"].month   # 元数据同源
+
+
+def test_abstract_chunk_survives_empty_paper_text():
+    """title/one_line 全空的残条：paper 级照旧跳过，abstract chunk 仍入库
+    （消费方按 citekey 找不到 paper 元数据时自行跳过展示）。"""
+    idx = {"papers": [_paper("j2025NoOL", title="", one_line="", dedup_key="doi:10.1/y")]}
+    cks = chunks_from_index(idx, abstracts={"doi:10.1/y": "Some abstract."})
+    assert [c.level for c in cks] == ["abstract"]
+
+
+def test_no_abstract_keeps_legacy_two_segment_text():
+    """abstracts 缺失/缺键时产出与历史逐字节一致（text_hash 不变 → 不触发重嵌），
+    且不产生 abstract chunk。"""
+    idx = {"papers": [_paper("k2025Old", one_line="判词", dedup_key="doi:10.1/z")]}
+    legacy = chunks_from_index(idx)
+    assert [c.level for c in legacy] == ["paper"]
+    assert legacy[0].text == "T\n判词"
+    assert chunks_from_index(idx, abstracts=None)[0].text == legacy[0].text
+    assert chunks_from_index(idx, abstracts={})[0].text == legacy[0].text
+    assert [c.level for c in chunks_from_index(idx, abstracts={"doi:10.1/other": "x"})] == ["paper"]
+
+
+def test_load_abstracts_defensive(tmp_path):
+    """文件缺失 → {}（合法降级）；**存在但损坏/结构不对 → raise**（按无摘要继续
+    会让增量 diff 删光全部 ab: 向量，0.5 骤缩闸拦不住）；正常 → 只收非空 abstract、
+    单条脏 entry 只跳过不连坐。"""
+    assert load_abstracts(tmp_path) == {}
+    p = tmp_path / ABSTRACTS_NAME
+    p.write_text("not json", encoding="utf-8")
+    with pytest.raises(VectorStoreError, match="读不出"):
+        load_abstracts(tmp_path)
+    p.write_text('{"no_abstracts_section": 1}', encoding="utf-8")
+    with pytest.raises(VectorStoreError, match="缺少 abstracts 段"):
+        load_abstracts(tmp_path)
+    p.write_text(
+        '{"abstracts": {"doi:10.1/a": {"abstract": "text A", "source": "openalex"},'
+        ' "doi:10.1/b": {"abstract": "  "}, "doi:10.1/c": "malformed"}}',
+        encoding="utf-8")
+    assert load_abstracts(tmp_path) == {"doi:10.1/a": "text A"}
+
+
+def test_sync_refuses_when_abstracts_sidecar_vanishes(tmp_path):
+    """abstracts.json 被误删（文件不存在 = load_abstracts 合法降级路径）后跑增量：
+    期望集零 ab: 而库内有 → 拒绝同步且库内厚向量原样保留。0.5 骤缩闸对此无感
+    （实测比值 20780/22584≈0.92），没有这道专项闸就是静默删光 + digest 阈值失配。"""
+    import json as _json
+    import sqlite3 as _sq
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("n2025Gone", one_line="判词", dedup_key="doi:10.1/n")]}
+    sidecar = tmp_path / ABSTRACTS_NAME
+    sidecar.write_text(_json.dumps(
+        {"abstracts": {"doi:10.1/n": {"abstract": "An abstract."}}}), encoding="utf-8")
+    sync_store(db, idx, _FakeEmbedClient())                       # 厚库首嵌（p: + ab:）
+    sidecar.unlink()                                              # 模拟误删
+    with pytest.raises(VectorStoreError, match="abstract 级"):
+        sync_store(db, idx, _FakeEmbedClient())
+    conn = _sq.connect(str(db))
+    try:
+        ids = {r[0] for r in conn.execute("SELECT id FROM chunks")}
+    finally:
+        conn.close()
+    assert ids == {"p:n2025Gone", "ab:n2025Gone"}                 # 厚向量未被删
+
+
+def test_sync_refuses_when_abstracts_sidecar_halved(tmp_path):
+    """abstracts.json 被截半/删档重抓的中途产物（2026-08-21 第2轮：闸只拦全灭不拦半灭）：
+    backfill 从头重抓时首次 flush 只落零头键，watcher 随即增量同步——期望集 ab: 仅剩
+    1/3，比例闸必须拒绝且厚向量原样保留，否则其余 ab: 向量被当场删掉再分批重嵌（震荡）。"""
+    import json as _json
+    import sqlite3 as _sq
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("h2025A", one_line="判词", dedup_key="doi:10.1/ha"),
+                      _paper("h2025B", one_line="判词", dedup_key="doi:10.1/hb"),
+                      _paper("h2025C", one_line="判词", dedup_key="doi:10.1/hc")]}
+    sidecar = tmp_path / ABSTRACTS_NAME
+    sidecar.write_text(_json.dumps({"abstracts": {
+        "doi:10.1/ha": {"abstract": "Abs A."},
+        "doi:10.1/hb": {"abstract": "Abs B."},
+        "doi:10.1/hc": {"abstract": "Abs C."}}}), encoding="utf-8")
+    sync_store(db, idx, _FakeEmbedClient())                       # 3 ab: 首嵌
+    sidecar.write_text(_json.dumps({"abstracts": {
+        "doi:10.1/ha": {"abstract": "Abs A."}}}), encoding="utf-8")   # 截到 1/3
+    with pytest.raises(VectorStoreError, match="abstract 级"):
+        sync_store(db, idx, _FakeEmbedClient())
+    conn = _sq.connect(str(db))
+    try:
+        ab_ids = {r[0] for r in conn.execute(
+            "SELECT id FROM chunks WHERE level='abstract'")}
+    finally:
+        conn.close()
+    assert ab_ids == {"ab:h2025A", "ab:h2025B", "ab:h2025C"}      # 厚向量未被删
+
+
+def test_sync_allows_abstract_shrink_at_half_boundary(tmp_path):
+    """边界口径与 0.5 总量闸一致（严格小于才拦）：2 条 ab: 缩到 1 条（恰为一半）放行，
+    合法的少量摘要删减不被误伤。"""
+    import json as _json
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("g2025A", one_line="判词", dedup_key="doi:10.1/ga"),
+                      _paper("g2025B", one_line="判词", dedup_key="doi:10.1/gb")]}
+    sidecar = tmp_path / ABSTRACTS_NAME
+    sidecar.write_text(_json.dumps({"abstracts": {
+        "doi:10.1/ga": {"abstract": "Abs A."},
+        "doi:10.1/gb": {"abstract": "Abs B."}}}), encoding="utf-8")
+    sync_store(db, idx, _FakeEmbedClient())
+    sidecar.write_text(_json.dumps({"abstracts": {
+        "doi:10.1/ga": {"abstract": "Abs A."}}}), encoding="utf-8")
+    stats = sync_store(db, idx, _FakeEmbedClient())
+    assert stats.deleted_abstract == 1                            # 恰半放行，正常删 1 条
+    assert stats.deleted == 1
+
+
+def _abs_idx_and_sidecar(tmp_path, n_total, n_keep):
+    """n_total 篇带摘要的索引 + 只保留前 n_keep 键的 sidecar（模拟 backfill 中途产物）。"""
+    import json as _json
+    idx = {"papers": [_paper("w2025K{}".format(i), one_line="判词",
+                             dedup_key="doi:10.1/k{}".format(i))
+                      for i in range(n_total)]}
+    full = {"doi:10.1/k{}".format(i): {"abstract": "Abs {}.".format(i)}
+            for i in range(n_total)}
+    sidecar = tmp_path / ABSTRACTS_NAME
+    sidecar.write_text(_json.dumps({"abstracts": full}), encoding="utf-8")
+    partial = {"doi:10.1/k{}".format(i): full["doi:10.1/k{}".format(i)]
+               for i in range(n_keep)}
+    return idx, sidecar, _json.dumps({"abstracts": partial})
+
+
+def test_sync_refuses_mass_abstract_delete_past_half(tmp_path):
+    """2026-08-21 第3轮：0.5 比例闸只挡 <50% 阶段——backfill 从头重抓每 ~100 键 flush
+    一次，watcher 采样一旦落在 50%-99% 窗口（new_ab ≥ 半数）比例闸放行，未抓完的
+    ab: 厚向量仍被整批删掉再震荡重嵌。删除量独立闸（> max(20, 5%)）必须拒绝且厚向量
+    原样保留。42 条抓回 21 条：new_ab=21 恰为半数（比例闸放行），ab_delete=21 > 20。"""
+    import sqlite3 as _sq
+    db = tmp_path / "e.sqlite3"
+    idx, sidecar, partial_json = _abs_idx_and_sidecar(tmp_path, 42, 21)
+    sync_store(db, idx, _FakeEmbedClient())                       # 42 ab: 首嵌
+    sidecar.write_text(partial_json, encoding="utf-8")            # 中途产物：21/42
+    with pytest.raises(VectorStoreError, match="abstract 级"):
+        sync_store(db, idx, _FakeEmbedClient())
+    conn = _sq.connect(str(db))
+    try:
+        n_ab = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE level='abstract'").fetchone()[0]
+    finally:
+        conn.close()
+    assert n_ab == 42                                             # 厚向量未被删
+
+
+def test_sync_allows_abstract_delete_at_floor_boundary(tmp_path):
+    """删除量闸边界口径（严格大于才拦）：恰删 _AB_DELETE_FLOOR 条放行——
+    零星合法删减（撤稿踢库/摘要修订）不被误伤。41 条保留 21 条：ab_delete=20 = 闸值。"""
+    db = tmp_path / "e.sqlite3"
+    idx, sidecar, partial_json = _abs_idx_and_sidecar(tmp_path, 41, 21)
+    sync_store(db, idx, _FakeEmbedClient())
+    sidecar.write_text(partial_json, encoding="utf-8")
+    stats = sync_store(db, idx, _FakeEmbedClient())
+    assert stats.deleted_abstract == 20                           # 恰在上限，放行
+    assert stats.deleted == 20
+
+
+def test_sync_refuses_when_abstracts_sidecar_corrupt(tmp_path):
+    """abstracts.json 存在但写坏：sync_store 在单点加载处即拒绝（load_abstracts raise），
+    不产生任何删除计划。"""
+    import json as _json
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("o2025Bad", one_line="判词", dedup_key="doi:10.1/o")]}
+    sidecar = tmp_path / ABSTRACTS_NAME
+    sidecar.write_text(_json.dumps(
+        {"abstracts": {"doi:10.1/o": {"abstract": "An abstract."}}}), encoding="utf-8")
+    sync_store(db, idx, _FakeEmbedClient())
+    sidecar.write_text("{truncated", encoding="utf-8")            # 模拟写坏
+    with pytest.raises(VectorStoreError, match="读不出"):
+        sync_store(db, idx, _FakeEmbedClient())
+
+
+def test_sync_store_discovers_abstracts_sidecar_no_churn(tmp_path):
+    """sync_store 按 db 同目录自动发现 abstracts.json（单点加载，入口零改动）；
+    摘要落地 = 只新增 ab: chunk（paper 向量纹丝不动），第二次增量 0 嵌入——
+    厚/瘦震荡是本批审核确认的 high 风险。"""
+    import json as _json
+    import sqlite3 as _sq
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("m2025Fat", one_line="判词", dedup_key="doi:10.1/m")]}
+    sync_store(db, idx, _FakeEmbedClient())                       # 无摘要首嵌
+    (tmp_path / ABSTRACTS_NAME).write_text(_json.dumps(
+        {"abstracts": {"doi:10.1/m": {"abstract": "An abstract."}}}), encoding="utf-8")
+    stats = sync_store(db, idx, _FakeEmbedClient())
+    assert stats.embedded == 1                                    # 只新增 ab: chunk
+    assert stats.embedded_paper == 0                              # paper 级零扰动
+    stats2 = sync_store(db, idx, _FakeEmbedClient())
+    assert (stats2.embedded, stats2.deleted) == (0, 0)            # 稳定，无震荡
+    conn = _sq.connect(str(db))
+    try:
+        rows = dict(conn.execute("SELECT id, text FROM chunks"))
+    finally:
+        conn.close()
+    assert rows["p:m2025Fat"] == "T\n判词"
+    assert rows["ab:m2025Fat"] == "T\n判词\nAn abstract."
 
 
 # ---------------- workflow._library_neighbors happy path ----------------
@@ -412,6 +690,53 @@ def test_library_neighbors_happy_path():
     assert hits[0]["one_line"] == "一句话甲"
     assert hits[1]["one_line"] == ""                                   # 无 one_line 不错位
     assert wf._library_neighbors_cache[7] == hits                      # 已入缓存
+
+
+def test_library_neighbors_abstract_hit_maps_back_to_paper_one_line():
+    """abstract chunk（ab:）命中：近邻注入必须反查该篇 paper 记录取判词——
+    800 字摘要文本冒充判词进裁决 prompt 是本批审核确认的缺陷模式；
+    同篇 paper+abstract 双命中只保留一条（按 citekey 去重取高分）。"""
+    from types import SimpleNamespace
+    from src.scholar.workflow import ScholarWorkflow
+
+    meta = {"model": "bge-m3", "dim": "2"}
+    records = [
+        # 同一篇论文的两个 chunk：abstract 与 query 更相似（0.99），paper 稍低（0.9）
+        {"level": "abstract", "citekey": "fat2026A", "year": 2026,
+         "text": "A very long backfilled abstract that must stay out."},
+        {"level": "paper", "citekey": "fat2026A", "year": 2026, "text": "Some Title\n人工判词"},
+        # 只有 abstract 在库、paper 级残缺的条目：没法展示，必须被跳过
+        {"level": "abstract", "citekey": "orphan2026B", "year": 2026,
+         "text": "Orphan abstract without paper chunk."},
+    ]
+    v = np.array([[0.99, np.sqrt(1 - 0.9801)],
+                  [0.90, np.sqrt(1 - 0.81)],
+                  [0.80, np.sqrt(1 - 0.64)]], dtype=np.float32)
+    store = VectorStore(meta, records, v)
+
+    class _Client:
+        model = "bge-m3"
+        def probe(self):
+            return {"model": "bge-m3", "dim": 2}
+        def embed(self, texts, batch_size=64):
+            return np.tile(np.array([[1.0, 0.0]], dtype=np.float32), (len(texts), 1))
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=Path(".")),
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None, ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = store
+    wf._paper_mask = np.array([True, True, True])
+    wf._embedding_client = _Client()
+    wf._library_neighbors_unavailable = False
+
+    seg = SimpleNamespace(segment_id=1, metadata=SimpleNamespace(title="q"), original_abstract="a")
+    hits = wf._library_neighbors([seg], k=3, min_sim=0.65)[1]
+    assert [h["citekey"] for h in hits] == ["fat2026A"]      # 双命中去重 + 孤儿摘要被跳过
+    assert hits[0]["one_line"] == "人工判词"                  # 反查 paper 记录的判词
+    assert hits[0]["sim"] == pytest.approx(0.99, abs=1e-3)   # 保留的是更高的 abstract 分
+    assert "abstract" not in hits[0]["one_line"].lower()
 
 
 def test_library_neighbors_self_hit_strips_one_line():
@@ -616,3 +941,76 @@ def test_library_neighbors_warns_but_still_serves_when_only_slightly_stale(tmp_p
     assert wf._library_neighbors_unavailable is False
     assert [h["citekey"] for h in out[1]] == ["fani2025Coefficient"]   # 仍然出结果
     assert any("落后" in s for s in lines)                              # 但提醒照打
+
+
+# ---------------- 第2轮审查回归：abstract 掩码构造必须走真实加载路径 ----------------
+
+def test_library_neighbors_real_load_path_mask_admits_abstract_chunks(tmp_path):
+    """封堵假绿盲区：workflow 里唯一构造 _paper_mask 的分支（`_vector_store is None`
+    时的 `level in ("paper", "abstract")`，workflow.py:760-762）此前零覆盖——既有的
+    ab: 命中/自命中测试全部手工注入 `_paper_mask = np.array([True, ...])`，把表达式
+    回退成 `== "paper"` 全量测试依旧全绿，而 digest 近邻的摘要向量召回（本批 P0 的
+    核心收益）在生产中静默消失。本测试用 sync_store 建真库（p:/ab:/h: 三级 chunk
+    齐备）后让 workflow 自己加载并构造掩码：
+    - query 精确回放 ab: 向量 → 必须以 sim≈1.0 命中并反查回 paper 判词；
+    - query 精确回放 highlight 向量 → 必须空手（掩码同时要挡住 highlight 级）。"""
+    import json as _json
+    from types import SimpleNamespace
+    from src.scholar.embed_store import DB_NAME
+    from src.scholar.workflow import ScholarWorkflow
+
+    gen = "2026-08-21T09:00:00"
+    db = tmp_path / DB_NAME
+    (tmp_path / ABSTRACTS_NAME).write_text(_json.dumps(
+        {"abstracts": {"doi:10.1/mask": {"abstract": "A thick recall abstract."}}}),
+        encoding="utf-8")
+    idx = {"generated_at": gen,
+           "papers": [_paper("mask2026Fat", one_line="人工判词", dedup_key="doi:10.1/mask",
+                             highlights=[_hl("citable", "a highlight sentence")])]}
+    sync_store(db, idx, _FakeEmbedClient())              # source_generated_at=gen，新鲜度对齐
+    (tmp_path / "literature_index.json").write_text(
+        '{"schema_version": 4, "generated_at": "%s", "papers": []}' % gen, encoding="utf-8")
+
+    loaded = VectorStore.load(db)
+    vec_by_id = {rec["id"]: loaded.mat[i].copy() for i, rec in enumerate(loaded.records)}
+    ab_vec = vec_by_id["ab:mask2026Fat"]
+    hl_vec = next(v for cid, v in vec_by_id.items() if cid.startswith("h:"))
+
+    class _ReplayClient:
+        model = "bge-m3"
+        def __init__(self, vecs):
+            self._vecs = vecs
+        def probe(self):
+            return {"model": "bge-m3", "dim": int(ab_vec.shape[0])}
+        def embed(self, texts, batch_size=64):
+            assert len(texts) == len(self._vecs)
+            return np.stack(self._vecs)
+
+    wf = ScholarWorkflow.__new__(ScholarWorkflow)
+    wf.settings = SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=tmp_path),
+        llm=SimpleNamespace(embedding_model="bge-m3", embedding_base_url=None,
+                            ollama_base_url=None))
+    wf._library_neighbors_cache = {}
+    wf._vector_store = None                              # 关键：不注入，逼生产分支自建掩码
+    wf._paper_mask = None
+    wf._embedding_client = _ReplayClient([ab_vec, hl_vec])
+    wf._library_neighbors_unavailable = False
+
+    segs = [SimpleNamespace(segment_id=1, metadata=SimpleNamespace(title="q1"),
+                            original_abstract="a"),
+            SimpleNamespace(segment_id=2, metadata=SimpleNamespace(title="q2"),
+                            original_abstract="b")]
+    out = wf._library_neighbors(segs, k=3, min_sim=0.999)   # 只有精确回放才够到阈值
+
+    assert wf._library_neighbors_unavailable is False        # 全程没走静默降级
+    # 掩码表达式本体：paper/abstract 放行、highlight 拦下，且三种 level 都真实在库
+    levels = [r.get("level") for r in wf._vector_store.records]
+    assert {"paper", "abstract", "highlight"} <= set(levels)
+    assert [bool(m) for m in wf._paper_mask] == [lvl in ("paper", "abstract") for lvl in levels]
+    # ab: 命中走通生产掩码，并反查 paper 记录取判词（摘要文本不外泄）
+    assert [h["citekey"] for h in out[1]] == ["mask2026Fat"]
+    assert out[1][0]["sim"] == pytest.approx(1.0, abs=1e-5)
+    assert out[1][0]["one_line"] == "人工判词"
+    # highlight 向量即使与 query 余弦为 1 也不得进近邻
+    assert out[2] == []

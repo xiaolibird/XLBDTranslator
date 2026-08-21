@@ -85,6 +85,17 @@ DEFAULT_MIN_SIM = 0.55
 # 证据排到前面，但不足以让加成后的分数跨档反超一条明显更相关的证据。
 DEFAULT_BUCKET_BONUS = 0.03
 
+# per-query 相对判据系数：eff_min = max(min_sim, alpha × 本次 query 的 top1 分)。
+# 全局绝对阈值与查询强度耦合（2026-08-21 标定，config/topics.yaml 全部 36 条真实 query
+# 实测，表存 docs/decisions/topics_threshold_calibration_2026-08.md）：强 query
+# （top1≥0.70，如 "informative missingness"）在 0.55 下 top-200 全数过线，边缘尾巴
+# 靠 per_query_k 截断而不是靠阈值；冷门 query（top1<0.62，如 "shadow variable MNAR"）
+# 只召回个位数是诚实的库覆盖信号，不该再收紧。α=0.85 恰好只对 top1≥0.647 的强 query
+# 生效（0.85×0.647≈0.55），对冷门 query 完全退回 floor：
+#   α=0.80 几乎不生效（36 条里仅 4 条门槛动了）；α=0.90 把强 query 砍到只剩 3-7 条，
+#   0.60~0.65 段的真命中被误杀。传 0 可彻底关闭相对判据（退回纯绝对阈值）。
+DEFAULT_RELATIVE_ALPHA = 0.85
+
 # 默认排除的精读分节：这不是文献内容，是精读者自己的推测性批注，混进证据池会被综述
 # 当成"已验证结论"引用（2026-08-16 审计实测：missingness-causal.md 把「对我研究的联想」
 # 里"可为跨中心MNAR缺失图学习提供隐私保障"这句主观联想写成了论文证明过的能力）。
@@ -296,7 +307,8 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
                       min_sim: float = DEFAULT_MIN_SIM,
                       per_query_k: int = 80,
                       per_paper_cap: int = DEFAULT_PER_PAPER_CAP,
-                      bucket_bonus: float = DEFAULT_BUCKET_BONUS) -> List[Evidence]:
+                      bucket_bonus: float = DEFAULT_BUCKET_BONUS,
+                      relative_alpha: float = DEFAULT_RELATIVE_ALPHA) -> List[Evidence]:
     """多 query 向量检索 -> 合并去重 -> select_evidence 定稿。
 
     每个 query 各检索一次而不是把 queries 拼成一句：拼接会把几个概念平均成一个
@@ -338,8 +350,13 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
     best: Dict[str, Evidence] = {}
     for q in spec.queries:
         vec = embed_client.embed([q])[0]
-        for idx, score in store.search(vec, mask=mask, top_k=per_query_k):
-            if score < min_sim:
+        hits = store.search(vec, mask=mask, top_k=per_query_k)
+        # per-query 相对判据：min_sim 是 floor（语义不变），强 query 按自身 top1 抬门槛，
+        # 冷门 query 退回 floor（见 DEFAULT_RELATIVE_ALPHA 注释与标定表）。
+        top1 = hits[0][1] if hits else 0.0
+        eff_min = max(min_sim, relative_alpha * top1)
+        for idx, score in hits:
+            if score < eff_min:
                 continue
             r = store.records[idx]
             cid = r["id"]

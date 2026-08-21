@@ -13,19 +13,24 @@ citekey/role 硬门槛场景用它）；本工具是语义检索，专治"中文
     python scripts/notes_search.py informative missingness --mode sparse   # 纯关键词，不需要 Ollama
 
 三种 --mode：
-  dense  ：query 整句嵌入一次，与向量库做余弦相似度（原 phase 1 逻辑）
+  dense  ：query 整句嵌入一次，与向量库做余弦相似度（原 phase 1 逻辑）。paper 侧
+           瘦/厚泳道按原始余弦混排，跨泳道有偏置（见 _paper_side_hits），日常用 hybrid
   sparse ：BM25(k1=1.2, b=0.75) 纯关键词倒排检索，分词复用 vault.tokenize（英文词+
            中文2-gram），不调用 Ollama，query 走 --mode dense/hybrid 才需要 embedding
-  hybrid ：默认模式。dense 与 sparse 各自在 paper 级、highlight 级分别取
-           top-200（TOP_K_PER_LEVEL），RRF(k=60) 融合排序；展示用的 score 优先给 dense 余弦（人更好理解 0~1 的
-           数），只有 dense 没命中、纯靠关键词命中的条目才展示 RRF 分并标 [关键词]
+  hybrid ：默认模式。highlight 侧 dense+BM25 两路、paper 侧瘦(p:)/厚(ab:摘要) dense
+           +BM25 三路，各取 top-200（TOP_K_PER_LEVEL）后 RRF(k=60) 融合排序；展示用的
+           score 优先给 dense 余弦（人更好理解 0~1 的数），只有 dense 没命中、纯靠
+           关键词命中的条目才展示 RRF 分并标 [关键词]
 
-覆盖面警告：句级证据只覆盖库内 480 篇精读文献（23%）。若某篇只有 paper 级命中，
+覆盖面警告：句级证据只覆盖库内约三成精读文献（668/2254 ≈ 30%，截至 2026-08-21；
+实时数以 literature_index.json 为准）。若某篇只有 paper 级命中，
 且它在全库中确实没有任何 highlight chunk（不是"这次没搜到"，是真的没有），会在
 该条结果下加一行提示——避免被误读为"库里没有这方面内容"。
 
 退出码：0=有命中；1=无命中；2=向量库缺失/损坏/模型与配置不一致；3=Ollama embedding
-不可用（与 notes_embed.py 的 3 对齐，wrapper/launchd 可区分"重建库"2 vs "起 Ollama"3）。
+不可用（与 notes_embed.py 的 3 对齐，wrapper/launchd 可区分"重建库"2 vs "起 Ollama"3）；
+4=未预期内部错误（崩溃兜底——Python 未捕获异常默认退出码是 1，会与"无命中"契约撞车，
+调用方（如 rag_bench）靠 4 区分"真没搜到"和"程序炸了"）。
 --mode sparse 不需要 Ollama，纯向量库缺失/损坏才会走到 2。
 """
 import argparse
@@ -46,10 +51,8 @@ from src.scholar.schema import ScholarSettings                            # noqa
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
-from src.scholar.embed_store import DB_NAME, VectorStore, VectorStoreError, model_matches  # noqa: E402
+from src.scholar.embed_store import DB_NAME, INDEX_NAME, VectorStore, VectorStoreError, model_matches  # noqa: E402
 from src.scholar.vault import tokenize                                    # noqa: E402
-
-INDEX_NAME = "literature_index.json"
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
@@ -63,14 +66,13 @@ TOP_K_PER_LEVEL = 200  # RRF 只融合列表内名次；截断越小越易漏掉
 
 
 def _split_paper_text(text: str):
-    """paper 级 chunk 文本是 chunks_from_index 拼的 title[\\ntitle_zh 之后是 one_line]。
-    还原展示用的 (title, one_line)。"""
+    """paper 级 (p:) chunk 文本恒为两段：title\\none_line（one_line 空则仅 title）。
+    回填摘要在独立的 ab: chunk 里（embed_store.chunks_from_index 一篇双向量方案），
+    只参与检索，不经过本函数。这里还原展示用的 (title, one_line)。"""
     if not text:
         return "", ""
-    parts = text.split("\n", 1)
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], parts[1]
+    parts = text.split("\n")
+    return parts[0], (parts[1] if len(parts) > 1 else "")
 
 
 def _build_mask(store: VectorStore, args) -> np.ndarray:
@@ -196,6 +198,71 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
     return out
 
 
+def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.ndarray,
+                     mode: str, query_vec, query_tokens: List[str], min_score: float,
+                     top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K,
+                     lanes: str = "both") -> List[Tuple[int, float, str, float]]:
+    """paper 侧检索：瘦 chunk（p:）与厚 chunk（ab:）dense 各一路 + BM25（合并掩码）一路。
+    hybrid 下三路按 rank RRF 融合。返回形状与 _level_hits 一致：(idx, score, kind, sort_score)。
+
+    为什么不能把两级 dense 塞同一个掩码里跑一次 search：瘦 chunk 是短中文判词文本、
+    厚 chunk 是长中英混合文本，同一 query 下两者的余弦分布整体错位，同掩码 top_k 会让
+    某一路系统性淹没另一路（见调用处注释的实测）——所以两路各自独立截断。注意独立截断
+    只在 hybrid 的按名次 RRF 融合下真正消除淹没；dense 模式最终仍按原始余弦混排，跨泳道
+    偏置依旧（见 dense 分支注释）。但 dense 模式的 sort_score 仍必须是余弦，不能换成 RRF：
+    主循环把 paper/highlight 两侧的 sort_score 直接混排，highlight 侧 dense 用的是余弦
+    （_level_hits），量纲必须一致。
+    min_score 只过滤 dense 候选（与 _level_hits 口径一致）。
+    """
+    thin_mask = base_mask & (level_arr == "paper")
+    # lanes="thin"：禁用厚路（ab: chunk）。p: chunk 文本自摘要喂厚前从未变，
+    # 该模式就是喂厚前检索行为的精确复现——rag_bench A/B 对照用，日常检索别用。
+    thick_mask = (base_mask & (level_arr == "abstract")) if lanes == "both" \
+        else np.zeros(len(base_mask), dtype=bool)
+    merged_mask = thin_mask | thick_mask
+
+    if mode == "sparse":
+        hits = _bm25_search(store, merged_mask, query_tokens, top_k=top_k)
+        return [(idx, s, "bm25", s) for idx, s in hits]
+
+    dense_lists = []
+    for m in (thin_mask, thick_mask):
+        if m.any():
+            dense_lists.append([(idx, s) for idx, s in store.search(query_vec, mask=m, top_k=top_k)
+                                if s >= min_score])
+        else:
+            dense_lists.append([])
+
+    if mode == "dense":
+        # sort_score 必须用余弦而非 RRF：highlight 侧（_level_hits）dense 的 sort_score
+        # 是余弦，主循环把两侧混排比大小，paper 侧若给 RRF 分（上限 1/(rrf_k+1)≈0.016）
+        # 会被任何过了 min_score 的 highlight 命中（≥0.4）恒定碾压。
+        # 诚实声明：两泳道余弦分布错位在 dense 下并未解决——各泳道独立 top_k(200) 截断
+        # 只保证两路都进候选池，下面仍按原始余弦混排；limit（默认 10）远小于 top_k，
+        # 分布整体偏高的一路照样淹没另一路的头部。跨泳道偏置是 dense=纯余弦语义的
+        # 固有代价；要泳道公平请用 hybrid（三路按名次 RRF 融合）。
+        out = [(idx, s, "cosine", s) for lst in dense_lists for idx, s in lst]
+        out.sort(key=lambda t: -t[3])
+        return out
+
+    # hybrid：瘦 dense + 厚 dense + BM25 三路 RRF
+    sparse_hits = _bm25_search(store, merged_mask, query_tokens, top_k=top_k)
+    lists = dense_lists + [sparse_hits]
+    rank_maps = [{idx: r for r, (idx, _s) in enumerate(lst, start=1)} for lst in lists]
+    dense_score = {}
+    for lst in dense_lists:
+        dense_score.update(dict(lst))
+    out = []
+    for idx in set().union(*[set(m) for m in rank_maps]):
+        rrf = sum(1.0 / (rrf_k + m[idx]) for m in rank_maps if idx in m)
+        if idx in dense_score:
+            out.append((idx, dense_score[idx], "cosine", rrf))
+        else:
+            out.append((idx, rrf, "rrf", rrf))
+    out.sort(key=lambda t: -t[3])
+    return out
+
+
 def _load_store(db_path: Path, expected_model: str):
     """load 校验：库缺失/损坏 -> (None, 提示)；model 与配置不一致 -> (None, 提示)。"""
     try:
@@ -232,16 +299,21 @@ def main() -> int:
     ap.add_argument("--series", choices=["auto", "manual"], help="auto=流水线精读 manual=手动深读")
     ap.add_argument("--full-text-only", action="store_true", help="只要有全文精读的条目")
     ap.add_argument("--mode", choices=["dense", "hybrid", "sparse"], default="hybrid",
-                    help="检索模式（默认 hybrid）：dense=纯向量余弦 "
-                         "sparse=纯关键词BM25(不需要Ollama) hybrid=两者RRF融合")
+                    help="检索模式（默认 hybrid）：dense=纯向量余弦(paper 侧瘦/厚泳道按原始"
+                         "余弦混排，跨泳道有偏置) sparse=纯关键词BM25(不需要Ollama) "
+                         "hybrid=按名次RRF融合(泳道公平，推荐)")
     ap.add_argument("--level", choices=["auto", "paper", "highlight"], default="auto",
-                    help="auto=两级都查（默认） paper=只查标题+一句话 highlight=只查精读句")
+                    help="auto=两级都查（默认） paper=只查论文级（默认双路：标题+一句话 与 "
+                         "回填摘要，见 --paper-lanes） highlight=只查精读句")
     ap.add_argument("--min-score", type=float, default=0.4,
                     help="最低余弦相似度（默认 0.4）。只过滤 dense 侧候选；--mode sparse "
                          "下不生效，--mode hybrid 下只过滤参与 RRF 融合的 dense 候选")
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
     ap.add_argument("--json", action="store_true", dest="as_json", help="结构化输出（含 total）")
+    ap.add_argument("--paper-lanes", choices=["both", "thin"], default="both",
+                    help="paper 侧检索泳道：both=瘦(p:)+厚(ab:摘要)双路 RRF（默认）；"
+                         "thin=只查瘦路（=摘要喂厚前的检索行为，rag_bench A/B 对照用）")
     ap.add_argument("--config", default="config/scholar.env")
     args = ap.parse_args()
 
@@ -296,9 +368,14 @@ def main() -> int:
 
     paper_hits: List[Tuple[int, float, str, float]] = []
     if search_paper:
-        paper_mask = base_mask & (level_arr == "paper")
-        paper_hits = _level_hits(store, paper_mask, args.mode, query_vec, query_tokens,
-                                  args.min_score)
+        # paper 侧 = 瘦 chunk（p:，title+判词）与厚 chunk（ab:，title+判词+摘要）两路。
+        # 两路余弦分布不可同台比较（短中文文本 vs 长混合文本；2026-08-21 实测中文 query
+        # 下瘦 chunk 系统性占前排、把厚 chunk 的真命中挤出 top-5），所以各自独立排名后
+        # 按 rank 做 RRF 融合，BM25 在合并掩码上单独一路。展示层仍按 citekey 取
+        # paper 级的 title/one_line，摘要不刷屏。
+        paper_hits = _paper_side_hits(store, base_mask, level_arr, args.mode,
+                                       query_vec, query_tokens, args.min_score,
+                                       lanes=args.paper_lanes)
     highlight_hits: List[Tuple[int, float, str, float]] = []
     if search_highlight:
         highlight_mask = base_mask & (level_arr == "highlight")
@@ -312,12 +389,13 @@ def main() -> int:
     # 每条 hit 是 (idx, score, kind, sort_score)：score/kind 是展示值（dense 命中给
     # 余弦、纯关键词命中给 RRF/BM25 分并标 kind!=cosine）；sort_score 是排序值（hybrid
     # 下统一用 RRF 分，跟展示值分离——RRF 才是两路真正可比的量纲）
-    groups = defaultdict(lambda: {"paper": None, "hits": []})
+    groups = defaultdict(lambda: {"paper": None, "paper_src": None, "hits": []})
     for idx, score, kind, sort_score in paper_hits:
         r = store.records[idx]
         g = groups[r["citekey"]]
         if g["paper"] is None or sort_score > g["paper"][2]:
             g["paper"] = (score, kind, sort_score)
+            g["paper_src"] = r["level"]          # "paper"（标题+判词）或 "abstract"（回填摘要）
     for idx, score, kind, sort_score in highlight_hits:
         r = store.records[idx]
         groups[r["citekey"]]["hits"].append((score, kind, sort_score, r))
@@ -334,16 +412,19 @@ def main() -> int:
         best_sort = max(t[2] for t in candidates)
         cosine_cands = [c for c in candidates if c[1] == "cosine"]
         if cosine_cands:
-            best_score, best_kind = max(cosine_cands, key=lambda t: t[2])[:2]
+            # 展示分按 t[0]（余弦）取 max，不能按 t[2]：hybrid 下 sort_score 是 RRF，
+            # 按 t[2] 取会展示"RRF 最高的那条的余弦"而非全篇最高余弦
+            best_score, best_kind = max(cosine_cands, key=lambda t: t[0])[:2]
         else:
             best_score, best_kind = max(candidates, key=lambda t: t[2])[:2]
         title, one_line = _split_paper_text(meta["text"])
         match_level = "highlight" if g["hits"] else "paper"
+        paper_src = g.get("paper_src") or "paper"
         no_evidence = not g["hits"] and ck not in highlight_citekeys
         g["hits"].sort(key=lambda t: -t[2])
         rows.append({
             "citekey": ck, "score": best_score, "score_kind": best_kind, "_sort": best_sort,
-            "match_level": match_level,
+            "match_level": match_level, "paper_src": paper_src,
             "year": meta.get("year"), "title": title, "one_line": one_line,
             "tier": meta.get("tier"), "note_file": meta.get("note_file"),
             "note_line": meta.get("note_line"), "hits": g["hits"],
@@ -361,7 +442,9 @@ def main() -> int:
             "results": [{
                 "citekey": row["citekey"], "score": round(row["score"], 4),
                 "score_kind": row["score_kind"],
-                "match_level": row["match_level"], "match_source": "highlight" if row["hits"] else "title",
+                "match_level": row["match_level"],
+                "match_source": ("highlight" if row["hits"]
+                                 else ("abstract" if row["paper_src"] == "abstract" else "title")),
                 "no_sentence_evidence": row["no_sentence_evidence"],
                 "year": row["year"],
                 "title": row["title"], "one_line": row["one_line"],
@@ -418,9 +501,19 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def cli_entry() -> int:
+    """CLI 兜底层：未预期异常一律转退出码 4，绝不让默认的 1 污染"无命中"契约。"""
     try:
-        sys.exit(main())
+        return main()
     except KeyboardInterrupt:
         print("\n已中断", file=sys.stderr)
-        sys.exit(130)
+        return 130
+    except Exception:  # noqa: BLE001 —— 兜底就是要接住一切未预期异常
+        import traceback
+        traceback.print_exc()
+        print("notes_search 未预期内部错误（exit 4，见上方 traceback）", file=sys.stderr)
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(cli_entry())

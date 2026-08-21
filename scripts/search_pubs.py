@@ -22,8 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.scholar.academic_search import AcademicSearchClient  # noqa: E402
+from src.scholar.notes_index import INDEX_JSON                # noqa: E402
 
-INDEX_PATH = PROJECT_ROOT / "output" / "scholar_notes" / "literature_index.json"
+INDEX_PATH = PROJECT_ROOT / "output" / "scholar_notes" / INDEX_JSON
 MAX_CAP = 100  # PubMed efetch 走 GET，PMID 拼进 URL；上限护栏防 URL 过长/被拒
 
 

@@ -278,13 +278,13 @@ def main() -> int:
     # 让 --list 显示的就是真正会入库的，--pick 的序号也才有意义。
     seen = None
     if not args.no_dedup:
-        from src.scholar.notes_index import load_seen_keys
+        from src.scholar.notes_index import INDEX_JSON, load_seen_keys
         # 剔除本 label 自己文件的键：同一周第二次入库时，上一批论文不被 seen 判成
         # 「库里已有」——否则 run_ingest 的覆盖守卫必然拒绝（新批永远缺上一批的键），
         # 且守卫报错建议的「把上一批一起传入」会在这里被剥掉、根本传不进去。
         # 剔掉后：--auto/--pick 把上一批与新批一起选上 → 覆盖守卫的 missing_dk 为空
         # → 同一周多次跑真正落在同一个文件上（week_label 的既定语义）。
-        seen = load_seen_keys(Path(settings.processing.notes_dir) / "literature_index.json",
+        seen = load_seen_keys(Path(settings.processing.notes_dir) / INDEX_JSON,
                               exclude_months={label})
         before = len(segs)
         # 只筛不改 seen——真正的去重（含元数据增强后的第二轮）在 run_ingest 里做

@@ -116,6 +116,29 @@ RETRACTED_FLAG = "RETRACTED"
 def is_retracted(entry: dict) -> bool:
     """这条是不是已标记撤稿。索引与向量库两侧共用同一个判据，别各写各的。"""
     return RETRACTED_FLAG in (entry.get("flags") or [])
+
+
+def load_index_file(index_path):
+    """读 literature_index.json：返回 (data, None) 或 (None, 可操作错误信息)。
+
+    2026-08-21 收敛前 ask_notes / build_topics / notes_query / notes_embed 各写一份
+    读索引逻辑且已漂移（有的不校验结构、有的用 assert、提示措辞四样）——统一到这里。
+    校验三件事：文件存在、JSON 可解析、papers 是数组。调用方拿到 err 打给 stderr
+    并按自己的退出码约定退出即可。
+    """
+    p = Path(index_path)
+    if not p.exists():
+        return None, ("找不到索引：{}\n先在仓库根跑：PYTHONPATH=. python scripts/notes_index.py"
+                      .format(p))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, ("索引解析失败（{}）：{}\n可重建：PYTHONPATH=. python scripts/notes_index.py --full"
+                      .format(type(exc).__name__, p))
+    if not isinstance(data, dict) or not isinstance(data.get("papers"), list):
+        return None, ("索引结构异常（缺 papers 数组）：{}\n可重建："
+                      "PYTHONPATH=. python scripts/notes_index.py --full".format(p))
+    return data, None
 _DOI_RE = re.compile(r"^\*\*DOI\*\*: \[([^\]]+)\]")
 _URL_RE = re.compile(r"^\*\*链接\*\*: (\S+)")
 _CLOSEREAD_RE = re.compile(r"^### (全文精读|精读（仅摘要降级）)(?: · 来源 `(.+?)`)?")

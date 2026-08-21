@@ -22,27 +22,20 @@ from src.scholar.schema import ScholarSettings                            # noqa
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
-from src.scholar.embed_store import DB_NAME, sync_store, read_store_meta, SCHEMA_VERSION, VectorStoreError  # noqa: E402
+from src.scholar.embed_store import (                                     # noqa: E402
+    DB_NAME, INDEX_NAME, ABSTRACTS_NAME, sync_store, read_store_meta, SCHEMA_VERSION,
+    VectorStoreError, load_abstracts,
+)
+from src.scholar.notes_index import load_index_file                       # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
 
 logger = get_logger("notes_embed")
 
-INDEX_NAME = "literature_index.json"
-
-
 def _load_index(index_path: Path):
-    if not index_path.exists():
-        print("找不到索引：{}\n先跑：PYTHONPATH=. python scripts/notes_index.py".format(index_path),
-              file=sys.stderr)
-        return None
-    try:
-        data = json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print("索引解析失败（{}）：{}".format(type(exc).__name__, index_path), file=sys.stderr)
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("papers"), list):
-        print("索引结构异常（缺 papers 数组）：{}".format(index_path), file=sys.stderr)
-        return None
+    """读索引（单点实现在 notes_index.load_index_file，别再各写各的）。"""
+    data, err = load_index_file(index_path)
+    if err:
+        print(err, file=sys.stderr)
     return data
 
 
@@ -59,6 +52,7 @@ def _print_stats(db_path: Path, index_path: Path):
     conn = sqlite3.connect(str(db_path))
     try:
         n_paper = conn.execute("SELECT COUNT(*) FROM chunks WHERE level='paper'").fetchone()[0]
+        n_ab = conn.execute("SELECT COUNT(*) FROM chunks WHERE level='abstract'").fetchone()[0]
         n_hl = conn.execute("SELECT COUNT(*) FROM chunks WHERE level='highlight'").fetchone()[0]
     finally:
         conn.close()
@@ -68,7 +62,19 @@ def _print_stats(db_path: Path, index_path: Path):
     print("  model = {}  dim = {}  normalized = {}".format(
         meta.get("model"), meta.get("dim"), meta.get("normalized")))
     print("  built_at = {}".format(meta.get("built_at")))
-    print("  paper chunks = {}  highlight chunks = {}  合计 = {}".format(n_paper, n_hl, n_paper + n_hl))
+    print("  paper chunks = {}  abstract chunks = {}  highlight chunks = {}  合计 = {}".format(
+        n_paper, n_ab, n_hl, n_paper + n_ab + n_hl))
+    # 喂厚生效的直接观测：sidecar 条数应≈abstract chunks（无摘要条目不产 ab:）。
+    # sidecar 损坏时 stats 仍是只读报告，只提示不改退出码（sync 才会硬拒）。
+    if not (db_path.parent / ABSTRACTS_NAME).exists():
+        print("  {} 不存在（瘦库模式，未回填摘要）".format(ABSTRACTS_NAME))
+    else:
+        try:
+            abstracts = load_abstracts(db_path.parent)
+        except VectorStoreError as e:
+            print("  ⚠️ {} 存在但读不出，下次同步会被拒绝：{}".format(ABSTRACTS_NAME, e))
+        else:
+            print("  {} = {} 条摘要".format(ABSTRACTS_NAME, len(abstracts)))
     src = meta.get("source_generated_at") or ""
     print("  source_generated_at = {}".format(src or "（无）"))
     if index_generated_at:
@@ -117,11 +123,12 @@ def main() -> int:
             return 2
         print("同步计划（干跑，未连接 Ollama）：")
         print("  期望 chunk 总数 = {}".format(stats.total))
-        print("  待嵌 = {}（paper {} + highlight {}）".format(
-            stats.embedded, stats.embedded_paper, stats.embedded_highlight))
-        print("  待删 = {}（paper {} + highlight {}）".format(
-            stats.deleted, stats.deleted_paper, stats.deleted_highlight))
-        print("  仅元数据刷新（不重嵌）= {}".format(stats.meta_refreshed))
+        print("  待嵌 = {}（paper {} + abstract {} + highlight {}）".format(
+            stats.embedded, stats.embedded_paper, stats.embedded_abstract, stats.embedded_highlight))
+        print("  待删 = {}（paper {} + abstract {} + highlight {}）".format(
+            stats.deleted, stats.deleted_paper, stats.deleted_abstract, stats.deleted_highlight))
+        print("  hash 未变（不重嵌）= {}，其中元数据有变将 UPDATE = {}".format(
+            stats.meta_refreshed, stats.meta_updated))
         print("  model = {}".format(stats.model))
         return 0
 
@@ -150,11 +157,12 @@ def main() -> int:
     finally:
         client.close()
 
-    print("✅ 同步完成：期望 {} 条 | 新嵌 {}（paper {} + highlight {}） | "
-          "删除 {}（paper {} + highlight {}） | 元数据刷新 {} | model={}".format(
-              stats.total, stats.embedded, stats.embedded_paper, stats.embedded_highlight,
-              stats.deleted, stats.deleted_paper, stats.deleted_highlight,
-              stats.meta_refreshed, stats.model))
+    print("✅ 同步完成：期望 {} 条 | 新嵌 {}（paper {} + abstract {} + highlight {}） | "
+          "删除 {}（paper {} + abstract {} + highlight {}） | hash 未变 {}（元数据 UPDATE {}） | model={}".format(
+              stats.total, stats.embedded, stats.embedded_paper, stats.embedded_abstract,
+              stats.embedded_highlight,
+              stats.deleted, stats.deleted_paper, stats.deleted_abstract, stats.deleted_highlight,
+              stats.meta_refreshed, stats.meta_updated, stats.model))
     return 0
 
 

@@ -1216,6 +1216,35 @@ def test_a_nonpositive_cap_is_rejected_instead_of_silently_becoming_one():
             Q.select_qa_evidence(_thin_pool(), max_evidence=28, per_paper_cap=bad)
 
 
+def _qa_highlight_record(citekey, score):
+    """4 维单位向量记录：FakeEmbed 对未映射文本返回 [0,0,0,1]，这里的向量与它的
+    点积精确等于 score，召回门槛完全可控。"""
+    record = {
+        "id": "h:{}:citable:x:0".format(citekey), "level": "highlight",
+        "citekey": citekey, "role": "citable", "section": "结果",
+        "bucket": [], "year": 2024, "tier": None,
+        "note_file": "x.md", "note_line": 1,
+        "text": "{} 的证据句".format(citekey),
+    }
+    return record, [float((1 - score ** 2) ** 0.5), 0.0, 0.0, score]
+
+
+def test_qa_retrieval_keeps_the_absolute_threshold_not_topics_relative_one():
+    """QA 召回不许被动继承概念页的相对判据（α=0.85）：那套 α 只在 topics.yaml 的
+    36 条概念页短 query 上标定过，QA 的整句问题分布从未验证。若继承，强问题
+    （top1=0.90）下 eff_min 抬到 0.765，0.55~0.765 段的证据整段被砍，
+    nearby_papers 那行「本次未纳入的近邻论文」也跟着消失。"""
+    rec_hi = _qa_highlight_record("strong2024A", 0.90)
+    rec_lo = _qa_highlight_record("tail2024B", 0.60)     # 过绝对阈值 0.55，在 0.85×0.90 之下
+    store = FakeStore([r for r, _ in (rec_hi, rec_lo)],
+                      [v for _, v in (rec_hi, rec_lo)])
+    spec = Q.build_qa_spec("MNAR 诊断有哪些方法？", exclude_sections=[])
+
+    picked, _ = Q.retrieve_qa_evidence(spec, store, FakeEmbed({}), min_sim=0.55)
+    assert {e.citekey for e in picked} == {"strong2024A", "tail2024B"}, \
+        "0.55~α×top1 段的证据被相对判据误砍：QA 侧必须是纯绝对阈值"
+
+
 # ---------------------------------------------------------------------------
 # 17. B4/B5/B6/B7/B8/B9：其余
 # ---------------------------------------------------------------------------

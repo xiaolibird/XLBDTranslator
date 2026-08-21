@@ -51,6 +51,7 @@ test_output/
 # 负向规则必须配合 test/* 才生效
 test/*
 !test/*.py
+!test/data/
 !test/test_toc.csv
 !test/test_pdf.pdf
 !test/test.epub
