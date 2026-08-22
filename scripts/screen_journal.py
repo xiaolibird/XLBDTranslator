@@ -30,19 +30,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.scholar.journal_screen import JournalScreener  # noqa: E402
 from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.schema import ScholarSettings  # noqa: E402
+from src.scholar.settings import load_scholar_settings  # noqa: E402
 
 DEFAULT_MAX_RESULTS = 5000  # npj DM 五年约 2500 篇，上限绰绰有余
 
 
 def _load_settings() -> ScholarSettings:
-    """与 notes_search.py/scholar_main.py 同口径：读 config/scholar.env + 仓库根锚定。
-    裸 ScholarSettings() 会丢配置里的 embedding_model 等项，且 notes_dir 随 cwd 漂，
-    从非仓库根运行时向量库找不到、filter 的 library_neighbors 静默全空。"""
-    cfg = repo_path("config/scholar.env")
-    settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
-    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
-    settings.processing.output_dir = repo_path(settings.processing.output_dir)
-    return settings
+    """统一走共享 loader（历史动机保留：裸 ScholarSettings() 会丢配置里的
+    embedding_model 等项，且 notes_dir 随 cwd 漂，从非仓库根运行时向量库找不到、
+    filter 的 library_neighbors 静默全空——锚定逻辑现在在 loader 里）。
+    与收敛前的行为差异（有意）：缺失回退从静默变有警告；config 写 gemini 时
+    筛选 LLM 与全链一致改走 deepseek。"""
+    return load_scholar_settings()
 
 
 def _parse_date(s: str) -> date:
