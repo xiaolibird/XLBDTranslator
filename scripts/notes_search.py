@@ -47,7 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from src.scholar.paths import repo_path                                   # noqa: E402
-from src.scholar.schema import ScholarSettings                            # noqa: E402
+from src.scholar.settings import load_scholar_settings                    # noqa: E402
+from src.scholar.thresholds import NOTES_SEARCH_MIN_SCORE                 # noqa: E402
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
@@ -305,9 +306,10 @@ def main() -> int:
     ap.add_argument("--level", choices=["auto", "paper", "highlight"], default="auto",
                     help="auto=两级都查（默认） paper=只查论文级（默认双路：标题+一句话 与 "
                          "回填摘要，见 --paper-lanes） highlight=只查精读句")
-    ap.add_argument("--min-score", type=float, default=0.4,
-                    help="最低余弦相似度（默认 0.4）。只过滤 dense 侧候选；--mode sparse "
-                         "下不生效，--mode hybrid 下只过滤参与 RRF 融合的 dense 候选")
+    ap.add_argument("--min-score", type=float, default=NOTES_SEARCH_MIN_SCORE,
+                    help="最低余弦相似度（默认 {}，集中在 thresholds.py）。只过滤 dense 侧"
+                         "候选；--mode sparse 下不生效，--mode hybrid 下只过滤参与 RRF "
+                         "融合的 dense 候选".format(NOTES_SEARCH_MIN_SCORE))
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
     ap.add_argument("--json", action="store_true", dest="as_json", help="结构化输出（含 total）")
@@ -329,9 +331,8 @@ def main() -> int:
     if not query:
         ap.error("查询词为空")
 
-    cfg = repo_path(args.config)
-    settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
-    notes_dir = repo_path(settings.processing.notes_dir)
+    settings = load_scholar_settings(args.config, patch_gemini=False)  # 本脚本不碰 LLM provider
+    notes_dir = settings.processing.notes_dir  # loader 已锚定仓库根
     db_path = notes_dir / DB_NAME
 
     store, err = _load_store(db_path, settings.llm.embedding_model)
