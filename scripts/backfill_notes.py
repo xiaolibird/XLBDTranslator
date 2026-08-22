@@ -42,7 +42,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.paths import repo_path  # noqa: E402
-from src.scholar.schema import ScholarSettings, DigestOutput, DigestStatus  # noqa: E402
+from src.scholar.schema import DigestOutput, DigestStatus  # noqa: E402
+from src.scholar.settings import load_scholar_settings  # noqa: E402
 from src.scholar.workflow import ScholarWorkflow  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 from src.utils.notify import notify      # noqa: E402
@@ -252,42 +253,14 @@ def _refresh_topics_for_keys(notes_dir, citekeys, timeout=2400) -> bool:
     ingest_notes.py 早就两者都做了）；这里补上 notify——多月合并成一次调用后天然
     也只有一条汇总通知，不会像"每月一条"那样刷屏。
 
-    安全前提：子进程用 build_topics.py 自己的默认配置独立加载**生产** notes_dir，
-    与这里传入的 notes_dir 完全脱钩——notes_dir 不在仓库 output/ 下（测试隔离场景）
-    一律跳过，不发子进程，见 T.notes_dir_is_production（read_pdf.py 的同类触发器
-    实测因为漏了这层判断，被单测意外打到过生产环境并挂起 13 分钟）。
+    薄包装保名：test_backfill.py monkeypatch 钉住这个符号。子进程调用、best-effort
+    语义与 W3 解读收敛在 topics.trigger_topic_refresh（战史见其 docstring）；这里
+    保留的只有 W7 的批量形状——citekey 并集一次调用。
     """
-    import subprocess
-    from src.scholar import topics as T
-    if not T.notes_dir_is_production(notes_dir):
-        return True
-    script = repo_path("scripts/build_topics.py")
-    if not script.exists():
-        return True
-    cmd = [sys.executable, str(script)]
-    for k in citekeys:
-        cmd += ["--affected-by", k]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              cwd=str(repo_path(".")))
-    except subprocess.TimeoutExpired:
-        logger.warning("概念页更新超时（{}s），本次回填已完成".format(timeout))
-        notify("Scholar 月度回填", "概念页更新超时，回填本身已完成")
-        return False
-    except Exception as e:
-        logger.warning("概念页更新跳过（不影响回填）：{}".format(e))
-        notify("Scholar 月度回填", "概念页更新异常（回填已完成）：{}".format(str(e)[:120]))
-        return False
-
-    # 全量入日志，不再只截尾部 4 行——与周度 ingest_notes.py 同一个坑（W3）。
-    for line in (proc.stdout or "").strip().splitlines():
-        logger.info("  {}".format(line))
-    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
-    if not outcome.ok:
-        logger.warning("概念页更新未全部成功，回填已完成：{}".format(outcome.detail))
-        notify("Scholar 月度回填", "概念页有页面未更新成功（回填已完成）：{}".format(
-            outcome.detail[:300]))
-    return outcome.ok
+    from src.scholar.topics import trigger_topic_refresh
+    return trigger_topic_refresh(notes_dir, citekeys=list(citekeys), timeout=timeout,
+                                 notify_title="Scholar 月度回填",
+                                 subject="回填本身已完成").ok
 
 
 def _run_knowledge_lint(notes_dir, timeout=900) -> bool:
@@ -388,10 +361,10 @@ def main():
     if args.prev_month:
         args.since = args.until = prev_month_label()
 
-    settings = ScholarSettings.from_env_file(repo_path(args.config))
-    # 相对 notes_dir 锚死仓库根，别随 cwd 漂（见 paths.repo_path）
-    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
+    # 加载/锚定/gemini 补丁统一走 load_scholar_settings（F1 收敛，契约见其 docstring）
+    settings = load_scholar_settings(args.config)
     # 并行分片：每个进程用独立 token 副本，避免多进程刷新时并发写 config/token.json 损坏
+    # （分片专属逻辑，不入共享 loader）
     if args.token_path:
         import shutil
         tp = Path(args.token_path)
@@ -400,9 +373,6 @@ def main():
         if src.exists() and not tp.exists():
             shutil.copy2(str(src), str(tp))
         settings.gmail.token_path = tp
-    if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
-        settings.llm.provider = "deepseek"  # 与既有 pipeline 一致，走 deepseek
-        logger.info("LLM provider 从 gemini 自动切换为 deepseek（model={}）".format(settings.llm.model))
     months = month_list(args.since, args.until)
     logger.info("=" * 60)
     logger.info("按月回填：{} → {}，共 {} 个月".format(args.since, args.until, len(months)))
@@ -479,24 +449,10 @@ def main():
             notes_dir = Path(settings.processing.notes_dir)
             index_data = update_index(notes_dir)
             write_outputs(index_data, notes_dir)
-            # best-effort 向量同步：batch 回填后跟进向量库（失败只 warning，不影响回填结果）
-            try:
-                from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-                from src.scholar.embed_store import DB_NAME, sync_store
-                client = EmbeddingClient(
-                    base_url=resolve_embedding_base_url(settings.llm),
-                    model=settings.llm.embedding_model,
-                )
-                try:
-                    stats = sync_store(notes_dir / DB_NAME, index_data, client)
-                finally:
-                    client.close()
-                logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
-                    stats.embedded, stats.deleted, stats.meta_refreshed))
-            except Exception as e2:
-                logger.warning("向量库同步跳过（不影响回填结果）：{}".format(e2))
-                # 每月 1 日 launchd 无人值守——弹系统通知，向量库静默落后要有人知道
-                notify("Scholar 月度回填", "向量库同步失败（回填已完成）：{}".format(str(e2)[:120]))
+            # best-effort 向量同步（收敛在 embed_store.sync_store_best_effort，契约见其 docstring）
+            from src.scholar.embed_store import sync_store_best_effort
+            sync_store_best_effort(notes_dir, index_data, settings,
+                                   notify_title="Scholar 月度回填", context="回填")
         except Exception as e:
             index_err = e
             logger.warning("⚠️ 刷新文献索引失败（可手动跑 scripts/notes_index.py）: {}".format(e))
