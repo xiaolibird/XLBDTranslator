@@ -174,3 +174,67 @@ def test_in_library_empty_fields_no_false_hit():
     keys = {"": "shouldNotHit"}
     item = {"doi": "", "arxiv_id": "", "title": ""}
     assert sp._in_library(item, keys) is None
+
+
+# ---------------- 结尾行按实际生效源生成（F6 文案修复） ----------------
+# 此前写死「arXiv+PubMed 未去重」：单源检索或一源失败时既误导来源，又暗示做过
+# 一次不存在的跨源合并（scholar-search skill 还把这行当判据引用）。契约：
+# 只有 >1 个源实际成功才提「未去重」，失败源保留尾注。
+
+def _fake_client(monkeypatch, *, arxiv=None, pubmed=None):
+    """arxiv/pubmed: None=不该被调到；list=返回值；Exception 实例=抛出。"""
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def search_arxiv(self, *a, **kw):
+            if isinstance(arxiv, Exception):
+                raise arxiv
+            assert arxiv is not None, "arXiv 不该被检索"
+            return list(arxiv)
+
+        def search_pubmed(self, *a, **kw):
+            if isinstance(pubmed, Exception):
+                raise pubmed
+            assert pubmed is not None, "PubMed 不该被检索"
+            return list(pubmed)
+
+    monkeypatch.setattr(sp, "AcademicSearchClient", _Client)
+
+
+def _item(title, source):
+    return {"title": title, "source": source, "authors": [], "published": "2026-01-01"}
+
+
+def _run_main(monkeypatch, capsys, argv):
+    import sys as _sys
+    monkeypatch.setattr(sp, "INDEX_PATH", __import__("pathlib").Path("/nonexistent/index.json"))
+    monkeypatch.setattr(_sys, "argv", ["search_pubs.py"] + argv)
+    sp.main()
+    return capsys.readouterr()
+
+
+def test_tail_single_source_omits_dedup_note(monkeypatch, capsys):
+    _fake_client(monkeypatch, arxiv=[_item("A", "arXiv")])
+    out = _run_main(monkeypatch, capsys, ["q", "--source", "arxiv"]).out
+    assert "共 1 条" in out
+    assert "未去重" not in out
+
+
+def test_tail_all_sources_ok_keeps_dedup_note(monkeypatch, capsys):
+    _fake_client(monkeypatch, arxiv=[_item("A", "arXiv")], pubmed=[_item("P", "PubMed")])
+    out = _run_main(monkeypatch, capsys, ["q", "--source", "all"]).out
+    assert "共 2 条" in out
+    assert "arXiv+PubMed 未去重" in out
+
+
+def test_tail_partial_failure_drops_dedup_note_keeps_failure(monkeypatch, capsys):
+    _fake_client(monkeypatch, arxiv=[_item("A", "arXiv")], pubmed=RuntimeError("限流"))
+    got = _run_main(monkeypatch, capsys, ["q", "--source", "all"])
+    assert "共 1 条" in got.out
+    assert "未去重" not in got.out               # 只剩一个成功源，没有"跨源未去重"可言
+    assert "PubMed 检索失败已跳过" in got.out    # 失败尾注保留

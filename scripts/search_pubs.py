@@ -206,8 +206,14 @@ def main():
         ab = (it.get("abstract") or "").strip()
         if ab:
             print(f"    {ab if args.abstract else ab[:240] + ('…' if len(ab) > 240 else '')}")
+    # 结尾行按**实际生效的源**生成：此前写死「arXiv+PubMed 未去重」，单源检索或
+    # 一源失败时既误导来源、又暗示做过一次不存在的跨源合并（skill 文档还把这行当判据引）。
+    attempted = [s for s, key in (("arXiv", "arxiv"), ("PubMed", "pubmed"))
+                 if args.source in (key, "all")]
+    ok_sources = [s for s in attempted if s not in failures]
+    dedup_note = f"{'+'.join(ok_sources)} 未去重；" if len(ok_sources) > 1 else ""
     tail = f"（{'/'.join(failures)} 检索失败已跳过）" if failures else ""
-    print(f"\n共 {len(results)} 条（arXiv+PubMed 未去重；📚 = 札记库已收录）{tail}")
+    print(f"\n共 {len(results)} 条（{dedup_note}📚 = 札记库已收录）{tail}")
 
 
 if __name__ == "__main__":
