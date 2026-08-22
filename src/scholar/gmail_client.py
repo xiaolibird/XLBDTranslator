@@ -287,7 +287,7 @@ class GmailClient:
         elif 'date' in headers:
             try:
                 received_at = parsedate_to_datetime(headers['date'])
-            except:
+            except (TypeError, ValueError):
                 pass
         
         # 检查是否为 Google Scholar 邮件

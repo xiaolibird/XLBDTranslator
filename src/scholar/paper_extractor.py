@@ -535,7 +535,7 @@ class ScholarEmailParser:
             try:
                 year = int(year_match.group())
                 pub_date = date(year, 1, 1)  # 只抽到年份，月日是占位（精度见构造处）
-            except:
+            except (ValueError, TypeError):
                 pass
         
         # 尝试提取期刊名（通常在斜体或特定格式中）
@@ -591,7 +591,7 @@ class ScholarEmailParser:
         if match:
             try:
                 return int(match.group(1))
-            except:
+            except (ValueError, TypeError):
                 pass
         return None
     
