@@ -33,7 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.scholar.schema import ScholarSettings  # noqa: E402
+from src.scholar.settings import load_scholar_settings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
 from src.scholar.paths import repo_path  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
@@ -58,11 +58,8 @@ def _cur_ts() -> str:
 
 
 def _load_settings(config):
-    settings = ScholarSettings.from_env_file(repo_path(config))
-    if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
-        settings.llm.provider = "deepseek"
-    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
-    return settings
+    # 薄包装保名：test_backfill_methods.py monkeypatch 钉住这个符号。逻辑全在共享 loader。
+    return load_scholar_settings(config)
 
 
 # ---------------- bundle 扫描 ----------------
