@@ -16,6 +16,9 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 - `科研札记_YYYY-MM-DD_全文精读.md` —— **周札记**(周一日期),2026-07 起改为每周一自动入库
 - `科研札记_YYYY-MM(-DD)_手动精读.md` —— 手动 PDF 深度精读(agent 交叉核验)
 
+⚠️ **定位某篇论文在哪个文件,以索引条目的 `note_file` 字段为准,不要按 month 拼文件名**——
+同一个月可能同时有月度/周/手动精读三种文件,靠月份猜必错(手动精读的论文尤其如此)。
+
 每篇 md 配同名 `references.json`(CSL-JSON)。总索引:`literature_index.json`;
 完整使用说明:该目录 `AGENTS.md`(先读它)。
 
@@ -197,15 +200,24 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
    jq -r '.papers[] | select(.duplicate_of==null)
           | . as $p | .highlights[] | select(.role=="citable")
           | [$p.citekey, .section, .text] | @tsv' literature_index.json
-   # 某篇的所有"可反驳靶子"(写 critique 用):
-   jq -r '.papers[] | select(.citekey=="<citekey>")
+   # 某篇的所有"可反驳靶子"(写 critique 用)——按 citekey 精确查**也要**带 duplicate_of
+   # 过滤:库里有 87 条重复条目,同 citekey 可能命中新旧两条且 one_line 内容不同:
+   jq -r '.papers[] | select(.citekey=="<citekey>" and .duplicate_of==null)
           | .highlights[] | select(.role=="refutable") | .text' literature_index.json
    # 全库"方法论借鉴"灵感库:  select(.role=="method")
    ```
    历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃);
    手动精读的 refutable 还含对抗核验的纠错条。新精读由 LLM/subagent 直接精确产出三类。
-2. **读原文**:`grep -nF '[@<citekey>]' <note_file>` 拿行号,Read 该小节——重点是「全文精读」节
-   (句级标记:`〔可引用证据〕`取证 / `〔可反驳观点〕`靶子 / `〔方法论借鉴〕`方法思路,以及「对我研究的联想」小节;历史札记可能仍是旧标记〔方法学创新/重要发现/研究背景〕)。
+2. **读原文**:索引条目自带定位字段,直接取用,不要按 month 猜文件名:
+   ```bash
+   jq -r '.papers[] | select(.citekey=="<citekey>" and .duplicate_of==null)
+          | [.note_file, .note_line, .note_heading] | @tsv' literature_index.json
+   ```
+   `note_file` 是裸文件名(拼上库目录前缀),`note_line` 是该篇标题行的 1-based 行号——
+   用 Read 带 offset 直达该小节;`grep -nF '[@<citekey>]' <note_file>` 只作行号漂移时的兜底。
+   重点是「全文精读」节(句级标记:`〔可引用证据〕`取证 / `〔可反驳观点〕`靶子 /
+   `〔方法论借鉴〕`方法思路,以及「对我研究的联想」小节;历史札记可能仍是旧标记
+   〔方法学创新/重要发现/研究背景〕)。
 3. **引用**:论文正文用 pandoc 语法 `[@citekey]`。
 4. **书目**:直接用现成的全局书目 `all_references.json`(全库去重合并,含全文精读+手动精读两个系列,
    由 `scripts/notes_index.py` 自动刷新、勿手改):
@@ -214,6 +226,21 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
    ```
    用前确认 `jq '.citekey_collisions' literature_index.json` 为 `[]`(非空先跑 `notes_index.py --fix-collisions`)。
    写作取证的完整流程(按 role 轴 query → 写稿 → 出稿)见 skill `scholar-write`。
+
+### 索引 schema 速查(`literature_index.json` 的 `.papers[]`,共 33 键,常用这些)
+
+| 字段 | 含义 |
+|---|---|
+| `citekey` / `doi` / `arxiv_id` | 身份键(citekey 是引用键;跨源身份是 `dedup_key`) |
+| `title` / `title_zh` / `year` / `journal` | 基本书目 |
+| `month` | 归属月份键(仅分组用,**定位文件用 note_file**) |
+| `series` | `auto`(月度回填+周札记) / `manual`(手动精读) 二分 |
+| `note_file` / `note_line` / `note_heading` | 札记定位:裸文件名 / 标题行号(1-based) / 标题行原文 |
+| `decision` / `priority_tier` / `one_line` | 筛选裁决 / 优先级档 / 一句话判词 |
+| `role` / `bucket` / `flags` | 主 role 轴 / 研究维度 / 旗标(含 `⚑ RETRACTED`) |
+| `has_full_text_reading` / `reading_depth` | 是否有全文精读 / 精读深度 |
+| `highlights[]` | 句级证据 `{role, tag, section, text}` |
+| `duplicate_of` | 非 null = 重复条目(指向 keeper 的 dedup_key)——**取数一律过滤掉** |
 
 ## 语义检索
 

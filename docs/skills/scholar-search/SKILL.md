@@ -62,7 +62,8 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 ## 跨源去重（`--source all` 时你负责合并）
 
-脚本对 arXiv + PubMed 的结果**不去重**（结尾行会标注「未去重」）。同一篇预印本常同时
+脚本对 arXiv + PubMed 的结果**不去重**（多个源同时成功时结尾行会标注「未去重」；
+单源检索不涉及）。同一篇预印本常同时
 命中 arXiv 与 PubMed（发表后）。要给用户一份干净列表时，用 `--json` 拿结构化结果、自己合并：
 
 - **首选按归一化 DOI 合并**：把 DOI 小写、去 `https://doi.org/`、去尾标点后比较（脚本内部
@@ -71,6 +72,9 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 - DOI 都缺时退而用 `arxiv_id`（去 `vN` 版本后缀）比较，再退到标题（小写、非字母数字折空格；
   纯 CJK 标题归一为空串、不可比，此时不合并）。
 - 合并只在最终呈现层做；`in_library` 标记以任一条命中为准。
+- **📚 标注的匹配键同上面这套三级回退**：DOI → `arxiv_id`（去 `vN`）→ 归一化标题。
+  新预印本通常无 DOI，此时按 arxiv_id 精确匹配——所以「无 📚 标注 = 确实不在库」
+  对 arXiv 结果同样可信（除非该文在库里只有 PubMed 侧身份且两边都没 DOI，极少见）。
 
 ## 汇报格式
 
@@ -84,6 +88,12 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 （XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。`--level paper` 默认走
 瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——加 `--json` 后每条结果的
 `match_source` 会标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇/近邻"更可信）。
+
+**怎么读语义命中（勿误报）**：语义命中 ≠ 已收录——📚（索引精确匹配）才是收录判据，
+notes_search 的结果只说明库里有**近邻**。命中数本身没有意义（默认门槛 0.4 很宽），
+要看相似度分（`--json` 每条带分）：paper 级 ≥0.62 才值得向用户提示「库内疑似同篇/
+强近邻」（digest 近邻注入的标定线）；0.4~0.6 只是主题相关，别说成"已有类似文献"。
+（句级证据检索是另一套 0.55 口径；三条链路阈值集中在仓库 `src/scholar/thresholds.py`。）
 
 ## 边界
 
