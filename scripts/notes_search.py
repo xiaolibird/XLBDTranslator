@@ -20,7 +20,10 @@ citekey/role 硬门槛场景用它）；本工具是语义检索，专治"中文
   hybrid ：默认模式。highlight 侧 dense+BM25 两路、paper 侧瘦(p:)/厚(ab:摘要) dense
            +BM25 三路，各取 top-200（TOP_K_PER_LEVEL）后 RRF(k=60) 融合排序；展示用的
            score 优先给 dense 余弦（人更好理解 0~1 的数），只有 dense 没命中、纯靠
-           关键词命中的条目才展示 RRF 分并标 [关键词]
+           关键词命中的条目才展示 RRF 分并标 [关键词]。
+           注意：--min-score 在 hybrid 下**同样约束 BM25 单路命中**（回查其余弦，见
+           _gate_sparse），所以显式传门槛时 [关键词]/score_kind="rrf" 这条展示路径
+           基本不会再出现——纯关键词命中的余弦按定义低于门槛。
 
 覆盖面警告：句级证据只覆盖库内约三成精读文献（668/2254 ≈ 30%，截至 2026-08-21；
 实时数以 literature_index.json 为准）。若某篇只有 paper 级命中，
@@ -151,9 +154,28 @@ def _bm25_search(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
     return result
 
 
+def _gate_sparse(hits: List[Tuple[int, float]], all_cos: Optional[np.ndarray],
+                 min_score: float) -> List[Tuple[int, float]]:
+    """BM25 单路命中同受 --min-score 约束（hybrid 专用）。
+
+    --min-score 的语义是"最低余弦相似度"，与哪条泳道找到它无关。不加这道门槛时，
+    抬高门槛只会缩小 dense 泳道、把 --limit 名额让给无门槛的 BM25 命中——**门槛越高
+    结果越脏，反向单调**（实测 0.62 下 top-5 的 cosine 席位从 100% 掉到 54%；
+    离题探针 `--min-score 0.95` 在修复前仍能返回 108 篇，而 thresholds.py 的标定档案
+    白纸黑字写着硬离题探针 max sim 0.575；`--cite --min-score 0.7` 还会把全库没有一条
+    ≥0.7 的 query 吐成可粘贴的引用串，假引用直接进稿子）。
+
+    all_cos 为 None（--mode sparse 不算 query 向量）时原样放行：纯关键词模式语义不变。
+    """
+    if all_cos is None:
+        return hits
+    return [(idx, s) for idx, s in hits if float(all_cos[idx]) >= min_score]
+
+
 def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
                  query_vec: Optional[np.ndarray], query_tokens: List[str],
-                 min_score: float, top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K
+                 min_score: float, top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K,
+                 all_cos: Optional[np.ndarray] = None
                  ) -> List[Tuple[int, float, str, float]]:
     """按 mode 检索一个 level（paper 或 highlight），返回 (idx, score, kind, sort_score)。
 
@@ -162,7 +184,8 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
     - sort_score：组内/组间排序用的分。dense/sparse 模式下等于 score；hybrid 模式
       下统一用 RRF 分排序（两路量纲不可比，融合排序不能拿余弦和 bm25 直接比大小，
       但展示给人看时余弦更好懂，所以两者分离）
-    - min_score 只过滤 dense 候选（cosine 分数），语义见模块 docstring
+    - min_score 过滤全部候选的余弦（dense 直接过滤；hybrid 下 BM25 单路命中也用
+      all_cos 回查余弦后过滤，见 _gate_sparse）；--mode sparse 不算 query 向量，不生效
     """
     if mode == "dense":
         if not mask.any():
@@ -179,7 +202,8 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
     if mask.any():
         dense_hits = [(idx, s) for idx, s in store.search(query_vec, mask=mask, top_k=top_k)
                       if s >= min_score]
-    sparse_hits = _bm25_search(store, mask, query_tokens, top_k=top_k)
+    sparse_hits = _gate_sparse(_bm25_search(store, mask, query_tokens, top_k=top_k),
+                               all_cos, min_score)
     dense_rank = {idx: r for r, (idx, _s) in enumerate(dense_hits, start=1)}
     sparse_rank = {idx: r for r, (idx, _s) in enumerate(sparse_hits, start=1)}
     dense_score = dict(dense_hits)
@@ -202,7 +226,9 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
 def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.ndarray,
                      mode: str, query_vec, query_tokens: List[str], min_score: float,
                      top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K,
-                     lanes: str = "both") -> List[Tuple[int, float, str, float]]:
+                     lanes: str = "both",
+                     all_cos: Optional[np.ndarray] = None
+                     ) -> List[Tuple[int, float, str, float]]:
     """paper 侧检索：瘦 chunk（p:）与厚 chunk（ab:）dense 各一路 + BM25（合并掩码）一路。
     hybrid 下三路按 rank RRF 融合。返回形状与 _level_hits 一致：(idx, score, kind, sort_score)。
 
@@ -247,7 +273,8 @@ def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.nd
         return out
 
     # hybrid：瘦 dense + 厚 dense + BM25 三路 RRF
-    sparse_hits = _bm25_search(store, merged_mask, query_tokens, top_k=top_k)
+    sparse_hits = _gate_sparse(_bm25_search(store, merged_mask, query_tokens, top_k=top_k),
+                               all_cos, min_score)
     lists = dense_lists + [sparse_hits]
     rank_maps = [{idx: r for r, (idx, _s) in enumerate(lst, start=1)} for lst in lists]
     dense_score = {}
@@ -307,9 +334,11 @@ def main() -> int:
                     help="auto=两级都查（默认） paper=只查论文级（默认双路：标题+一句话 与 "
                          "回填摘要，见 --paper-lanes） highlight=只查精读句")
     ap.add_argument("--min-score", type=float, default=NOTES_SEARCH_MIN_SCORE,
-                    help="最低余弦相似度（默认 {}，集中在 thresholds.py）。只过滤 dense 侧"
-                         "候选；--mode sparse 下不生效，--mode hybrid 下只过滤参与 RRF "
-                         "融合的 dense 候选".format(NOTES_SEARCH_MIN_SCORE))
+                    help="最低余弦相似度（默认 {}，集中在 thresholds.py）。dense 与 hybrid "
+                         "下**全部候选**都受它约束（hybrid 的 BM25 单路命中回查余弦后过滤）；"
+                         "--mode sparse 不算 query 向量，不生效。注意它只管过滤，不管排序——"
+                         "hybrid 仍按 RRF 名次排序，要按分数看排名请用 --mode dense"
+                         .format(NOTES_SEARCH_MIN_SCORE))
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
     ap.add_argument("--json", action="store_true", dest="as_json", help="结构化输出（含 total）")
@@ -363,6 +392,12 @@ def main() -> int:
             client.close()
 
     base_mask = _build_mask(store, args)
+    # hybrid 下 BM25 单路命中要能回查自己的余弦才能受 --min-score 约束（见 _gate_sparse）。
+    # 只在 hybrid 算：dense 分支本来就拿得到余弦，sparse 分支压根没有 query 向量。
+    # 成本可忽略——store.search 内部无视 mask 做的就是同一个整矩阵乘法，--level auto 下
+    # 已经做了 3 次，这里是第 4 次（真库 22592×1024 实测 ~1ms，同 query 的 BM25 是 40-185ms）。
+    all_cos = (store.mat @ query_vec.astype(np.float32)) if (
+        args.mode == "hybrid" and query_vec is not None) else None
     level_arr = np.array([r["level"] for r in store.records])
     search_paper = args.level in ("auto", "paper")
     search_highlight = args.level in ("auto", "highlight")
@@ -376,12 +411,12 @@ def main() -> int:
         # paper 级的 title/one_line，摘要不刷屏。
         paper_hits = _paper_side_hits(store, base_mask, level_arr, args.mode,
                                        query_vec, query_tokens, args.min_score,
-                                       lanes=args.paper_lanes)
+                                       lanes=args.paper_lanes, all_cos=all_cos)
     highlight_hits: List[Tuple[int, float, str, float]] = []
     if search_highlight:
         highlight_mask = base_mask & (level_arr == "highlight")
         highlight_hits = _level_hits(store, highlight_mask, args.mode, query_vec, query_tokens,
-                                      args.min_score)
+                                      args.min_score, all_cos=all_cos)
 
     # 全库真相：这个 citekey 是否本就有句级证据（与本次查询命中与否无关）
     highlight_citekeys = {r["citekey"] for r in store.records if r["level"] == "highlight"}
@@ -390,13 +425,23 @@ def main() -> int:
     # 每条 hit 是 (idx, score, kind, sort_score)：score/kind 是展示值（dense 命中给
     # 余弦、纯关键词命中给 RRF/BM25 分并标 kind!=cosine）；sort_score 是排序值（hybrid
     # 下统一用 RRF 分，跟展示值分离——RRF 才是两路真正可比的量纲）
-    groups = defaultdict(lambda: {"paper": None, "paper_src": None, "hits": []})
+    # paper     ：排序代表（sort_score 最大者，hybrid 下即 RRF）
+    # paper_cos ：展示代表（paper 侧全部 chunk 的最高余弦 + 它来自哪条泳道）
+    # 两者必须分开存：hybrid 下 RRF 最高的那条未必余弦最高，只留一条会把更高的兄弟
+    # chunk 当场丢掉，下游 cosine_cands 的 max 再也捞不回来——实测 1898/28076 个
+    # (query,citekey) 对被低报、最大低报 0.080，其中 72 例展示 <0.62 而真实 ≥0.62，
+    # 正好落在 skill 判重线两侧；并列时 paper_src 还会由 set 迭代序而非分数决定
+    # （45 个实例分布在 33/75 条 bench query 上）。
+    groups = defaultdict(lambda: {"paper": None, "paper_src": None,
+                                  "paper_cos": None, "hits": []})
     for idx, score, kind, sort_score in paper_hits:
         r = store.records[idx]
         g = groups[r["citekey"]]
         if g["paper"] is None or sort_score > g["paper"][2]:
             g["paper"] = (score, kind, sort_score)
             g["paper_src"] = r["level"]          # "paper"（标题+判词）或 "abstract"（回填摘要）
+        if kind == "cosine" and (g["paper_cos"] is None or score > g["paper_cos"][0]):
+            g["paper_cos"] = (score, r["level"])
     for idx, score, kind, sort_score in highlight_hits:
         r = store.records[idx]
         groups[r["citekey"]]["hits"].append((score, kind, sort_score, r))
@@ -411,22 +456,28 @@ def main() -> int:
         # 展示分优先 dense 余弦命中（有则给真实余弦分），纯关键词命中才给 RRF 分并标 [关键词]。
         # 跨篇排序与展示解耦：_sort 恒取全篇最优 sort_score（RRF），保证位次可比。
         best_sort = max(t[2] for t in candidates)
-        cosine_cands = [c for c in candidates if c[1] == "cosine"]
+        # 展示候选 = paper 侧**最高余弦**（paper_cos，而非排序代表 g["paper"]）+ 句级余弦命中。
+        # 同时记账它来自哪一侧：score_from 不能靠"与 paper_cos 比大小"反推——纯关键词命中的
+        # paper 行 paper_cos 恒为 None，反推会一律落到 "highlight"，给一条 hits 为空的行打上
+        # 「句」标记，与同一条目下紧跟着的"该篇无精读句级证据"直接打架。
+        cosine_cands = ([(g["paper_cos"][0], "paper")] if g["paper_cos"] else []) + \
+                       [(s, "highlight") for s, k, _ss, _r in g["hits"] if k == "cosine"]
         if cosine_cands:
-            # 展示分按 t[0]（余弦）取 max，不能按 t[2]：hybrid 下 sort_score 是 RRF，
-            # 按 t[2] 取会展示"RRF 最高的那条的余弦"而非全篇最高余弦
-            best_score, best_kind = max(cosine_cands, key=lambda t: t[0])[:2]
+            best_score, score_from = max(cosine_cands, key=lambda t: t[0])
+            best_kind = "cosine"
         else:
-            best_score, best_kind = max(candidates, key=lambda t: t[2])[:2]
+            _b = max(candidates, key=lambda t: t[2])
+            best_score, best_kind = _b[0], _b[1]
+            score_from = "paper" if (g["paper"] and _b is g["paper"]) else "highlight"
         # 这个展示分**未必是篇级分**：--level auto 下候选里混着句级命中，某篇标题/摘要
         # 根本没过 min_score、只有一条精读句命中 0.71 时，展示分就是那 0.71。而
         # scholar-search skill 教的是"≥0.62 判库内疑似同篇"——那条判据只对篇级分成立，
         # 不标出来就会被当成篇级分读，把"库里有一句相关证据"误报成"库里已有这篇"。
-        paper_cos = g["paper"][0] if (g["paper"] and g["paper"][1] == "cosine") else None
-        score_from = "paper" if (paper_cos is not None and best_score <= paper_cos) else "highlight"
         title, one_line = _split_paper_text(meta["text"])
         match_level = "highlight" if g["hits"] else "paper"
-        paper_src = g.get("paper_src") or "paper"
+        # paper_src 跟**展示分实际取自哪条 chunk**，不再跟 RRF 排序代表（并列时由 set
+        # 迭代序决定，等于掷硬币）。没有余弦命中时退回排序代表的泳道。
+        paper_src = (g["paper_cos"][1] if g["paper_cos"] else g.get("paper_src")) or "paper"
         no_evidence = not g["hits"] and ck not in highlight_citekeys
         g["hits"].sort(key=lambda t: -t[2])
         rows.append({
@@ -450,6 +501,12 @@ def main() -> int:
             "results": [{
                 "citekey": row["citekey"], "score": round(row["score"], 4),
                 "score_kind": row["score_kind"],
+                # 展示分取自篇级还是句级。skill 的「≥0.62 判库内疑似同篇」判据**只对
+                # score_from=="paper" 成立**；match_source 回答的是另一个问题（这篇有没有
+                # 句级命中），两者不可互相替代：paper 0.71+句级 0.55 与 paper 0.55+句级 0.71
+                # 的 score 都是 0.71、match_source 都是 "highlight"，JSON 消费方无从区分。
+                # 人读模式有「句」标记兜着，而 skill 推荐的正是 --json。
+                "score_from": row["score_from"],
                 "match_level": row["match_level"],
                 "match_source": ("highlight" if row["hits"]
                                  else ("abstract" if row["paper_src"] == "abstract" else "title")),

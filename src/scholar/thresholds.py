@@ -19,6 +19,13 @@ notes_search.py 的 argparse 默认值、topics.py 的模块常量、workflow.py
 # 历史默认值，**无标定档案**——这是三个阈值里唯一没做过系统标定的（低门槛 + --limit
 # 截断的组合在 CLI 交互场景够用；rag_bench 固化的是排序质量，不依赖这个门槛）。
 # 若要标定，参考 docs/decisions/rag_bench_baseline_2026-08.md 的 case 集。
+#
+# ⚠️ docs/skills/scholar-search/SKILL.md 的判重命令手传 `--min-score 0.62`，那是下面
+# DIGEST_NEIGHBOR_MIN_SIM 的标定值，属**跨链路借用**而非本链路标定：掩码口径相同
+# （paper+abstract），但 query 形状不同——skill 传的是标题或摘要句，digest 标定用的是
+# title+abstract[:800]。这笔账 2026-08-23 复审时才被理清，此前无人记过。要把 0.62 固化成
+# 本链路默认值，必须先按 digest_neighbors_calibration_2026-08.md 的方法二，在 skill 的
+# 真实 query 形状上重做逐对人工判定。
 NOTES_SEARCH_MIN_SCORE = 0.4
 
 # ---------------------------------------------------------------------------

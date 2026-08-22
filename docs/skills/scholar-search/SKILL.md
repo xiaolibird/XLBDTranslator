@@ -96,18 +96,29 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 \
 里可能根本没有分最高的那条（实测：某查询全库唯一一条 ≥0.62 的命中排在 hybrid 第 12 位，
 `--limit 5` 完全看不到它，照着下结论就会漏报库内强近邻）。`--mode dense` 才按分数降序，
 `--min-score` 直接施加阈值、把判据交给脚本而不是靠眼睛看列表。
+
+（2026-08-23 更新：`--min-score` 在 `hybrid` 下**已经能真正过滤**了——此前它只约束 dense
+泳道，BM25 单路命中无门槛地占 `--limit` 名额，导致门槛越高结果越脏；离题探针配
+`--min-score 0.95` 曾能返回 108 篇。**但排序仍是 RRF 名次**，所以上面 `--mode dense`
+这条建议一个字都不能省：要按分数看排名，只有 dense。）
 `--level paper` 默认走瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——
 每条结果的 `match_source` 标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇"更可信）。
 
 `--json` 输出结构：顶层 `{total, shown, truncated, query, mode, results}`，
-`results[]` 每条含 `citekey / score / score_kind / match_level / match_source /
+`results[]` 每条含 `citekey / score / score_kind / score_from / match_level / match_source /
 year / title / one_line / hits / note_file / note_line`。
+**`score_from` 必看**：它说明 `score` 取自篇级（`"paper"`）还是句级（`"highlight"`）。
+下面「≥0.62 判库内疑似同篇」那条判据**只对 `score_from == "paper"` 成立**——句级 0.71
+只说明"库里有一句相关证据"，不等于"库里已有这篇"。`match_source` 回答的是另一个问题
+（这篇有没有句级命中），两者不能互相替代。
 
 **怎么读语义命中（勿误报）**：
 - 语义命中 ≠ 已收录——📚（索引精确匹配）才是收录判据，notes_search 只说明库里有**近邻**；
 - **命中数本身没有意义**（不加 `--min-score` 时门槛 0.4 极宽，随便一个查询都有几百条），
   只看分；上面那条命令已经把 0.4~0.62 的主题相关噪声滤掉了，**有输出才提，没输出就是没有**；
-- 分数怎么读：≥0.62 才值得向用户提示「库内疑似同篇/强近邻」（digest 近邻注入的标定线）；
+- 分数怎么读：≥0.62 **且 `score_from == "paper"`** 才值得向用户提示「库内疑似同篇/强近邻」
+  （0.62 是 digest 近邻注入的标定线，本链路属**借用**、query 形状与那次标定不完全一致，
+  见 thresholds.py 的记账）；
   **≥0.78 且 citekey 与某条结果的 📚 标注一致，多半是这篇自己**（已收录论文会自命中
   ~0.8），那不是"新发现的近邻"，先回头看该条有没有 📚；
 - 句级证据检索是另一套 0.55 口径；三条链路阈值集中在仓库 `src/scholar/thresholds.py`。

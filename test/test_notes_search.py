@@ -10,6 +10,9 @@
 导入方式沿用 test_notes_query.py：pytest 时 repo root 在 sys.path，
 scripts 作为隐式命名空间包可直接 import。
 """
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -196,3 +199,121 @@ def test_scholar_search_skill_doc_mentions_abstract_match_source():
     assert "abstract" in text
     # 与 --level paper 的建议命令出现在同一份文档，且明确双路（摘要也参与）
     assert "--level paper" in text and "摘要" in text
+
+
+# ---------------- R1：--min-score 在 hybrid 下同等约束 sparse 泳道 ----------------
+
+def _gate_store():
+    """两行：alpha 余弦 0.90（强命中）、noise 余弦 0.20（离题，但 BM25 词面命中）。"""
+    records = [_rec("paper", "alpha"), _rec("paper", "noise")]
+    records[0]["text"] = "missing data mechanism\n关于缺失机制"
+    records[1]["text"] = "missing missing missing\n词面撞车但语义离题"
+    mat = np.stack([_unit(c, np.sqrt(1 - c * c), 0.0) for c in (0.90, 0.20)])
+    return VectorStore(meta={"model": "test", "dim": "3"}, records=records, mat=mat)
+
+
+def test_hybrid_min_score_gates_sparse_lane():
+    """BM25 单路命中此前无任何分数门槛却照样占 --limit 名额。真库实测：离题探针
+    `--min-score 0.95` 修复前仍返回 108 篇，而标定档案写着硬离题探针 max sim 0.575。"""
+    store = _gate_store()
+    base, level_arr = _masks(store)
+    all_cos = store.mat @ QUERY
+    hits = ns._paper_side_hits(store, base, level_arr, "hybrid", QUERY,
+                               ["missing"], 0.62, all_cos=all_cos)
+    assert [store.records[i]["citekey"] for i, *_ in hits] == ["alpha"]
+
+
+def test_hybrid_min_score_is_monotone():
+    """反向单调是这条缺陷的根因：门槛越高，dense 泳道越小、无门槛的 BM25 命中占的
+    名额越多，结果反而更脏。修复后结果集必须随门槛单调收缩。"""
+    store = _gate_store()
+    base, level_arr = _masks(store)
+    all_cos = store.mat @ QUERY
+    def _keys(ms):
+        return {store.records[i]["citekey"] for i, *_ in ns._paper_side_hits(
+            store, base, level_arr, "hybrid", QUERY, ["missing"], ms, all_cos=all_cos)}
+    lo, hi = _keys(0.1), _keys(0.7)
+    assert hi <= lo and lo - hi == {"noise"}
+
+
+def test_sparse_mode_unaffected_by_min_score():
+    """--mode sparse 压根不算 query 向量（all_cos=None），门槛必须原样放行。"""
+    store = _gate_store()
+    base, level_arr = _masks(store)
+    hits = ns._paper_side_hits(store, base, level_arr, "sparse", None,
+                               ["missing"], 0.95, all_cos=None)
+    assert {store.records[i]["citekey"] for i, *_ in hits} == {"alpha", "noise"}
+
+
+def test_gate_sparse_passthrough_without_cosines():
+    assert ns._gate_sparse([(0, 3.2), (1, 1.1)], None, 0.9) == [(0, 3.2), (1, 1.1)]
+
+
+# ---------------- R1：展示分取篇级最高余弦 / score_from 按来源记账 / JSON 导出 ----------------
+
+def _run_main(monkeypatch, capsys, store, argv, min_score="0.4"):
+    """驱动 main()：桩掉配置加载、库加载与 query 嵌入，只测聚组/展示/输出这一段。"""
+    import sys as _sys
+    from types import SimpleNamespace
+    monkeypatch.setattr(ns, "load_scholar_settings", lambda cfg, **kw: SimpleNamespace(
+        processing=SimpleNamespace(notes_dir=Path(".")),
+        llm=SimpleNamespace(embedding_model="test")))
+    monkeypatch.setattr(ns, "_load_store", lambda db, m: (store, None))
+    monkeypatch.setattr(ns, "_freshness_hint", lambda s, d: None)
+    class _C:
+        model = "test"
+        def embed(self, texts): return np.stack([QUERY])
+        def close(self): pass
+    monkeypatch.setattr(ns, "EmbeddingClient", lambda **kw: _C())
+    monkeypatch.setattr(ns, "resolve_embedding_base_url", lambda llm: "http://x")
+    monkeypatch.setattr(_sys, "argv", ["notes_search.py"] + argv + ["--min-score", min_score])
+    rc = ns.main()
+    return rc, capsys.readouterr().out
+
+
+def _tie_store():
+    """alpha 的瘦 chunk 余弦 0.66、厚 chunk 0.61，但**厚泳道赢 BM25**（词面重复更多）
+    → 厚的 RRF 更高、成为排序代表。此时按 RRF 选展示代表就会展示 0.61 而非 0.66，
+    正是真库里 1898 次低报的形态。"""
+    records = [_rec("paper", "alpha"), _rec("abstract", "alpha")]
+    records[0]["text"] = "Thin title\n瘦判词 filler filler filler filler"
+    records[1]["text"] = "Thin title thin title thin title\n判词\nthin title abstract"
+    mat = np.stack([_unit(c, np.sqrt(1 - c * c), 0.0) for c in (0.66, 0.61)])
+    return VectorStore(meta={"model": "test", "dim": "3"}, records=records, mat=mat)
+
+
+def test_paper_display_score_is_max_cosine_across_lanes(monkeypatch, capsys):
+    """真库实测 1898/28076 个 (query,citekey) 对被低报、最大低报 0.080，其中 72 例
+    展示 <0.62 而真实 ≥0.62——正好落在 skill 判重线两侧。"""
+    from pathlib import Path as _P
+    globals().setdefault("Path", _P)
+    rc, out = _run_main(monkeypatch, capsys, _tie_store(), ["thin", "title", "--json"])
+    data = json.loads(out)
+    assert rc == 0
+    row = data["results"][0]
+    assert row["score"] == pytest.approx(0.66, abs=1e-3), "必须是篇级最高余弦，不是 RRF 代表那条"
+    assert row["match_source"] == "title"      # 展示分来自瘦泳道
+    assert row["score_from"] == "paper"
+
+
+def test_json_exposes_score_from(monkeypatch, capsys):
+    """skill 推荐的正是 --json，而 ≥0.62 判据只对 score_from=="paper" 成立。"""
+    from pathlib import Path as _P
+    globals().setdefault("Path", _P)
+    _rc, out = _run_main(monkeypatch, capsys, _tie_store(), ["thin", "title", "--json"])
+    row = json.loads(out)["results"][0]
+    assert "score_from" in row and row["score_from"] in ("paper", "highlight")
+
+
+def test_score_from_consistent_with_no_sentence_evidence(monkeypatch, capsys):
+    """永久不变量：一条根本没有句级命中的行，score_from 不许是 "highlight"
+    （此前纯关键词命中的 paper 行 paper_cos 恒为 None，反推一律落到 highlight，
+    于是人读输出给它打「句」标记，与紧邻的"该篇无精读句级证据"直接打架）。"""
+    from pathlib import Path as _P
+    globals().setdefault("Path", _P)
+    store = _gate_store()
+    _rc, out = _run_main(monkeypatch, capsys, store,
+                         ["missing", "--json", "--mode", "sparse"], min_score="0.0")
+    for row in json.loads(out)["results"]:
+        if row["no_sentence_evidence"]:
+            assert row["score_from"] != "highlight", row
