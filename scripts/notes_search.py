@@ -483,9 +483,12 @@ def main() -> int:
         "· role={}({})".format(args.role, ROLE_HINT[args.role]) if args.role else ""))
     for row in shown:
         row_kw = "[关键词] " if row["score_kind"] != "cosine" else ""
-        print("[@{}] ({}) {} {}{}".format(
+        # 篇级分数必须打出来：句级命中行一直带分，篇级此前只有标题——判"库里是否已有
+        # 类似文献"恰恰看的是篇级分（0.62 是 paper 级强近邻的标定线，见 thresholds.py），
+        # 不显示就只能靠 --json 反查，实测让调用方把弱相关误报成"库内已有"。
+        print("[@{}] ({}) {} {}{:.2f} {}".format(
             row["citekey"], row["year"] or "?", TIER_EMOJI.get(row["tier"], ""),
-            row_kw, (row["title"] or "")[:90]))
+            row_kw, row["score"], (row["title"] or "")[:90]))
         if row["one_line"]:
             print("    ⭐ {}".format(row["one_line"]))
         if row["no_sentence_evidence"]:

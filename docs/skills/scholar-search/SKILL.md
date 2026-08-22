@@ -83,17 +83,34 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 - 「精读这篇」→ 让用户提供 PDF（或 OA 可得时先下载）走 `read-paper` skill；
 - 「札记库里有没有相关的」→ 走 `scholar-notes` skill。
 
-判断"库里是否已有类似文献"（比自动的 📚 标注更模糊的相似判断）可用语义检索：
-`PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py "<标题或摘要句>" --level paper --limit 5`
-（XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）。`--level paper` 默认走
-瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——加 `--json` 后每条结果的
-`match_source` 会标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇/近邻"更可信）。
+判断"库里是否已有类似文献"（比自动的 📚 标注更模糊的相似判断）用语义检索。
+**照抄这条命令**（XLBDTranslator-dev 仓库根目录跑，语义命中不要求原文用词一致）：
 
-**怎么读语义命中（勿误报）**：语义命中 ≠ 已收录——📚（索引精确匹配）才是收录判据，
-notes_search 的结果只说明库里有**近邻**。命中数本身没有意义（默认门槛 0.4 很宽），
-要看相似度分（`--json` 每条带分）：paper 级 ≥0.62 才值得向用户提示「库内疑似同篇/
-强近邻」（digest 近邻注入的标定线）；0.4~0.6 只是主题相关，别说成"已有类似文献"。
-（句级证据检索是另一套 0.55 口径；三条链路阈值集中在仓库 `src/scholar/thresholds.py`。）
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 \
+  scripts/notes_search.py "<标题或摘要句>" --level paper --mode dense --min-score 0.62 --limit 5 --json
+```
+
+⚠️ **`--mode dense --min-score 0.62` 两个参数都不能省**，原因是默认模式有个会坑人的性质：
+默认 `hybrid` 按 RRF **融合名次**排序，**不是按分数排序**，所以 `--limit N` 截出来的前 N 条
+里可能根本没有分最高的那条（实测：某查询全库唯一一条 ≥0.62 的命中排在 hybrid 第 12 位，
+`--limit 5` 完全看不到它，照着下结论就会漏报库内强近邻）。`--mode dense` 才按分数降序，
+`--min-score` 直接施加阈值、把判据交给脚本而不是靠眼睛看列表。
+`--level paper` 默认走瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——
+每条结果的 `match_source` 标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇"更可信）。
+
+`--json` 输出结构：顶层 `{total, shown, truncated, query, mode, results}`，
+`results[]` 每条含 `citekey / score / score_kind / match_level / match_source /
+year / title / one_line / hits / note_file / note_line`。
+
+**怎么读语义命中（勿误报）**：
+- 语义命中 ≠ 已收录——📚（索引精确匹配）才是收录判据，notes_search 只说明库里有**近邻**；
+- **命中数本身没有意义**（不加 `--min-score` 时门槛 0.4 极宽，随便一个查询都有几百条），
+  只看分；上面那条命令已经把 0.4~0.62 的主题相关噪声滤掉了，**有输出才提，没输出就是没有**；
+- 分数怎么读：≥0.62 才值得向用户提示「库内疑似同篇/强近邻」（digest 近邻注入的标定线）；
+  **≥0.78 且 citekey 与某条结果的 📚 标注一致，多半是这篇自己**（已收录论文会自命中
+  ~0.8），那不是"新发现的近邻"，先回头看该条有没有 📚；
+- 句级证据检索是另一套 0.55 口径；三条链路阈值集中在仓库 `src/scholar/thresholds.py`。
 
 ## 边界
 
