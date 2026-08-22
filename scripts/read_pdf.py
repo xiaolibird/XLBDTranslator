@@ -298,8 +298,34 @@ def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
     return out
 
 
-def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
-    """从当月全部 final bundle 重建手动精读四件套 + 刷索引。"""
+def _archived_keys(notes_dir: Path, month: str):
+    """上一轮 sidecar 里已归档条目的 dedup_key 集合；sidecar 不存在/读不出返回 None。
+
+    None = 「不知道上一轮有什么」，调用方据此**不做**止损判断（首次建月、坏 sidecar）——
+    宁可放过也不要拿空集当"上一轮什么都没有"，那会让止损闸恒不触发。
+    """
+    from src.scholar._citekey_utils import recompute_entry_key
+    sidecar = notes_dir / "科研札记_{}_手动精读.index.json".format(month)
+    if not sidecar.exists():
+        return None
+    try:
+        rows = (json.loads(sidecar.read_text(encoding="utf-8")) or {}).get("papers") or []
+    except Exception:
+        return None
+    return {recompute_entry_key(r) for r in rows if isinstance(r, dict) and r.get("citekey")}
+
+
+def _rebuild_month(notes_dir: Path, month: str, settings,
+                   allow_removals: bool = False) -> dict:
+    """从当月全部 final bundle 重建手动精读四件套 + 刷索引。
+
+    allow_removals：跳过「净删除止损闸」。默认 False——整月重建是**整篇重写**，一份
+    bundle 被拒收（结构非法 / 读不出 / verified_count=0）就等于把那篇已归档论文从
+    md、references、sidecar、索引、书目、向量库里一起删掉。上一轮把回执改红、退出码
+    改成 1 只解决了「你会知道出事了」，没解决「已经出事了」。所以在**动库之前**先比对：
+    这一轮会不会净删掉上一轮已归档的条目？会就整月一字不动，让人先去修那份 JSON。
+    确要删（真的不想要那篇了）加 --allow-removals。
+    """
     from src.scholar.pdf_ingest import load_bundle, segment_from_bundle, BUNDLE_SUFFIX
     from src.scholar.notes import write_notes
     from src.scholar.notes_index import update_index, write_outputs, existing_citekeys
@@ -375,6 +401,26 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         _sync_embedding_best_effort(notes_dir, idx, settings)
         return {"month": month, "papers": 0, "skipped_drafts": skipped,
                 "broken_bundles": broken, "index": idx}
+
+    # ── 净删除止损闸（动库之前，见函数 docstring）──────────────────────────────
+    # 只在**确实有 bundle 被拒收**时才查：没有拒收的正常重建即使条目变少，也是人主动
+    # 删了 bundle，不该拦。判据用 dedup_key 而非计数：一进一出时计数不变，但确实删了一篇。
+    if (broken or skipped) and not allow_removals:
+        from src.scholar.ingest import dedup_key as _seg_dedup_key
+        prev_keys = _archived_keys(notes_dir, month)
+        if prev_keys:
+            now_keys = {_seg_dedup_key(s.metadata) for s in segments}
+            missing = prev_keys - now_keys
+            if missing:
+                logger.error(
+                    "  ⛔ 本轮重建会从 {} 的札记里**净删除 {} 篇已归档论文**（有 {} 份 bundle 被拒收）。\n"
+                    "     整月一字未动。请先修好被拒收的 bundle JSON 再重跑；\n"
+                    "     确要删除那些论文请加 --allow-removals。".format(
+                        month, len(missing), len(broken) + len(skipped)))
+                idx = update_index(notes_dir)
+                return {"month": month, "papers": len(segments), "refused": True,
+                        "removed_keys": sorted(missing),
+                        "skipped_drafts": skipped, "broken_bundles": broken, "index": idx}
 
     citekeys = _reuse_citekeys(notes_dir, month, segments)
     res = write_notes(
@@ -524,21 +570,23 @@ def cmd_finalize(args):
                      "这篇不会被纳入任何一月。请把它挪进 manual/{}/ 后再跑: {}"
                      .format(month, bucket, month, bundle.name))
         return 1
-    r = _rebuild_month(notes_dir, month, settings)
+    r = _rebuild_month(notes_dir, month, settings,
+                       allow_removals=getattr(args, "allow_removals", False))
     _report_final(r, notes_dir)
     # 在 _rebuild_month 里「拒收」等价于「从已归档的 md 里删掉」：整月 md 被重写、索引重建、
     # 向量库同步，一篇已核验论文当场蒸发。绿回执 + exit 0 会让自动权限模式的 agent 直接
     # 往下走（同 audit_citekeys_vs_pmlr 的论证），所以这里必须非 0。
-    return 1 if r.get("broken_bundles") else 0
+    return 1 if (r.get("broken_bundles") or r.get("refused")) else 0
 
 
 def cmd_regen(args):
     settings = _load_settings(args.config)
     notes_dir = Path(settings.processing.notes_dir)
     month = args.month or _cur_month()
-    r = _rebuild_month(notes_dir, month, settings)
+    r = _rebuild_month(notes_dir, month, settings,
+                       allow_removals=getattr(args, "allow_removals", False))
     _report_final(r, notes_dir)
-    return 1 if r.get("broken_bundles") else 0
+    return 1 if (r.get("broken_bundles") or r.get("refused")) else 0
 
 
 def _report_final(r, notes_dir):
@@ -548,7 +596,13 @@ def _report_final(r, notes_dir):
         idx = update_index(notes_dir)
     collisions = idx.get("citekey_collisions", [])
     print("\n" + "=" * 66)
-    if r.get("broken_bundles"):
+    if r.get("refused"):
+        print("⛔ 手动精读归档 · {}：**整月未改动**（本轮重建会净删除 {} 篇已归档论文）".format(
+            r["month"], len(r.get("removed_keys") or [])))
+        print("   净删除的条目（dedup_key）: {}".format(
+            ", ".join((r.get("removed_keys") or [])[:5])))
+        print("   → 先修好下面被拒收的 bundle JSON 再重跑；确要删除请加 --allow-removals")
+    elif r.get("broken_bundles"):
         print("⛔ 手动精读归档 · {}：{} 篇（**有 bundle 未入库，见下**）".format(
             r["month"], r["papers"]))
     else:
@@ -591,11 +645,15 @@ def main():
 
     p_fin = sub.add_parser("finalize", help="从 final bundle 重建当月手动精读札记")
     p_fin.add_argument("bundle", help="已 final 的 bundle.json 路径")
+    p_fin.add_argument("--allow-removals", action="store_true",
+                       help="允许本轮重建净删除已归档论文（默认拒绝：一份 bundle 被拒收就等于把那篇从 md/索引/书目/向量库一起删掉）")
     p_fin.set_defaults(func=cmd_finalize)
 
     p_reg = sub.add_parser("regen", help="按现有 final bundle 重建某月（不新增论文）")
     p_reg.add_argument("--month", default=None, type=_month_arg,
                        help="月份桶 YYYY-MM[-DD][-批次名]（默认当月）")
+    p_reg.add_argument("--allow-removals", action="store_true",
+                       help="允许本轮重建净删除已归档论文（默认拒绝：一份 bundle 被拒收就等于把那篇从 md/索引/书目/向量库一起删掉）")
     p_reg.set_defaults(func=cmd_regen)
 
     args = ap.parse_args()

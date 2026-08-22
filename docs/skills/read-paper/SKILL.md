@@ -87,6 +87,11 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 它从当月**全部 final bundle** 重建手动精读四件套并刷新索引（同月可多篇追加、幂等）。
 交叉核验报告会自动渲染为精读末节「交叉核验记录」。
 
+⚠️ **finalize 会在动库之前先止损**：整月重建是**整篇重写**，一份 bundle 被拒收就等于把那篇
+已归档论文从 md/references/sidecar/索引/书目/向量库里一起删掉。所以如果本轮重建会**净删除**
+上一轮已归档的条目，finalize 会**整月一字不动**并打印 `⛔ … 整月未改动`，退出码 1。
+处理方式：修好被点名的 bundle JSON 再重跑。确实不想要那几篇了才加 `--allow-removals`。
+
 ⚠️ **finalize 的输出有两条必看行**：
 - `⏭ 跳过 N 篇 draft（未 agent 核验）` —— 这些还没做核验；
 - `⛔ N 篇 bundle 读不出/结构非法，**未入库**` —— 这些**核验做完了但 JSON 坏了**，一篇都没进库。

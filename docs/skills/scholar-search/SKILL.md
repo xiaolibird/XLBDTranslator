@@ -97,6 +97,11 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 \
 `--limit 5` 完全看不到它，照着下结论就会漏报库内强近邻）。`--mode dense` 才按分数降序，
 `--min-score` 直接施加阈值、把判据交给脚本而不是靠眼睛看列表。
 
+**两轮用法（推荐）**：先 `--mode dense` 看分数判强弱，若无输出再跑一次 `--mode hybrid`
+补召回——实测两种模式的失败集**完全不相交**（75-case bench 上两者都丢出 top-10 的 = 0 条，
+并集 @10 = 75/75，而单跑最好的模式只有 70/75）。dense 强在概念换述、hybrid 强在纯关键词
+与中文词面命中，任何一个单跑都会漏掉另一个的主场。
+
 （2026-08-23 更新：`--min-score` 在 `hybrid` 下**已经能真正过滤**了——此前它只约束 dense
 泳道，BM25 单路命中无门槛地占 `--limit` 名额，导致门槛越高结果越脏；离题探针配
 `--min-score 0.95` 曾能返回 108 篇。**但排序仍是 RRF 名次**，所以上面 `--mode dense`

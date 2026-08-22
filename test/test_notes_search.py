@@ -237,7 +237,9 @@ def test_hybrid_min_score_is_monotone():
 
 
 def test_sparse_mode_unaffected_by_min_score():
-    """--mode sparse 压根不算 query 向量（all_cos=None），门槛必须原样放行。"""
+    """--mode sparse 在 _paper_side_hits 里**直接早返回**，_gate_sparse 一次都不会被调用。
+    这条钉的是「早返回路径不受门槛影响」，不是 all_cos=None 放行（那条见
+    test_gate_sparse_passthrough_without_cosines 与 test_level_hits_sparse_lane_gated）。"""
     store = _gate_store()
     base, level_arr = _masks(store)
     hits = ns._paper_side_hits(store, base, level_arr, "sparse", None,
@@ -247,6 +249,20 @@ def test_sparse_mode_unaffected_by_min_score():
 
 def test_gate_sparse_passthrough_without_cosines():
     assert ns._gate_sparse([(0, 3.2), (1, 1.1)], None, 0.9) == [(0, 3.2), (1, 1.1)]
+
+
+def test_level_hits_sparse_lane_gated():
+    """R3 变异发现:paper 侧的 gate 有 3 条测试,**highlight 侧一条都没有**——
+    而 highlight 泳道正是 --cite 取句级证据那条。"""
+    records = [_rec("highlight", "alpha"), _rec("highlight", "noise")]
+    records[0]["text"] = "missing data mechanism 缺失机制"
+    records[1]["text"] = "missing missing missing 词面撞车但语义离题"
+    mat = np.stack([_unit(c, np.sqrt(1 - c * c), 0.0) for c in (0.90, 0.20)])
+    store = VectorStore(meta={"model": "test", "dim": "3"}, records=records, mat=mat)
+    mask = np.ones(2, dtype=bool)
+    all_cos = store.mat @ QUERY
+    hits = ns._level_hits(store, mask, "hybrid", QUERY, ["missing"], 0.62, all_cos=all_cos)
+    assert [store.records[i]["citekey"] for i, *_ in hits] == ["alpha"]
 
 
 # ---------------- R1：展示分取篇级最高余弦 / score_from 按来源记账 / JSON 导出 ----------------

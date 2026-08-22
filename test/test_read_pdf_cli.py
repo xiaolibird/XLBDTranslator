@@ -660,3 +660,137 @@ def test_report_final_header_turns_red_on_broken_bundles(capsys):
                      "index": {"papers": [], "citekey_collisions": []}}, None)
     out = capsys.readouterr().out
     assert "⛔ 手动精读归档" in out and "✅ 手动精读归档" not in out
+
+
+# ---------------- R3：净删除止损闸 + 补齐半条链路 ----------------
+
+def test_rebuild_month_refuses_net_removal_when_a_bundle_is_rejected(tmp_path):
+    """R2 把回执改红、退出码改成 1,只解决了「你会知道出事了」——那一篇仍然已经从
+    md/references/sidecar/索引/书目/向量库里消失。整月重建是**整篇重写**,所以必须在
+    动库之前拦:这一轮会不会净删掉上一轮已归档的条目?"""
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pa1", "Archived Paper A", "Zhang", "10.1/a1")
+    b = _manual_seg("pb1", "Archived Paper B", "Wang", "10.1/b1")
+    _write_final_bundle(tmp_path, month, a, "/a1.pdf")
+    _write_final_bundle(tmp_path, month, b, "/b1.pdf")
+    r1 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r1["papers"] == 2
+    md_before = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+
+    # B 的 bundle 被写坏（agent 手改 JSON 的常态失误）
+    pi.bundle_path(tmp_path, month, "pb1").write_text('{"status": "final"', encoding="utf-8")
+    r2 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r2.get("refused") is True
+    assert r2["removed_keys"], "必须点名哪些条目会被净删除"
+    md_after = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert md_after == md_before, "整月必须一字未动"
+    assert "Archived Paper B" in md_after
+
+
+def test_rebuild_month_allows_removal_with_flag(tmp_path):
+    """确要删时 --allow-removals 放行（否则修不掉「我就是不想要那篇了」的场景）。"""
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pa2", "Keep Me", "Zhang", "10.1/a2")
+    b = _manual_seg("pb2", "Drop Me", "Wang", "10.1/b2")
+    _write_final_bundle(tmp_path, month, a, "/a2.pdf")
+    _write_final_bundle(tmp_path, month, b, "/b2.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    pi.bundle_path(tmp_path, month, "pb2").write_text('{"status": "final"', encoding="utf-8")
+    r = M._rebuild_month(tmp_path, month, _FakeSettings(), allow_removals=True)
+    assert not r.get("refused") and r["papers"] == 1
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Drop Me" not in md and "Keep Me" in md
+
+
+def test_rebuild_month_does_not_refuse_on_clean_removal(tmp_path):
+    """没有 bundle 被拒收时,条目变少是人主动删了 bundle,不该拦。"""
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pa3", "Stay", "Zhang", "10.1/a3")
+    b = _manual_seg("pb3", "Gone", "Wang", "10.1/b3")
+    _write_final_bundle(tmp_path, month, a, "/a3.pdf")
+    _write_final_bundle(tmp_path, month, b, "/b3.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    pi.bundle_path(tmp_path, month, "pb3").unlink()        # 干净删除,无拒收
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert not r.get("refused") and r["papers"] == 1
+
+
+def test_rebuild_month_refuses_on_verified_count_zero_removal(tmp_path):
+    """verified_count=0 对一篇**已归档**论文同样是「从 md 里删掉」,判据必须把 skipped
+    也算进去——R1/R2 都只把 broken 当危害。"""
+    month = "2026-08"
+    a = _manual_seg("pa4", "Archived X", "Zhang", "10.1/a4")
+    b = _manual_seg("pb4", "Archived Y", "Wang", "10.1/b4")
+    _write_final_bundle(tmp_path, month, a, "/a4.pdf")
+    _write_final_bundle(tmp_path, month, b, "/b4.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    _write_final_bundle(tmp_path, month, b, "/b4.pdf",
+                        cross_check_report={"verified_count": 0, "corrected": [], "added": []})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r.get("refused") is True
+
+
+def test_rebuild_month_rejects_non_dict_cross_check(tmp_path):
+    """R3 变异发现的缺口:非 dict 报告的拒收只在 cmd_finalize 侧有测,_rebuild_month
+    侧没有——而 regen 与同月兄弟的 finalize 都走这条路。"""
+    month = "2026-08"
+    seg = _manual_seg("pnd", "Non Dict Report", "Li", "10.1/nd")
+    _write_final_bundle(tmp_path, month, seg, "/nd.pdf",
+                        cross_check_report="已亲读核验，纠错3处")
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 0 and any("pnd" in n for n in r["broken_bundles"])
+
+
+def test_regen_exits_nonzero_when_a_bundle_was_not_ingested(tmp_path, monkeypatch):
+    """R2 的非 0 退出码只在 finalize 侧有测;regen 是 SKILL 教的批量重建入口。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    good = _manual_seg("pg", "Good", "Zhou", "10.1/g")
+    _write_final_bundle(tmp_path, month, good, "/g.pdf")
+    pi.bundle_path(tmp_path, month, "pbroken").write_text('{"status":', encoding="utf-8")
+
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    rc = M.cmd_regen(SimpleNamespace(config="unused", month=month, allow_removals=False))
+    assert rc == 1
+
+
+def test_cmd_ingest_forwards_title_ignored(tmp_path, monkeypatch):
+    """R3 变异发现:_print_attention 本体测了,但 cmd_ingest 是否真的把 --title 传进去没测。"""
+    from types import SimpleNamespace
+    seen = {}
+    monkeypatch.setattr(M, "_print_attention",
+                        lambda outs, failed, title_ignored="": seen.update(t=title_ignored))
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+        zotero_email = ""
+        external_email = ""
+        research_interests = ""
+    class _S:
+        processing = _Proc()
+        class llm:
+            closeread_model = "m"
+            model = "m"
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _S())
+    monkeypatch.setattr(M, "LLMClient", lambda cfg: None)
+    import src.scholar.pdf_ingest as pi
+    monkeypatch.setattr(pi, "ingest_pdf", lambda *a, **k: {
+        "title": "T", "bundle": "b", "pdf_path": "p", "meta_source": "x", "doi": None,
+        "arxiv_id": None, "n_pages": 1, "chunk_ok": 1, "chunks": 1,
+        "has_close_reading": True, "draft_status": "ok", "authors_n": 1, "duplicate": None})
+    for f in ("a.pdf", "b.pdf"):
+        (tmp_path / f).write_bytes(b"%PDF")
+    args = SimpleNamespace(config="u", month="2026-08", pdf=[str(tmp_path)], recursive=False,
+                           title="Exact Title", force=False)
+    M.cmd_ingest(args)
+    assert seen.get("t") == "Exact Title"
+    args.pdf = [str(tmp_path / "a.pdf")]
+    M.cmd_ingest(args)
+    assert seen.get("t") == "", "单篇时 --title 生效，不该报忽略"

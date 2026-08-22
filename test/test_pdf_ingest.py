@@ -711,5 +711,63 @@ def test_abstract_drops_pair_when_salvaged_and_zh_missing():
 
 
 def test_chunk_text_never_loops_when_overlap_exceeds_size():
+    """overlap >= size 会让 `start = end - overlap` 不前进、while 死循环。
+
+    ⚠️ 不直接调 chunk_text 跑穿：去掉钳位后它是**挂死**而非报错，会把整个套件吊死在 CI
+    上（本仓无 pytest-timeout）。改为断言钳位这件事本身：块数必须等于按钳位后步长
+    (size-overlap 被钳成 ≥1) 算出来的有限值。"""
+    import inspect
+    src = inspect.getsource(pi.chunk_text)
+    assert "min(overlap, size - 1)" in src, "overlap 钳位不见了，chunk_text 可能死循环"
+    # overlap 被钳到 size-1=99 → 步长 1 → 5000-100+1 = 4901 块。数字大但**有限**，
+    # 这正是钳位要保证的（不钳位则 start 不前进、永不退出）。
     out = pi.chunk_text("x" * 5000, size=100, overlap=500)
-    assert len(out) > 1 and "".join(out).count("x") >= 5000
+    assert len(out) == 4901 and all(len(c) <= 100 for c in out)
+
+
+def test_synthesize_writes_truncation_onto_closereading():
+    """R3 变异发现:裁剪写进 CloseReading 这件事只有 auto 侧被咬住,manual 侧零保护——
+    而 R1/R2 举证的活体样本(229 页/49 块)正是 manual 链路。"""
+    payload = {"one_line": "x", "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]}
+    llm = _FakeLLM([json.dumps(payload)])
+    notes = [{"claims": ["c" * 400 for _ in range(12)]} for _ in range(40)]
+    info = {}
+    cr, _one, _err = pi.synthesize_deep_read(notes, llm, "m", "ri", budget_info=info)
+    assert info.get("note"), "构造前提：必须触发裁剪"
+    assert cr is not None
+    assert cr.synth_truncated is True
+    assert cr.synth_dropped_chunks == (info.get("n_dropped") or 0)
+
+
+def test_synthesize_leaves_truncation_unset_when_within_budget():
+    """缺失 = 未知，不是 false。没裁过就不许写出 True（同 fulltext_chars 那组口径）。"""
+    payload = {"one_line": "x", "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]}
+    cr, _one, _err = pi.synthesize_deep_read(
+        [{"claims": ["c"]}], _FakeLLM([json.dumps(payload)]), "m", "ri", budget_info={})
+    assert cr.synth_truncated is None and cr.synth_dropped_chunks is None
+
+
+def test_pack_chunk_notes_drops_from_middle_not_tail():
+    """丢块必须从中段起:头部是背景/方法、尾部是结果/局限,两端都比中段贵。"""
+    # 不可压缩底座：单个超长**标量**字段，_shrink_note 只能丢列表条目、压不动它，
+    # 于是均摊裁剪不够用，必然退到丢块——这才是能测出丢块方位的构造。
+    notes = [{"tag": "chunk{}".format(i), "note": "n" * 400, "claims": ["c" * 40]}
+             for i in range(30)]
+    info = {}
+    out = pi._pack_chunk_notes(notes, budget=3000, info=info)
+    data = json.loads(out)
+    assert info.get("n_dropped", 0) > 0, "构造前提：均摊裁剪不够用，必须丢块"
+    tags = [d.get("tag") for d in data]
+    assert "chunk0" in tags and "chunk29" in tags, "首尾块必须保住"
+
+
+def test_shrink_note_drops_round_robin_across_fields():
+    """轮转丢弃:四类要点等比例受损,不能先削光某一类让它整类消失。"""
+    note = {"method_details": ["m" * 40] * 10, "key_numbers": ["k" * 40] * 10,
+            "claims": ["c" * 40] * 10, "limitations": ["l" * 40] * 10}
+    out, did = pi._shrink_note(note, 700)
+    assert did
+    for k in ("method_details", "key_numbers", "claims", "limitations"):
+        assert len(out[k]) >= 1, "{} 整类消失了".format(k)

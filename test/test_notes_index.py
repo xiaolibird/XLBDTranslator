@@ -1713,14 +1713,26 @@ def test_md_retracted_flag_overrides_sidecar(tmp_path):
 
 def test_sidecar_flags_survive_roundtrip(tmp_path):
     """反向保护：sidecar 里已有的 flags（THREAT/BENCHMARK）经 md 渲染 → 回读必须原样还原。
-    真库 18 条带 flags 的 sidecar 条目实测 mismatch=0，这条把它钉住。"""
+    真库 18 条带 flags 的 sidecar 条目实测 mismatch=0，这条把它钉住。
+
+    单看这一条是**非歧视性**的（不回读 md 时它也绿）——所以额外断言 flags 确实来自 md：
+    改掉 md 的裁决行后回读值必须跟着变，否则说明根本没读 md。"""
     _write_month(tmp_path, sidecar=True)
     stem = "科研札记_2025-03_全文精读"
-    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+    md = tmp_path / (stem + ".md")
+    entries = ni.build_month_entries("2025-03", md,
                                      ref_path=tmp_path / (stem + ".references.json"),
                                      sidecar_path=tmp_path / (stem + ".index.json"))
     by = {e["citekey"]: e for e in entries}
     assert by["public2025Deep"]["flags"] == ["THREAT"]
+
+    text = md.read_text(encoding="utf-8").replace("⚑ THREAT", "⚑ THREAT/RETRACTED")
+    md.write_text(text, encoding="utf-8")
+    entries2 = ni.build_month_entries("2025-03", md,
+                                      ref_path=tmp_path / (stem + ".references.json"),
+                                      sidecar_path=tmp_path / (stem + ".index.json"))
+    by2 = {e["citekey"]: e for e in entries2}
+    assert by2["public2025Deep"]["flags"] == ["THREAT", "RETRACTED"], "flags 必须真的来自 md"
 
 
 def test_md_row_unmatched_keeps_sidecar_flags(tmp_path):
@@ -1755,4 +1767,7 @@ def test_fix_collisions_reports_vector_sync_failure(tmp_path, monkeypatch):
                         lambda *a, **k: None)          # 模拟同步失败
     side = {}
     ni.fix_citekey_collisions(tmp_path, side_out=side)
-    assert side.get("error"), "同步失败必须经出参带给调用方"
+    # 只断真值性是恒绿的:删掉 `if stats is None` 守卫后代码撞进外层 except 照样置 error,
+    # 而且会同时留下 synced=True 的自相矛盾态。两条一起断才咬得住。
+    assert "向量库同步失败" in (side.get("error") or "")
+    assert side.get("synced") is not True, "同步失败时不许同时自称 synced"
