@@ -147,6 +147,7 @@ def main():
         return 0
 
     renamed = 0
+    sync_failed = False
     plan, skipped, failed, partial = [], [], [], []
     for e, sn, sy, _cn, _cy, _bn, _by in rows:
         ck = e.get("citekey") or ""
@@ -197,7 +198,11 @@ def main():
         print("\n改键 {} 篇；请重跑 scripts/notes_index.py --full 重建索引".format(renamed))
         # 改键只动 md/references/sidecar 三处；向量库与已渲染 docx 是不会自己跟上的派生物。
         # 不在这里告知，运维就只能靠"某天发现 pandoc 报 citation not found"才知道库旧了。
-        announce_rekey_side_effects(notes_dir, touched)
+        side = announce_rekey_side_effects(notes_dir, touched) or {}
+        if side.get("error"):
+            # 向量库没跟上 = 检索会吐已注销的旧键。退出码必须反映它，否则自动权限模式的
+            # agent 会话按 exit 0 判定成功继续往下走，而 stdout 上的 warning 没人看。
+            sync_failed = True
 
     if skipped:
         print("\n⚠️ 跳过 {} 篇（未改动任何文件）：".format(len(skipped)))
@@ -215,7 +220,10 @@ def main():
             len(failed)))
         for old, new, nf in failed:
             print("    {:<30} → {:<30} {}".format(old, new, nf))
-    if partial or failed:
+    if sync_failed:
+        print("\n⛔ 改键已落盘，但向量库自动同步失败——检索会吐已注销的旧 citekey。"
+              "请手动跑 `PYTHONPATH=. python scripts/notes_embed.py` 后再引用。")
+    if partial or failed or sync_failed:
         return 1
     return 0
 

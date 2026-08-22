@@ -1684,3 +1684,62 @@ def test_write_notes_success_no_tmp_leftover(tmp_path):
     assert not list(tmp_path.glob("*.tmp-*"))
     for ext in (".md", ".references.json", ".index.json"):
         assert (tmp_path / ("科研札记_2025-03_全文精读" + ext)).exists()
+
+
+# ---------------- R1：md 是 flags 的真相源（撤稿踢库） ----------------
+
+def test_md_retracted_flag_overrides_sidecar(tmp_path):
+    """⚑ RETRACTED 是人工事后写进 md 裁决行的，不在 sidecar 快照里。sidecar 全量顶掉
+    md 时 flags 一次都没回读 → 撤稿踢库对全部有 sidecar 的月份静默失效（真库 40/83 月、
+    1019/2343 篇 = 43%），而 lint 读的也是索引，会永远报「已撤稿且未标记」。"""
+    _write_month(tmp_path, sidecar=True)
+    stem = "科研札记_2025-03_全文精读"
+    md = tmp_path / (stem + ".md")
+    text = md.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.startswith("**裁决**") and "THREAT" not in ln:
+            lines[i] = ln + " ⚑ RETRACTED"
+            break
+    md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    entries = ni.build_month_entries("2025-03", md,
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    assert all(e["_source"] == "sidecar" for e in entries)      # 仍走 sidecar 路径
+    assert any("RETRACTED" in (e.get("flags") or []) for e in entries)
+    assert any(ni.is_retracted(e) for e in entries)
+
+
+def test_sidecar_flags_survive_roundtrip(tmp_path):
+    """反向保护：sidecar 里已有的 flags（THREAT/BENCHMARK）经 md 渲染 → 回读必须原样还原。
+    真库 18 条带 flags 的 sidecar 条目实测 mismatch=0，这条把它钉住。"""
+    _write_month(tmp_path, sidecar=True)
+    stem = "科研札记_2025-03_全文精读"
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=tmp_path / (stem + ".index.json"))
+    by = {e["citekey"]: e for e in entries}
+    assert by["public2025Deep"]["flags"] == ["THREAT"]
+
+
+def test_md_row_unmatched_keeps_sidecar_flags(tmp_path):
+    """认不到 md 行时必须**保留 sidecar 原值、绝不清空**：RENAME_PARTIAL（md 已是新键、
+    sidecar 仍旧键）是显式分流处理的活状态，那时按 citekey 认领会认空——一清空就把
+    撤稿论文重新放回向量库，比不修更危险。"""
+    _write_month(tmp_path, sidecar=True)
+    stem = "科研札记_2025-03_全文精读"
+    sc = tmp_path / (stem + ".index.json")
+    data = json.loads(sc.read_text(encoding="utf-8"))
+    for p in data["papers"]:
+        if p.get("citekey") == "public2025Deep":
+            p["citekey"] = "public2025DeepRENAMED"    # 模拟 md/sidecar 键失同步
+            p["flags"] = ["RETRACTED"]
+    sc.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    entries = ni.build_month_entries("2025-03", tmp_path / (stem + ".md"),
+                                     ref_path=tmp_path / (stem + ".references.json"),
+                                     sidecar_path=sc)
+    e = next(x for x in entries if x["citekey"] == "public2025DeepRENAMED")
+    assert e["note_line"] is None                       # 确认真的认不到 md 行
+    assert e["flags"] == ["RETRACTED"], "认不到就保留，不许清空"

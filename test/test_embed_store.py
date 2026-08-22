@@ -30,6 +30,14 @@ def _paper(citekey, *, title="T", one_line="x", highlights=(), **kw):
     return e
 
 
+def _capture_warnings():
+    """loguru 不走标准 logging，caplog 抓不到——挂一个临时 sink 收字符串。"""
+    from loguru import logger as _lg
+    buf = []
+    sink_id = _lg.add(lambda m: buf.append(str(m)), level="WARNING")
+    return buf, (lambda: _lg.remove(sink_id))
+
+
 def _hl(role, text, section="方法与数据"):
     return {"role": role, "tag": "x", "section": section, "text": text}
 
@@ -1078,3 +1086,100 @@ def test_sync_best_effort_failure_notifies_once_and_swallows(monkeypatch, tmp_pa
     assert title == "Scholar 手动精读"
     assert "手动精读归档" in text and "Ollama 不可达" in text
     assert closed == [True]     # sync_store 抛异常也必须走到 finally 关连接
+
+
+# ---------------- R1：撞键 / schema 版本闸 / 漂移告警 ----------------
+
+def test_citekey_collision_warns_and_keeps_first(tmp_path):
+    """两条 keeper 共用一个 citekey（fix_citekey_collisions 存在的理由）时，
+    字典推导式是 last-wins：甲的 p:/ab: 被乙静默覆盖、total 少算，而甲的 highlight
+    仍带该 citekey，被 workflow 的 paper_rec_by_ck 反查到乙的身份。"""
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [
+        _paper("dup2025A", title="论文甲", one_line="甲的判词",
+               highlights=[_hl("citable", "甲的证据句")]),
+        _paper("dup2025A", title="论文乙", one_line="乙的判词",
+               highlights=[_hl("citable", "乙的证据句")]),
+    ]}
+    buf, stop = _capture_warnings()
+    try:
+        stats = sync_store(db, idx, _FakeEmbedClient())
+    finally:
+        stop()
+    log = "".join(buf)
+    assert stats.total == 3, "撞键的第二份 p: 被丢弃，total 必须如实反映"
+    assert "撞键" in log and "fix-collisions" in log
+    import sqlite3 as _sq
+    conn = _sq.connect(str(db))
+    try:
+        texts = dict(conn.execute("SELECT id, text FROM chunks WHERE level='paper'"))
+    finally:
+        conn.close()
+    assert texts["p:dup2025A"].startswith("论文甲"), "保留先出现者，可复现"
+
+
+def test_incremental_refuses_stale_schema_version(tmp_path):
+    """_ensure_schema 只 CREATE IF NOT EXISTS、从不看版本，而收尾 _write_meta 无条件写
+    当前版本——一次增量就把旧库静默盖章成新版，永久解除读侧 VectorStore.load 那道闸。"""
+    import sqlite3 as _sq
+    from src.scholar.embed_store import sync_store as _sync
+    db = tmp_path / "e.sqlite3"
+    idx = {"papers": [_paper("a2024A")]}
+    _sync(db, idx, _FakeEmbedClient())
+    conn = _sq.connect(str(db))
+    try:
+        conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(VectorStoreError, match="schema 版本"):
+        _sync(db, idx, _FakeEmbedClient())
+    conn = _sq.connect(str(db))
+    try:
+        ver = dict(conn.execute("SELECT key, value FROM meta"))["schema_version"]
+    finally:
+        conn.close()
+    assert ver == "1", "拒绝之后不许把版本号盖成新的"
+
+
+def test_orphan_abstract_delete_warns_and_names_backfill(tmp_path):
+    """dedup_key 升级（backfill_pmlr_metadata 补 url）让 abstracts.json 的键成孤儿：
+    该篇仍在索引里，厚向量却被当作"该删的"删掉，且没有任何自动入口补回。
+    删除量小于 ab: 闸的放行窗口时它完全静默，日志只写"-1 删除"，读起来像正常增量。"""
+    import json as _json
+    db = tmp_path / "e.sqlite3"
+    keys = ["title:k{}".format(i) for i in range(30)]
+    (tmp_path / "abstracts.json").write_text(
+        _json.dumps({"abstracts": {k: {"abstract": "abstract text {}".format(k)}
+                                   for k in keys}}), encoding="utf-8")
+    papers = [_paper("p2024K{}".format(i), dedup_key=keys[i]) for i in range(30)]
+    s1 = sync_store(db, {"papers": papers}, _FakeEmbedClient())
+    assert s1.embedded_abstract == 30
+    # 一篇的键升级：条目还在索引里，只是 dedup_key 变了 → abstracts.get 查空
+    papers[3] = _paper("p2024K3", dedup_key="pmlr:v297/new")
+    buf, stop = _capture_warnings()
+    try:
+        s2 = sync_store(db, {"papers": papers}, _FakeEmbedClient())
+    finally:
+        stop()
+    log = "".join(buf)
+    assert s2.deleted_abstract == 1, "放行窗口内，闸不会拦——正是它静默的原因"
+    assert "backfill_abstracts" in log and "p2024K3" in log
+
+
+def test_orphan_warning_silent_when_paper_left_index(tmp_path):
+    """条目整个离开索引（撤稿踢库/duplicate_of 归并）时删厚向量是正确的，不该报警。"""
+    import json as _json
+    db = tmp_path / "e.sqlite3"
+    keys = ["title:k{}".format(i) for i in range(30)]
+    (tmp_path / "abstracts.json").write_text(
+        _json.dumps({"abstracts": {k: {"abstract": "abstract text {}".format(k)}
+                                   for k in keys}}), encoding="utf-8")
+    papers = [_paper("p2024K{}".format(i), dedup_key=keys[i]) for i in range(30)]
+    sync_store(db, {"papers": papers}, _FakeEmbedClient())
+    buf, stop = _capture_warnings()
+    try:
+        sync_store(db, {"papers": papers[:-1]}, _FakeEmbedClient())   # 最后一篇整个走了
+    finally:
+        stop()
+    assert "backfill_abstracts" not in "".join(buf)

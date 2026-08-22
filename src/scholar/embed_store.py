@@ -53,6 +53,14 @@ ABSTRACT_CLIP = 800  # ab: 厚 chunk 拼入的摘要截断长度，与 digest �
 # 按"本次要删多少条 ab:"设独立闸：超过 max(FLOOR, old_ab*RATIO) 即拒绝。
 # FLOOR 容忍零星合法删减（撤稿踢库/个别摘要修订/少量改键）；RATIO 兜大库比例。
 # 残余放行窗口只剩最后 ~RATIO（1804 条约 90 条），震荡规模从上千条压到一次 flush 量级。
+#
+# 2026-08-23 复审记账（防止把这个窗口误读成"随时会被键漂移填满"）：dedup_key 漂移能造成的
+# ab: 删除量在当前库规模下有天花板——全库"键还能再升级且已有摘要"的 keeper 只有 70 篇，
+# 而 cap = max(20, 1798×0.05) = 89.9，即**漂移这条路根本触不到删除闸**（改 citekey 更是
+# 完全正交：dedup_key_fields 里 citekey 只出现在 id: 兜底那一支，recompute_entry_key 还会
+# 保留原值，实测把全部 2343 条的 citekey 都改掉，dedup_key 变化 0 条）。漂移的真实危害是
+# 静默通过（见 sync_store 里的 _drift 告警），不是卡死。若将来摘要覆盖率补到接近全量、
+# old_ab 抬到 2256（cap 112.8）而可升级集涨到 295，才需要重新评估这个结论。
 _AB_DELETE_FLOOR = 20
 _AB_DELETE_RATIO = 0.05
 
@@ -367,9 +375,24 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
             "索引没有产出任何 chunk（papers 为空或全被 duplicate_of 过滤）。"
             "拒绝执行，避免清空现有向量库。")
     model = client.model
-    expected: Dict[str, Tuple[Chunk, str]] = {
-        c.id: (c, _text_hash(model, c.text)) for c in chunks
-    }
+    # 显式循环而非字典推导式：citekey 撞键（两条 keeper 共用一个 citekey，正是
+    # fix_citekey_collisions 存在的理由）会让两篇的 p:/ab: 算出同一个 id，推导式是
+    # last-wins —— 甲的篇级向量被乙静默覆盖、SyncStats.total 跟着少算，而甲的 highlight
+    # （内容哈希不同得以存活）仍带着这个 citekey，被 workflow._library_neighbors 的
+    # paper_rec_by_ck 反查到**乙**的 title/one_line/year，成了跨篇张冠李戴。
+    expected: Dict[str, Tuple[Chunk, str]] = {}
+    _collided: Dict[str, int] = {}
+    for c in chunks:
+        if c.id in expected:
+            _collided[c.citekey] = _collided.get(c.citekey, 0) + 1
+            continue                    # 保留先出现者：与索引顺序一致，可复现
+        expected[c.id] = (c, _text_hash(model, c.text))
+    if _collided:
+        logger.warning(
+            "citekey 撞键 {} 组、{} 条 chunk 被丢弃（同 citekey 只能有一份 p:/ab: 向量，"
+            "存活的句级证据会被按 citekey 反查到另一篇）：{}。先跑 "
+            "`PYTHONPATH=. python scripts/notes_index.py --fix-collisions` 再同步",
+            len(_collided), sum(_collided.values()), ", ".join(sorted(_collided)))
 
     # --full 模式持排他文件锁：防止两个进程同时全量重建互相覆盖（各自 embed 完再
     # os.replace，后完成的把先完成的静默抹掉）。增量模式不抢锁——WAL + BEGIN IMMEDIATE
@@ -437,6 +460,19 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
             try:
                 _ensure_schema(conn)
                 meta = _read_meta_dict(conn)
+                # schema 版本闸。_ensure_schema 只 CREATE IF NOT EXISTS、从不看版本，而
+                # 收尾的 _write_meta 无条件写当前 SCHEMA_VERSION——于是一次增量同步就把
+                # 旧版库**静默盖章**成新版：库行仍是旧语义（v1 的 highlight id 不含
+                # role+seq，正是 v2 要修的"同文本覆盖丢数据"），却从此骗过读侧
+                # VectorStore.load 那道唯一的版本闸。而 embed watcher 是 WatchPaths
+                # 自动跑的，升级代码后第一次索引变动就完成这次伪迁移，人没有介入窗口。
+                old_ver = (meta.get("schema_version") or "").strip()
+                if old_ver and old_ver != str(SCHEMA_VERSION):
+                    raise VectorStoreError(
+                        "向量库 schema 版本是 {}，代码期望 {}：增量同步无法迁移库行语义，"
+                        "只会把版本号盖成新的（读侧从此放行一个旧语义库）。"
+                        "请跑 `PYTHONPATH=. python scripts/notes_embed.py --full` 重建。"
+                        .format(old_ver, SCHEMA_VERSION))
                 old_model = meta.get("model", "")
                 if old_model and not model_matches(old_model, model):
                     # 换 embedding 模型后跑增量：text_hash 织入模型名 → 全部旧 hash 对不上 →
@@ -480,6 +516,24 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
             # 有意回退瘦库/大批改键的出口是删库后 --full 重建（full 路径不经此闸）。
             old_ab = sum(1 for lvl in existing_level.values() if lvl == "abstract")
             new_ab = sum(1 for c, _ in expected.values() if c.level == "abstract")
+            # 漂移检测（只读，不改删除行为）：一篇**仍在索引里**、库里有 ab: 厚向量、
+            # 而这轮期望集里没有它 —— 这就是 dedup_key 升级（backfill_pmlr_metadata /
+            # enrich 补 url、doi）让 abstracts.json 的键成孤儿的指纹。删除量小于闸的
+            # 放行窗口时它完全静默，日志只写"-N 删除"，读起来像正常增量；而**没有任何
+            # 自动入口按新键补抓**（backfill_abstracts.py 会做漂移对账，但它没有任何调度）。
+            # 判据刻意限定"该 citekey 仍有 p: 期望"，排除掉「条目已整个离开索引」
+            # （撤稿踢库、duplicate_of 归并）那一类——那类删除是正确的，不该报警。
+            _drift = sorted({cid[len("ab:"):] for cid, lvl in existing_level.items()
+                             if lvl == "abstract" and cid not in expected
+                             and "p:" + cid[len("ab:"):] in expected})
+            if _drift:
+                logger.warning(
+                    "本次将删除 {} 条 ab: 厚向量，而这些篇仍在索引里（{}{}）——"
+                    "多半是 dedup_key 漂移导致 {} 的键成孤儿。删掉后没有任何自动入口补回，"
+                    "该篇只剩 p: 瘦向量、跨语召回按基线掉档。请先跑 "
+                    "`PYTHONPATH=. python scripts/backfill_abstracts.py`（启动时会做漂移对账）"
+                    "再同步。".format(len(_drift), ", ".join(_drift[:5]),
+                                      " 等" if len(_drift) > 5 else "", ABSTRACTS_NAME))
             if old_ab:
                 ab_delete = sum(1 for cid, lvl in existing_level.items()
                                 if lvl == "abstract" and cid not in expected)
@@ -730,7 +784,10 @@ def sync_store_best_effort(notes_dir, index: dict, settings, *,
     except Exception as e:
         logger.warning("向量库同步跳过（不影响{}）：{}".format(context, e))
         # 无人值守时 warning 没人看——弹系统通知（notify 自身失败静默，见 utils.notify）
-        notify(notify_title, "向量库同步失败（{}已完成）：{}".format(context, str(e)[:120]))
+        # 240 而非 120：本模块的闸消息把「怎么修」放在句尾（实测一条 202 字符的
+        # ab: 删除闸消息在 120 处被砍成「…拒绝增量同步（批」，可操作部分一个字没露出来）。
+        # 无人值守路径上 notify 是唯一出口，截掉修复指引等于这条通知白发。
+        notify(notify_title, "向量库同步失败（{}已完成）：{}".format(context, str(e)[:240]))
         return None
     logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
         stats.embedded, stats.deleted, stats.meta_refreshed))

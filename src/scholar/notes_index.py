@@ -350,8 +350,18 @@ def build_month_entries(month: str, md_path: Path,
         locs = _locate_headings(md_path)
         # 历史 sidecar（v2 及更早）无 highlights/新口径 tag_counts —— 从 md 句级标记回填（近似，
         # 按 citekey 匹配）。新 sidecar（v3+，含 highlights）直接沿用，不触碰。
-        hl_map = ({m["citekey"]: m for m in parse_note_md(md_path)}
+        _md_parsed = parse_note_md(md_path)
+        hl_map = ({m["citekey"]: m for m in _md_parsed}
                   if any("highlights" not in e for e in entries) else {})
+        # flags 的真相源是 md，不是 sidecar（见 RETRACTED_FLAG 上方那段）。sidecar 是
+        # write_notes 落盘那一刻的快照，人工事后在裁决行补的 `⚑ RETRACTED` 不在里面——
+        # 不回读就等于撤稿踢库对**全部有 sidecar 的月份**静默失效（实测 40/83 月、1019/2343
+        # 篇 = 43%），而 lint 读的也是索引，于是它会永远报「已撤稿且未标记」、用户永远白改。
+        # 按 note_line 精确认领（parse_note_md 与 _locate_headings 同用 _SECTION_RE 扫同一份
+        # 文件，行号可直接对齐），**认不到就保留 sidecar 原值、绝不清空**：RENAME_PARTIAL
+        # （md 已是新键、sidecar 仍旧键）是显式分流处理的活状态，那时按 citekey 认领会认空，
+        # 一清空就把撤稿论文重新放回向量库——比不修更危险。
+        _md_by_line = {m.get("note_line"): m for m in _md_parsed if m.get("note_line")}
         # sidecar 条目已按 priority_rank 排好，与 build_digest_note 落盘顺序一致——
         # 同 citekey 出现多次时（近重复文献各自精读）按出现次序逐个认领，不能整批复用
         # 同一个 (行号, 标题)，否则第二条以后全部指向最后一节。
@@ -364,6 +374,9 @@ def build_month_entries(month: str, md_path: Path,
             _loc_cursor[ck] = i + 1
             e["note_line"] = loc[0] if loc else None
             e["note_heading"] = loc[1] if loc else None
+            src_md = _md_by_line.get(e["note_line"]) if e["note_line"] else None
+            if src_md is not None:
+                e["flags"] = list(src_md.get("flags") or [])
             if "highlights" not in e:
                 src_e = hl_map.get(e.get("citekey"))
                 e["highlights"] = src_e.get("highlights", []) if src_e else []
@@ -1363,8 +1376,7 @@ def announce_rekey_side_effects(notes_dir: Path,
                    "notes_search --cite 会吐死引用）。现在尝试自动同步；"
                    "若失败请手动跑：{}".format(len(renamed_entries), db_path.name, REKEY_SYNC_HINT))
     try:
-        from .embed_store import sync_store
-        from .embeddings import EmbeddingClient, resolve_embedding_base_url
+        from .embed_store import sync_store_best_effort
         if settings is None:
             from .paths import repo_path
             from .schema import ScholarSettings
@@ -1374,22 +1386,25 @@ def announce_rekey_side_effects(notes_dir: Path,
         # 拿它 diff 等于什么都不改。刷完顺手落盘，调用方紧接着的那次重建会自然变成空跑。
         index_data = update_index(notes_dir)
         write_outputs(index_data, notes_dir)
-        client = EmbeddingClient(
-            base_url=resolve_embedding_base_url(settings.llm),
-            model=settings.llm.embedding_model,
-        )
-        try:
-            stats = sync_store(db_path, index_data, client)
-        finally:
-            client.close()
+        # 走共享的 best-effort 封装（此前是全仓第 5 份复制，且是唯一不 notify 的那份）。
+        # 跑这条路径的是自动权限模式的 agent 会话——stdout 上的 warning 没人看，而失败后果是
+        # 向量库留着已注销的旧键，notes_search --cite 吐出的引用粘进 pandoc 渲染成 (key?)。
+        stats = sync_store_best_effort(notes_dir, index_data, settings,
+                                       notify_title="Scholar 改键", context="改键")
+        if stats is None:
+            out["error"] = "向量库同步失败（详见上方 warning 与系统通知）"
+            logger.warning("      向量库现在是**陈旧**的，检索会吐已注销的旧 citekey，"
+                           "务必手动跑：{}".format(REKEY_SYNC_HINT))
+            return out
         out["synced"] = True
         out["stats"] = {"embedded": stats.embedded, "deleted": stats.deleted,
                         "meta_refreshed": stats.meta_refreshed}
         logger.info("  ✅ 向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
             stats.embedded, stats.deleted, stats.meta_refreshed))
     except Exception as e:
+        # sync_store_best_effort 自己吞异常，这里兜的是它之前的 update_index/write_outputs
         out["error"] = "{}: {}".format(type(e).__name__, e)
-        logger.warning("  ⚠️ 向量库自动同步失败（改键本身已完成，不影响退出码）：{}\n"
+        logger.warning("  ⚠️ 改键收尾失败（改键本身已完成）：{}\n"
                        "      向量库现在是**陈旧**的，检索会吐已注销的旧 citekey，"
                        "务必手动跑：{}".format(out["error"], REKEY_SYNC_HINT))
     return out
