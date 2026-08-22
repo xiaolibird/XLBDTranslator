@@ -234,3 +234,32 @@ def test_deep_and_single_both_fail_returns_none_and_ingest_raises(monkeypatch, t
                        top_n=1, close_read=True, seen=set())
     assert not written                 # 终稿一个字都没写
     assert seg.close_reading is None
+
+
+def test_deep_close_read_records_synth_budget_truncation(monkeypatch):
+    """R2:auto 侧的 max_chunks=12 并**不能**保证不越 60000 汇总预算(实测 12 块 ×
+    每块 ~5.8k 字符即超),而 auto 没有 manual 那样的亲读核验兜底——裁剪必须留痕在条目上,
+    否则 reading_depth="chunked" / n_chunks=12 是在虚报"完整分块深读"。"""
+    from src.scholar import closereading as crmod
+    from src.scholar import pdf_ingest as pi
+    from src.scholar.schema import CloseReading, CloseReadSection, CloseReadSentence
+
+    big = [{"claims": ["c" * 5800]} for _ in range(12)]
+    monkeypatch.setattr(pi, "chunk_text", lambda *a, **k: ["x" * 1000] * 12)
+    monkeypatch.setattr(pi, "deep_read_chunks", lambda *a, **k: big)
+
+    def _fake(notes, llm, model, ri, budget_info=None):
+        # 真跑打包逻辑（这才是被测对象），CloseReading 用固定桩
+        pi._pack_chunk_notes([n for n in notes if not n.get("_error")], info=budget_info)
+        cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+            CloseReadSection(heading="研究问题", sentences=[
+                CloseReadSentence(text="x", tag=None)])])
+        return cr, "", False
+
+    monkeypatch.setattr(pi, "synthesize_deep_read", _fake)
+    cr = crmod.deep_close_read("body" * 5000, None, "m", "ri",
+                               source="oa-pdf", from_full_text=True)
+    assert cr is not None
+    assert cr.synth_truncated is True
+    assert cr.synth_dropped_chunks is not None
+    assert cr.n_chunks == 12 and cr.reading_depth == "chunked"

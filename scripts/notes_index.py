@@ -31,9 +31,15 @@ def main():
     if not notes_dir.is_dir():
         print("❌ 札记目录不存在: {}".format(notes_dir))
         return 1
+    rc = 0
     if args.fix_collisions:
-        n = fix_citekey_collisions(notes_dir)
+        side = {}
+        n = fix_citekey_collisions(notes_dir, side_out=side)
         print("🔧 撞键改键 {} 篇".format(n))
+        if side.get("error"):
+            print("\n⛔ 改键已落盘，但向量库自动同步失败——检索会吐已注销的旧 citekey。"
+                  "请手动跑 `PYTHONPATH=. python scripts/notes_embed.py` 后再引用。")
+            rc = 1
     index = update_index(notes_dir, full=args.full, since=args.since, until=args.until)
     wrote = write_outputs(index, notes_dir)
     uniq = [e for e in index["papers"] if not e.get("duplicate_of")]
@@ -42,7 +48,7 @@ def main():
         len(index["months"]), n_months, len(index["papers"]), len(uniq),
         len(index["citekey_collisions"]),
         ", ".join(k for k, v in wrote.items() if v) or "无变化"))
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

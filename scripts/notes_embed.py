@@ -86,6 +86,29 @@ def _print_stats(db_path: Path, index_path: Path):
     return 0
 
 
+def _sqlite_error_exit(e) -> int:
+    """把 sqlite 异常翻成可操作的诊断并返回退出码 2（正式路径与 --dry-run 共用）。
+
+    OperationalError 不只有"被锁"：磁盘写满、卷只读、加列后未迁移 schema
+    （CREATE TABLE IF NOT EXISTS 不会 ALTER 已有表，SELECT 新列抛 no such column）
+    全是它。一律说成"被锁"会让唯一的读者（cron_embed.err.log）照着"等一会儿再重试"白等。
+    DatabaseError（库损坏/根本不是 SQLite 文件）此前完全不接，会裸抛 traceback 并以
+    退出码 1 收场，与本脚本 docstring 承诺的 0/2/3 契约不符（1 在别处是"无命中"语义）。
+    """
+    msg = str(e)
+    if isinstance(e, sqlite3.OperationalError):
+        if "locked" in msg or "busy" in msg:
+            print("❌ 向量库被并发写锁定（可能另一进程正在同步）：{}".format(e), file=sys.stderr)
+        else:
+            print("❌ 向量库 SQLite 操作失败（**不是**并发锁；常见成因：磁盘写满、卷只读、"
+                  "schema 与代码不符需 --full 重建）：{}".format(e), file=sys.stderr)
+    else:
+        print("❌ 向量库文件损坏或不是 SQLite 库：{}\n"
+              "请删除后重建：PYTHONPATH=. python scripts/notes_embed.py --full".format(e),
+              file=sys.stderr)
+    return 2
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="同步札记库语义向量（literature_index.json -> SQLite）")
     ap.add_argument("--config", default="config/scholar.env")
@@ -121,6 +144,10 @@ def main() -> int:
         except VectorStoreError as e:
             print("❌ 向量库/索引异常：{}".format(e), file=sys.stderr)
             return 2
+        except sqlite3.DatabaseError as e:
+            # 与正式路径同款：dry-run 同样要开 sqlite 连接做 diff，坏库/坏 schema
+            # 在这里裸抛 traceback 会以退出码 1 收场，与 docstring 的 0/2/3 契约不符。
+            return _sqlite_error_exit(e)
         print("同步计划（干跑，未连接 Ollama）：")
         print("  期望 chunk 总数 = {}".format(stats.total))
         print("  待嵌 = {}（paper {} + abstract {} + highlight {}）".format(
@@ -150,25 +177,9 @@ def main() -> int:
     except EmbeddingError as e:
         print("❌ Ollama embedding 调用失败：{}".format(e), file=sys.stderr)
         return 3
-    except sqlite3.OperationalError as e:
-        msg = str(e)
-        if "locked" in msg or "busy" in msg:
-            # 并发写者持锁跨 embed 时，本进程默认 5s 超时拿到 database is locked
-            print("❌ 向量库被并发写锁定（可能另一进程正在同步）：{}".format(e), file=sys.stderr)
-        else:
-            # 磁盘写满、卷只读、加列后未迁移 schema（CREATE TABLE IF NOT EXISTS 不会 ALTER
-            # 已有表，SELECT 新列会抛 no such column）——全都是 OperationalError。一律说成
-            # "被锁"会让唯一的读者（cron_embed.err.log）照着"等一会儿再重试"白等到天荒地老。
-            print("❌ 向量库 SQLite 操作失败（**不是**并发锁；常见成因：磁盘写满、卷只读、"
-                  "schema 与代码不符需 --full 重建）：{}".format(e), file=sys.stderr)
-        return 2
     except sqlite3.DatabaseError as e:
-        # 库文件损坏/根本不是 SQLite 文件：此前不接，会裸抛 traceback 并以退出码 1 收场，
-        # 与本脚本 docstring 承诺的 0/2/3 契约不符（1 在别处是"无命中"语义）。
-        print("❌ 向量库文件损坏或不是 SQLite 库：{}\n"
-              "请删除后重建：PYTHONPATH=. python scripts/notes_embed.py --full".format(e),
-              file=sys.stderr)
-        return 2
+        # OperationalError 是它的子类，一并接住（分流在 _sqlite_error_exit 里）
+        return _sqlite_error_exit(e)
     finally:
         client.close()
 

@@ -562,7 +562,11 @@ def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_B
     full = json.dumps(usable, ensure_ascii=False)
     if len(full) <= budget:
         return full
-    per = max(200, budget // max(1, len(usable)))
+    # 预算要先扣掉 JSON 数组自身的开销：括号 2 + 分隔符 2(n-1) + 每块的 _truncated 标记。
+    # 不扣就必然溢出，于是明明还剩几百字符头寸却要去丢整块（实测 40/49/60 块各白丢 1/1/2 块）。
+    _MARK = len(', "_truncated": true')
+    _overhead = 2 + 2 * max(0, len(usable) - 1) + len(usable) * _MARK
+    per = max(200, (budget - _overhead) // max(1, len(usable)))
     packed, n_trunc = [], 0
     for n in usable:
         shrunk, did = _shrink_note(n, per)
@@ -579,7 +583,8 @@ def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_B
     msg = ("块笔记超汇总预算（{} 块 / {} 字符 > {}）：已按每块 {} 字符均摊裁剪 {} 块"
            .format(len(usable), len(full), budget, per, n_trunc)
            + ("、并丢弃中段 {} 块".format(dropped) if dropped else "")
-           + "——亲读核验时对被裁部分不能依赖草稿")
+           + "——被裁的是每块笔记的尾部条目"
+           + ("；丢块从中段起（两端更贵）" if dropped else ""))
     logger.warning("  ⚠️ {}".format(msg))
     if info is not None:
         info["note"] = msg
@@ -619,6 +624,11 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
         cr.from_full_text = True
         cr.model = model
         cr.source = "manual-pdf"
+        # 裁剪留痕落在条目上（两条链路共用）：draft_note 只在 manual 的 bundle 里，
+        # 而 sidecar/索引的消费方看到的是 CloseReading。缺失 = 未知，不是"没裁过"。
+        if budget_info and budget_info.get("note"):
+            cr.synth_truncated = True
+            cr.synth_dropped_chunks = int(budget_info.get("n_dropped") or 0)
     return cr, one_line, False
 
 
@@ -750,11 +760,12 @@ def find_final_bundle(notes_dir: Path, month: str, pdf_path: Path,
                       paper_id: str) -> Optional[Path]:
     """**任何月份桶**里是否已有一个 final bundle 在保护这篇 PDF。没有返回 None。
 
-    两条判据缺一不可：
-      · paper_id 命中——O(1)，覆盖绝大多数情况；
+    两条判据**互为兜底**（任一命中即拦），跨桶同样成立：
+      · paper_id 命中——先查当月的 O(1) 路径，再在全桶扫描里逐份比对；
       · **同一个 PDF 路径**命中——paper_id 是「标题+前三作者」的哈希，而元数据每次都要重新解析：
         Crossref 超时、DOI 抽取粘连、LLM 抽出的标题措辞不同，都会让同一个 PDF 算出不同的
         paper_id、落到不同的文件名。此时 paper_id 判据完全失效，靠这条兜住。
+      反之 PDF 换了文件（重新下载、读完后移出待读目录）时 pdf_path 判据失效，靠 paper_id 兜住。
 
     **扫全部月份桶而不只是本月**：`--month` 缺省即当月，同一批 PDF 在月边界之后重跑
     （或对 ~/Downloads/待读/ 整目录再跑一次 ingest）会落到另一个桶，同月扫描完全失效。
@@ -781,7 +792,18 @@ def find_final_bundle(notes_dir: Path, month: str, pdf_path: Path,
             continue
         try:
             d = load_bundle(bf)
-            if not _is_final_bundle(d) or not d.get("pdf_path"):
+            if not _is_final_bundle(d):
+                continue
+            # 判据一：paper_id。跨桶同样成立——守卫保护的是「这篇已被亲读核验」，与它
+            # 归档到哪个月、PDF 现在躺在哪个目录都无关。只靠 pdf_path 会漏掉最常见的
+            # 跨桶形态：同一篇论文第二次拿到的是**另一个文件**（重新下载、或读完后 PDF
+            # 已移出待读目录）。磁盘上那 3 组同 paper_id 跨桶双 final 事故，pdf_path
+            # 全不相同——只有这条判据拦得住它们。
+            if paper_id and d.get("paper_id") == paper_id:
+                return bf
+            # 判据二：同一个 PDF 路径。paper_id 是「标题+前三作者」的哈希，元数据每次
+            # 重解析都可能变（Crossref 超时、DOI 粘连、LLM 标题措辞不同），此时靠它兜住。
+            if not d.get("pdf_path"):
                 continue
             if Path(d["pdf_path"]).resolve() == target:
                 return bf

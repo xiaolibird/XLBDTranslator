@@ -283,7 +283,12 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     if not chunks:
         return None
     notes = deep_read_chunks(chunks, llm, model, max_workers=4)
-    cr, _one_line, _api_err = synthesize_deep_read(notes, llm, model, research_interests)
+    # 接住汇总步的预算裁剪信息：max_chunks=12 并不能保证不越 60000 预算（实测 12 块 ×
+    # 每块 ~5.8k 字符即超），而 auto 链路没有 manual 那样的亲读核验兜底，裁剪必须留痕——
+    # 否则 reading_depth="chunked" / n_chunks=12 是在虚报"完整分块深读"。
+    _binfo = {}
+    cr, _one_line, _api_err = synthesize_deep_read(notes, llm, model, research_interests,
+                                                   budget_info=_binfo)
     if cr is None:
         # 全块失败或汇总失败：交回调用方走单跳，保证最差不比现状差
         return None
@@ -296,6 +301,10 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     cr.from_full_text = from_full_text
     cr.reading_depth = "chunked"
     cr.n_chunks = len(chunks)
+    if _binfo.get("note"):
+        cr.synth_truncated = True
+        cr.synth_dropped_chunks = int(_binfo.get("n_dropped") or 0)
+        logger.warning("  ⚠️ 汇总预算裁剪：{}".format(_binfo["note"]))
     return cr
 
 

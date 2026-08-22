@@ -595,7 +595,7 @@ def test_deep_falls_back_to_single_call_when_synthesis_fails(monkeypatch, tmp_pa
     _pdf_route(monkeypatch, tmp_path, body)
     from src.scholar import pdf_ingest as pi
     monkeypatch.setattr(pi, "synthesize_deep_read",
-                        lambda notes, llm, model, ri: (None, "", False))
+                        lambda notes, llm, model, ri, budget_info=None: (None, "", False))
     llm = _RoutingLLM()
     seg = _seg(doi="10.1/oa")
     seg.priority_score = 1.0

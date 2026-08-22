@@ -335,6 +335,12 @@ class CloseReading(BaseModel):
     body_chars_raw: Optional[int] = Field(None, description="抽取到的原始正文长度（未经任何截断）")
     truncated: Optional[bool] = Field(None, description="正文是否被截断：body_chars_raw > body_chars")
     n_chunks: Optional[int] = Field(None, description="分块精读的块数（单跳为 1）")
+    # 汇总步的预算裁剪留痕。缺失 = 未知（老 bundle / 老 digest JSON），不是"没裁过"——
+    # 与 fulltext_chars 那组量尺同一套「缺失≠false」口径。n_chunks 说的是"读了几块"，
+    # 这两项说的是"其中有多少进了汇总 prompt"，不写出来 chunked/12 块就是虚报。
+    synth_truncated: Optional[bool] = Field(None, description="汇总步是否对块笔记做过裁剪")
+    synth_dropped_chunks: Optional[int] = Field(
+        None, description="汇总步整块丢弃的块数（均摊裁剪后仍超预算时才发生）")
     # reading_depth 四态（与 AGENTS.md 逐字一致，不得有第二套定义）：
     #   'chunked'        = manual 全部 + 开关打开后的 auto
     #   'single-call'    = auto 单跳

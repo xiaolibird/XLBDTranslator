@@ -1410,7 +1410,8 @@ def announce_rekey_side_effects(notes_dir: Path,
     return out
 
 
-def fix_citekey_collisions(notes_dir: Path) -> int:
+def fix_citekey_collisions(notes_dir: Path,
+                           side_out: Optional[Dict[str, Any]] = None) -> int:
     """自动修复撞键：同 citekey 指向不同论文时，保最早月不动，
     后出现者加 b/c… 后缀（仿 BBT 消歧），就地改 md + references.json。
 
@@ -1470,7 +1471,12 @@ def fix_citekey_collisions(notes_dir: Path) -> int:
             logger.warning("      {}".format(s))
     # 派生物（向量库 / docx）不会自己跟着改键走，收尾统一告知 + best-effort 同步。
     # 判据用 touched 而非 renamed：半改条目的新键也已经落在磁盘上，派生物照样失效。
-    announce_rekey_side_effects(notes_dir, touched)
+    side = announce_rekey_side_effects(notes_dir, touched) or {}
+    if side_out is not None:
+        # 出参而非改返回值：renamed 这个 int 被 5 处既有测试以 `renamed = ...` 接住并断言。
+        # 调用方据此决定退出码——向量库没跟上 = 检索会吐已注销的旧键，exit 0 会让自动权限
+        # 模式的 agent 判定成功继续往下走（同 audit_citekeys_vs_pmlr 的论证）。
+        side_out.update(side)
     return renamed
 
 

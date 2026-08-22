@@ -198,8 +198,7 @@ def _print_attention(outs, failed, title_ignored: str = ""):
         print("    → citekey 会退化成 anon*、bibliography 缺卷期页；"
               "可**单独对那一篇**重跑 ingest --title \"精确标题\"（--title 批量时不生效）")
     if title_ignored:
-        print("  · --title \"{}\" 本次被忽略：批量（{} 篇）时不生效".format(
-            title_ignored[:40], len(outs)))
+        print("  · --title \"{}\" 本次被忽略：批量时不生效".format(title_ignored[:40]))
         print("    → 需要覆盖标题请单独对那一篇重跑 ingest --title")
     for r in skipped:
         print("  · 已 final 未覆盖：{}".format(r["title"][:48]))
@@ -398,6 +397,19 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
             "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
 
 
+def _first_list(rep, *keys):
+    """按顺序取第一个**确实是数组**的别名值，取不到返回 []。
+
+    不能用 `rep.get(a) or rep.get(b)`：旧 schema 里同名字段可能是计数（实测
+    `"added_new": 2`），链式 or 会把它取进来当数组用。
+    """
+    for k in keys:
+        v = rep.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
 def _inject_cross_check(seg, report):
     """把 agent 的交叉核验报告摘要注入为精读末节「交叉核验记录」（渲染层零改动）。"""
     if not report or not seg.close_reading:
@@ -417,13 +429,17 @@ def _inject_cross_check(seg, report):
         raise ValueError("cross_check_report 不是 JSON 对象（实为 {}）".format(type(report).__name__))
     # 别名兼容：早期 3 种 schema 用 corrections/additions 等键，只认 corrected/added 会把
     # 这些篇的核验内容静默吞成「纠错 0 处、补漏 0 处」（存量实测约 10 篇已如此）。
-    corrected = report.get("corrected") or report.get("corrections") or []
-    added = report.get("added") or report.get("additions") or report.get("added_new") or []
-    if not isinstance(corrected, list) or not isinstance(added, list):
-        raise ValueError("cross_check_report 的 corrected/added 必须是数组（实为 {}/{}）"
-                         .format(type(corrected).__name__, type(added).__name__))
-    if isinstance(report, dict) and not any(
-            k in report for k in ("corrected", "corrections", "added", "additions", "added_new")):
+    # **别名只在取到数组时才认**：同名字段在旧 schema 里可能是计数——磁盘上真有一份
+    # `{"corrections": [...], "added_new": 2, "corrected_or_rewritten": 6}`，把 2 当数组会
+    # 让这篇已归档的 final 被拒收，下一次同月 finalize 就把它从 md/索引/书目/向量库一并抹掉。
+    # 硬拒只留给**主键显式写错类型**（corrected: "字符串" 的逐字符切片投毒仍拒）。
+    corrected = _first_list(report, "corrected", "corrections")
+    added = _first_list(report, "added", "additions", "added_new")
+    for _k in ("corrected", "added"):
+        if _k in report and not isinstance(report[_k], list):
+            raise ValueError("cross_check_report 的 {} 必须是数组（实为 {}）"
+                             .format(_k, type(report[_k]).__name__))
+    if not any(k in report for k in ("corrected", "corrections", "added", "additions")):
         logger.warning("⚠️ cross_check_report 既无 corrected 也无 corrections 键（现有键：{}）"
                        "——纠错/补漏内容不会进札记".format(sorted(report)[:8]))
     verified = report.get("verified_count")
@@ -510,7 +526,10 @@ def cmd_finalize(args):
         return 1
     r = _rebuild_month(notes_dir, month, settings)
     _report_final(r, notes_dir)
-    return 0
+    # 在 _rebuild_month 里「拒收」等价于「从已归档的 md 里删掉」：整月 md 被重写、索引重建、
+    # 向量库同步，一篇已核验论文当场蒸发。绿回执 + exit 0 会让自动权限模式的 agent 直接
+    # 往下走（同 audit_citekeys_vs_pmlr 的论证），所以这里必须非 0。
+    return 1 if r.get("broken_bundles") else 0
 
 
 def cmd_regen(args):
@@ -519,7 +538,7 @@ def cmd_regen(args):
     month = args.month or _cur_month()
     r = _rebuild_month(notes_dir, month, settings)
     _report_final(r, notes_dir)
-    return 0
+    return 1 if r.get("broken_bundles") else 0
 
 
 def _report_final(r, notes_dir):
@@ -529,7 +548,11 @@ def _report_final(r, notes_dir):
         idx = update_index(notes_dir)
     collisions = idx.get("citekey_collisions", [])
     print("\n" + "=" * 66)
-    print("✅ 手动精读归档 · {}：{} 篇".format(r["month"], r["papers"]))
+    if r.get("broken_bundles"):
+        print("⛔ 手动精读归档 · {}：{} 篇（**有 bundle 未入库，见下**）".format(
+            r["month"], r["papers"]))
+    else:
+        print("✅ 手动精读归档 · {}：{} 篇".format(r["month"], r["papers"]))
     if r.get("md"):
         print("   札记: {}".format(r["md"]))
     if r.get("docx"):

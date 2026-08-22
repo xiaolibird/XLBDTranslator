@@ -599,3 +599,64 @@ def test_title_ignored_in_batch_is_announced(capsys):
     M._print_attention(outs, [], title_ignored="An Exact Paper Title")
     out = capsys.readouterr().out
     assert "--title" in out and "批量" in out and "单独" in out
+
+
+# ---------------- R2：R1 自引入缺陷的回归 ----------------
+
+def test_cross_check_alias_count_field_is_ignored_not_rejected(tmp_path):
+    """R1 自引入:早期 schema 里 `added_new` 是**计数**不是数组(磁盘上真有一份),
+    链式 or 把 2 取进 added → isinstance 拒收 → 下一次同月 finalize 就把这篇已归档的
+    论文从 md/索引/书目/向量库一并抹掉。别名只能在取到数组时才认。"""
+    month = "2026-08"
+    seg = _manual_seg("pcount", "Count Alias Paper", "Sun", "10.1/count")
+    _write_final_bundle(tmp_path, month, seg, "/count.pdf",
+                        cross_check_report={"verified_count": 30,
+                                            "confirmed_accurate": 22,
+                                            "corrected_or_rewritten": 6,
+                                            "added_new": 2,
+                                            "corrections": ["原文 Table 2 的 AUC 为 0.87"]})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1, "计数型别名不该让已归档论文被拒收"
+    assert not r["broken_bundles"]
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "纠错 1 处、补漏 0 处" in md          # added_new=2 不当数组用
+    assert "原文 Table 2 的 AUC 为 0.87" in md
+
+
+def test_main_key_written_as_wrong_type_is_still_rejected(tmp_path):
+    """收窄不能把投毒路径一起放行:主键 corrected 显式写成字符串仍必须拒收。"""
+    month = "2026-08"
+    seg = _manual_seg("pstr2", "String Main Key", "Qian", "10.1/str2")
+    _write_final_bundle(tmp_path, month, seg, "/str2.pdf",
+                        cross_check_report={"verified_count": 2,
+                                            "corrected": "把表3的AUC从0.91改成0.81"})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 0 and any("pstr2" in n for n in r["broken_bundles"])
+
+
+def test_finalize_exits_nonzero_when_a_bundle_was_not_ingested(tmp_path, monkeypatch):
+    """在 _rebuild_month 里「拒收」= 从已归档 md 里删除。绿回执 + exit 0 会让 agent
+    直接往下走,所以有 broken_bundles 时必须非 0 且抬头变红。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    good = _manual_seg("pfine", "Fine Paper", "Zhou", "10.1/fine")
+    _write_final_bundle(tmp_path, month, good, "/fine.pdf")
+    broken = pi.bundle_path(tmp_path, month, "pbad")
+    broken.write_text('{"status": "final", "close_reading_final"', encoding="utf-8")
+    bundle = pi.bundle_path(tmp_path, month, good.paper_id)
+
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    assert M.cmd_finalize(SimpleNamespace(config="unused", bundle=str(bundle))) == 1
+
+
+def test_report_final_header_turns_red_on_broken_bundles(capsys):
+    M._report_final({"month": "2026-08", "papers": 1, "skipped_drafts": [],
+                     "broken_bundles": ["x.paper.json"],
+                     "index": {"papers": [], "citekey_collisions": []}}, None)
+    out = capsys.readouterr().out
+    assert "⛔ 手动精读归档" in out and "✅ 手动精读归档" not in out

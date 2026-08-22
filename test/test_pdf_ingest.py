@@ -607,17 +607,23 @@ def test_repo_dedup_overrides_are_isolated_from_this_file():
 def test_final_guard_holds_across_month_buckets(tmp_path):
     """--month 缺省即当月：同一批 PDF 在月边界后重跑会落到另一个桶，同月扫描完全失效。
     磁盘上已因此留下 3 组同 paper_id 跨桶双 final（2 组还把 citekey 分裂成两个键）。"""
-    seg = _make_segment()
+    seg = _make_segment()                      # segment.paper_id == "pm"
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
-    pi.write_bundle(pi.bundle_path(tmp_path, "2026-08", "pid1"), status="final",
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-08", "pm"), status="final",
                     month="2026-08", pdf_path=str(pdf), metadata_source="x",
                     segment=seg, close_reading_script=None,
                     close_reading_final={"sections": []})
-    assert pi.find_final_bundle(tmp_path, "2026-08", pdf, "pid1") is not None
-    assert pi.find_final_bundle(tmp_path, "2026-09", pdf, "pid1") is not None
+    assert pi.find_final_bundle(tmp_path, "2026-08", pdf, "pm") is not None
+    assert pi.find_final_bundle(tmp_path, "2026-09", pdf, "pm") is not None
     # paper_id 漂移（元数据重解析出不同哈希）+ 跨月：靠 pdf_path 判据兜住
     assert pi.find_final_bundle(tmp_path, "2026-09", pdf, "pid_drifted") is not None
+    # 反过来：PDF 换了文件（重新下载 / 读完后移出待读目录）而 paper_id 相同——
+    # 磁盘上那 3 组跨桶双 final 事故的 pdf_path 全不相同，只有 paper_id 判据拦得住。
+    moved = tmp_path / "moved" / "paper.pdf"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    moved.write_bytes(b"%PDF")
+    assert pi.find_final_bundle(tmp_path, "2026-09", moved, "pm") is not None
     # 别的 PDF 不该被误保护
     other = tmp_path / "other.pdf"
     other.write_bytes(b"%PDF")
@@ -650,9 +656,12 @@ def test_is_credit_error_covers_403():
 def test_pack_chunk_notes_keeps_every_chunk_represented(caplog):
     """裸 [:60000] 会从 JSON 串中间切开，且尾部整块静默消失——而论文尾部正是
     结果/局限/附录，恰是 _SYNTH_PROMPT 里价值最高的三节。"""
-    notes = [{"method_details": ["m{}-{}".format(i, "x" * 200) for _ in range(8)],
-              "key_numbers": ["k{}={}".format(i, "9" * 150)],
-              "claims": ["c{}".format(i)], "limitations": ["l{}".format(i)]}
+    # 条目长度贴近真实块笔记（~60 字符），而不是 200+ ——过长的条目会让 pop 大幅过冲、
+    # 留下几千字符头寸，恰好把"预算没扣 JSON 开销就去丢块"这个缺陷遮住。
+    notes = [{"method_details": ["m{}-{}".format(i, "x" * 55) for _ in range(12)],
+              "key_numbers": ["k{}={}".format(i, "9" * 50) for _ in range(12)],
+              "claims": ["c{}-{}".format(i, "y" * 50) for _ in range(12)],
+              "limitations": ["l{}-{}".format(i, "z" * 50) for _ in range(12)]}
              for i in range(40)]
     raw = json.dumps(notes, ensure_ascii=False)
     assert len(raw) > pi._SYNTH_NOTES_BUDGET, "构造前提：必须超预算"
@@ -663,6 +672,7 @@ def test_pack_chunk_notes_keeps_every_chunk_represented(caplog):
     assert len(data) == 40, "每一块都要有代表，不能丢尾块"
     assert info.get("note") and "超汇总预算" in info["note"]
     assert any(n.get("_truncated") for n in data)
+    assert info.get("n_dropped") == 0, "均摊裁剪够用时不许丢整块（预算必须先扣 JSON 开销）"
 
 
 def test_pack_chunk_notes_passthrough_when_within_budget():

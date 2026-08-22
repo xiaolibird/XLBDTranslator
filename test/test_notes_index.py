@@ -1743,3 +1743,16 @@ def test_md_row_unmatched_keeps_sidecar_flags(tmp_path):
     e = next(x for x in entries if x["citekey"] == "public2025DeepRENAMED")
     assert e["note_line"] is None                       # 确认真的认不到 md 行
     assert e["flags"] == ["RETRACTED"], "认不到就保留，不许清空"
+
+
+def test_fix_collisions_reports_vector_sync_failure(tmp_path, monkeypatch):
+    """R2:改键落盘后向量库没跟上 = 检索会吐已注销的旧键。此前 --fix-collisions 恒 exit 0,
+    与同一批刚给 audit_citekeys_vs_pmlr 立的标准打架。用出参带出,不动 int 返回值。"""
+    _write_month(tmp_path, citekeys={"pa": "dup2025Key", "pb": "dup2025Key", "pc": None},
+                 sidecar=True)
+    (tmp_path / ni.DB_NAME if hasattr(ni, "DB_NAME") else tmp_path / "embeddings.sqlite3").write_bytes(b"x")
+    monkeypatch.setattr("src.scholar.embed_store.sync_store_best_effort",
+                        lambda *a, **k: None)          # 模拟同步失败
+    side = {}
+    ni.fix_citekey_collisions(tmp_path, side_out=side)
+    assert side.get("error"), "同步失败必须经出参带给调用方"
