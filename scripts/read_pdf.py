@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.scholar.schema import ScholarSettings  # noqa: E402
+from src.scholar.settings import load_scholar_settings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
 from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.notes_index import INDEX_JSON  # noqa: E402
@@ -55,13 +55,8 @@ def _month_arg(v):
 
 
 def _load_settings(config):
-    settings = ScholarSettings.from_env_file(repo_path(config))
-    # 与既有 pipeline 一致：gemini 模型名走 deepseek provider
-    if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
-        settings.llm.provider = "deepseek"
-    # notes_dir 默认是相对路径，语义是「仓库里的那个目录」——锚死，别随 cwd 漂（见 paths.repo_path）
-    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
-    return settings
+    # 薄包装保名：test_read_pdf_cli.py monkeypatch 钉住这个符号。逻辑全在共享 loader。
+    return load_scholar_settings(config)
 
 
 def _expand_pdfs(paths, recursive: bool = False):
@@ -209,81 +204,27 @@ def _print_attention(outs, failed):
 def _sync_embedding_best_effort(notes_dir: Path, index: dict, settings) -> None:
     """best-effort 向量库同步：手动精读重建索引后跟进向量库。
 
-    与 ingest_notes.py 的挂钩一致——任何异常只 log warning，绝不打断手动精读主流程。
+    收敛在 embed_store.sync_store_best_effort（契约见其 docstring）。这次收敛顺带
+    修掉一个漂移：此前这里失败只 warning 不 notify，而本文件 Y3 复审早已论证过
+    「实际跑这条路径的是自动权限模式的 agent 会话，warning 没人看」——同一论证
+    对向量同步等价成立，现在 notify 是共享函数的统一行为。
     """
-    try:
-        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-        from src.scholar.embed_store import DB_NAME, sync_store
-        client = EmbeddingClient(
-            base_url=resolve_embedding_base_url(settings.llm),
-            model=settings.llm.embedding_model,
-        )
-        try:
-            stats = sync_store(notes_dir / DB_NAME, index, client)
-        finally:
-            client.close()
-        logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
-            stats.embedded, stats.deleted, stats.meta_refreshed))
-    except Exception as e:
-        logger.warning("向量库同步跳过（不影响手动精读结果）：{}".format(e))
+    from src.scholar.embed_store import sync_store_best_effort
+    sync_store_best_effort(notes_dir, index, settings,
+                           notify_title="Scholar 手动精读", context="手动精读归档")
 
 
 def _sync_topics_best_effort(notes_dir: Path, note_md: str) -> None:
     """best-effort 触发概念页路由 + 合成（P2：让概念页跟着新论文长）。
 
-    W6：`grep -rln "build_topics\\|_refresh_topics\\|affected_topics\\|new_citekeys_from_note"
-    src/ scripts/` 此前只命中 topics.py / build_topics.py / ingest_notes.py /
-    backfill_notes.py——三条真实入库路径只接了两条，本脚本（手动 PDF 深度精读）没接。
-    而手动精读入的恰是全库标注最细、质量最高的那批（220 篇 manual 系列），它们入库后
-    概念页永远不会跟着更新，除非有人事后想起来手跑一遍 build_topics.py。
-
-    与 ingest_notes.py._refresh_topics 同一套子进程调用方式（不 import，路由/熔断/
-    索引页重建只在 build_topics.py 一处维护，这里不复制一份）。同样 best-effort：
-    手动精读主流程已经落盘成功，概念页失败绝不能倒过来影响这次精读的结果。
-
-    Y3（2026-08-17 运行时复审现场证伪）：此前这里不 notify，理由写的是"本脚本是人
-    亲自在终端跑的交互式命令（finalize/regen），warning 已经在眼前，不需要再弹系统
-    通知"——复审期间 `ps aux` 现场看到真正在跑这条路径的是**自动权限模式的 Claude
-    Code 会话**（`--permission-mode auto`），不是人盯着终端；docs/skills/read-paper/
-    SKILL.md 的"批量协议"还写明多篇 PDF 会在同一会话内连续跑，warning 级日志完全
-    可能被会话自己的输出吞掉、没人看见。现在接成与 ingest_notes.py/backfill_notes.py
-    同一套：不会多打扰人——只在概念页合成真失败（超时/异常/有页面未成功）时才弹一次。
-
-    安全前提（事故实测）：子进程用 build_topics.py 自己的默认配置独立加载**生产**
-    notes_dir，与这里传入的 notes_dir 完全脱钩——test_read_pdf_cli.py 直调
-    `_rebuild_month(tmp_path, ...)` 时，子进程曾拿 tmp 目录里的 note 文件名去匹配
-    生产索引，撞上生产库里同名的当月文件，真的起了一个指向生产环境的子进程并挂起
-    13 分钟。notes_dir 不在仓库 output/ 下（测试用的 tmp_path 等）一律跳过，见
-    `T.notes_dir_is_production`。
+    收敛在 topics.trigger_topic_refresh（W3/W6/W7/Y3 战史与安全前提见其 docstring；
+    W6 正是本脚本——三条入库路径里它曾是漏接概念页的那条）。返回值有意忽略：
+    read_pdf 是交互/skill 驱动入口，docs/skills/read-paper 的批量协议依赖现行
+    退出码语义，概念页失败靠共享函数里的 notify 保证可见，不影响本次精读退出码。
     """
-    import subprocess
-    from src.scholar import topics as T
-    from src.utils.notify import notify
-    if not T.notes_dir_is_production(notes_dir):
-        return
-    script = repo_path("scripts/build_topics.py")
-    if not script.exists():
-        return
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script), "--affected-by-note", str(note_md)],
-            capture_output=True, text=True, timeout=2400,
-            cwd=str(repo_path(".")))
-    except subprocess.TimeoutExpired:
-        logger.warning("概念页更新超时，本次精读跳过（不影响归档结果）")
-        notify("Scholar 手动精读", "概念页更新超时，精读已正常归档")
-        return
-    except Exception as e:
-        logger.warning("概念页更新跳过（不影响归档结果）：{}".format(e))
-        notify("Scholar 手动精读", "概念页更新异常（精读已正常归档）：{}".format(str(e)[:120]))
-        return
-    for line in (proc.stdout or "").strip().splitlines():
-        logger.info("  {}".format(line))
-    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
-    if not outcome.ok:
-        logger.warning("概念页更新未全部成功，归档已完成：{}".format(outcome.detail))
-        notify("Scholar 手动精读", "概念页有页面未更新成功（精读已归档）：{}".format(
-            outcome.detail[:300]))
+    from src.scholar.topics import trigger_topic_refresh
+    trigger_topic_refresh(notes_dir, note_md=note_md,
+                          notify_title="Scholar 手动精读", subject="精读已正常归档")
 
 
 def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
