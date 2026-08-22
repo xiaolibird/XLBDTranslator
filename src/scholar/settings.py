@@ -271,3 +271,47 @@ class ScholarSettings(BaseSettings):
     def from_env_file(cls, env_file_path: Path = Path('config/scholar.env')) -> 'ScholarSettings':
         """从指定的 .env 文件路径加载设置"""
         return cls(_env_file=env_file_path)
+
+
+def load_scholar_settings(config="config/scholar.env", *,
+                          patch_gemini: bool = True,
+                          require: bool = False) -> ScholarSettings:
+    """脚本入口统一的配置加载：锚定路径 + 可选 gemini→deepseek 迁移补丁。
+
+    此前 7 个入口（ingest_notes / read_pdf / backfill_notes / backfill_methods /
+    screen_journal / notes_search / cli）各自手写加载，漂移出四类差异：config 是否过
+    repo_path、是否打 gemini 补丁、缺失时静默还是回退、notes_dir/output_dir 是否锚定。
+    收敛后的统一契约：
+
+    - `config` 一律过 `paths.repo_path` 锚定仓库根（从别处/launchd cwd 未设对时启动，
+      不再静默读到另一份不存在的配置而落回默认值）。
+    - 缺失时：`require=True` 抛 FileNotFoundError（交互式入口映射成自己的退出码）；
+      否则 warning + 裸 ScholarSettings() 回退（无人值守入口的既有语义，静默回退升级
+      为有警告）。
+    - `patch_gemini=True`（默认）时执行 deepseek-chat 下线后的迁移补丁：config 写的
+      是 gemini provider + gemini 模型名 → 实际走 deepseek。**撤销这块补丁时只删这里**。
+      cli.py 的 digest 主链路历史上不打此补丁（provider 切换走 --provider 参数），
+      必须显式传 patch_gemini=False，勿改变其行为。
+    - notes_dir/output_dir 无条件锚定 repo_path：二者默认是相对路径，语义是「仓库里的
+      那个目录」，不锚定就会随 cwd 漂（写去另一棵目录树 / 向量库找不到 / filter 的
+      library_neighbors 静默全空，见 screen_journal 的历史注释）。
+    """
+    from ..utils.logger import get_logger
+    from .paths import repo_path
+    logger = get_logger(__name__)
+
+    cfg = repo_path(config)
+    if cfg.exists():
+        settings = ScholarSettings.from_env_file(cfg)
+        logger.info("已加载配置文件: {}".format(cfg))
+    else:
+        if require:
+            raise FileNotFoundError(cfg)
+        logger.warning("配置文件不存在: {}，使用默认配置".format(cfg))
+        settings = ScholarSettings()
+    if patch_gemini and settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
+        settings.llm.provider = "deepseek"
+        logger.info("LLM provider 从 gemini 自动切换为 deepseek（model={}）".format(settings.llm.model))
+    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
+    settings.processing.output_dir = repo_path(settings.processing.output_dir)
+    return settings

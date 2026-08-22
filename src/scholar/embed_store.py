@@ -701,6 +701,42 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                 pass
 
 
+def sync_store_best_effort(notes_dir, index: dict, settings, *,
+                           notify_title: str, context: str) -> Optional[SyncStats]:
+    """best-effort 向量库同步：入库/回填/手动精读收尾统一走这里。
+
+    三条入库路径（周度 ingest_notes.py / 月度 backfill_notes.py / 手动 read_pdf.py）
+    此前各自复制一份 8 行同款的「建 client → sync_store → finally close」，且已漂移出
+    行为差异：read_pdf 的版本失败只 warning 不 notify——而它自己的 Y3 复审早已论证过
+    「实际跑这条路径的是自动权限模式的 agent 会话，warning 没人看」，同一论证对向量
+    同步等价成立。收敛到这里后 notify 是统一行为，不再看调用方记不记得。
+
+    契约：向量库是索引的纯派生物，任何异常（Ollama 不可达 / 模型未 pull / 网络问题）
+    只 log warning + 弹系统通知并返回 None——不抛、不改变调用方退出码、不中断主流程。
+    成功返回 SyncStats。context 填主流程名（"入库"/"回填"/"手动精读归档"），
+    notify_title 与调用方其它通知同名（如 "Scholar 周入库"）。
+    """
+    from ..utils.notify import notify
+    try:
+        from .embeddings import EmbeddingClient, resolve_embedding_base_url
+        client = EmbeddingClient(
+            base_url=resolve_embedding_base_url(settings.llm),
+            model=settings.llm.embedding_model,
+        )
+        try:
+            stats = sync_store(Path(notes_dir) / DB_NAME, index, client)
+        finally:
+            client.close()
+    except Exception as e:
+        logger.warning("向量库同步跳过（不影响{}）：{}".format(context, e))
+        # 无人值守时 warning 没人看——弹系统通知（notify 自身失败静默，见 utils.notify）
+        notify(notify_title, "向量库同步失败（{}已完成）：{}".format(context, str(e)[:120]))
+        return None
+    logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
+        stats.embedded, stats.deleted, stats.meta_refreshed))
+    return stats
+
+
 def read_store_meta(db_path) -> Dict[str, str]:
     """只读 meta 表（供 --stats 用，不加载整表向量）。库不存在返回空 dict。"""
     db_path = Path(db_path)

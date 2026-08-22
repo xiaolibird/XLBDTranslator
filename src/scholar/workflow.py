@@ -25,6 +25,7 @@ from .paths import repo_path
 from .paper_extractor import ScholarEmailParser
 from .research_profile import get_exclusion_dims, get_inclusion_dims
 from ._citekey_utils import _norm_title
+from .thresholds import DIGEST_NEIGHBOR_MIN_SIM
 from ..utils.json_tools import loads_lenient
 from ..utils.logger import get_logger
 
@@ -677,21 +678,15 @@ class ScholarWorkflow:
         return self._filter_prompt_version
 
     def _library_neighbors(self, papers: List[PaperSegment], k: int = 3,
-                            min_sim: float = 0.62) -> Dict[int, List[dict]]:
+                            min_sim: float = DIGEST_NEIGHBOR_MIN_SIM) -> Dict[int, List[dict]]:
         """查札记库（本地已收文献）语义近邻：segment_id -> [{citekey, year, one_line, sim}, ...]。
 
         查询文本口径与 _build_filter_prompt 送审文本一致：title + "\\n" + abstract[:800]（截断
         长度对齐现有裁决 prompt，避免两条截断口径打架）。一次性批量 embed 所有候选论文（不是
         逐篇请求 Ollama），查 paper+abstract 级向量（双 chunk 掩码，2026-08-21 起摘要独立
         成 ab: chunk）取 top-k，按 citekey 归并去重，sim < min_sim 丢弃。
-        min_sim=0.62 是 2026-08-21 摘要喂厚后的标定值（此前 0.65 是瘦库口径，已过时）：
-        30 条真实形状查询 × top-3 共 90 对逐对人工判定，≥0.62 注入精度 100%、
-        0.62-0.65 区间有 ~7/90 真近邻被旧值误杀；6 条硬离题探针（量子纠错/小麦施肥/
-        弱引力透镜等）max sim 0.575，与 0.62 有 4.5pt 安全边际。0.60-0.62 是弱相关与
-        离题的混杂区，留作缓冲勿再调低。定案依据是逐对人工判定档案
-        docs/decisions/digest_neighbors_calibration_2026-08.md（方法二；裁决未落脚本，
-        不可脚本复现）。scripts/calibrate_digest_neighbors.py 实现的是同档案判失败的
-        方法一（topics 共现法，正负不可分），仅作分布监控用，复跑不会得出 0.62。
+        min_sim 默认值的标定档案（2026-08-21 摘要喂厚后 90 对逐对人工判定）见
+        thresholds.DIGEST_NEIGHBOR_MIN_SIM 的注释——改值先看那边的铁律，勿在此处硬编码。
 
         结果按 segment_id 缓存在 self._library_neighbors_cache，同一次 run 内 filter 阶段
         （_build_filter_prompt 注入）与裁决落盘（_build_filter_decision/_fallback_partition

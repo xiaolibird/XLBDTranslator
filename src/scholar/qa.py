@@ -342,7 +342,7 @@ def build_qa_spec(question: str, *, extra_queries: Sequence[str] = (),
     """把一个问题包装成临时 `TopicSpec`，直接喂给 `topics.retrieve_evidence`。
 
     复用而不是另写一套召回的理由：那一套已经被多轮审核加固过——`min_sim` 的经验值
-    （0.55 而不是 notes_search 的 0.65，见 `topics.DEFAULT_MIN_SIM` 的实测依据）、
+    （句级 0.55，不同于 paper 级链路的取值，见 `thresholds.TOPICS_MIN_SIM` 的实测依据）、
     单篇证据配额的轮次制、「对我研究的联想」这类主观批注按前缀排除，每一条都是踩出来的。
     另写一份必然要把这些坑重踩一遍。
 

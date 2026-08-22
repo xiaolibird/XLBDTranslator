@@ -1991,3 +1991,88 @@ def test_annotated_vault_lint_copy_is_never_deleted(tmp_path):
     assert rep["pruned"] == []
     assert dst.exists() and "ack: ab12cd34" in dst.read_text(encoding="utf-8")
     assert any("_lint.md" in s for s in rep["skipped"])
+
+
+# ---------------- trigger_topic_refresh（F3 三处触发器收敛） ----------------
+# 契约：note_md/citekeys 互斥必填其一；非生产 notes_dir 绝不 spawn（13 分钟挂起事故）；
+# 超时/异常 → ok=False + notify（Y3：无人值守时 warning 没人看）；正常路径命令形状
+# 与收敛前三处调用点一致（--affected-by-note / 逐个 --affected-by）。
+
+def _no_notify(monkeypatch):
+    from src.utils import notify as N
+    calls = []
+    monkeypatch.setattr(N, "notify", lambda title, text: calls.append((title, text)))
+    return calls
+
+
+def test_trigger_requires_exactly_one_of_note_md_citekeys(tmp_path):
+    with pytest.raises(ValueError):
+        T.trigger_topic_refresh(tmp_path, notify_title="t", subject="s")
+    with pytest.raises(ValueError):
+        T.trigger_topic_refresh(tmp_path, note_md="a.md", citekeys=["k"],
+                                notify_title="t", subject="s")
+
+
+def test_trigger_skips_non_production_dir_without_spawning(monkeypatch, tmp_path):
+    import subprocess
+
+    def _bomb(*a, **kw):
+        raise AssertionError("非生产 notes_dir 不得发子进程")
+
+    monkeypatch.setattr(subprocess, "run", _bomb)
+    calls = _no_notify(monkeypatch)
+    out = T.trigger_topic_refresh(tmp_path, note_md="x.md", notify_title="t", subject="s")
+    assert out.ok and "skipped" in out.detail
+    assert calls == []
+
+
+def test_trigger_command_shapes(monkeypatch, tmp_path):
+    import subprocess
+    import types
+    monkeypatch.setattr(T, "notes_dir_is_production", lambda nd: True)
+    _no_notify(monkeypatch)
+    seen = []
+
+    def _fake_run(cmd, **kw):
+        seen.append(cmd)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    out = T.trigger_topic_refresh(tmp_path, note_md="科研札记_2026-08_手动精读.md",
+                                  notify_title="t", subject="s")
+    assert out.ok
+    assert "--affected-by-note" in seen[0]
+    assert "科研札记_2026-08_手动精读.md" in seen[0]
+
+    out = T.trigger_topic_refresh(tmp_path, citekeys=["a2026X", "b2026Y"],
+                                  notify_title="t", subject="s")
+    assert out.ok
+    assert seen[1].count("--affected-by") == 2
+    assert "a2026X" in seen[1] and "b2026Y" in seen[1]
+
+
+def test_trigger_timeout_and_failure_notify(monkeypatch, tmp_path):
+    import subprocess
+    import types
+    monkeypatch.setattr(T, "notes_dir_is_production", lambda nd: True)
+    calls = _no_notify(monkeypatch)
+
+    def _timeout(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", _timeout)
+    out = T.trigger_topic_refresh(tmp_path, note_md="x.md",
+                                  notify_title="Scholar 周入库", subject="札记已正常入库")
+    assert not out.ok
+    assert calls and calls[-1][0] == "Scholar 周入库" and "札记已正常入库" in calls[-1][1]
+
+    # 子进程非零退出：outcome 透传 summarize_build_topics_run 的解读并 notify
+    def _fail(cmd, **kw):
+        return types.SimpleNamespace(stdout="❌ topic-a 合成失败\n", stderr="", returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", _fail)
+    out = T.trigger_topic_refresh(tmp_path, note_md="x.md",
+                                  notify_title="Scholar 周入库", subject="札记已正常入库")
+    assert not out.ok and "topic-a" in out.detail
+    assert "topic-a" in calls[-1][1]

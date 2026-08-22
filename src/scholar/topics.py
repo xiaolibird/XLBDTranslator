@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
 from .notes_index import write_if_changed
+from .thresholds import TOPICS_MIN_SIM, TOPICS_RELATIVE_ALPHA
 from .vault import (
     ROLE_LABEL, extract_user_zone, generated_block_tampered, split_frontmatter,
     _gen_hash, GEN_END, _SAFE_KEY, _YAML_WORDS, _y,
@@ -62,18 +63,9 @@ DEFAULT_MAX_EVIDENCE = 60
 # 单篇论文最多贡献几条证据。没有这个配额，一篇 highlight 特别多的综述型文献能占满
 # 整个召回集，页面读起来像它的读书笔记——概念页的价值恰恰在于横跨多篇。
 DEFAULT_PER_PAPER_CAP = 4
-# 召回相似度下限。**不要照抄 notes_search 的 0.65**——那是 paper 级检索（标题+一句话，
-# 语义密度高）的口径，套到句级证据上会把真命中滤掉：实测 query "shadow variable MNAR
-# identification" 的最佳命中（chen2026Partial「影子变量区间中点平均绝对误差 0.06」）
-# 只有 0.593 分，0.65 下整页召回 0 条。
-#
-# 2026-08-16 在本库 17775 条 highlight 上分段抽查的结果：
-#   ≥0.55       全部题内，可直接当证据
-#   0.50~0.55   一半题内一半漂移（"结局识别算法未做诊断性能评估"这类挂到因果泛化查询上）
-#   <0.50       基本是词面巧合
-# 故取 0.55。冷门概念（如影子变量）只召回十来条是**诚实的信号**而非故障——页面会把
-# 证据数写在标题栏，缺口一节也会点明证据不足，这正是概念页该暴露的库覆盖缺口。
-DEFAULT_MIN_SIM = 0.55
+# 召回相似度下限（句级证据口径）。标定依据与"为什么不是 0.4/0.62"见
+# thresholds.TOPICS_MIN_SIM 的注释——三条检索链路的阈值集中在那里，改值先看那边的铁律。
+DEFAULT_MIN_SIM = TOPICS_MIN_SIM
 
 # bucket 命中给 select_evidence 排序加的分（只影响排序，不影响 min_sim 判定，见
 # retrieve_evidence）。2026-08-16 之前 bucket 是硬过滤，审计发现全库 2216 篇 keeper 里
@@ -86,15 +78,9 @@ DEFAULT_MIN_SIM = 0.55
 DEFAULT_BUCKET_BONUS = 0.03
 
 # per-query 相对判据系数：eff_min = max(min_sim, alpha × 本次 query 的 top1 分)。
-# 全局绝对阈值与查询强度耦合（2026-08-21 标定，config/topics.yaml 全部 36 条真实 query
-# 实测，表存 docs/decisions/topics_threshold_calibration_2026-08.md）：强 query
-# （top1≥0.70，如 "informative missingness"）在 0.55 下 top-200 全数过线，边缘尾巴
-# 靠 per_query_k 截断而不是靠阈值；冷门 query（top1<0.62，如 "shadow variable MNAR"）
-# 只召回个位数是诚实的库覆盖信号，不该再收紧。α=0.85 恰好只对 top1≥0.647 的强 query
-# 生效（0.85×0.647≈0.55），对冷门 query 完全退回 floor：
-#   α=0.80 几乎不生效（36 条里仅 4 条门槛动了）；α=0.90 把强 query 砍到只剩 3-7 条，
-#   0.60~0.65 段的真命中被误杀。传 0 可彻底关闭相对判据（退回纯绝对阈值）。
-DEFAULT_RELATIVE_ALPHA = 0.85
+# 标定表与 α 取值论证见 thresholds.TOPICS_RELATIVE_ALPHA 的注释
+# （docs/decisions/topics_threshold_calibration_2026-08.md）。
+DEFAULT_RELATIVE_ALPHA = TOPICS_RELATIVE_ALPHA
 
 # 默认排除的精读分节：这不是文献内容，是精读者自己的推测性批注，混进证据池会被综述
 # 当成"已验证结论"引用（2026-08-16 审计实测：missingness-causal.md 把「对我研究的联想」
@@ -1346,6 +1332,75 @@ def summarize_build_topics_run(stdout: str, stderr: str, returncode: int
             pages += "（等，共 {} 页，仅列前 {}）".format(len(flagged), len(shown))
         detail += "；失败/冲突页：{}".format(pages)
     return SubprocessRefreshOutcome(ok=False, detail=detail)
+
+
+def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
+                          timeout: int = 2400, notify_title: str, subject: str
+                          ) -> SubprocessRefreshOutcome:
+    """入库后触发概念页"受影响页"的路由 + 合成（P2：让概念页成为活文档）。
+
+    三条入库路径（周度 ingest_notes.py / 月度 backfill_notes.py / 手动 read_pdf.py）
+    此前各自复制一份这个子进程包装，且已出现行为漂移（返回语义、notify 与否各不相同）；
+    现在收敛到这里，调用方只决定两件事：文案（notify_title/subject）和要不要用返回的
+    `.ok` 影响自己的退出码。历次事故教训（正典在此，调用点不再复述）：
+
+    - 走 subprocess 而不是 import：与 sync_vault.py 调 build_vault.py 同理，路由、
+      熔断、索引页重建这些逻辑只在 build_topics.py 一处维护，这里不复制一份。
+    - best-effort：三条路径都可能无人值守跑（launchd / --permission-mode auto 的
+      agent 会话），概念页是索引的派生物，合成失败绝不能影响入库/回填/归档结果本身。
+    - W3（三重吞掉事故）：返回值必须可被调用方读到（ok=False ≠ 本批入库失败，只代表
+      概念页这轮没跟上）；stdout 全量入日志不截尾；stderr/退出码经
+      summarize_build_topics_run 统一解读。
+    - Y3（"人盯着终端"假设被现场证伪）：失败必须 notify——实际跑这些路径的经常是
+      自动权限模式的 agent 会话，warning 级日志会被会话输出吞掉。
+    - W7（逐月各起一次子进程撞限流）：批量场景把新增 citekey 收集成并集后**只调一次**
+      （citekeys 形态），不要一份 note 一次调用地循环。
+    - 安全前提（13 分钟挂起事故）：子进程用 build_topics.py 自己的默认配置独立加载
+      **生产** notes_dir，与传入的 notes_dir 完全脱钩——notes_dir 不在仓库 output/
+      下（测试隔离场景）一律跳过不发子进程，见 notes_dir_is_production。
+
+    note_md（--affected-by-note，单份札记路由）与 citekeys（--affected-by 并集路由）
+    二选一，都给或都不给直接 ValueError（编程错误，不走 best-effort）。
+    """
+    import subprocess
+    import sys
+    from .paths import repo_path
+    from ..utils.notify import notify
+
+    if (note_md is None) == (citekeys is None):
+        raise ValueError("note_md 与 citekeys 必须恰好提供一个")
+    if not notes_dir_is_production(notes_dir):
+        return SubprocessRefreshOutcome(ok=True, detail="skipped：notes_dir 非生产库，不发子进程")
+    script = repo_path("scripts/build_topics.py")
+    if not script.exists():
+        return SubprocessRefreshOutcome(ok=True, detail="skipped：scripts/build_topics.py 不存在")
+
+    cmd = [sys.executable, str(script)]
+    if note_md is not None:
+        cmd += ["--affected-by-note", str(note_md)]
+    else:
+        for k in citekeys:
+            cmd += ["--affected-by", k]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              cwd=str(repo_path(".")))
+    except subprocess.TimeoutExpired:
+        logger.warning("概念页更新超时（{}s），本轮跳过（{}）".format(timeout, subject))
+        notify(notify_title, "概念页更新超时，{}".format(subject))
+        return SubprocessRefreshOutcome(ok=False, detail="超时（{}s）".format(timeout))
+    except Exception as e:
+        logger.warning("概念页更新跳过（{}）：{}".format(subject, e))
+        notify(notify_title, "概念页更新异常（{}）：{}".format(subject, str(e)[:120]))
+        return SubprocessRefreshOutcome(ok=False, detail=str(e)[:300])
+
+    # 全量入日志，不截尾（W3：失败页身份曾恰好落在被截掉的窗口外）
+    for line in (proc.stdout or "").strip().splitlines():
+        logger.info("  {}".format(line))
+    outcome = summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
+    if not outcome.ok:
+        logger.warning("概念页更新未全部成功（{}）：{}".format(subject, outcome.detail))
+        notify(notify_title, "概念页有页面未更新成功（{}）：{}".format(subject, outcome.detail[:300]))
+    return outcome
 
 
 # ---------------------------------------------------------------------------

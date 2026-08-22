@@ -1014,3 +1014,62 @@ def test_library_neighbors_real_load_path_mask_admits_abstract_chunks(tmp_path):
     assert out[1][0]["one_line"] == "人工判词"
     # highlight 向量即使与 query 余弦为 1 也不得进近邻
     assert out[2] == []
+
+
+# ---------------- sync_store_best_effort（F2 三处复制收敛） ----------------
+# 契约：成功返回 SyncStats；任何异常绝不外抛——warning + notify 恰好一次后返回 None
+# （向量库是索引的纯派生物，同步失败不允许影响调用方退出码）。
+
+def _bes_settings():
+    import types
+    return types.SimpleNamespace(llm=types.SimpleNamespace(embedding_model="bge-m3"))
+
+
+def _patch_embedding_client(monkeypatch):
+    import types
+    from src.scholar import embeddings as E
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(E, "EmbeddingClient", _Client)
+    monkeypatch.setattr(E, "resolve_embedding_base_url", lambda llm: "http://localhost:11434")
+
+
+def test_sync_best_effort_success_returns_stats(monkeypatch, tmp_path):
+    import types
+    from src.scholar import embed_store as S
+    from src.utils import notify as N
+    _patch_embedding_client(monkeypatch)
+    stats = types.SimpleNamespace(embedded=3, deleted=1, meta_refreshed=2)
+    monkeypatch.setattr(S, "sync_store", lambda *a, **kw: stats)
+    calls = []
+    monkeypatch.setattr(N, "notify", lambda *a: calls.append(a))
+    out = S.sync_store_best_effort(tmp_path, {"papers": []}, _bes_settings(),
+                                   notify_title="Scholar 周入库", context="入库")
+    assert out is stats
+    assert calls == []          # 成功不打扰人
+
+
+def test_sync_best_effort_failure_notifies_once_and_swallows(monkeypatch, tmp_path):
+    from src.scholar import embed_store as S
+    from src.utils import notify as N
+    _patch_embedding_client(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("Ollama 不可达")
+
+    monkeypatch.setattr(S, "sync_store", _boom)
+    calls = []
+    monkeypatch.setattr(N, "notify", lambda title, text: calls.append((title, text)))
+    out = S.sync_store_best_effort(tmp_path, {"papers": []}, _bes_settings(),
+                                   notify_title="Scholar 手动精读", context="手动精读归档")
+    assert out is None
+    assert len(calls) == 1
+    title, text = calls[0]
+    assert title == "Scholar 手动精读"
+    assert "手动精读归档" in text and "Ollama 不可达" in text
