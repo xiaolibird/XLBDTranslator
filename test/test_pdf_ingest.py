@@ -600,3 +600,106 @@ def test_repo_dedup_overrides_are_isolated_from_this_file():
     from src.scholar import notes_index as ni
     assert ni._read_override_files(None) == []
     assert not Path(ni.REPO_OVERRIDES_PATH).exists()
+
+
+# ---------------- R1：跨月守卫 / 403 / 汇总预算 / 原子写 / 摘要 ----------------
+
+def test_final_guard_holds_across_month_buckets(tmp_path):
+    """--month 缺省即当月：同一批 PDF 在月边界后重跑会落到另一个桶，同月扫描完全失效。
+    磁盘上已因此留下 3 组同 paper_id 跨桶双 final（2 组还把 citekey 分裂成两个键）。"""
+    seg = _make_segment()
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-08", "pid1"), status="final",
+                    month="2026-08", pdf_path=str(pdf), metadata_source="x",
+                    segment=seg, close_reading_script=None,
+                    close_reading_final={"sections": []})
+    assert pi.find_final_bundle(tmp_path, "2026-08", pdf, "pid1") is not None
+    assert pi.find_final_bundle(tmp_path, "2026-09", pdf, "pid1") is not None
+    # paper_id 漂移（元数据重解析出不同哈希）+ 跨月：靠 pdf_path 判据兜住
+    assert pi.find_final_bundle(tmp_path, "2026-09", pdf, "pid_drifted") is not None
+    # 别的 PDF 不该被误保护
+    other = tmp_path / "other.pdf"
+    other.write_bytes(b"%PDF")
+    assert pi.find_final_bundle(tmp_path, "2026-09", other, "pid_other") is None
+
+
+def test_final_guard_covers_bundle_that_forgot_status_flip(tmp_path):
+    """写了 close_reading_final 却忘翻 status 的 bundle 也要被保护——否则重跑 ingest
+    会把已完成的核验成果当可覆盖的 draft 静默抹掉。"""
+    seg = _make_segment()
+    pdf = tmp_path / "p.pdf"
+    pdf.write_bytes(b"%PDF")
+    pi.write_bundle(pi.bundle_path(tmp_path, "2026-08", "pidx"), status="draft",
+                    month="2026-08", pdf_path=str(pdf), metadata_source="x",
+                    segment=seg, close_reading_script=None,
+                    close_reading_final={"sections": []})
+    assert pi.find_final_bundle(tmp_path, "2026-08", pdf, "pidx") is not None
+
+
+def test_is_credit_error_covers_403():
+    """403 = key 被吊销/组织禁用/区域封锁，与 401/402 同为「重试与换棒都无用」的终局。
+    漏认会让 draft_status 落成 empty 而非 api_error，agent 被指去核验一份空草稿。"""
+    assert pi.is_credit_error(Exception("API Error: 403 Forbidden"))
+    assert pi.is_credit_error(Exception("Client error '403 Forbidden' for url"))
+    assert pi.is_credit_error(Exception("permission denied for this organization"))
+    assert not pi.is_credit_error(Exception("我读了 4031 页"))     # 整词匹配不回退
+    assert not pi.is_credit_error(Exception("500 Internal Server Error"))
+
+
+def test_pack_chunk_notes_keeps_every_chunk_represented(caplog):
+    """裸 [:60000] 会从 JSON 串中间切开，且尾部整块静默消失——而论文尾部正是
+    结果/局限/附录，恰是 _SYNTH_PROMPT 里价值最高的三节。"""
+    notes = [{"method_details": ["m{}-{}".format(i, "x" * 200) for _ in range(8)],
+              "key_numbers": ["k{}={}".format(i, "9" * 150)],
+              "claims": ["c{}".format(i)], "limitations": ["l{}".format(i)]}
+             for i in range(40)]
+    raw = json.dumps(notes, ensure_ascii=False)
+    assert len(raw) > pi._SYNTH_NOTES_BUDGET, "构造前提：必须超预算"
+    info = {}
+    packed = pi._pack_chunk_notes(notes, info=info)
+    assert len(packed) <= pi._SYNTH_NOTES_BUDGET
+    data = json.loads(packed)              # 必须仍是合法 JSON（裸切片做不到）
+    assert len(data) == 40, "每一块都要有代表，不能丢尾块"
+    assert info.get("note") and "超汇总预算" in info["note"]
+    assert any(n.get("_truncated") for n in data)
+
+
+def test_pack_chunk_notes_passthrough_when_within_budget():
+    notes = [{"claims": ["a"]}, {"claims": ["b"]}]
+    assert pi._pack_chunk_notes(notes) == json.dumps(notes, ensure_ascii=False)
+
+
+def test_write_bundle_is_atomic(tmp_path, monkeypatch):
+    """bundle 是 agent 亲读核验成果的唯一载体，必须与 notes.py 三件套同一套原子写语义。"""
+    from src.scholar import notes_index
+    calls = []
+    real = notes_index._atomic_write
+    monkeypatch.setattr(notes_index, "_atomic_write",
+                        lambda p, s: calls.append(Path(p).name) or real(p, s))
+    seg = _make_segment()
+    bf = pi.bundle_path(tmp_path, "2026-08", "pat")
+    pi.write_bundle(bf, status="draft", month="2026-08", pdf_path="x.pdf",
+                    metadata_source="x", segment=seg, close_reading_script=None)
+    assert calls == [bf.name]
+    assert json.loads(bf.read_text(encoding="utf-8"))["paper_id"] == seg.paper_id
+
+
+def test_abstract_keeps_english_when_json_clean_but_no_translation():
+    """JSON 完整、模型单纯没给译文时丢掉整条 = 拿完好英文摘要换来「*摘要暂无*」，
+    严格少信息（存量实测手动精读 md 里 11 处「摘要暂无」）。"""
+    llm = _FakeLLM(['{"abstract_en": "We study missing data.", "abstract_zh": ""}'])
+    en, zh = pi.extract_abstract("body text", llm)
+    assert en == "We study missing data." and zh == ""
+
+
+def test_abstract_drops_pair_when_salvaged_and_zh_missing():
+    """走过抢救分支时中文为空说明是被削掉的半截，此时整条判失败仍是对的。"""
+    llm = _FakeLLM(['{"abstract_en": "We study missing data.", "abstract_zh": "研究'])
+    en, zh = pi.extract_abstract("body text", llm)
+    assert (en, zh) == ("", "")
+
+
+def test_chunk_text_never_loops_when_overlap_exceeds_size():
+    out = pi.chunk_text("x" * 5000, size=100, overlap=500)
+    assert len(out) > 1 and "".join(out).count("x") >= 5000

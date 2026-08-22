@@ -36,12 +36,16 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 它抽全文、拉 Crossref/arXiv 权威元数据、分块通读出**脚本草稿**，落 `output/scholar_notes/manual/<月>/<paper_id>.paper.json`（status=draft）。每篇单独打印 **bundle 路径**与 **「亲读范围」那一行**（总页数 + 20 页窗口切分，第 2 步照它读）。
 
-已 final 的 bundle **不会被覆盖**，只打印 `⛔ 已 final，本次跳过`（确需重跑加 `--force`，会丢弃已有核验成果）。
+已 final 的 bundle **不会被覆盖**，只打印 `⛔ 已 final（在 <月> 桶），跳过`（确需重跑加 `--force`，会丢弃已有核验成果）。守卫**跨月份桶**生效：同一个 PDF 在上个月已精读过，这个月再跑同样被拦——括号里的桶名就是保护它的那一月，不必困惑「我这个月没读过」。写了 `close_reading_final` 却忘翻 `status` 的 bundle 同样受保护。
 
-输出最末的 **「⚠️ 需要注意」块** 必看：索引里已有同文（别白读一遍几个月前已精读的）、元数据不全（会退化成 `anon*` 键、书目缺卷期页，可加 `--title "精确标题"` 重跑）、ingest 失败。
+输出最末的 **「⚠️ 需要注意」块** 必看：索引里已有同文（别白读一遍几个月前已精读的）、元数据不全（会退化成 `anon*` 键、书目缺卷期页，**单独对那一篇**重跑 `--title "精确标题"`——批量时 `--title` 不生效且会在这里报出来）、ingest 失败。
 
 **看 `draft_status`**：若为 `ok`，走下面正常协议（2–5 步，你亲读核验脚本草稿）；
-若为 **`api_error`**（LLM 无额度/鉴权失败，如 DeepSeek 402），脚本草稿这一轨作废，改走「回退协议」。
+若为 **`api_error`**（LLM 无额度/鉴权失败，如 402/401/403），脚本草稿这一轨作废，改走「回退协议」。
+
+**看 `draft_note`**：`draft_status: ok` 时它通常为空；若出现「块笔记超汇总预算」，说明这篇太长
+（块数 × 单块笔记长度 > 60000 字符），汇总时每块笔记都被均摊裁剪过——**被裁的部分不在草稿里**，
+亲读核验时对论文后段（结果/局限/附录）不能依赖草稿，必须自己从 PDF 补齐。
 
 ### 2. 亲读整本 PDF（不可跳过）
 用 **Read 工具**按 ingest 打印的「亲读范围」窗口**从头读到尾**读完整篇 PDF（`Read <pdf>` 带 `pages` 参数循环），
@@ -66,6 +70,12 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
   ⚠️ **「代码与数据可得性」最容易漏**——论文的 Code/Data availability 声明排版上紧挨参考文献、离方法节很远，读到那里时注意力已经松了。实测漏过一次（原文 p.11 明写 GitHub + Zenodo 链接，精读里整个维度消失）。务必单独写一句，有链接就抄全，没有就写「原文未报告」。
   句级 `tag` **只用**三值之一或 null（按对后续工作流的用途）：`"可引用证据"`（含具体数字/效应量/可溯源结果）/ `"可反驳观点"`（作者主张/可质疑处，写 critique 的靶子）/ `"方法论借鉴"`（可迁移的方法思路）。纯背景/动机置 null。这些句子会被索引聚合成 `highlights[]` 供工作流按 role（citable/refutable/method）跨库检索。
 - `cross_check_report`：`{"corrected": [{"page": 7, "note": "脚本写 AUC=0.91，原文 Table 2 为 0.87，已改"}], "added": ["脚本漏了敏感性分析…"], "verified_count": 23}`。
+  ⚠️ **形状是机器门禁**：报告必须是 JSON 对象，`corrected`/`added` 必须是**数组**。写成字符串会被
+  逐字符切成十几条假纠错条，因此现在会被直接拒收并在 finalize 输出里点名（见第 5 步）。
+  `verified_count` 显式写 0 的 bundle 也会被拒——核验了几项就写几项。
+  纠错条会渲进札记的「交叉核验记录」节但**不打句级 tag**：实测这类条目里压倒性是「草稿写错了」
+  而非论文本身的可质疑处，打成〔可反驳观点〕会污染 `scholar-write` 的取证轴。论文级的可质疑处
+  请写进 `close_reading_final` 的「局限与可质疑点」节。
 - `one_line`（顶层，可选但推荐）：一句话说清这篇对研究者的用处（≤30字），会成为索引的「一句话用处」检索字段；脚本失败时它是占位符，务必覆盖。
 
 （保留 bundle 其余字段不动；用 Read 读原 bundle → Write 回写整个 JSON。）
@@ -76,6 +86,13 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 ```
 它从当月**全部 final bundle** 重建手动精读四件套并刷新索引（同月可多篇追加、幂等）。
 交叉核验报告会自动渲染为精读末节「交叉核验记录」。
+
+⚠️ **finalize 的输出有两条必看行**：
+- `⏭ 跳过 N 篇 draft（未 agent 核验）` —— 这些还没做核验；
+- `⛔ N 篇 bundle 读不出/结构非法，**未入库**` —— 这些**核验做完了但 JSON 坏了**，一篇都没进库。
+  看到它必须修好那份 JSON 再重跑 finalize，**不要**重做核验。
+  另：bundle 的 `month` 字段必须与它所在的 `manual/<月>/` 目录一致，否则 finalize 直接拒绝
+  （按月重建会扫空桶，那篇会静默消失）。
 
 ### 6. 汇报
 给用户：归档的 md/docx 路径、本月手动深读篇数、索引撞键组数（非 0 时提示先跑

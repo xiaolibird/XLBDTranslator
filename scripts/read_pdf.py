@@ -27,7 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.settings import load_scholar_settings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
-from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.notes_index import INDEX_JSON  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
@@ -150,7 +149,8 @@ def cmd_ingest(args):
         print("\n下一步（agent）：**按上面的「亲读范围」把 PDF 读到最后一页**"
               "（附录里的表格常是核验关键）→ 核验脚本草稿 → 写回 close_reading_final + "
               "cross_check_report + status=final → finalize。协议见 skill: read-paper。")
-    _print_attention(outs, failed)
+    _print_attention(outs, failed,
+                     title_ignored=(args.title or "") if len(pdfs) > 1 else "")
     print("=" * 66)
     return 0 if outs else 1
 
@@ -169,17 +169,18 @@ def _read_plan(n_pages, size: int = 20) -> str:
         n_pages, len(wins), size, ", ".join("{}-{}".format(a, b) for a, b in wins))
 
 
-def _print_attention(outs, failed):
+def _print_attention(outs, failed, title_ignored: str = ""):
     """把「必须有人看一眼」的事项汇总到输出最末。
 
     单篇时散在中间也看得见，21 篇一批时必被淹掉——今天正是这样漏掉一条「索引里已有同文」，
-    白读了一篇几个月前已精读过的论文。
+    白读了一篇几个月前已精读过的论文。title_ignored 同理：批量时被丢弃的 --title 若只在
+    循环前 warning 一次，会落在同一个被淹掉的位置。
     """
     dups = [r for r in outs if r.get("duplicate")]
     thin = [r for r in outs if not r.get("skipped")
             and (r.get("meta_source") == "pdf-only" or not r.get("authors_n"))]
     skipped = [r for r in outs if r.get("skipped") == "final"]
-    n = len(dups) + len(thin) + len(skipped) + len(failed)
+    n = len(dups) + len(thin) + len(skipped) + len(failed) + (1 if title_ignored else 0)
     if not n:
         return
     print("\n" + "-" * 66)
@@ -194,7 +195,12 @@ def _print_attention(outs, failed):
         print("  · 元数据不全（来源 {}、作者 {} 位）：{}".format(
             r.get("meta_source"), r.get("authors_n", 0), r["title"][:48]))
     if thin:
-        print("    → citekey 会退化成 anon*、bibliography 缺卷期页；可加 --title \"精确标题\" 重跑")
+        print("    → citekey 会退化成 anon*、bibliography 缺卷期页；"
+              "可**单独对那一篇**重跑 ingest --title \"精确标题\"（--title 批量时不生效）")
+    if title_ignored:
+        print("  · --title \"{}\" 本次被忽略：批量（{} 篇）时不生效".format(
+            title_ignored[:40], len(outs)))
+        print("    → 需要覆盖标题请单独对那一篇重跑 ingest --title")
     for r in skipped:
         print("  · 已 final 未覆盖：{}".format(r["title"][:48]))
     for name, err in failed:
@@ -254,7 +260,18 @@ def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
     try:
         rows = (json.loads(sidecar.read_text(encoding="utf-8")) or {}).get("papers") or []
     except Exception as e:                      # 坏 sidecar 不该挡住重建
-        logger.warning("  ⚠️ 读 sidecar 失败，本次不沿用 citekey（{}）: {}".format(sidecar.name, e))
+        # 代价必须可见：不沿用 = 札记侧已修正的键（audit_citekeys_vs_pmlr 实测 22 篇）
+        # 在这一轮 regen 被 bundle 里的旧元数据顶回，而 citekey 是 all_references /
+        # vault / 已发出的 [@key] 引用的身份锚。warning 在自动权限模式的 agent 会话里
+        # 看不见（同 _sync_embedding_best_effort 的论证），故走 notify。
+        logger.error("  ⛔ 读 sidecar 失败，本次**不沿用 citekey**（本月键将被重算，"
+                     "已在札记侧修正过的键会被顶回）（{}）: {}".format(sidecar.name, e))
+        try:
+            from src.utils.notify import notify
+            notify("Scholar 手动精读",
+                   "sidecar 读失败，{} 月 citekey 不沿用、将被重算：{}".format(month, str(e)[:120]))
+        except Exception:                        # notify 失败不该挡住重建
+            pass
         return out
 
     prev: dict = {}
@@ -300,11 +317,16 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     bundles = sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))) if mdir.exists() else []
     segments = []
     skipped = []
+    broken = []
     for bf in bundles:
         try:
             data = load_bundle(bf)
         except Exception as e:
+            # 读不出 = 这篇的全部亲读核验成果进不了库。只 continue 会让它既不在
+            # skipped_drafts 也不在 papers 里，_report_final 照打 ✅——一篇已核验完的
+            # 论文永久蒸发且回执是绿的（agent 收到成功回执不会重跑，PDF 也已移出待读）。
             logger.warning("  ⚠️ 读 bundle 失败 {}: {}".format(bf.name, e))
+            broken.append(bf.name)
             continue
         if data.get("status") != "final" or not data.get("close_reading_final"):
             skipped.append(bf.name)
@@ -322,8 +344,27 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
                            .format(bf.name))
             skipped.append(bf.name)
             continue
-        seg = segment_from_bundle(data)
-        _inject_cross_check(seg, data.get("cross_check_report"))
+        # 显式自报「一项都没核验」的 bundle：自己 finalize 会被 cmd_finalize 的
+        # verified_count>=1 拒掉，却能靠同月兄弟触发的整月重建搭车入库。只拒显式的 0，
+        # None/缺键的 legacy 异构报告照旧放行（上一段已论证）。
+        _vc = (data.get("cross_check_report") or {}).get("verified_count") \
+            if isinstance(data.get("cross_check_report"), dict) else None
+        if isinstance(_vc, int) and _vc < 1:
+            logger.warning("  ⛔ {} 的 cross_check_report 自报 verified_count=0（一项都没核验），"
+                           "不纳入本月重建".format(bf.name))
+            skipped.append(bf.name)
+            continue
+        try:
+            seg = segment_from_bundle(data)
+            _inject_cross_check(seg, data.get("cross_check_report"))
+        except Exception as e:
+            # bundle 的 close_reading_final / cross_check_report 是 agent 手写的 JSON，
+            # 形状错误（tag 写成近义词、报告写成字符串）属常态失误。不隔离就是一份坏
+            # bundle 抛裸 traceback 炸掉整月归档，且异常里不含文件名，21 篇一批只能二分排查。
+            logger.error("  ⛔ bundle 结构非法，跳过 {}（{}: {}）；修好后重跑 finalize"
+                         .format(bf.name, type(e).__name__, str(e)[:300]))
+            broken.append(bf.name)
+            continue
         segments.append(seg)
 
     proc = settings.processing
@@ -333,7 +374,8 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
         idx = update_index(notes_dir)
         write_outputs(idx, notes_dir)
         _sync_embedding_best_effort(notes_dir, idx, settings)
-        return {"month": month, "papers": 0, "skipped_drafts": skipped, "index": idx}
+        return {"month": month, "papers": 0, "skipped_drafts": skipped,
+                "broken_bundles": broken, "index": idx}
 
     citekeys = _reuse_citekeys(notes_dir, month, segments)
     res = write_notes(
@@ -352,6 +394,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings) -> dict:
     _sync_embedding_best_effort(notes_dir, idx, settings)
     _sync_topics_best_effort(notes_dir, res["note_path"])   # W6：接入 P2，见函数文档
     return {"month": month, "papers": len(segments), "skipped_drafts": skipped,
+            "broken_bundles": broken,
             "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
 
 
@@ -366,24 +409,45 @@ def _inject_cross_check(seg, report):
                            .format((seg.metadata.title or seg.paper_id or "?")[:60]))
         return
     from src.scholar.schema import CloseReadSection, CloseReadSentence
-    corrected = report.get("corrected") or []
-    added = report.get("added") or []
+    # 形状防线：报告与 corrected/added 都是 agent 手写的。非 dict 会在 report.get 处炸；
+    # corrected 写成字符串则更坏——`for c in corrected[:20]` 把它逐字符切片，一句纠错
+    # 变成十几条单字 highlights 全部进 refutable 取证轴，静默投毒。抛出由 _rebuild_month
+    # 的 try 路由进 broken_bundles（拒收该篇并点名），不改 :319 的「无报告即拒」门禁语义。
+    if not isinstance(report, dict):
+        raise ValueError("cross_check_report 不是 JSON 对象（实为 {}）".format(type(report).__name__))
+    # 别名兼容：早期 3 种 schema 用 corrections/additions 等键，只认 corrected/added 会把
+    # 这些篇的核验内容静默吞成「纠错 0 处、补漏 0 处」（存量实测约 10 篇已如此）。
+    corrected = report.get("corrected") or report.get("corrections") or []
+    added = report.get("added") or report.get("additions") or report.get("added_new") or []
+    if not isinstance(corrected, list) or not isinstance(added, list):
+        raise ValueError("cross_check_report 的 corrected/added 必须是数组（实为 {}/{}）"
+                         .format(type(corrected).__name__, type(added).__name__))
+    if isinstance(report, dict) and not any(
+            k in report for k in ("corrected", "corrections", "added", "additions", "added_new")):
+        logger.warning("⚠️ cross_check_report 既无 corrected 也无 corrections 键（现有键：{}）"
+                       "——纠错/补漏内容不会进札记".format(sorted(report)[:8]))
     verified = report.get("verified_count")
     sents = [CloseReadSentence(
         text="Claude 亲读 PDF 交叉核验：纠错 {} 处、补漏 {} 处{}。".format(
             len(corrected), len(added),
             "、核验通过 {} 项".format(verified) if verified is not None else ""),
         tag=None)]
-    # 纠错条 = 论文被证伪/过度断言处 = 天然的「可反驳观点」，打 tag 让其进 refutable highlights
+    # 纠错条**不打 tag**：曾按「纠错 = 论文被证伪/过度断言处」打成「可反驳观点」，但实测
+    # 918/3630（25.3%）的 manual refutable 取证条是这类，且内容压倒性是**草稿的错**而非
+    # 论文的可质疑处（「Opus 原稿所说的…」「Opus 原稿标注为 p.25，实际跨页」）。而 manual
+    # 在 _keeper_rank 里恒为 keeper、topics 还给它加权，等于给 scholar-write / notes_query
+    # 的 refutable 轴优先供应勘误噪声。cross_check_report 的 schema 无字段区分「论文级问题」
+    # 与「草稿级勘误」，故安全默认是 None：句子仍完整留在「交叉核验记录」节里（留痕不丢），
+    # 只是不再冒充可反驳证据。存量随各月 regen 重建自动清理。
     for c in corrected[:20]:
         if isinstance(c, dict):
             txt = c.get("note") or c.get("text") or json.dumps(c, ensure_ascii=False)
             pg = c.get("page")
             sents.append(CloseReadSentence(
                 text="纠错{}：{}".format("（p.{}）".format(pg) if pg else "", txt),
-                tag="可反驳观点"))
+                tag=None))
         else:
-            sents.append(CloseReadSentence(text="纠错：{}".format(c), tag="可反驳观点"))
+            sents.append(CloseReadSentence(text="纠错：{}".format(c), tag=None))
     seg.close_reading.sections.append(
         CloseReadSection(heading="交叉核验记录", sentences=sents))
 
@@ -396,7 +460,11 @@ def cmd_finalize(args):
     if not bundle.exists():
         logger.error("❌ bundle 不存在: {}".format(bundle))
         return 1
-    data = load_bundle(bundle)
+    try:
+        data = load_bundle(bundle)
+    except Exception as e:
+        logger.error("❌ bundle 不可解析（{}: {}）: {}".format(type(e).__name__, e, bundle.name))
+        return 1
     if data.get("status") != "final" or not data.get("close_reading_final"):
         logger.error("❌ bundle 未 final（需 agent 先写回 close_reading_final + status=final）: {}"
                      .format(bundle.name))
@@ -405,7 +473,14 @@ def cmd_finalize(args):
     # 不读 PDF 直接把脚本草稿抄成 final 也能通过——而脚本草稿的系统性偏差（把研究画像
     # 写成原文观点、虚构章节）正是要靠亲读核验挡的。机器门禁至少要求核验报告存在且
     # verified_count>=1；伪造报告仍可能，但「忘了核验/偷懒跳过」这类最常见的失败被挡死。
-    ccr = data.get("cross_check_report") or {}
+    ccr = data.get("cross_check_report")
+    if ccr is not None and not isinstance(ccr, dict):
+        # 手写成字符串时，下一行的 .get 会抛 AttributeError 裸 traceback（同一份 bundle
+        # 在 _rebuild_month 里也炸，但这里先撞上）——给出指名道姓的错误而不是栈。
+        logger.error("❌ cross_check_report 不是 JSON 对象（当前 {}）：{}"
+                     .format(type(ccr).__name__, bundle.name))
+        return 1
+    ccr = ccr or {}
     vc = ccr.get("verified_count")
     if not isinstance(vc, int) or vc < 1:
         logger.error("❌ bundle 缺有效 cross_check_report（需 verified_count>=1，当前: {!r}）：\n"
@@ -422,6 +497,16 @@ def cmd_finalize(args):
     except ValueError as e:
         logger.error("❌ bundle 的归档月份非法（{}）：请把 {} 的 month 改成合法值"
                      "并挪到对应的 manual/<月份>/ 目录后再 finalize".format(e, bundle.name))
+        return 1
+    # month 字段与所在目录必须一致：finalize 是**按月重建**，只 glob manual/<month>/。
+    # 字段写 A 而文件躺在 B 桶时，重建扫的是 A 桶（没有这篇）、这篇所在的 B 桶没人扫，
+    # 于是退出码 0、打印「✅ 归档 A：0 篇」，一篇已完成亲读核验的论文彻底消失。
+    # 上面那条错误文案本就在教用户维持这个不变量，这里把它变成机器检查。
+    bucket = bundle.resolve().parent.name
+    if bucket != month:
+        logger.error("❌ bundle 的 month 字段（{}）与所在目录（{}）不一致——finalize 按月重建，"
+                     "这篇不会被纳入任何一月。请把它挪进 manual/{}/ 后再跑: {}"
+                     .format(month, bucket, month, bundle.name))
         return 1
     r = _rebuild_month(notes_dir, month, settings)
     _report_final(r, notes_dir)
@@ -452,6 +537,11 @@ def _report_final(r, notes_dir):
     if r.get("skipped_drafts"):
         print("   ⏭ 跳过 {} 篇 draft（未 agent 核验）: {}".format(
             len(r["skipped_drafts"]), ", ".join(r["skipped_drafts"])))
+    if r.get("broken_bundles"):
+        # 与 ⏭ 分开报：那是「还没核验」，这是「核验完了但 JSON 坏了、**没入库**」。
+        # 混在一起会让 agent 去重做已经做过的核验。
+        print("   ⛔ {} 篇 bundle 读不出/结构非法，**未入库**（修好 JSON 后重跑 finalize）: {}"
+              .format(len(r["broken_bundles"]), ", ".join(r["broken_bundles"])))
     manual = [e for e in idx["papers"] if e.get("series") == "manual" and not e.get("duplicate_of")]
     print("   索引: 手动深读 {} 篇 · 撞键 {} 组".format(len(manual), len(collisions)))
     if collisions:

@@ -431,3 +431,171 @@ def test_rebuild_month_refuses_reuse_when_batch_has_duplicate_dedup_key(tmp_path
     idx = json.loads((tmp_path / "literature_index.json").read_text(encoding="utf-8"))
     keys = [p["citekey"] for p in idx["papers"] if p.get("month") == month]
     assert len(keys) == len(set(keys)), "撞键：{}".format(keys)
+
+
+# ---------------- R1：坏 bundle 隔离 / 回执 / 门禁 ----------------
+
+def test_rebuild_month_isolates_malformed_bundle(tmp_path):
+    """一份 agent 手写坏的 bundle 只能坏它自己，不能连坐整月。
+
+    close_reading_final 的 tag 越出 CloseReadTag 的 Literal（写成近义词「可引用」）会让
+    CloseReading.model_validate 抛 ValidationError；此前 segment_from_bundle 在循环里
+    裸奔，整月 finalize 抛裸 traceback 退出，同月全部已核验论文一篇都进不了库。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    good = _manual_seg("pgood", "Good Paper", "Zhang", "10.1/good")
+    _write_final_bundle(tmp_path, month, good, "/good.pdf")
+
+    bad = _manual_seg("pbadtag", "Bad Tag Paper", "Wang", "10.1/badtag")
+    final = bad.close_reading.model_dump(mode="json")
+    final["sections"][0]["sentences"][0]["tag"] = "可引用"        # 合法值是「可引用证据」
+    pi.write_bundle(pi.bundle_path(tmp_path, month, bad.paper_id), status="final",
+                    month=month, pdf_path="/badtag.pdf", metadata_source="crossref-doi",
+                    segment=bad, close_reading_script=bad.close_reading,
+                    close_reading_final=final,
+                    cross_check_report={"verified_count": 2, "corrected": [], "added": []})
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1, "坏 bundle 不该拖垮同月合规论文"
+    assert any("pbadtag" in n for n in r["broken_bundles"])
+
+
+def test_rebuild_month_rejects_string_shaped_cross_check(tmp_path):
+    """corrected 写成字符串会被 `for c in corrected[:20]` 逐字符切片成十几条单字
+    highlights 全进 refutable 取证轴——必须拒收该篇，而不是静默投毒。"""
+    month = "2026-08"
+    seg = _manual_seg("pstr", "String Report Paper", "Li", "10.1/str")
+    _write_final_bundle(tmp_path, month, seg, "/str.pdf",
+                        cross_check_report={"verified_count": 2,
+                                            "corrected": "把表3的AUC从0.91改成0.81",
+                                            "added": []})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 0
+    assert any("pstr" in n for n in r["broken_bundles"])
+
+
+def test_rebuild_month_reports_unreadable_bundle(tmp_path, capsys):
+    """读不出的 bundle 此前既不进 papers 也不进 skipped_drafts，_report_final 照打 ✅——
+    一篇已完成亲读核验的论文永久蒸发且回执是绿的。"""
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    good = _manual_seg("pok", "Fine Paper", "Zhang", "10.1/ok")
+    _write_final_bundle(tmp_path, month, good, "/ok.pdf")
+    broken = pi.bundle_path(tmp_path, month, "pbroken")
+    broken.write_text('{"status": "final", "close_reading_final"', encoding="utf-8")
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1
+    assert any("pbroken" in n for n in r["broken_bundles"])
+    M._report_final(r, tmp_path)
+    out = capsys.readouterr().out
+    assert "未入库" in out and "pbroken" in out
+
+
+def test_rebuild_month_rejects_explicit_zero_verified_count(tmp_path):
+    """自报 verified_count=0 的 bundle 自己 finalize 会被拒，却能靠同月兄弟搭车进整月重建。
+    只拒显式的 0——legacy 的 None/缺键仍放行（见 test_rebuild_month_keeps_legacy_...）。"""
+    month = "2026-08"
+    good = _manual_seg("pv1", "Verified Paper", "Zhang", "10.1/v1")
+    _write_final_bundle(tmp_path, month, good, "/v1.pdf")
+    zero = _manual_seg("pv0", "Zero Verified Paper", "Wang", "10.1/v0")
+    _write_final_bundle(tmp_path, month, zero, "/v0.pdf",
+                        cross_check_report={"verified_count": 0, "corrected": [], "added": []})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1
+    assert any("pv0" in n for n in r["skipped_drafts"])
+
+
+def test_correction_lines_are_not_tagged_refutable(tmp_path):
+    """纠错条不再冒充「可反驳观点」：实测 918/3630（25.3%）的 manual refutable 取证条
+    是「Opus 原稿写错了」这类草稿勘误，不是论文的可质疑处。句子仍留在札记里。"""
+    month = "2026-08"
+    seg = _manual_seg("pcorr", "Correction Paper", "Li", "10.1/corr")
+    _write_final_bundle(tmp_path, month, seg, "/corr.pdf",
+                        cross_check_report={
+                            "verified_count": 5,
+                            "corrected": [{"page": 4, "note": "Opus 原稿称 AUC 0.91，原文 Table 2 为 0.87"}],
+                            "added": []})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1
+    idx = json.loads((tmp_path / "literature_index.json").read_text(encoding="utf-8"))
+    paper = next(p for p in idx["papers"] if p.get("title") == "Correction Paper")
+    refutable = [h for h in (paper.get("highlights") or []) if h.get("role") == "refutable"]
+    assert not any(h["text"].startswith("纠错") for h in refutable)
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Opus 原稿称 AUC 0.91" in md, "留痕不能丢，只是不再打 tag"
+
+
+def test_cross_check_report_alias_keys_are_read(tmp_path):
+    """早期 schema 用 corrections/additions，只认 corrected/added 会把核验内容静默吞成
+    「纠错 0 处、补漏 0 处」（存量实测约 10 篇已如此）。"""
+    month = "2026-08"
+    seg = _manual_seg("palias", "Alias Report Paper", "Zhao", "10.1/alias")
+    _write_final_bundle(tmp_path, month, seg, "/alias.pdf",
+                        cross_check_report={"verified_count": 4,
+                                            "corrections": ["原文 Table 3 与正文自相矛盾"],
+                                            "additions": ["补漏：附录 D 的敏感性分析"]})
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 1
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "纠错 1 处、补漏 1 处" in md
+    assert "原文 Table 3 与正文自相矛盾" in md
+
+
+def test_finalize_rejects_month_bucket_mismatch(tmp_path, monkeypatch):
+    """bundle 的 month 字段与所在目录不一致时，按月重建扫的是空桶——退出码 0、
+    打印「✅ 归档 X：0 篇」，一篇已核验论文彻底消失。必须在动库之前拒绝。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    seg = _manual_seg("pmis", "Mismatch Paper", "Ann Lee", "10.9/mis")
+    bf = tmp_path / "manual" / "2026-08" / "pmis.bundle.json"
+    bf.parent.mkdir(parents=True)
+    pi.write_bundle(bf, status="final", month="2026-07", pdf_path="x.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"),
+                    cross_check_report={"verified_count": 3, "corrected": [], "added": []})
+
+    class _Proc:
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    rebuilt = []
+    monkeypatch.setattr(M, "_rebuild_month", lambda *a, **k: rebuilt.append(1) or {"month": "x"})
+    monkeypatch.setattr(M, "_report_final", lambda *a, **k: None)
+    assert M.cmd_finalize(SimpleNamespace(config="unused", bundle=str(bf))) == 1
+    assert not rebuilt
+
+
+def test_finalize_rejects_non_dict_cross_check_report(tmp_path, monkeypatch):
+    """报告写成字符串时，cmd_finalize 的 ccr.get 会抛 AttributeError 裸 traceback。"""
+    from types import SimpleNamespace
+    from src.scholar import pdf_ingest as pi
+    seg = _manual_seg("pncd", "Non Dict Paper", "Ann Lee", "10.9/ncd")
+    bf = tmp_path / "manual" / "2026-08" / "pncd.bundle.json"
+    bf.parent.mkdir(parents=True)
+    pi.write_bundle(bf, status="final", month="2026-08", pdf_path="x.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading,
+                    close_reading_final=seg.close_reading.model_dump(mode="json"),
+                    cross_check_report="已亲读核验，纠错3处")
+
+    class _Proc:
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    monkeypatch.setattr(M, "_rebuild_month", lambda *a, **k: pytest.fail("不该走到重建"))
+    assert M.cmd_finalize(SimpleNamespace(config="unused", bundle=str(bf))) == 1
+
+
+def test_title_ignored_in_batch_is_announced(capsys):
+    """--title 批量时被丢弃。告警必须落在末尾的「需要注意」块——循环前 warning 一次
+    正好落在本文件反复论证过的「21 篇一批必被淹掉」的位置。"""
+    outs = [{"title": "A", "duplicate": None, "meta_source": "crossref-doi", "authors_n": 3},
+            {"title": "B", "duplicate": None, "meta_source": "crossref-doi", "authors_n": 2}]
+    M._print_attention(outs, [], title_ignored="An Exact Paper Title")
+    out = capsys.readouterr().out
+    assert "--title" in out and "批量" in out and "单独" in out

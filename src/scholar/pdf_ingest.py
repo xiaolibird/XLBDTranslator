@@ -311,6 +311,7 @@ def extract_abstract(full_text: str, llm) -> Tuple[str, str]:
     """一次 LLM 调用抽英文摘要 + 中文翻译。失败返回 ("","")。"""
     if not full_text.strip() or llm is None:
         return "", ""
+    salvaged = False
     try:
         resp = llm.call(_ABSTRACT_PROMPT.format(text=full_text[:6000]),
                         max_tokens=2048, json_mode=True)
@@ -320,6 +321,7 @@ def extract_abstract(full_text: str, llm) -> Tuple[str, str]:
             data = _loads_lenient(resp)
             if data is None:
                 raise
+            salvaged = True
             # 抢救是有损的：畸形点之后被丢弃，abstract_zh 可能是半截。必须出声，
             # 否则札记里会静默出现一段截断的中文摘要而无人知道它为何截断。
             logger.warning("  ⚠️ 摘要 JSON 畸形，已抢救前缀（内容可能不完整）: {}".format(je))
@@ -328,9 +330,15 @@ def extract_abstract(full_text: str, llm) -> Tuple[str, str]:
         if en and not zh:
             # abstract_zh 排在 abstract_en 之后，抢救时最先被削掉。只查 en 会让
             # 「中文摘要静默消失」一路滑到札记渲染层的 `zh or en` 回退，读者看到英文
-            # 却不知道为什么。出声，并把这一篇当抽取失败处理。
-            logger.warning("  ⚠️ 摘要抽取只拿到英文、中文为空（多半是抢救削掉了 abstract_zh），按失败处理")
-            return "", ""
+            # 却不知道为什么。
+            # 但**只有走过抢救分支时**这个推断才成立：JSON 完全干净、模型单纯没给译文时
+            # 丢掉整条 = 拿一段完好的英文摘要换来「*摘要暂无*」，严格少信息（存量实测
+            # 手动精读 md 里 11 处「摘要暂无」）。故按成因分流。
+            if salvaged:
+                logger.warning("  ⚠️ 摘要抽取只拿到英文、中文为空（抢救削掉了 abstract_zh），按失败处理")
+                return "", ""
+            logger.warning("  ⚠️ 摘要抽取只拿到英文、中文为空（JSON 完整，模型未给译文）："
+                           "保留英文摘要，札记渲染层按 zh or en 回退")
         return en, zh
     except Exception as e:
         logger.warning("  ⚠️ 摘要抽取失败: {}".format(e))
@@ -342,6 +350,10 @@ def extract_abstract(full_text: str, llm) -> Tuple[str, str]:
 def chunk_text(full_text: str, size: int = 12000, overlap: int = 600) -> List[str]:
     """把全文切成带重叠的块（重叠避免跨块句子断裂丢信息）。"""
     text = full_text or ""
+    # overlap >= size 会让 `start = end - overlap` 不前进，while 死循环。今天两个
+    # 生产调用点都用默认值够不到，但一行钳位比一个隐式前提便宜。
+    size = max(1, size)
+    overlap = max(0, min(overlap, size - 1))
     if len(text) <= size:
         return [text] if text.strip() else []
     chunks = []
@@ -378,21 +390,25 @@ _CHUNK_PROMPT = """你在逐块通读一篇论文（这是第 {idx}/{total} 块�
 {chunk}"""
 
 
-_CREDIT_CODE_RE = re.compile(r"\b(401|402)\b")
+# 码集与短语表**复用 llm_client 的权威定义**，不再手抄第三遍：这里已经漂过两次
+# （先是漏了整词匹配，补上后又漏了 403）。403 = key 被吊销/组织禁用/区域封锁，与
+# 401/402 同为「重试与换棒都无用」的鉴权类终局；漏认它会让 fatal_evt 不置位、
+# draft_status 落成 "empty" 而非 "api_error"，于是 read_pdf 不打回退协议、反而
+# 让 agent 去「核验」一份空草稿。
+from .llm_client import _FATAL_CODE_RE as _CREDIT_CODE_RE  # noqa: E402
 
 
 def is_credit_error(exc) -> bool:
-    """判断异常是否为 API 额度/鉴权类（402 余额不足 / 401 / quota）——这类重试无用，应回退。"""
+    """判断异常是否为 API 额度/鉴权类（402 余额不足 / 401 / 403 / quota）——这类重试无用，应回退。"""
     s = str(exc).lower()
     # 状态码必须整词匹配。裸子串会被任何含该数字的诊断信息误触——例如
     # "正文 4021 字符" 里的 402 —— 一旦误判就 fatal_evt.set()、cancel 掉整篇
     # 论文剩余的块，还会让 read_pdf 向 agent 打「LLM 无额度」的假警报。
-    # （llm_client 的 _FATAL_CODE_RE 早就是 \b 整词匹配，这里一直漏了。）
     if _CREDIT_CODE_RE.search(s):
         return True
     return any(k in s for k in (
         "payment required", "insufficient", "balance", "quota",
-        "unauthorized", "invalid api key", "no api key"))
+        "unauthorized", "invalid api key", "no api key", "permission denied"))
 
 
 def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
@@ -499,16 +515,95 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
 }}"""
 
 
+_SYNTH_NOTES_BUDGET = 60000
+
+
+def _shrink_note(note: Dict[str, Any], budget: int) -> Tuple[Dict[str, Any], bool]:
+    """把单块笔记裁进 budget 字符内：轮转丢弃各列表字段的尾部条目，保持 JSON 合法。
+
+    轮转（而不是先削光 method_details 再削 key_numbers）是为了让四类要点等比例受损，
+    否则某一类会整类消失。
+    """
+    out: Dict[str, Any] = {k: (list(v) if isinstance(v, list) else v) for k, v in note.items()}
+
+    def size(d) -> int:
+        return len(json.dumps(d, ensure_ascii=False))
+
+    if size(out) <= budget:
+        return out, False
+    list_keys = [k for k, v in out.items() if isinstance(v, list) and v]
+    while list_keys and size(out) > budget:
+        progressed = False
+        for k in list(list_keys):
+            if out[k]:
+                out[k].pop()
+                progressed = True
+                if size(out) <= budget:
+                    break
+            if not out[k]:
+                list_keys.remove(k)
+        if not progressed:
+            break
+    out["_truncated"] = True
+    return out, True
+
+
+def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_BUDGET,
+                      info: Optional[Dict[str, Any]] = None) -> str:
+    """把块笔记序列化进预算内，**保证每一块都有代表**。
+
+    此前是裸 `json.dumps(usable)[:budget]`：切点落在 JSON 串中间（模型拿到的是残缺
+    结构），更要命的是尾部整块静默消失——而论文尾部正是结果/局限/附录，恰是
+    _SYNTH_PROMPT 里价值最高的三节。实测一份 229 页 / 49 块的**已归档 final** bundle，
+    60000 预算摊到每块只有 1224 字符，末尾约 14 块（近 30%）从未进入汇总 prompt；
+    该 bundle 的草稿里用「论文目录中提及的附录 D」描述附录内容，正是只看到 TOC 的指纹。
+    manual 链路不设块数上限（auto 侧 deep_close_read 有 max_chunks=12 兜着），是独有的洞。
+    """
+    full = json.dumps(usable, ensure_ascii=False)
+    if len(full) <= budget:
+        return full
+    per = max(200, budget // max(1, len(usable)))
+    packed, n_trunc = [], 0
+    for n in usable:
+        shrunk, did = _shrink_note(n, per)
+        packed.append(shrunk)
+        n_trunc += 1 if did else 0
+    out = json.dumps(packed, ensure_ascii=False)
+    dropped = 0
+    # 均摊后仍超（各块不可压缩底座之和过大）才退到丢块，且从**中段**丢：
+    # 头部是背景/方法、尾部是结果/局限，两端都比中段贵。
+    while len(out) > budget and len(packed) > 1:
+        packed.pop(len(packed) // 2)
+        dropped += 1
+        out = json.dumps(packed, ensure_ascii=False)
+    msg = ("块笔记超汇总预算（{} 块 / {} 字符 > {}）：已按每块 {} 字符均摊裁剪 {} 块"
+           .format(len(usable), len(full), budget, per, n_trunc)
+           + ("、并丢弃中段 {} 块".format(dropped) if dropped else "")
+           + "——亲读核验时对被裁部分不能依赖草稿")
+    logger.warning("  ⚠️ {}".format(msg))
+    if info is not None:
+        info["note"] = msg
+        info["n_truncated"] = n_trunc
+        info["n_dropped"] = dropped
+    return out
+
+
 def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional[str],
-                         research_interests: str) -> Tuple[Optional[CloseReading], str, bool]:
-    """把块笔记汇总为扩展分节 CloseReading。返回 (CloseReading|None, one_line, api_error)。"""
+                         research_interests: str,
+                         budget_info: Optional[Dict[str, Any]] = None
+                         ) -> Tuple[Optional[CloseReading], str, bool]:
+    """把块笔记汇总为扩展分节 CloseReading。返回 (CloseReading|None, one_line, api_error)。
+
+    budget_info：可选的出参字典，超预算裁剪时写入 note/n_truncated/n_dropped，供调用方
+    落进 bundle 的 draft_note——logger.warning 在自动权限模式的 agent 会话里看不见。
+    """
     usable = [n for n in chunk_notes if not n.get("_error")]
     if not usable:
         return None, "", False
     prompt = _SYNTH_PROMPT.format(
         research_interests=research_interests or "（未提供）",
         contamination_examples="、".join(get_contamination_example_terms()),
-        chunk_notes=json.dumps(usable, ensure_ascii=False)[:60000])
+        chunk_notes=_pack_chunk_notes(usable, info=budget_info))
     try:
         resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
@@ -586,12 +681,28 @@ def write_bundle(bundle_file: Path, *, status: str, month: str, pdf_path: str,
         "close_reading_final": close_reading_final,
         "cross_check_report": cross_check_report,
     }
-    bundle_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 原子写：与 notes.py 的三件套、relink_manual_pdfs 的 bundle 回写同一套语义。
+    # bundle 是 agent 亲读核验成果的唯一载体，裸 write_text 先截断再写，批量 ingest
+    # 途中被 Ctrl-C/杀掉会留下半截 JSON——而半截 bundle 在 _rebuild_month 里只是一条
+    # warning（这正是 broken_bundles 回执要解决的那类静默）。tmp 名带 pid，并发安全，
+    # 且 `.paper.json.tmp-<pid>` 不匹配两处 `*.paper.json` glob，不会被误当 bundle 读入。
+    from .notes_index import _atomic_write        # 函数内 import：与 notes.py 同款避免成环
+    _atomic_write(bundle_file, json.dumps(data, ensure_ascii=False, indent=2))
     return bundle_file
 
 
 def load_bundle(bundle_file: Path) -> Dict[str, Any]:
     return json.loads(Path(bundle_file).read_text(encoding="utf-8"))
+
+
+def _is_final_bundle(d: Dict[str, Any]) -> bool:
+    """守卫口径：status=final **或**已写了 close_reading_final。
+
+    只看 status 会漏掉「agent 写完终稿却忘了翻 status」的 bundle——它在 cmd_finalize
+    会被当场拒掉（所以人能发现），但重跑 ingest 时会被当成可覆盖的 draft，静默抹掉
+    已完成的核验成果。跨桶扫描落地后能扫到它的路径变多了，这道加固的收益随之变大。
+    """
+    return d.get("status") == "final" or bool(d.get("close_reading_final"))
 
 
 def segment_from_bundle(data: Dict[str, Any]) -> PaperSegment:
@@ -637,34 +748,40 @@ def find_duplicate(index_path: Optional[Path], meta: PaperMetadata) -> Optional[
 
 def find_final_bundle(notes_dir: Path, month: str, pdf_path: Path,
                       paper_id: str) -> Optional[Path]:
-    """本月是否已有一个 final bundle 在保护这篇 PDF。没有返回 None。
+    """**任何月份桶**里是否已有一个 final bundle 在保护这篇 PDF。没有返回 None。
 
     两条判据缺一不可：
       · paper_id 命中——O(1)，覆盖绝大多数情况；
       · **同一个 PDF 路径**命中——paper_id 是「标题+前三作者」的哈希，而元数据每次都要重新解析：
         Crossref 超时、DOI 抽取粘连、LLM 抽出的标题措辞不同，都会让同一个 PDF 算出不同的
         paper_id、落到不同的文件名。此时 paper_id 判据完全失效，靠这条兜住。
+
+    **扫全部月份桶而不只是本月**：`--month` 缺省即当月，同一批 PDF 在月边界之后重跑
+    （或对 ~/Downloads/待读/ 整目录再跑一次 ingest）会落到另一个桶，同月扫描完全失效。
+    守卫保护的是「这个 PDF 已被亲读核验过」，与它归档到哪个月无关。磁盘上已经因此留下
+    3 组同 paper_id 跨桶双 final，其中 2 组还把 citekey 分裂成两个键（choi2019/choi2020、
+    umPropagate/anonPropagate）。实测全扫 242 份 bundle 仅 0.037s，相对一次分块通读可忽略。
     """
-    mdir = Path(notes_dir) / "manual" / month
+    root = Path(notes_dir) / "manual"
     by_id = bundle_path(notes_dir, month, paper_id)
     if by_id.exists():
         try:
-            if load_bundle(by_id).get("status") == "final":
+            if _is_final_bundle(load_bundle(by_id)):
                 return by_id
         except Exception:
             pass
-    if not mdir.is_dir():
+    if not root.is_dir():
         return None
     try:
         target = Path(pdf_path).resolve()
     except Exception:
         return None
-    for bf in sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))):
+    for bf in sorted(root.glob("*/*{}".format(BUNDLE_SUFFIX))):
         if bf == by_id:
             continue
         try:
             d = load_bundle(bf)
-            if d.get("status") != "final" or not d.get("pdf_path"):
+            if not _is_final_bundle(d) or not d.get("pdf_path"):
                 continue
             if Path(d["pdf_path"]).resolve() == target:
                 return bf
@@ -703,8 +820,11 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
         guard = find_final_bundle(notes_dir, month, pdf_path, meta.paper_id)
         if guard is not None:
             old = load_bundle(guard)
-            logger.warning("  ⛔ 已有 final bundle，跳过（要重跑加 --force，会丢弃已有核验成果）: {}"
-                           .format(guard))
+            # 点名保护它的是哪个桶：跨桶命中时（本月没读过、上个月读过）不说清楚，
+            # agent 会困惑「我这个月没读过这篇啊」。
+            logger.warning("  ⛔ 已有 final bundle（在 {} 桶），跳过"
+                           "（要重跑加 --force，会丢弃已有核验成果）: {}"
+                           .format(guard.parent.name, guard))
             return {
                 "bundle": str(guard), "paper_id": old.get("paper_id") or meta.paper_id,
                 "title": meta.title,
@@ -727,13 +847,17 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     chunks = chunk_text(full_text)
     logger.info("  分块通读: {} 块（全文 {} 字符）".format(len(chunks), len(full_text)))
     chunk_notes = deep_read_chunks(chunks, llm, model, research_interests)
-    cr, one_line, synth_api_err = synthesize_deep_read(chunk_notes, llm, model, research_interests)
+    budget_info: Dict[str, Any] = {}
+    cr, one_line, synth_api_err = synthesize_deep_read(
+        chunk_notes, llm, model, research_interests, budget_info=budget_info)
 
     # 草稿状态：区分「API 无额度（应回退 subagent 对抗生成）」与普通降级
     n_ok = sum(1 for n in chunk_notes if not n.get("_error"))
     n_api = sum(1 for n in chunk_notes if n.get("_api_error"))
     if cr is not None:
-        draft_status, draft_note = "ok", ""
+        # 草稿本身可用，但可能是**裁剪过的**块笔记汇总出来的。这条必须落进 bundle：
+        # agent 拿草稿当亲读核验基线，只会核验草稿写了的条目，被裁掉的那部分不会被发现。
+        draft_status, draft_note = "ok", budget_info.get("note", "")
     elif synth_api_err or (n_api and n_ok == 0):
         draft_status = "api_error"
         draft_note = "LLM 无额度/鉴权失败（如 402），脚本草稿不可用——应回退 subagent 对抗生成"

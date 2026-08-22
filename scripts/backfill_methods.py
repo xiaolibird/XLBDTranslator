@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.scholar.settings import load_scholar_settings  # noqa: E402
 from src.scholar.llm_client import LLMClient  # noqa: E402
 from src.scholar.paths import repo_path  # noqa: E402
+from src.scholar.notes_index import _atomic_write  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 logger = get_logger("backfill_methods")
@@ -351,7 +352,7 @@ def backfill_one(bf: Path, data: dict, llm, model: str, backup_dir: Path) -> dic
     backup_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(bf, backup_dir / bf.name)
     insert_section(data, sents)
-    bf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write(bf, json.dumps(data, ensure_ascii=False, indent=2))
     return {"status": "ok", "n": len(sents), "demoted": n_demoted,
             "pages": n_pages, "chars": raw, "model": model}
 
@@ -501,7 +502,9 @@ def cmd_repair_paths(args):
         return 0
     for bf, data, old, new in fixed:
         data["pdf_path"] = new
-        bf.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 与本文件另一条写路径（先 shutil.copy2 备份）不同，这里改的同样是 final bundle
+        # 却既无备份也非原子——--apply 跑到一半被中断会留下半截 JSON。
+        _atomic_write(bf, json.dumps(data, ensure_ascii=False, indent=2))
     print("\n✅ 已写回 {} 个 bundle 的 pdf_path".format(len(fixed)))
     return 0
 
