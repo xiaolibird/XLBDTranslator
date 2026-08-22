@@ -13,7 +13,8 @@ import traceback
 
 from src.utils.notify import notify
 from src.scholar.paths import repo_path
-from src.scholar.schema import ScholarSettings
+from src.scholar.schema import ScholarSettings  # noqa: F401  re-export 兼容（run_digest 等签名仍用）
+from src.scholar.settings import load_scholar_settings
 from src.scholar.workflow import ScholarWorkflow
 from src.utils.logger import logger
 
@@ -441,18 +442,10 @@ def main():
             args = legacy_parser.parse_args()
             args.command = 'digest'
 
-        # 加载配置
-        config_path = repo_path(args.config)
-        if config_path.exists():
-            settings = ScholarSettings.from_env_file(config_path)
-            logger.info("已加载配置文件: {}".format(config_path))
-        else:
-            settings = ScholarSettings()
-            logger.warning("配置文件不存在: {}，使用默认配置".format(config_path))
-        # notes_dir/output_dir 默认是相对路径，语义是「仓库里的那个目录」；不锚定的话
-        # 从别处（或 launchd 里 cwd 未设对）启动就会静默写去另一棵目录树。见 paths.repo_path
-        settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
-        settings.processing.output_dir = repo_path(settings.processing.output_dir)
+        # 加载配置（F1 收敛：加载/锚定统一走 load_scholar_settings，契约见其 docstring）。
+        # patch_gemini=False 是硬约束：digest 主链路历史上不打 gemini→deepseek 迁移补丁
+        # （provider 切换走 --provider 参数），统一 loader 时不得静默改变这一行为。
+        settings = load_scholar_settings(args.config, patch_gemini=False)
 
         # 设置调试日志
         if args.debug:
