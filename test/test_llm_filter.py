@@ -532,24 +532,57 @@ def test_filter_batch_transient_failure_recovered_by_retry(tmp_path, monkeypatch
     assert wf.excluded[0]["stage"] == "llm_judge"
 
 
-def test_filter_batch_retry_rewinds_provider_chain(tmp_path, monkeypatch):
-    """重试前必须把粘性链位拨回链首，否则重试还在链尾那个已耗尽的位置。"""
+def test_filter_batch_retry_rewinds_chain_between_rounds(tmp_path, monkeypatch):
+    """rewind 必须发生在**首轮之后、重试之前**——只数调用次数是抓不住回归的。
+
+    变异测试实证：把 rewind_chain() 挪到 _filter_by_llm 最开头（首轮之前），
+    "断言被调用过一次"的写法照样全绿，而那正是它要防的那个 bug（重试时链位没拨回，
+    还在链尾耗尽位）。所以这里断言的是**时序**。
+    """
     settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
     wf = ScholarWorkflow(settings)
-    rewound = []
+    timeline = []
 
     def _rewind():
-        rewound.append(True)
+        timeline.append("rewind")
         return True
 
+    def boom(prompt, model=None, json_mode=None):
+        timeline.append("call")
+        raise RuntimeError("API down")
+
     monkeypatch.setattr(wf.llm_client, "rewind_chain", _rewind)
+    monkeypatch.setattr(wf, "_call_llm", boom)
+    wf._filter_by_llm([_make_paper(1, "EHR risk prediction")])
+
+    assert timeline == ["call", "rewind", "call"]
+
+
+def test_filter_retry_survives_rewind_failure(tmp_path, monkeypatch):
+    """rewind 是基础设施，它自己抛异常绝不能掀翻重试轮。
+
+    真实边角：全部 provider 构造失败时 _create_from_chain 会把链位停在**越界位**，
+    此前 rewind_chain 裸取下标 IndexError，而调用点在 try 之外——结果比不重试更差
+    （整轮零产出、连兜底记录都没有）。
+    """
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+
+    def _boom_rewind():
+        raise IndexError("list index out of range")
 
     def boom(prompt, model=None, json_mode=None):
         raise RuntimeError("API down")
 
+    monkeypatch.setattr(wf.llm_client, "rewind_chain", _boom_rewind)
     monkeypatch.setattr(wf, "_call_llm", boom)
-    wf._filter_by_llm([_make_paper(1, "EHR risk prediction")])
-    assert rewound == [True]
+
+    papers = [_make_paper(1, "EHR risk prediction"), _make_paper(2, "Quasar spectroscopy")]
+    kept = wf._filter_by_llm(papers)          # 不抛
+
+    assert [p.segment_id for p in kept] == [1]        # 白名单命中的照常入选
+    assert len(wf.undecided_segments) == 1            # 未命中的挂账，不是凭空消失
+    assert wf._filter_fallback_count == 2
 
 
 def test_filter_batch_persistent_failure_records_cause(tmp_path, monkeypatch):
@@ -571,3 +604,88 @@ def test_filter_batch_persistent_failure_records_cause(tmp_path, monkeypatch):
     assert len(wf.undecided_segments) == 1
     reason = wf.undecided_segments[0].filter_decision.reason
     assert "首轮限流 429" in reason and "重试仍然 429" in reason
+
+
+def test_filter_missing_verdicts_are_retried_not_dumped_to_keywords(tmp_path, monkeypatch):
+    """截断形状：批调用成功但只回了部分 id——缺裁决的论文必须进重试，不能当场落兜底。
+
+    这是重试层能不能盖住真实事故形状的关键。_parse_filter_response 有前缀抢救层，
+    截断响应只要救得出前几条就不抛异常，批次因此不会进 deferred；若缺裁决的论文当场
+    落 keyword_fallback，末尾重试根本碰不到它们——等于只盖了「整批抛异常」这没证据的一半。
+    """
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    papers = [_make_paper(1, "EHR alpha"), _make_paper(2, "EHR beta"), _make_paper(3, "EHR gamma")]
+
+    calls = {"n": 0}
+
+    def truncated_then_full(prompt, model=None, json_mode=None):
+        calls["n"] += 1
+        if calls["n"] == 1:      # 首轮：只回 id=1（模拟截断后被抢救出前一条）
+            return '{"verdicts": [{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.8}]}'
+        return ('{"verdicts": ['
+                '{"id": 2, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok2", "confidence": 0.7},'
+                '{"id": 3, "decision": "EXCLUDE", "bucket": [], "one_line": "无关", "confidence": 0.9}]}')
+
+    monkeypatch.setattr(wf, "_call_llm", truncated_then_full)
+    kept = wf._filter_by_llm(papers)
+
+    assert calls["n"] == 2
+    stages = {d.paper_id: d.stage for d in wf.included_decisions}
+    assert stages == {"paper_1": "llm_judge", "paper_2": "llm_judge"}   # 2 号是重试救回的真裁决
+    assert wf._filter_fallback_count == 0        # 一篇都没掉进关键词
+    assert wf._filter_retry_recovered == 2       # 2、3 号都是重试轮拿到的
+    assert wf.excluded[0]["stage"] == "llm_judge"
+
+
+def test_filter_retry_recovered_count_excludes_still_missing(tmp_path, monkeypatch):
+    """重试轮只回了部分 id：recovered 必须只数真拿到裁决的，不能按整批记。
+
+    按 len(batch) 记会虚高——一次「只回 1 个 id」的半截响应会被记成整批救回，
+    恰好废掉这个字段被单列出来的理由（这次瞬态故障到底有多严重）。
+    """
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["nomatch"])
+    wf = ScholarWorkflow(settings)
+    papers = [_make_paper(1, "Alpha"), _make_paper(2, "Beta"), _make_paper(3, "Gamma")]
+
+    calls = {"n": 0}
+
+    def flaky(prompt, model=None, json_mode=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("整批失败")
+        return '{"verdicts": [{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.8}]}'
+
+    monkeypatch.setattr(wf, "_call_llm", flaky)
+    wf._filter_by_llm(papers)
+
+    assert wf._filter_retry_recovered == 1       # 只有 id=1 拿到真裁决
+    assert wf._filter_fallback_count == 2        # 2、3 号重试后仍缺裁决 → 兜底
+    assert wf._filter_retry_recovered + wf._filter_fallback_count == len(papers)
+
+
+def test_filter_retry_preserves_input_order(tmp_path, monkeypatch):
+    """重试救回的论文必须回到原输入顺序，不能被永久推到 kept 末尾。
+
+    排序是稳定的（_sort_by_priority / closereading 的 top-N 都是），而 digest 并列分
+    极多（08-17 那份 47 篇里 33 篇分数并列），留在末尾会让「被重试救回的论文系统性
+    挤不进全文精读名额」成为可复现的偏置。
+    """
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    papers = [_make_paper(i, "EHR paper {}".format(i)) for i in (1, 2, 3)]
+
+    calls = {"n": 0}
+
+    def first_id_missing(prompt, model=None, json_mode=None):
+        calls["n"] += 1
+        if calls["n"] == 1:      # 首轮漏掉 id=1（它将走重试）
+            return ('{"verdicts": ['
+                    '{"id": 2, "decision": "INCLUDE", "bucket": ["A"], "one_line": "b", "confidence": 0.7},'
+                    '{"id": 3, "decision": "INCLUDE", "bucket": ["A"], "one_line": "c", "confidence": 0.7}]}')
+        return '{"verdicts": [{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "a", "confidence": 0.7}]}'
+
+    monkeypatch.setattr(wf, "_call_llm", first_id_missing)
+    kept = wf._filter_by_llm(papers)
+
+    assert [p.segment_id for p in kept] == [1, 2, 3]   # 不是 [2, 3, 1]

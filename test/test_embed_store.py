@@ -1029,22 +1029,25 @@ def _patch_embedding_client(monkeypatch):
     import types
     from src.scholar import embeddings as E
 
+    closed = []
+
     class _Client:
         def __init__(self, *a, **kw):
             pass
 
         def close(self):
-            pass
+            closed.append(True)
 
     monkeypatch.setattr(E, "EmbeddingClient", _Client)
     monkeypatch.setattr(E, "resolve_embedding_base_url", lambda llm: "http://localhost:11434")
+    return closed
 
 
 def test_sync_best_effort_success_returns_stats(monkeypatch, tmp_path):
     import types
     from src.scholar import embed_store as S
     from src.utils import notify as N
-    _patch_embedding_client(monkeypatch)
+    closed = _patch_embedding_client(monkeypatch)
     stats = types.SimpleNamespace(embedded=3, deleted=1, meta_refreshed=2)
     monkeypatch.setattr(S, "sync_store", lambda *a, **kw: stats)
     calls = []
@@ -1053,12 +1056,13 @@ def test_sync_best_effort_success_returns_stats(monkeypatch, tmp_path):
                                    notify_title="Scholar 周入库", context="入库")
     assert out is stats
     assert calls == []          # 成功不打扰人
+    assert closed == [True]     # 连接必须关闭（此前删掉 finally: close() 测试照样绿）
 
 
 def test_sync_best_effort_failure_notifies_once_and_swallows(monkeypatch, tmp_path):
     from src.scholar import embed_store as S
     from src.utils import notify as N
-    _patch_embedding_client(monkeypatch)
+    closed = _patch_embedding_client(monkeypatch)
 
     def _boom(*a, **kw):
         raise RuntimeError("Ollama 不可达")
@@ -1073,3 +1077,4 @@ def test_sync_best_effort_failure_notifies_once_and_swallows(monkeypatch, tmp_pa
     title, text = calls[0]
     assert title == "Scholar 手动精读"
     assert "手动精读归档" in text and "Ollama 不可达" in text
+    assert closed == [True]     # sync_store 抛异常也必须走到 finally 关连接

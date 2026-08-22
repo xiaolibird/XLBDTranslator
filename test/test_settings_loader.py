@@ -46,6 +46,30 @@ def test_missing_config_falls_back_to_defaults(fake_repo):
     assert s.processing.notes_dir == fake_repo / "output" / "scholar_notes"
 
 
+def test_missing_config_does_not_leak_production_config(fake_repo, monkeypatch):
+    """「使用默认配置」必须是**真**默认值，不能把 cwd 下的生产 config 读进来。
+
+    此前用裸 ScholarSettings() 回退，它走类级 model_config.env_file='config/scholar.env'
+    ——**cwd 相对**。于是在仓库根跑时，--config 打个错字会从「用默认值、跑不动、立刻
+    暴露」变成「照着生产配置连同 API key 和整条回退链真跑起来」，日志还写着"使用默认配置"。
+    这里在 cwd 下摆一份"生产 config"，断言它没有被读进来。
+    """
+    (fake_repo / "config").mkdir(exist_ok=True)
+    poison = fake_repo / "cwd_here"
+    (poison / "config").mkdir(parents=True)
+    (poison / "config" / "scholar.env").write_text(
+        "LLM__PROVIDER=claude-agent\nLLM__MODEL=sonnet\n"
+        "LLM__GEMINI_API_KEY=SHOULD_NOT_BE_READ\n"
+        "LLM__FALLBACK_PROVIDERS=deepseek,gemini\n", encoding="utf-8")
+    monkeypatch.chdir(poison)
+
+    s = load_scholar_settings("config/absent.env")
+    assert s.llm.provider != "claude-agent", "把 cwd 下的 config 当成默认配置读进来了"
+    assert s.llm.model != "sonnet"
+    assert not s.llm.api_key, "默认配置不该带 API key"
+    assert s.llm.fallback_providers == ""
+
+
 def test_patch_gemini_applied(fake_repo):
     _write_env(fake_repo, "LLM__PROVIDER=gemini\nLLM__MODEL=gemini-2.5-pro\n")
     s = load_scholar_settings()

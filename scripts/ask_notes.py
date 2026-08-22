@@ -86,8 +86,8 @@ def main() -> int:
     ap.add_argument("--max-evidence", type=int, default=Q.DEFAULT_QA_MAX_EVIDENCE,
                     help="喂给 LLM 的证据上限（默认 {}）".format(Q.DEFAULT_QA_MAX_EVIDENCE))
     ap.add_argument("--min-sim", type=float, default=T.DEFAULT_MIN_SIM,
-                    help="召回相似度下限（默认 {}；**不要照抄 notes_search 的 0.65**，"
-                         "那是 paper 级口径，见 topics.DEFAULT_MIN_SIM 的实测依据）".format(
+                    help="召回相似度下限（默认 {}，句级证据口径；paper 级链路是另一套取值，"
+                         "别互相照抄，标定依据见 src/scholar/thresholds.py）".format(
                              T.DEFAULT_MIN_SIM))
     ap.add_argument("--per-paper-cap", type=int, default=Q.DEFAULT_QA_PER_PAPER_CAP,
                     help="单篇论文最多贡献几条证据（默认 {}；比概念页的 {} 小是**有意的**，"

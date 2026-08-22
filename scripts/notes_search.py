@@ -418,6 +418,12 @@ def main() -> int:
             best_score, best_kind = max(cosine_cands, key=lambda t: t[0])[:2]
         else:
             best_score, best_kind = max(candidates, key=lambda t: t[2])[:2]
+        # 这个展示分**未必是篇级分**：--level auto 下候选里混着句级命中，某篇标题/摘要
+        # 根本没过 min_score、只有一条精读句命中 0.71 时，展示分就是那 0.71。而
+        # scholar-search skill 教的是"≥0.62 判库内疑似同篇"——那条判据只对篇级分成立，
+        # 不标出来就会被当成篇级分读，把"库里有一句相关证据"误报成"库里已有这篇"。
+        paper_cos = g["paper"][0] if (g["paper"] and g["paper"][1] == "cosine") else None
+        score_from = "paper" if (paper_cos is not None and best_score <= paper_cos) else "highlight"
         title, one_line = _split_paper_text(meta["text"])
         match_level = "highlight" if g["hits"] else "paper"
         paper_src = g.get("paper_src") or "paper"
@@ -425,6 +431,7 @@ def main() -> int:
         g["hits"].sort(key=lambda t: -t[2])
         rows.append({
             "citekey": ck, "score": best_score, "score_kind": best_kind, "_sort": best_sort,
+            "score_from": score_from,
             "match_level": match_level, "paper_src": paper_src,
             "year": meta.get("year"), "title": title, "one_line": one_line,
             "tier": meta.get("tier"), "note_file": meta.get("note_file"),
@@ -486,9 +493,12 @@ def main() -> int:
         # 篇级分数必须打出来：句级命中行一直带分，篇级此前只有标题——判"库里是否已有
         # 类似文献"恰恰看的是篇级分（0.62 是 paper 级强近邻的标定线，见 thresholds.py），
         # 不显示就只能靠 --json 反查，实测让调用方把弱相关误报成"库内已有"。
-        print("[@{}] ({}) {} {}{:.2f} {}".format(
+        # 分数来自句级时打 `句` 标记：0.62 那条判据只对篇级分成立，不标出来会把
+        # "库里有一句相关证据"读成"库里已有这篇"（--level auto 下才会出现）。
+        row_sfx = "句" if row.get("score_from") == "highlight" else ""
+        print("[@{}] ({}) {} {}{:.2f}{} {}".format(
             row["citekey"], row["year"] or "?", TIER_EMOJI.get(row["tier"], ""),
-            row_kw, row["score"], (row["title"] or "")[:90]))
+            row_kw, row["score"], row_sfx, (row["title"] or "")[:90]))
         if row["one_line"]:
             print("    ⭐ {}".format(row["one_line"]))
         if row["no_sentence_evidence"]:

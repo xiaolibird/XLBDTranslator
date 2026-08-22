@@ -557,13 +557,21 @@ class ScholarWorkflow:
         为什么要有「末尾重试」这一层（2026-08-22 复盘 08-17 生产运行）：那次 12 批里
         **2 个整批**（40 篇）裁决失败掉进关键词兜底，其中 21 篇因未命中白名单被挂
         undecided——真正的三态审稿对这 21 篇根本没发生过。根因是回退链
-        `claude-agent(sonnet) → deepseek → claude-agent:opus → gemini` 里 deepseek 欠费、
-        gemini key 失效，实际只剩两个共用同一订阅额度的 claude-agent 档位：订阅短时
-        触顶时整条链一次性塌掉。**但这类故障会自愈**——额度窗口过去就恢复，同一次运行
-        里其余 10 批都正常。原先的「失败即兜底」把一个几分钟的瞬态窗口固化成了永久的
-        质量损失。
+        **确切原因已不可考**（那次 cron 日志已删，当时兜底也不记异常——这个可观测性
+        缺口已一并补上）。两个候选形状，本方法都要盖住：
+          1. 整批调用抛异常（限流/超时/链耗尽）→ 进 `deferred`；
+          2. 响应**截断**，前缀抢救层救出前几条、不抛异常 → 缺裁决的十几篇只是拿不到
+             verdict。40 = 2×20 恰好是「两批各只救出前几条」的形状，且
+             `_parse_filter_response` docstring 记着同款截断事故。
+        形状 2 若不管，批次根本不会进 `deferred`，重试层等于只盖了没证据的那一半——
+        所以首轮的缺裁决论文走 `missing_out` 一并延后重试（见 `_apply_filter_verdicts`）。
 
-        重试放在**所有批次跑完之后**而不是原地重试：原地重试撞的是同一个额度窗口，
+        探活实测的链路现状（08-22）：deepseek 402 欠费、gemini key 有效、两个
+        claude-agent 档位共用同一订阅额度。可确定的是这类故障**会自愈**——同一次运行里
+        其余 10 批全部正常，08-22 用同一窗口重跑 12/12 批零回退。原先的「失败即兜底」
+        把一个几分钟的瞬态窗口固化成了永久的质量损失。
+
+        重试放在**所有批次跑完之后**而不是原地重试：原地重试撞的是同一个故障窗口，
         大概率再失败一次；跑完一轮通常已过去数分钟（实测整轮 10+ 分钟），窗口早已过去。
         重试前 `rewind_chain()` 把粘性链位拨回链首，否则重试还在拿链尾那个已耗尽的位置。
         """
@@ -574,6 +582,7 @@ class ScholarWorkflow:
         kept: List[PaperSegment] = []
         total_batches = (len(papers) + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
         deferred: List[Tuple[int, List[PaperSegment], str]] = []   # (批号, 批, 首次失败原因)
+        missing: List[PaperSegment] = []      # 批调用成功但响应里没有它的裁决（截断/漏 id）
 
         for i in range(0, len(papers), FILTER_BATCH_SIZE):
             batch = papers[i:i + FILTER_BATCH_SIZE]
@@ -591,15 +600,28 @@ class ScholarWorkflow:
                 deferred.append((batch_num, batch, str(e)))
                 continue
 
-            kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
+            kept.extend(self._apply_filter_verdicts(
+                batch, verdicts, model, prompt_version, missing_out=missing))
 
-        # ---- 失败批次末尾重试一轮（见本方法 docstring 的 08-17 复盘）----
-        if deferred:
-            logger.warning("  {} 个批次首轮裁决失败（{} 篇），末尾重试一轮".format(
-                len(deferred), sum(len(b) for _, b, _ in deferred)))
-            self.llm_client.rewind_chain()   # 粘性链位拨回链首，否则重试还在链尾耗尽位
-            for batch_num, batch, first_err in deferred:
-                logger.info("  重试批次 {}（{} 篇）".format(batch_num, len(batch)))
+        # ---- 末尾重试一轮（见本方法 docstring 的 08-17 复盘）----
+        if deferred or missing:
+            logger.warning("  首轮未拿到真裁决：{} 个整批失败（{} 篇）+ {} 篇漏裁决，末尾重试一轮".format(
+                len(deferred), sum(len(b) for _, b, _ in deferred), len(missing)))
+            # rewind 是基础设施，绝不能让它把重试轮本身掀翻（链位越界等边角）
+            try:
+                self.llm_client.rewind_chain()   # 粘性链位拨回链首，否则重试还在链尾耗尽位
+            except Exception as e:
+                logger.warning("  链位拨回失败（不影响重试本身）：{}".format(e))
+
+            # 漏裁决的单篇按批大小重组成新批，与整批失败的一起重试
+            retry_units: List[Tuple[str, List[PaperSegment], str]] = [
+                ("批次 {}".format(bn), b, err) for bn, b, err in deferred]
+            for j in range(0, len(missing), FILTER_BATCH_SIZE):
+                retry_units.append(
+                    ("漏裁决重组批", missing[j:j + FILTER_BATCH_SIZE], "首轮响应里没有这些 id（截断/漏 id）"))
+
+            for label, batch, first_err in retry_units:
+                logger.info("  重试{}（{} 篇）".format(label, len(batch)))
                 try:
                     prompt = self._build_filter_prompt(batch)
                     response = self._call_llm(prompt, model=model, json_mode=True)
@@ -608,27 +630,60 @@ class ScholarWorkflow:
                 except Exception as e:
                     # 重试仍失败：这才落关键词兜底，并把两次的原因都记进裁决供事后定位
                     cause = "首次: {} ｜ 重试: {}".format(str(first_err)[:150], str(e)[:150])
-                    logger.warning("  批次 {} 重试仍失败，回退关键词白名单: {}".format(batch_num, e))
+                    logger.warning("  {}重试仍失败，回退关键词白名单: {}".format(label, e))
                     self._filter_fallback_count += len(batch)
                     kept.extend(self._fallback_partition(batch, cause=cause))
                     continue
-                logger.info("  ✅ 批次 {} 重试成功（{} 篇拿到真裁决）".format(batch_num, len(batch)))
-                self._filter_retry_recovered += len(batch)
-                kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
+                # 真正救回来的篇数 = 批大小 - 本次仍掉进兜底的篇数（重试轮 missing_out
+                # 不再收集，缺裁决的当场兜底）。直接按 len(batch) 记会虚高：一次「只回了
+                # 1 个 id」的半截响应会被记成整批救回，恰好废掉这个字段存在的意义。
+                before_fb = self._filter_fallback_count
+                try:
+                    kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
+                except Exception as e:
+                    # 落裁决这一步抛异常不能连坐掉后面还没重试的批
+                    logger.warning("  {}裁决落盘异常，回退关键词白名单: {}".format(label, e))
+                    self._filter_fallback_count += len(batch)
+                    kept.extend(self._fallback_partition(
+                        batch, cause="重试后落裁决异常: {}".format(str(e)[:150])))
+                    continue
+                recovered = len(batch) - (self._filter_fallback_count - before_fb)
+                self._filter_retry_recovered += recovered
+                logger.info("  ✅ {}重试完成（{}/{} 篇拿到真裁决）".format(label, recovered, len(batch)))
 
+        # 顺序还原：重试批若留在 kept 末尾，会永久排在同分论文之后。排序是**稳定**的
+        # （_sort_by_priority / closereading 的 top-N 都是），而实测 digest 并列分极多
+        # （08-17 那份 47 篇里 33 篇分数并列，最大并列组 11 篇），于是「被重试救回来的
+        # 论文系统性挤不进全文精读名额」会成为可复现的偏置。按输入顺序还原即可消除。
+        order = {p.segment_id: i for i, p in enumerate(papers)}
+        kept.sort(key=lambda p: order.get(p.segment_id, len(order)))
         return kept
 
     def _apply_filter_verdicts(self, batch: List[PaperSegment], verdicts: dict,
-                                model: str, prompt_version: str) -> List[PaperSegment]:
+                                model: str, prompt_version: str,
+                                missing_out: Optional[List[PaperSegment]] = None
+                                ) -> List[PaperSegment]:
         """把一批已解析的裁决落到 paper 上，返回入选的那些。
 
         首轮与末尾重试轮共用这一份（此前只有首轮一处，重试轮加进来时若各写一份，
         单篇 MISS 容错、脏字段容错这些逐篇防线必然漂移）。
+
+        missing_out 非 None（首轮）时，响应里没有裁决的论文**收集起来交给末尾重试**而不是
+        当场兜底。这条路径不是可有可无的补充，而是重试层能不能盖住真实事故形状的关键：
+        `_parse_filter_response` 有前缀抢救层，一次**截断**的响应只要救得出前几条就不抛
+        异常——批次因此不会进 `deferred`，缺裁决的十几篇会直接落 keyword_fallback，
+        末尾重试压根碰不到它们。而截断恰恰是有档可查的那次事故形状（见
+        `_parse_filter_response` docstring 记的「一次截断让整批 20 篇一起降级」）。
+        只盖「整批抛异常」等于只盖了没证据的那一半。
         """
         kept: List[PaperSegment] = []
         for paper in batch:
             verdict = verdicts.get(paper.segment_id)
             if verdict is None:
+                if missing_out is not None:
+                    logger.warning("  [MISS] 裁决结果缺失 id={}，延后重试".format(paper.segment_id))
+                    missing_out.append(paper)
+                    continue
                 # LLM 响应缺失该 id：单篇回退关键词判断
                 logger.warning("  [MISS] 裁决结果缺失 id={}，回退关键词".format(paper.segment_id))
                 self._filter_fallback_count += 1
@@ -1762,9 +1817,12 @@ __PAPERS_JSON__
             if count > 0:
                 logger.info(f"  ✅ 已将所有 {count} 封历史 Scholar 邮件标记为已读")
         else:
-            # 仅标记本次处理过的邮件 ID。用 .get 过滤缺 metadata 的条目：裸下标在
-            # 这里抛 KeyError 会穿透到 execute() 的收尾兜底（2026-08-17 exit 1 事故的
-            # 头号嫌疑路径）——缺 metadata 的邮件本就无 id 可标，跳过即可。
+            # 仅标记本次处理过的邮件 ID。用 .get 而非裸下标纯属纵深防御：缺 metadata
+            # 的邮件本就无 id 可标，跳过即可，不该让 KeyError 掀翻收尾。
+            # ⚠️ 别把它当成 08-17 exit 1 事故的解释——复审已证伪：gmail_client 构造
+            # 时 'metadata' 恒存在且非 None（解析失败的邮件在那里就 skip 了），且
+            # Step 2 的 `email_data['metadata']` 是裸下标，真缺键会先在 Step 2 炸。
+            # 这条路径当前不可达，事故真凶另有其人，勿就此结案。
             all_ids = [
                 email['metadata'].email_id
                 for email in self.emails

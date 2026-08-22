@@ -2035,6 +2035,11 @@ def test_trigger_command_shapes(monkeypatch, tmp_path):
 
     def _fake_run(cmd, **kw):
         seen.append(cmd)
+        # 连 kwargs 一起断言：只看 cmd 的话，删掉 timeout=（13 分钟挂起事故的直接防线）
+        # 或把 cwd 改成别处，测试都照样绿——变异测试实证过。
+        assert kw["timeout"] == 2400
+        assert str(kw["cwd"]).endswith("XLBDTranslator-dev")
+        assert kw["capture_output"] is True and kw["text"] is True
         return types.SimpleNamespace(stdout="", stderr="", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", _fake_run)

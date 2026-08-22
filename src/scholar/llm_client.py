@@ -293,7 +293,12 @@ class LLMClient:
         with self._conn_lock:
             if self._chain_idx == 0:
                 return False
-            old = self._chain[self._chain_idx]
+            # 指针可能停在**越界位**：_create_from_chain 在全部 provider 构造失败时
+            # 是先把 _chain_idx 推到 len(_chain) 再抛 RuntimeError 的。裸取
+            # self._chain[self._chain_idx] 会 IndexError，而调用方（workflow 末尾重试）
+            # 拿它当基础设施用、不设防，结果是「本来还能逐批兜底出 digest」变成整轮
+            # 崩溃且一条兜底记录都没有——比不做这次 rewind 更差。先夹回合法范围。
+            old = self._chain[min(self._chain_idx, len(self._chain) - 1)]
             if self._conn is not None and isinstance(self._conn, dict):
                 c = self._conn.get('client')
                 if isinstance(c, httpx.Client):

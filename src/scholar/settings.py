@@ -308,7 +308,13 @@ def load_scholar_settings(config="config/scholar.env", *,
         if require:
             raise FileNotFoundError(cfg)
         logger.warning("配置文件不存在: {}，使用默认配置".format(cfg))
-        settings = ScholarSettings()
+        # 必须仍走 from_env_file(不存在的路径)，**不能**用裸 ScholarSettings()：
+        # 后者走类级 model_config.env_file=Path('config/scholar.env')，那是 **cwd 相对**的，
+        # 于是「配置文件不存在」这条路径会在仓库根 cwd 下**把生产配置连同 API key 和整条
+        # 回退链一起加载进来**，日志却写着"使用默认配置"。后果：--config 打个错字从
+        # 「用默认值跑不动、立刻暴露」变成「照着生产配置真跑起来」。
+        # 传一个不存在的 _env_file 给 pydantic-settings 才是真·默认值。
+        settings = ScholarSettings.from_env_file(cfg)
     if patch_gemini and settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
         settings.llm.provider = "deepseek"
         logger.info("LLM provider 从 gemini 自动切换为 deepseek（model={}）".format(settings.llm.model))
