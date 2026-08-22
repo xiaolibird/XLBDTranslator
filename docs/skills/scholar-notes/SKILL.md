@@ -16,11 +16,15 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 - `科研札记_YYYY-MM-DD_全文精读.md` —— **周札记**(周一日期),2026-07 起改为每周一自动入库
 - `科研札记_YYYY-MM(-DD)_手动精读.md` —— 手动 PDF 深度精读(agent 交叉核验)
 
-⚠️ **定位某篇论文在哪个文件,以索引条目的 `note_file` 字段为准,不要按 month 拼文件名**——
-同一个月可能同时有月度/周/手动精读三种文件,靠月份猜必错(手动精读的论文尤其如此)。
+还有带批次后缀的变体(如 `科研札记_2026-07-28-TFM_手动精读.md`、
+`科研札记_2026-07-27-HuiyingLiang_全文精读.md`),**上面三种模式不完备**。
+
+⚠️ **定位某篇论文在哪个文件,一律以索引条目的 `note_file` 字段为准,绝不要拼文件名**——
+单月可能同时存在 6 个以上文件(月度/周/手动/批次变体),而且 citekey 里的年份是**出版年**、
+与入库 `month` 常常不是一回事(实测 `lim2025Multicenter` 的 month 是 `2026-07`)。靠猜必错。
 
 每篇 md 配同名 `references.json`(CSL-JSON)。总索引:`literature_index.json`;
-完整使用说明:该目录 `AGENTS.md`(先读它)。
+完整使用说明:该目录 `AGENTS.md`(先读它——611 行/48KB,**用 Read 分段读,别 cat**)。
 
 **另有一份 per-paper 视图**:`~/Documents/ScholarVault/`(Obsidian vault,431 篇 = 已全文精读的)。
 一篇论文一个文件 `01-文献/<citekey>.md`,带 YAML frontmatter(citekey/doi/year/bucket/role/flags/
@@ -47,8 +51,9 @@ cat output/scholar_notes/topics/mnar-diagnosis.md # 读某一页
   越界即剔除;模型自己写出的引用标记——不论带不带方括号——也会被剥离),citekey 因此
   不是模型现编的,而是来自召回集合。`build_topics.py --verify` 会扫描死键与残留裸引用
   (`bare_cites`)兜底,看到 ⚠️ 再去核实,没有异常不必逐条复核;
-- 页底「本页证据」给出每条证据的 `note_file:note_line`,要核验原句照着点进去;○ 表示
-  召回了但未被采用;
+- 页底「本页证据」给出每条证据的 `note_file:note_line`。注意这是**篇级**定位(指向该篇
+  在札记里的标题行,与索引 `note_line` 同值),不是原句所在行——核验时 Read 到该篇小节后,
+  再按证据的 `section` 找那一段(一篇小节常有上百行);○ 表示召回了但未被采用;
 - 「⚔️ 分歧与冲突」是**有意保留的矛盾**,写 critique / discussion 时是现成的靶子;
 - **引用率不能单独当质量信号**:○ 多不一定是 `queries` 跑偏,也可能是证据池混进了「对我
   研究的联想」这类主观批注(已默认排除,见 `config/topics.yaml` 的 `exclude_sections`);
