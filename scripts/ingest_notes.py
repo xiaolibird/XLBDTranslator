@@ -22,7 +22,7 @@
   PYTHONPATH=. python scripts/read_pdf.py ingest <目录或 PDF 路径>
 
 退出码：0 成功 / 1 无论文可入 / 2 配置或输入错误 / 3 札记已正常入库但概念页未全部
-更新成功（不是入库失败，是它的派生产物这一轮没跟上，见 _refresh_topics）。
+更新成功（不是入库失败，是它的派生产物这一轮没跟上，见 topics.trigger_topic_refresh）。
 """
 import argparse
 import json
@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar import ingest as ing                        # noqa: E402
 from src.scholar.paths import repo_path                         # noqa: E402
-from src.scholar.schema import ScholarSettings               # noqa: E402
+from src.scholar.settings import load_scholar_settings       # noqa: E402
 from src.utils.logger import get_logger                      # noqa: E402
 from src.utils.notify import notify                          # noqa: E402
 
@@ -69,96 +69,17 @@ def _refresh_index_and_vectors(settings) -> None:
     跳过这一整段，于是只要连着几周没有新论文，陈旧状态就无限期存续，且日志上只写着
     「无新论文」——读起来像一切正常。
 
-    向量同步走 best-effort：周一无人值守绝不能因 Ollama 没起而失败。任何异常
-    （Ollama 不可达 / 模型未 pull / 网络问题）只 log warning + 弹系统通知，
-    不改变退出码、不中断脚本——向量库是索引的纯派生物，缺一次同步不影响入库结果。
+    向量同步走 best-effort（收敛在 embed_store.sync_store_best_effort，契约见其
+    docstring）：周一无人值守绝不能因 Ollama 没起而失败，缺一次同步不影响入库结果。
     """
     from src.scholar.notes_index import update_index, write_outputs
+    from src.scholar.embed_store import sync_store_best_effort
     nd = Path(settings.processing.notes_dir)
     index_data = update_index(nd)
     write_outputs(index_data, nd)      # 增量：只重解析新增的周文件
     logger.info("文献索引已刷新")
-
-    try:
-        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-        from src.scholar.embed_store import DB_NAME, sync_store
-        client = EmbeddingClient(
-            base_url=resolve_embedding_base_url(settings.llm),
-            model=settings.llm.embedding_model,
-        )
-        try:
-            stats = sync_store(nd / DB_NAME, index_data, client)
-        finally:
-            client.close()
-        logger.info("向量库已同步：+{} 嵌入 / -{} 删除 / {} 元数据刷新".format(
-            stats.embedded, stats.deleted, stats.meta_refreshed))
-    except Exception as e:
-        logger.warning("向量库同步跳过（不影响入库）：{}".format(e))
-        # launchd 无人值守时 warning 没人看——弹系统通知，向量库静默落后要有人知道
-        # （notify 自身失败静默，不会反过来影响入库退出码）
-        notify("Scholar 周入库", "向量库同步失败（札记已入库）：{}".format(str(e)[:120]))
-
-
-def _refresh_topics(notes_dir, note_md: str, timeout: int = 2400) -> bool:
-    """新论文入库后，重新合成**被它们影响的**概念页（P2：让概念页成为活文档）。
-
-    札记库原本是一次写成不再改的：某篇论文进来之后，"关于 MNAR 诊断全库的共识是什么"
-    这类结论不会跟着更新。这一步补上那一环——但只重合成新论文真正挤进了证据集的页
-    （build_topics.py --affected-by-note 内部先跑一遍召回做路由），而不是每周把 8 页
-    全量重跑：一轮全量要 20+ 分钟，且实测会撞 Claude 订阅限流，把回退链一路推到底。
-
-    走 subprocess 而不是 import：与 sync_vault.py 调 build_vault.py 同理，让路由、
-    熔断、索引页重建这些逻辑只在 build_topics.py 一处维护，这里不复制一份。
-
-    best-effort：周一 09:30 无人值守，概念页是索引的派生物，合成失败绝不能影响入库
-    结果本身——但"不影响入库结果"不等于"外面看不见"。
-
-    W3（生产实测：某周概念页 2 页失败，launchctl 显示退出码 0，无人知道）：此前是三重
-    吞掉——(1) 这里裸语句调用，返回值从不被读，main() 无论内部发生什么都 return 0；
-    (2) 只读 proc.stdout，proc.stderr 从未被引用，而 build_topics.py 唯一的向量库陈旧
-    警告（W2）正是打到 stderr 的；(3) 日志只截 stdout 尾部 6 行，失败页的身份可能恰好
-    落在被截掉的部分，事后只能靠重放 --dry-run 反推。现在返回一个 bool 供 main() 决定
-    退出码（True=完全成功或确认无需更新；False=任何超时/异常/非零退出——这不代表本批
-    入库失败，只代表概念页这个派生产物这一轮没跟上），stdout 全量入日志，stderr 非空
-    即 warning，失败详情（含哪几页失败、退出码对应什么故障）走 T.summarize_build_topics_run
-    统一解读——与 backfill_notes.py / read_pdf.py 的同类集成共用同一份解读逻辑。
-
-    安全前提：子进程用 build_topics.py 自己的默认配置独立加载**生产** notes_dir，
-    与这里传入的 notes_dir 完全脱钩——notes_dir 不在仓库 output/ 下（测试隔离场景）
-    一律跳过，不发子进程，见 T.notes_dir_is_production（read_pdf.py 的同类触发器
-    实测因为漏了这层判断，被单测意外打到过生产环境并挂起 13 分钟）。
-    """
-    import subprocess
-    from src.scholar import topics as T
-    if not T.notes_dir_is_production(notes_dir):
-        return True
-    script = repo_path("scripts/build_topics.py")
-    if not script.exists():
-        return True
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script), "--affected-by-note", str(note_md)],
-            capture_output=True, text=True, timeout=timeout,
-            cwd=str(repo_path(".")),
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("概念页更新超时（{}s），本批跳过（不影响入库）".format(timeout))
-        notify("Scholar 周入库", "概念页更新超时，札记已正常入库")
-        return False
-    except Exception as e:
-        logger.warning("概念页更新跳过（不影响入库）：{}".format(e))
-        notify("Scholar 周入库", "概念页更新异常（札记已正常入库）：{}".format(str(e)[:120]))
-        return False
-
-    # 全量入日志，不再只截尾部 6 行——今天生产事故里第二个失败页恰好被截在保留窗口
-    # 之外，运行时只能靠重放 --dry-run 路由反推身份。
-    for line in (proc.stdout or "").strip().splitlines():
-        logger.info("  {}".format(line))
-    outcome = T.summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
-    if not outcome.ok:
-        logger.warning("概念页更新未全部成功，札记已正常入库：{}".format(outcome.detail))
-        notify("Scholar 周入库", "概念页有页面未更新成功（札记已入库）：{}".format(outcome.detail[:300]))
-    return outcome.ok
+    sync_store_best_effort(nd, index_data, settings,
+                           notify_title="Scholar 周入库", context="入库")
 
 
 def parse_pick(spec: str, n: int) -> list:
@@ -220,15 +141,12 @@ def main() -> int:
     if args.pick and args.auto:
         ap.error("--pick 与 --auto 互斥")
 
-    cfg = Path(args.config)
-    if not cfg.exists():
-        print("找不到配置：{}".format(cfg), file=sys.stderr)
+    # 加载/锚定/gemini 补丁统一走 load_scholar_settings（F1 收敛，契约见其 docstring）
+    try:
+        settings = load_scholar_settings(args.config, require=True)
+    except FileNotFoundError as e:
+        print("找不到配置：{}".format(e), file=sys.stderr)
         return 2
-    settings = ScholarSettings.from_env_file(cfg)
-    if settings.llm.provider == "gemini" and settings.llm.model.startswith("gemini"):
-        settings.llm.provider = "deepseek"      # 与既有 pipeline 一致
-    # notes_dir 默认相对，语义是「仓库里的那个目录」——锚死，别随 cwd 漂（见 paths.repo_path）
-    settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
 
     # ---- 收集候选 ----
     if args.papers:
@@ -334,8 +252,12 @@ def main() -> int:
         _refresh_index_and_vectors(settings)
         # 概念页跟着新论文长（P2）。放在索引+向量库之后：路由要靠向量库跑召回，
         # 而向量库刚在上一步同步过，这时才看得见本批新入库的句子。
+        # 触发器收敛在 topics.trigger_topic_refresh（W3/W6/W7/Y3 战史见其 docstring）。
         if not args.no_topics:
-            topics_ok = _refresh_topics(settings.processing.notes_dir, rep["md"])
+            from src.scholar.topics import trigger_topic_refresh
+            topics_ok = trigger_topic_refresh(
+                settings.processing.notes_dir, note_md=rep["md"],
+                notify_title="Scholar 周入库", subject="札记已正常入库").ok
 
     print("\n{}".format("=" * 66))
     print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))
