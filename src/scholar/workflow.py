@@ -28,6 +28,7 @@ from ._citekey_utils import _norm_title
 from .thresholds import DIGEST_NEIGHBOR_MIN_SIM
 from ..utils.json_tools import loads_lenient
 from ..utils.logger import get_logger
+from ..utils.notify import notify
 
 logger = get_logger(__name__)
 
@@ -220,14 +221,31 @@ class ScholarWorkflow:
             # Step 4: 生成输出
             output = self._step_generate_output()
 
+            # ---- Step 4 之后是收尾步骤：digest 的全部产出（json/md/月度切分/_stats）
+            # 已在 _step_generate_output 内完整落盘，收尾失败不允许把整个 run 打成
+            # exit 1（2026-08-17 launchd 实测：产出四件套齐全、退出码却是 1，来源只能
+            # 是这段收尾——launchd 的 status 1 让人误判 digest 整体失败）。收尾各自
+            # try/except → warning + notify，继续 return output；Step 4 及之前的异常
+            # 语义不变（仍上抛 → cli exit 1，那时产出确实不完整）。----
+
             # Step 4.5: Zotero 联动（写库 + citekey + pandoc 札记；默认关闭，需 Zotero 在线）
             if self.settings.processing.zotero_enabled:
-                self._step_sync_zotero()
+                try:
+                    self._step_sync_zotero()
+                except Exception as e:
+                    logger.warning("Step 4.5 Zotero 联动失败（digest 产出已完整落盘，"
+                                   "不影响退出码）：{}".format(e))
+                    notify("Scholar digest", "Zotero 联动失败（产出已完整）：{}".format(str(e)[:200]))
 
             # Step 5: 标记邮件为已读
             if self.settings.processing.auto_mark_read:
-                self._step_mark_emails_read()
-            
+                try:
+                    self._step_mark_emails_read()
+                except Exception as e:
+                    logger.warning("Step 5 标记已读失败（digest 产出已完整落盘，"
+                                   "不影响退出码）：{}".format(e))
+                    notify("Scholar digest", "标记邮件已读失败（产出已完整）：{}".format(str(e)[:200]))
+
             logger.info("=" * 60)
             logger.info("🎉 Scholar Digest 工作流完成!")
             logger.info("   处理邮件: {}".format(len(self.processed_emails)))
@@ -1683,10 +1701,13 @@ __PAPERS_JSON__
             if count > 0:
                 logger.info(f"  ✅ 已将所有 {count} 封历史 Scholar 邮件标记为已读")
         else:
-            # 仅标记本次处理过的邮件 ID
+            # 仅标记本次处理过的邮件 ID。用 .get 过滤缺 metadata 的条目：裸下标在
+            # 这里抛 KeyError 会穿透到 execute() 的收尾兜底（2026-08-17 exit 1 事故的
+            # 头号嫌疑路径）——缺 metadata 的邮件本就无 id 可标，跳过即可。
             all_ids = [
-                email['metadata'].email_id 
+                email['metadata'].email_id
                 for email in self.emails
+                if email.get('metadata') is not None
             ]
             
             if all_ids:
