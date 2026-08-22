@@ -497,3 +497,77 @@ def test_filter_by_llm_maybe_is_included(tmp_path, monkeypatch):
     assert fd.decision == "MAYBE"
     assert "THREAT" in fd.flags
     assert fd.role == "MUST_ENGAGE"
+
+
+# ---------------- 失败批次末尾重试（2026-08-22，复盘 08-17 生产运行） ----------------
+# 背景：08-17 那次 12 批里 2 个整批（40 篇）裁决失败直接掉进关键词兜底，其中 21 篇
+# 未命中白名单被挂 undecided——真正的三态审稿对它们根本没发生过。根因是回退链里
+# deepseek 欠费、gemini key 失效，只剩两个共用同一订阅额度的 claude-agent 档位，
+# 订阅短时触顶时整条链一次性塌掉。这类故障会自愈，所以失败批不该当场判死。
+
+def test_filter_batch_transient_failure_recovered_by_retry(tmp_path, monkeypatch):
+    """首轮整批失败、末尾重试成功：拿到真裁决，不落关键词兜底。"""
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    papers = [_make_paper(1, "EHR risk prediction"), _make_paper(2, "Quasar spectroscopy")]
+
+    calls = {"n": 0}
+
+    def flaky(prompt, model=None, json_mode=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("429 订阅额度触顶")   # 瞬态
+        return ('{"verdicts": ['
+                '{"id": 1, "decision": "INCLUDE", "bucket": ["A"], "one_line": "ok", "confidence": 0.8},'
+                '{"id": 2, "decision": "EXCLUDE", "bucket": [], "one_line": "无关", "confidence": 0.9}]}')
+
+    monkeypatch.setattr(wf, "_call_llm", flaky)
+    kept = wf._filter_by_llm(papers)
+
+    assert calls["n"] == 2                       # 首轮 + 重试各一次
+    assert [p.segment_id for p in kept] == [1]
+    assert wf.included_decisions[0].stage == "llm_judge"   # 真裁决，不是兜底
+    assert wf._filter_fallback_count == 0                  # 一篇都没掉进关键词
+    assert wf._filter_retry_recovered == 2                 # 两篇都是重试救回来的
+    assert wf.excluded[0]["stage"] == "llm_judge"
+
+
+def test_filter_batch_retry_rewinds_provider_chain(tmp_path, monkeypatch):
+    """重试前必须把粘性链位拨回链首，否则重试还在链尾那个已耗尽的位置。"""
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    rewound = []
+
+    def _rewind():
+        rewound.append(True)
+        return True
+
+    monkeypatch.setattr(wf.llm_client, "rewind_chain", _rewind)
+
+    def boom(prompt, model=None, json_mode=None):
+        raise RuntimeError("API down")
+
+    monkeypatch.setattr(wf, "_call_llm", boom)
+    wf._filter_by_llm([_make_paper(1, "EHR risk prediction")])
+    assert rewound == [True]
+
+
+def test_filter_batch_persistent_failure_records_cause(tmp_path, monkeypatch):
+    """两轮都失败才落兜底，且两次原因都写进裁决 reason（08-17 事后无从定位的教训）。"""
+    settings = _make_settings(tmp_path, filter_mode="llm", whitelist=["EHR"])
+    wf = ScholarWorkflow(settings)
+    papers = [_make_paper(1, "Quasar spectroscopy")]   # 不命中白名单 → undecided
+
+    seq = ["首轮限流 429", "重试仍然 429"]
+
+    def boom(prompt, model=None, json_mode=None):
+        raise RuntimeError(seq.pop(0) if seq else "again")
+
+    monkeypatch.setattr(wf, "_call_llm", boom)
+    wf._filter_by_llm(papers)
+
+    assert wf._filter_fallback_count == 1
+    assert wf._filter_retry_recovered == 0
+    assert len(wf.undecided_segments) == 1
+    reason = wf.undecided_segments[0].filter_decision.reason
+    assert "首轮限流 429" in reason and "重试仍然 429" in reason

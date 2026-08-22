@@ -130,6 +130,10 @@ class ScholarWorkflow:
         self._filter_prompt_template: Optional[str] = None
         self._filter_prompt_version: Optional[str] = None
         self._filter_fallback_count = 0
+        # 末尾重试轮救回来的篇数（首轮整批失败 → 重试成功拿到真裁决）。单列是为了让
+        # 「这次瞬态故障有多严重、重试这层挡下了多少」在 stats 里看得见——只看
+        # fallback_count 会以为一切正常，而它恰恰是被重试轮压下去的那部分。
+        self._filter_retry_recovered = 0
         # 抢救计数：两类抢救损坏都不进 processed/failed/fallback 任何一个计数器，
         # 不单列就等于「下次发生时连靠 failed_papers 反推都做不到」。
         self._salvage_batches = 0     # 触发过前缀抢救的批次数
@@ -502,8 +506,13 @@ class ScholarWorkflow:
                 self._record_exclusion(paper, excl)
         return kept
 
-    def _fallback_partition(self, papers: List[PaperSegment]) -> List[PaperSegment]:
+    def _fallback_partition(self, papers: List[PaperSegment],
+                            cause: str = "") -> List[PaperSegment]:
         """LLM 裁决失败时的回退分流：白名单命中者照常入选；未命中者挂 undecided 待人工复核。
+
+        cause 是本次失败的具体原因，写进 undecided 裁决的 reason 里落到 excluded sidecar。
+        此前只写死一句「LLM 裁决失败且未命中白名单」，08-17 那次 21 篇未决事后完全无法
+        定位是限流、超时还是解析失败——查不到原因就只能靠猜和复现。
 
         不能沿用 _filter_by_whitelist 的 EXCLUDE 语义——审稿原则是「宁可 MAYBE 不可 EXCLUDE」，
         而关键词只认 ~40 个词面，失败批的未命中远不足以判无关；此前直接 EXCLUDE 会让论文
@@ -533,7 +542,8 @@ class ScholarWorkflow:
                     title=paper.metadata.title,
                     verdict="undecided",
                     stage="keyword_fallback",
-                    reason="LLM 裁决失败且未命中白名单，待人工复核",
+                    reason="LLM 裁决失败且未命中白名单，待人工复核{}".format(
+                        "（原因 {}）".format(cause) if cause else ""),
                     library_neighbors=self._library_neighbors_cache.get(paper.segment_id) or [],
                 )
                 paper.filter_decision = decision
@@ -542,13 +552,28 @@ class ScholarWorkflow:
         return kept
 
     def _filter_by_llm(self, papers: List[PaperSegment]) -> List[PaperSegment]:
-        """LLM 相关性裁决：分批送审；单批失败回退关键词白名单（不中断整体流程）"""
+        """LLM 相关性裁决：分批送审；整批失败先攒起来末尾重试一轮，仍失败才回退关键词。
+
+        为什么要有「末尾重试」这一层（2026-08-22 复盘 08-17 生产运行）：那次 12 批里
+        **2 个整批**（40 篇）裁决失败掉进关键词兜底，其中 21 篇因未命中白名单被挂
+        undecided——真正的三态审稿对这 21 篇根本没发生过。根因是回退链
+        `claude-agent(sonnet) → deepseek → claude-agent:opus → gemini` 里 deepseek 欠费、
+        gemini key 失效，实际只剩两个共用同一订阅额度的 claude-agent 档位：订阅短时
+        触顶时整条链一次性塌掉。**但这类故障会自愈**——额度窗口过去就恢复，同一次运行
+        里其余 10 批都正常。原先的「失败即兜底」把一个几分钟的瞬态窗口固化成了永久的
+        质量损失。
+
+        重试放在**所有批次跑完之后**而不是原地重试：原地重试撞的是同一个额度窗口，
+        大概率再失败一次；跑完一轮通常已过去数分钟（实测整轮 10+ 分钟），窗口早已过去。
+        重试前 `rewind_chain()` 把粘性链位拨回链首，否则重试还在拿链尾那个已耗尽的位置。
+        """
         model = self.settings.llm.filter_model or self.settings.llm.model
         prompt_version = self._get_filter_prompt_version()
         logger.info("  裁决模型: {} | prompt: {}".format(model, prompt_version))
 
         kept: List[PaperSegment] = []
         total_batches = (len(papers) + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
+        deferred: List[Tuple[int, List[PaperSegment], str]] = []   # (批号, 批, 首次失败原因)
 
         for i in range(0, len(papers), FILTER_BATCH_SIZE):
             batch = papers[i:i + FILTER_BATCH_SIZE]
@@ -561,39 +586,73 @@ class ScholarWorkflow:
                 batch_ids = {p.segment_id for p in batch}
                 verdicts = self._parse_filter_response(response, valid_ids=batch_ids)
             except Exception as e:
-                logger.warning("  批次 {} LLM 裁决失败，回退关键词白名单: {}".format(batch_num, e))
-                self._filter_fallback_count += len(batch)
-                kept.extend(self._fallback_partition(batch))
+                # 不当场兜底：攒到末尾重试一轮（瞬态窗口那时多半已过去）
+                logger.warning("  批次 {} LLM 裁决失败，延后重试: {}".format(batch_num, e))
+                deferred.append((batch_num, batch, str(e)))
                 continue
 
-            for paper in batch:
-                verdict = verdicts.get(paper.segment_id)
-                if verdict is None:
-                    # LLM 响应缺失该 id：单篇回退关键词判断
-                    logger.warning("  [MISS] 裁决结果缺失 id={}，回退关键词".format(paper.segment_id))
-                    self._filter_fallback_count += 1
-                    kept.extend(self._fallback_partition([paper]))
-                    continue
+            kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
 
-                # 单篇裁决构造独立容错：flash 级模型常把 confidence 返回成 "high"、
-                # bucket/flags 返回非 list 等，绝不能因一篇脏字段让整批 digest 崩溃。
+        # ---- 失败批次末尾重试一轮（见本方法 docstring 的 08-17 复盘）----
+        if deferred:
+            logger.warning("  {} 个批次首轮裁决失败（{} 篇），末尾重试一轮".format(
+                len(deferred), sum(len(b) for _, b, _ in deferred)))
+            self.llm_client.rewind_chain()   # 粘性链位拨回链首，否则重试还在链尾耗尽位
+            for batch_num, batch, first_err in deferred:
+                logger.info("  重试批次 {}（{} 篇）".format(batch_num, len(batch)))
                 try:
-                    decision = self._build_filter_decision(paper, verdict, model, prompt_version)
+                    prompt = self._build_filter_prompt(batch)
+                    response = self._call_llm(prompt, model=model, json_mode=True)
+                    batch_ids = {p.segment_id for p in batch}
+                    verdicts = self._parse_filter_response(response, valid_ids=batch_ids)
                 except Exception as e:
-                    logger.warning("  裁决字段异常 id={}，回退关键词: {}".format(paper.segment_id, e))
-                    self._filter_fallback_count += 1
-                    kept.extend(self._fallback_partition([paper]))
+                    # 重试仍失败：这才落关键词兜底，并把两次的原因都记进裁决供事后定位
+                    cause = "首次: {} ｜ 重试: {}".format(str(first_err)[:150], str(e)[:150])
+                    logger.warning("  批次 {} 重试仍失败，回退关键词白名单: {}".format(batch_num, e))
+                    self._filter_fallback_count += len(batch)
+                    kept.extend(self._fallback_partition(batch, cause=cause))
                     continue
+                logger.info("  ✅ 批次 {} 重试成功（{} 篇拿到真裁决）".format(batch_num, len(batch)))
+                self._filter_retry_recovered += len(batch)
+                kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
 
-                # 裁决随论文进入输出（分节/排序用）
-                paper.filter_decision = decision
-                if decision.verdict == "included":
-                    self.included_decisions.append(decision)
-                    kept.append(paper)
-                else:
-                    logger.debug("  跳过论文 (LLM 裁决): {}".format(paper.metadata.title[:50]))
-                    self._record_exclusion(paper, decision)
+        return kept
 
+    def _apply_filter_verdicts(self, batch: List[PaperSegment], verdicts: dict,
+                                model: str, prompt_version: str) -> List[PaperSegment]:
+        """把一批已解析的裁决落到 paper 上，返回入选的那些。
+
+        首轮与末尾重试轮共用这一份（此前只有首轮一处，重试轮加进来时若各写一份，
+        单篇 MISS 容错、脏字段容错这些逐篇防线必然漂移）。
+        """
+        kept: List[PaperSegment] = []
+        for paper in batch:
+            verdict = verdicts.get(paper.segment_id)
+            if verdict is None:
+                # LLM 响应缺失该 id：单篇回退关键词判断
+                logger.warning("  [MISS] 裁决结果缺失 id={}，回退关键词".format(paper.segment_id))
+                self._filter_fallback_count += 1
+                kept.extend(self._fallback_partition([paper], cause="LLM 响应缺失该 id"))
+                continue
+
+            # 单篇裁决构造独立容错：flash 级模型常把 confidence 返回成 "high"、
+            # bucket/flags 返回非 list 等，绝不能因一篇脏字段让整批 digest 崩溃。
+            try:
+                decision = self._build_filter_decision(paper, verdict, model, prompt_version)
+            except Exception as e:
+                logger.warning("  裁决字段异常 id={}，回退关键词: {}".format(paper.segment_id, e))
+                self._filter_fallback_count += 1
+                kept.extend(self._fallback_partition([paper], cause="裁决字段异常: {}".format(str(e)[:150])))
+                continue
+
+            # 裁决随论文进入输出（分节/排序用）
+            paper.filter_decision = decision
+            if decision.verdict == "included":
+                self.included_decisions.append(decision)
+                kept.append(paper)
+            else:
+                logger.debug("  跳过论文 (LLM 裁决): {}".format(paper.metadata.title[:50]))
+                self._record_exclusion(paper, decision)
         return kept
 
     @staticmethod
@@ -1520,6 +1579,7 @@ __PAPERS_JSON__
             'excluded_papers': len(self.excluded),
             'excluded_by_stage': stage_counts,
             'filter_fallback_count': self._filter_fallback_count,
+            'filter_retry_recovered': self._filter_retry_recovered,
             'undecided_count': len(self.undecided_segments),
             'salvage_batches': self._salvage_batches,
             'salvage_dropped_items': self._salvage_dropped,
@@ -1640,6 +1700,7 @@ __PAPERS_JSON__
             'llm_excluded_count': stage_counts.get('llm_judge', 0),
             'whitelist_miss_count': stage_counts.get('whitelist_keyword', 0) + stage_counts.get('keyword_fallback', 0),
             'fallback_count': self._filter_fallback_count,
+            'retry_recovered_count': self._filter_retry_recovered,
             'unique_excluded': len(self.excluded),
             'included_decisions': [
                 {'paper_id': d.paper_id, 'title': d.title, 'stage': d.stage, 'reason': d.reason}

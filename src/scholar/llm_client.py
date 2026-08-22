@@ -278,6 +278,35 @@ class LLMClient:
             self._chain_idx = base_idx
             logger.info("↩️ 内容拒答只影响本次调用，链位拨回 '{}'".format(back_to))
 
+    def rewind_chain(self) -> bool:
+        """把链位拨回链首，给主 provider 再来一次机会。返回是否真的动了链位。
+
+        用途：**跨批次的瞬态故障恢复**。粘性切换的前提是「那家是真的坏了，后续调用
+        不该再撞一次」——这在一次调用内成立，但对「订阅额度短时触顶」这类**会自愈**的
+        故障不成立：额度窗口过去后主 provider 恢复正常，而链位仍粘在尾部（甚至已耗尽），
+        后续所有调用都在拿次优 provider 或直接失败。
+
+        调用方必须是**明确知道时间已经过去**的重试路径（如 workflow 的失败批次末尾重试），
+        不能在正常调用里随手调——那会把粘性机制整个废掉，每批都重新撞一遍欠费的
+        provider。代价是每轮重试多一次探路请求，换回一整批真裁决，值得。
+        """
+        with self._conn_lock:
+            if self._chain_idx == 0:
+                return False
+            old = self._chain[self._chain_idx]
+            if self._conn is not None and isinstance(self._conn, dict):
+                c = self._conn.get('client')
+                if isinstance(c, httpx.Client):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+            self._conn = None
+            self._chain_idx = 0
+            self._reset_degraded()
+            logger.info("⏪ 链位从 '{}' 拨回链首 '{}'（瞬态故障重试）".format(old, self._chain[0]))
+            return True
+
     def _model_for(self, conn: dict, override: Optional[str]) -> str:
         """解析本次调用的模型名。
 
