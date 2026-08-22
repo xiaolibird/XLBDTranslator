@@ -621,3 +621,35 @@ def test_切链时降级连击必须清零():
         assert client._advance_chain(conn, "模拟故障") is True
     assert client._chain_idx == 1
     assert client._degraded_streak == 0
+
+
+# ==================== (e) rewind_chain 的边界与语义 ====================
+
+def test_rewind_chain_noop_at_head():
+    """链位本就在链首：不动、返回 False（别让调用方以为发生了切换）。"""
+    client = LLMClient(_settings())
+    assert client._chain_idx == 0
+    assert client.rewind_chain() is False
+    assert client._chain_idx == 0
+
+
+def test_rewind_chain_returns_to_head():
+    """粘性切走之后 rewind 回链首，后续调用重新从主 provider 起。"""
+    client = LLMClient(_settings(fallback_providers="gemini"))
+    client._chain_idx = 1
+    assert client.rewind_chain() is True
+    assert client._chain_idx == 0
+
+
+def test_rewind_chain_survives_out_of_range_index():
+    """**链位停在越界位**时 rewind 不得 IndexError。
+
+    真实来源：`_create_from_chain` 在全部 provider 构造失败时，是先把 `_chain_idx`
+    推到 `len(_chain)` 再抛 RuntimeError 的——指针就停在越界位。此处若裸取下标，
+    异常会穿透到 workflow 的末尾重试（那里拿 rewind 当基础设施用），把「本来还能
+    逐批兜底出 digest」变成整轮零产出且一条兜底记录都没有，比不做这次 rewind 更差。
+    """
+    client = LLMClient(_settings(fallback_providers="gemini"))
+    client._chain_idx = len(client._chain)      # 模拟构造全失败后的越界位
+    assert client.rewind_chain() is True        # 不抛
+    assert client._chain_idx == 0
