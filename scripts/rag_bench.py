@@ -34,6 +34,7 @@ hybrid + level auto），与真实用户/skill 调用路径完全一致——不
 """
 import argparse
 import json
+import math
 import subprocess
 import sys
 from collections import defaultdict
@@ -44,6 +45,25 @@ DEFAULT_CASES = REPO / "test" / "data" / "rag_bench_cases.jsonl"
 SEARCH_SCRIPT = REPO / "scripts" / "notes_search.py"
 VALID_TYPES = {"paraphrase", "en_paraphrase", "zh_oneline", "en_title", "legacy_5case",
                "acronym"}
+
+
+def ndcg_at_k(ranked, gold, k: int = 10) -> float:
+    """二元相关性的 nDCG@k（对齐 BEIR/pytrec_eval 口径，MTEB 检索任务的主指标）。
+
+    补它是因为 hit@1/@5 是**阶跃**指标：名次在档内挪动它一律读作"零变化"。
+    本项目的两次修复复盘里都出现过"@1/@5 全不变、逐 case 却有 5 处名次变动"，
+    那些变动是好是坏 hit@k 根本裁决不了——换句话说"零回退"这个结论本身，
+    过去只有阶跃分辨率。nDCG 对名次连续敏感，MRR 补第一条命中的位置。
+
+    gold 是"命中任一即算对"的集合，故用二元 rel；IDCG 按 min(len(gold), k) 条
+    理想命中算——gold 有 6 条而 k=10 时，理想排序是这 6 条全排在最前。
+    """
+    if not ranked or not gold:
+        return 0.0
+    gold_set = set(gold)
+    dcg = sum(1.0 / math.log2(i + 2) for i, ck in enumerate(ranked[:k]) if ck in gold_set)
+    idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(gold_set), k)))
+    return round(dcg / idcg, 6) if idcg else 0.0
 
 
 def load_cases(path: Path):
@@ -145,7 +165,10 @@ def main() -> int:
             rank = next((i for i, ck in enumerate(ranked, start=1) if ck in set(c["gold"])),
                         None)
             results.append({"id": c["id"], "type": c["type"], "query": c["query"],
-                            "gold": c["gold"], "rank": rank, "top": ranked[:5]})
+                            "gold": c["gold"], "rank": rank,
+                            "ndcg10": ndcg_at_k(ranked, c["gold"], 10),
+                            "rr": (1.0 / rank) if rank else 0.0,
+                            "top": ranked[:10]})
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -158,16 +181,21 @@ def main() -> int:
         hit = sum(1 for r in rows if r["rank"] is not None and r["rank"] <= k)
         return hit, len(rows), (hit / len(rows) if rows else 0.0)
 
+    def mean(rows, key):
+        return round(sum(r.get(key) or 0.0 for r in rows) / len(rows), 4) if rows else 0.0
+
     summary = {}
     for t, rows in sorted(by_type.items()):
         h1, n, r1 = rate(rows, 1)
         h5, _, r5 = rate(rows, 5)
         summary[t] = {"n": n, "at1": h1, "at1_rate": round(r1, 4),
-                      "at5": h5, "at5_rate": round(r5, 4)}
+                      "at5": h5, "at5_rate": round(r5, 4),
+                      "ndcg10": mean(rows, "ndcg10"), "mrr": mean(rows, "rr")}
     h1, n, r1 = rate(results, 1)
     h5, _, r5 = rate(results, 5)
     summary["_overall"] = {"n": n, "at1": h1, "at1_rate": round(r1, 4),
-                           "at5": h5, "at5_rate": round(r5, 4)}
+                           "at5": h5, "at5_rate": round(r5, 4),
+                           "ndcg10": mean(results, "ndcg10"), "mrr": mean(results, "rr")}
 
     if args.as_json:
         print(json.dumps({"mode": args.mode, "level": args.level,
@@ -179,11 +207,15 @@ def main() -> int:
     for t, s in summary.items():
         if t == "_overall":
             continue
-        print("  {:12s} n={:<3d} @1 {:>3d}/{:<3d} ({:.0%})   @5 {:>3d}/{:<3d} ({:.0%})".format(
-            t, s["n"], s["at1"], s["n"], s["at1_rate"], s["at5"], s["n"], s["at5_rate"]))
+        print("  {:12s} n={:<3d} @1 {:>3d}/{:<3d} ({:.0%})   @5 {:>3d}/{:<3d} ({:.0%})"
+              "   nDCG@10 {:.4f}   MRR {:.4f}".format(
+                  t, s["n"], s["at1"], s["n"], s["at1_rate"], s["at5"], s["n"], s["at5_rate"],
+                  s["ndcg10"], s["mrr"]))
     s = summary["_overall"]
-    print("  {:12s} n={:<3d} @1 {:>3d}/{:<3d} ({:.0%})   @5 {:>3d}/{:<3d} ({:.0%})".format(
-        "总计", s["n"], s["at1"], s["n"], s["at1_rate"], s["at5"], s["n"], s["at5_rate"]))
+    print("  {:12s} n={:<3d} @1 {:>3d}/{:<3d} ({:.0%})   @5 {:>3d}/{:<3d} ({:.0%})"
+          "   nDCG@10 {:.4f}   MRR {:.4f}".format(
+              "总计", s["n"], s["at1"], s["n"], s["at1_rate"], s["at5"], s["n"], s["at5_rate"],
+              s["ndcg10"], s["mrr"]))
     misses = [r for r in results if r["rank"] is None or r["rank"] > 1]
     if misses:
         print("\n未拿 @1 的 case：")

@@ -100,3 +100,34 @@ def test_cli_entry_passes_through_normal_return(monkeypatch):
     assert ns.cli_entry() == 1
     monkeypatch.setattr(ns, "main", lambda: 0)
     assert ns.cli_entry() == 0
+
+
+# ---------------- nDCG@10 / MRR（对齐 BEIR/MTEB 口径）----------------
+
+def test_ndcg_perfect_and_empty():
+    """gold 全排最前 = 1.0；一条没中 = 0.0；空输入不炸。"""
+    assert rb.ndcg_at_k(["a", "b", "c"], ["a"], 10) == 1.0
+    assert rb.ndcg_at_k(["a", "b"], ["a", "b"], 10) == 1.0      # IDCG 按 min(len(gold),k) 算
+    assert rb.ndcg_at_k(["x", "y"], ["a"], 10) == 0.0
+    assert rb.ndcg_at_k([], ["a"], 10) == 0.0
+    assert rb.ndcg_at_k(["a"], [], 10) == 0.0
+
+
+def test_ndcg_is_sensitive_where_hit_at_k_is_blind():
+    """这才是补 nDCG 的理由：hit@5 对档内名次挪动完全失明。
+
+    两个排序的 gold 都落在前 5，hit@1 与 hit@5 给出**完全相同**的数字，
+    而 nDCG 能分出高下。本项目两次修复复盘都撞上过"@1/@5 全不变、逐 case
+    却有 5 处名次变动"，那些变动的方向过去无法裁决。
+    """
+    better = rb.ndcg_at_k(["x", "gold", "y", "z", "w"], ["gold"], 10)
+    worse = rb.ndcg_at_k(["x", "y", "z", "w", "gold"], ["gold"], 10)
+    assert better > worse                       # nDCG 分得出
+    hit5 = lambda ranked: any(g in ranked[:5] for g in ["gold"])
+    assert hit5(["x", "gold", "y", "z", "w"]) == hit5(["x", "y", "z", "w", "gold"])  # hit@5 分不出
+
+
+def test_ndcg_respects_cutoff_k():
+    """k 之外的命中不计分——limit=10 时第 11 位的 gold 等于没召回。"""
+    assert rb.ndcg_at_k(["x"] * 10 + ["gold"], ["gold"], 10) == 0.0
+    assert rb.ndcg_at_k(["x"] * 9 + ["gold"], ["gold"], 10) > 0.0
