@@ -15,8 +15,9 @@ citekey/role 硬门槛场景用它）；本工具是语义检索，专治"中文
 三种 --mode：
   dense  ：query 整句嵌入一次，与向量库做余弦相似度（原 phase 1 逻辑）。paper 侧
            瘦/厚泳道按原始余弦混排，跨泳道有偏置（见 _paper_side_hits），日常用 hybrid
-  sparse ：BM25(k1=1.2, b=0.75) 纯关键词倒排检索，分词复用 vault.tokenize（英文词+
-           中文2-gram），不调用 Ollama，query 走 --mode dense/hybrid 才需要 embedding
+  sparse ：BM25(k1=1.2, b=0.75) 纯关键词倒排检索，分词走 bm25_tokenize（vault.tokenize
+           的英文词+中文2-gram，再补回 EM/MI/IV 这类两字母缩写），不调用 Ollama，
+           query 走 --mode dense/hybrid 才需要 embedding
   hybrid ：默认模式。highlight 侧 dense+BM25 两路、paper 侧瘦(p:)/厚(ab:摘要) dense
            +BM25 三路，各取 top-200（TOP_K_PER_LEVEL）后 RRF(k=60) 融合排序；展示用的
            score 优先给 dense 余弦（人更好理解 0~1 的数），只有 dense 没命中、纯靠
@@ -69,6 +70,30 @@ RRF_K = 60
 TOP_K_PER_LEVEL = 200  # RRF 只融合列表内名次；截断越小越易漏掉"两路都中等但 RRF 真值高"的条目。argpartition O(n) 成本≈0
 
 
+_ACRONYM = re.compile(r"(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])")
+
+
+def bm25_tokenize(text: str) -> List[str]:
+    """BM25 专用分词 = vault.tokenize + 补回两字母大写缩写。
+
+    vault.tokenize 的英文正则是 `[a-z]{3,}`，恰好两字母的 EM/MI/IV/RR 被整个丢掉，
+    而它们正是本库里 IDF 最高、BM25 本该最出力的术语（真库：含独立 EM/MI/IV 的
+    chunk 各 47/113/538 条）。丢掉的后果不是少一个词——`EM algorithm` 退化成只查
+    `algorithm`，BM25 top10 全成了算法选择类文献，与 dense 侧 top5 零交集，再经
+    RRF 把这批泛词命中送进 hybrid 默认结果（实测 2026-08-23，见
+    docs/decisions/oss_alignment_audit_2026-08.md ⚠️-2）。
+
+    只补**恰好两个**大写字母：单字母噪音太大；三字母及以上（EHR/MNAR）本就被
+    `[a-z]{3,}` 收着，再补一份等于给它们双倍词频。小写后不与任何既有 token 撞车
+    ——`[a-z]{3,}` 产不出两字母词，中文 2-gram 只产汉字对，_STOP 里也没有两字母词。
+
+    刻意不改 vault.tokenize 本体：那里还供着近邻图与 qa 词面查重，动它等于同时改掉
+    两处已标定的相似度分布。文档侧与查询侧必须共用本函数，否则 query 有 `em` 而
+    文档没有，等于白补。
+    """
+    return tokenize(text) + [m.lower() for m in _ACRONYM.findall(text)]
+
+
 def _split_paper_text(text: str):
     """paper 级 (p:) chunk 文本恒为两段：title\\none_line（one_line 空则仅 title）。
     回填摘要在独立的 ab: chunk 里（embed_store.chunks_from_index 一篇双向量方案），
@@ -115,7 +140,7 @@ def _bm25_search(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
     if not mask.any() or not query_tokens:
         return []
     idxs = np.nonzero(mask)[0]
-    doc_tokens = [tokenize(store.records[int(i)]["text"]) for i in idxs]
+    doc_tokens = [bm25_tokenize(store.records[int(i)]["text"]) for i in idxs]
     doc_len = np.array([len(t) for t in doc_tokens], dtype=np.float64)
     n = len(doc_tokens)
     avgdl = doc_len.mean() if n else 0.0
@@ -373,7 +398,7 @@ def main() -> int:
     if hint:
         print(hint, file=sys.stderr)
 
-    query_tokens = tokenize(query) if args.mode in ("sparse", "hybrid") else []
+    query_tokens = bm25_tokenize(query) if args.mode in ("sparse", "hybrid") else []
     # 查询无法分词（单字中文/纯数字/纯符号/全停用词）时，sparse 必然 0 命中——给针对性提示
     no_query_tokens = args.mode in ("sparse", "hybrid") and not query_tokens
 

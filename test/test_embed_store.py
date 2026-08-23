@@ -427,6 +427,69 @@ def test_embedding_client_l2_normalizes(monkeypatch):
     assert not np.isnan(out).any()
 
 
+def test_embed_request_disables_truncation_and_lifts_num_batch():
+    """入库/查询的请求体契约（对标审计 ⚠️-1）：必须显式关掉 truncate 并抬 num_batch。
+
+    llama.cpp 对 embedding 的 num_batch 默认 2048，与模型 8192 的上下文无关；
+    不传时 2048 token 以上的文本被**静默截断**，产出与全文语义不符的向量且没有
+    任何信号——正是本模块拒绝的坏索引。实测真库最长 chunk 1414 token，余量只有
+    1.45 倍而非曾经以为的 4 倍，且 highlight 没有长度上限。
+    """
+    from src.scholar.embeddings import EmbeddingClient, _NUM_BATCH
+
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"embeddings": [[1.0, 0.0]]}
+
+    class _Client:
+        def post(self, url, json=None):
+            seen.update(json or {})
+            return _Resp()
+
+    client = EmbeddingClient()
+    client._client = _Client()
+    client.embed(["hello"])
+
+    assert seen.get("truncate") is False, "truncate 必须显式 False，默认 true 会静默截断"
+    assert seen.get("options", {}).get("num_batch") == _NUM_BATCH
+    assert _NUM_BATCH >= 8192, "低于模型上下文就白抬了"
+
+
+def test_oversized_input_error_names_the_longest_text():
+    """truncate=False 后超长会拿 400，而一批 64 条只要一条超长就整批失败——
+    错误信息必须点名最长的那条，否则等于让人从 64 条里瞎猜是谁。"""
+    import httpx
+    from src.scholar.embeddings import _status_error_message
+
+    class _Resp:
+        status_code = 400
+        text = '{"error":"the input length exceeds the context length"}'
+
+    exc = httpx.HTTPStatusError("400", request=None, response=_Resp())
+    msg = _status_error_message(exc, ["短的", "这条特别长" * 40])
+    assert "这条特别长" in msg and "truncate" in msg
+    assert str(len("这条特别长" * 40)) in msg
+
+
+def test_status_error_message_falls_back_for_other_errors():
+    """非超长类错误（如 500）不许被伪装成"文本太长"，否则会把人引去砍文本。"""
+    import httpx
+    from src.scholar.embeddings import _status_error_message
+
+    class _Resp:
+        status_code = 500
+        text = "internal server error"
+
+    msg = _status_error_message(httpx.HTTPStatusError("500", request=None, response=_Resp()),
+                                ["abc"])
+    assert "超出" not in msg and "internal server error" in msg
+
+
 def test_multiline_title_keeps_one_line_alignment():
     """title 含内嵌换行时压成一段——按段 split('\\n') 还原不错位。"""
     idx = {"papers": [_paper("h2025NL", title="Line1\nLine2", one_line="一句话")]}

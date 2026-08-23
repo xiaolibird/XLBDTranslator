@@ -333,3 +333,47 @@ def test_score_from_consistent_with_no_sentence_evidence(monkeypatch, capsys):
     for row in json.loads(out)["results"]:
         if row["no_sentence_evidence"]:
             assert row["score_from"] != "highlight", row
+
+
+# ---------------- 两字母缩写（对标审计 ⚠️-2）----------------
+
+def test_bm25_tokenize_keeps_two_letter_acronyms():
+    """vault.tokenize 的 `[a-z]{3,}` 把 EM/MI/IV 整个丢掉，BM25 泳道对缩写失明：
+    `EM algorithm` 退化成只查 `algorithm`（真库实测 top10 全是算法选择类文献，
+    与 dense top5 零交集）。三字母及以上本就被收着，不该重复补。"""
+    assert "em" in ns.bm25_tokenize("EM algorithm")
+    assert "mi" in ns.bm25_tokenize("MI vs RI imputation")
+    assert "iv" in ns.bm25_tokenize("MIMIC-IV benchmark")
+    # 三字母以上不重复补：EHR 只应出现一次（来自 [a-z]{3,}），不该被缩写分支再加一份
+    assert ns.bm25_tokenize("EHR data").count("ehr") == 1
+
+
+def test_bm25_tokenize_ignores_lowercase_and_single_letters():
+    """只认全大写的恰好两字母：小写 em 是普通词尾（如 "them" 已被停用词管），
+    单字母噪音太大。放宽这两条会把词面噪音当术语召回。"""
+    toks = ns.bm25_tokenize("em dash and a b c")
+    assert "em" not in toks
+    assert not any(len(t) == 1 for t in toks)
+
+
+def test_bm25_tokenize_superset_of_vault_tokenize():
+    """契约：只做加法。vault.tokenize 还供着近邻图与 qa 词面查重，
+    BM25 侧的增强绝不能反过来改掉那两处已标定的相似度分布。"""
+    from src.scholar.vault import tokenize as vault_tokenize
+    text = "EM algorithm 缺失机制 with EHR data"
+    assert vault_tokenize(text) == ns.bm25_tokenize(text)[:len(vault_tokenize(text))]
+
+
+def test_bm25_acronym_query_beats_generic_word(monkeypatch, capsys):
+    """端到端：查 "EM algorithm" 时，真讲 EM 的那篇必须压过只含 algorithm 的泛词篇。
+    修复前 query 只剩 `algorithm`，两篇 BM25 分数由词频决定，泛词篇反而赢。"""
+    from pathlib import Path as _P
+    globals().setdefault("Path", _P)
+    records = [_rec("paper", "emPaper"), _rec("paper", "genericPaper")]
+    records[0]["text"] = "Causal discovery\nEM algorithm 联合插补与结构学习"
+    records[1]["text"] = "Algorithm selection survey\nalgorithm algorithm algorithm 算法选择"
+    mat = np.stack([_unit(c, np.sqrt(1 - c * c), 0.0) for c in (0.50, 0.50)])
+    store = VectorStore(meta={"model": "test", "dim": "3"}, records=records, mat=mat)
+    _rc, out = _run_main(monkeypatch, capsys, store,
+                         ["EM", "algorithm", "--json", "--mode", "sparse"], min_score="0.0")
+    assert json.loads(out)["results"][0]["citekey"] == "emPaper"

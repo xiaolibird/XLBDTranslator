@@ -8,7 +8,14 @@ case 集不落盘导致改语料（如摘要喂厚）前后无法同口径对比
 
 case 文件每行一个 JSON 对象：
     {"id": "para-001", "type": "paraphrase", "query": "……", "gold": ["citekeyA"]}
-- type ∈ {paraphrase(概念换述), zh_oneline(中文判词), en_title(英文标题), legacy_5case}
+- type ∈ {paraphrase(概念换述), zh_oneline(中文判词), en_title(英文标题), legacy_5case,
+  acronym(两字母缩写，见下)}
+- acronym 类专测 BM25 分词对 EM/MI 这类两字母缩写的处理：`vault.tokenize` 的
+  `[a-z]{3,}` 曾把它们整个丢掉，导致 `EM algorithm` 退化成只查 `algorithm`，而
+  原有 75 条 case 无一含两字母缩写，这类失明 bench 根本测不出来（2026-08-23 对标
+  审计发现，见 docs/decisions/oss_alignment_audit_2026-08.md ⚠️-2）。故意混入
+  歧义样本：MIMIC-IV 的 IV 是版本号罗马数字、Microsoft 数据集也简称 MI，缩写召回
+  不能靠放宽词面换来假阳性。
 - gold 是 citekey 列表，命中任一即算对（同主题多篇时避免 @1 判定过严）
 
 评测口径：每条 query 起一个 notes_search.py 子进程（--json --limit 10，默认
@@ -33,7 +40,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CASES = REPO / "test" / "data" / "rag_bench_cases.jsonl"
 SEARCH_SCRIPT = REPO / "scripts" / "notes_search.py"
-VALID_TYPES = {"paraphrase", "en_paraphrase", "zh_oneline", "en_title", "legacy_5case"}
+VALID_TYPES = {"paraphrase", "en_paraphrase", "zh_oneline", "en_title", "legacy_5case",
+               "acronym"}
 
 
 def load_cases(path: Path):

@@ -73,3 +73,12 @@
 {"id": "enpara-008", "type": "en_paraphrase", "query": "challenges implementing structured reporting in cardiology", "gold": ["kindermann2021Preliminary"]}
 {"id": "enpara-009", "type": "en_paraphrase", "query": "improving off-policy evaluation with LLM counterfactual annotations", "gold": ["mandyam2026Candor", "mandyam2026April"]}
 {"id": "enpara-010", "type": "en_paraphrase", "query": "completeness of heart failure outcome standard sets in hospital records", "gold": ["aerts2021Quality"]}
+{"id": "acr-001", "type": "acronym", "query": "EM algorithm", "gold": ["li2025Causal", "little1988Test", "li2025Robust", "sui2022Find", "morvan2020Neumiss", "qiao2023Identification"]}
+{"id": "acr-002", "type": "acronym", "query": "EM 算法迭代求极大似然估计", "gold": ["li2025Causal", "little1988Test", "li2025Robust", "sui2022Find"]}
+{"id": "acr-003", "type": "acronym", "query": "test of MCAR for multivariate data with missing values", "gold": ["little1988Test"]}
+{"id": "acr-004", "type": "acronym", "query": "MI vs RI for handling missing data", "gold": ["sisk2023Imputation"]}
+{"id": "acr-005", "type": "acronym", "query": "MI 缺失比例多大时才有收益", "gold": ["madleydowd2019Proportion"]}
+{"id": "acr-006", "type": "acronym", "query": "MIMIC-IV benchmark with language models", "gold": ["lovonmelgarejo2024Revisiting"]}
+{"id": "acr-007", "type": "acronym", "query": "IV 工具变量识别因果效应", "gold": ["wu2024Learning"]}
+{"id": "acr-008", "type": "acronym", "query": "ROME-EM mixed model distributionally robust aggregation", "gold": ["li2025Robust"]}
+{"id": "acr-009", "type": "acronym", "query": "MI-prior-IMV MI-during-IMV internal model validation", "gold": ["awounvo2025Combining"]}

@@ -19,6 +19,14 @@ logger = get_logger(__name__)
 _MAX_RETRIES = 3
 _RETRYABLE = (httpx.TimeoutException, httpx.TransportError)
 
+# llama.cpp 对 embedding 请求的单次批处理上限（token）。**不传就是 2048**，
+# 与模型自身的上下文长度无关：`ollama show bge-m3` 报的 8192 是模型能力，
+# 运行时真正卡脖子的是 num_batch。实测（2026-08-23）不传时 2872 中文字符 = 2048
+# token 处即报 `input length exceeds the context length`，传 8192 后同一条 4176
+# token 的文本全量吃进。默认 truncate=true 会把超出部分**静默丢弃**——向量与全文
+# 语义不符且没有任何信号，正是本模块 docstring 拒绝的那类坏索引。
+_NUM_BATCH = 8192
+
 
 class EmbeddingError(RuntimeError):
     """Ollama 不可达 / 模型未 pull / 返回维度异常。message 带可操作命令。"""
@@ -38,6 +46,32 @@ def resolve_embedding_base_url(llm_settings) -> str:
     if base.endswith("/v1"):
         base = base[: -len("/v1")]
     return base
+
+
+def _status_error_message(exc: httpx.HTTPStatusError, batch: List[str]) -> str:
+    """把 Ollama 的错误状态翻译成可操作信息。
+
+    truncate=false 下超长文本会拿到 400 `input length exceeds the context length`，
+    而一批 64 条里只要有一条超长就整批失败——只报状态码等于让人从 64 条里瞎猜，
+    所以这里必须点名最长的那条（入库侧的超长嫌疑犯只会是句级 highlight，它没有
+    长度上限，abstract 有 ABSTRACT_CLIP=800 兜着）。
+    """
+    body = ""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            body = resp.text[:300]
+        except Exception:
+            body = ""
+    if resp is not None and resp.status_code == 400 and "context length" in body:
+        longest = max(batch, key=len) if batch else ""
+        return (
+            "文本超出 embedding 模型输入上限（本批 {} 条，最长 {} 字符）：\n"
+            "  {}…\n"
+            "本客户端刻意不静默截断（truncate=false）：截断会产出与全文语义不符的向量且没有任何信号。\n"
+            "请缩短该文本（如给 highlight 设长度上限），或确认 Ollama 支持 options.num_batch={}。"
+        ).format(len(batch), len(longest), longest[:60].replace("\n", " "), _NUM_BATCH)
+    return "Ollama embedding 返回错误状态：{}\n{}".format(exc, body)
 
 
 class EmbeddingClient:
@@ -135,7 +169,13 @@ class EmbeddingClient:
             try:
                 resp = self.client.post(
                     "{}/api/embed".format(self.base_url),
-                    json={"model": self.model, "input": batch},
+                    json={
+                        "model": self.model,
+                        "input": batch,
+                        # 超长直接报错，不静默截断（见 _NUM_BATCH 注释与 _status_error_message）
+                        "truncate": False,
+                        "options": {"num_batch": _NUM_BATCH},
+                    },
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -156,7 +196,7 @@ class EmbeddingClient:
                 raise EmbeddingError(
                     "Ollama embedding 请求重试 {} 次仍失败：{}".format(_MAX_RETRIES, e)) from e
             except httpx.HTTPStatusError as e:
-                raise EmbeddingError("Ollama embedding 返回错误状态：{}".format(e)) from e
+                raise EmbeddingError(_status_error_message(e, batch)) from e
             except EmbeddingError:
                 raise
             except Exception as e:

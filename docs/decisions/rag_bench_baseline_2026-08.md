@@ -149,3 +149,41 @@ hybrid」的注释、它的绑定测试、4 处文档，净收益 +4/75，不划
 **该做的是零代码的用法升级**：把 skill 里「要按分数看排名用 `--mode dense`」升级成
 「**两轮：先 dense 看分数，没找到再 hybrid 补召回**」——捕获 100% 而非 93%，一行代码不用动。
 若将来要重开这个课题，先给 case 集补一类「罕见英文术语/缩写」query，否则 bench 裁决不了。
+
+## 2026-08-23 对标审计追记（acronym 类落地 + BM25 缩写失明修复）
+
+R3 上面那句「先给 case 集补一类罕见英文术语/缩写 query」正是这次做的事，而补 case 的
+过程直接撞出了一个真 bug（对标 4 家高 star 方案时发现，全文见
+`oss_alignment_audit_2026-08.md` ⚠️-2）。
+
+**改了什么**：`notes_search.bm25_tokenize` 取代直接调 `vault.tokenize` 做 BM25 分词，
+补回恰好两字母的大写缩写（EM/MI/IV/RR）。`vault.tokenize` 的 `[a-z]{3,}` 此前把它们
+整个丢掉——`EM algorithm` 退化成只查 `algorithm`，BM25 top10 全是算法选择类文献、与
+dense top5 **零交集**，再经 RRF 把这批泛词命中送进 hybrid 默认结果。真库语料侧：含独立
+EM/MI/IV 的 chunk 各 47/113/538 条，全是 IDF 最高、BM25 本该最出力的术语。
+vault.tokenize 本体**未动**（近邻图与 qa 词面查重还挂在上面）。
+
+**case 集**：75 → **84**，新增 `acronym` 类 9 条。故意混入歧义样本——MIMIC-IV 的 IV 是
+版本号罗马数字、Microsoft 数据集也简称 MI——缩写召回不能靠放宽词面换来假阳性。
+
+**修复前后（同口径，`--cases test/data/rag_bench_cases.jsonl`）**：
+
+| 口径 | 修复前 | 修复后 |
+|---|---|---|
+| 原 75 条 hybrid | 53 @1 / 63 @5 | **53 / 63**（逐 case 一致，零回退） |
+| 原 75 条 sparse | 47 @1 / 54 @5 | **47 / 54**（同上） |
+| 原 75 条 dense | 56 @1 / 68 @5 | **56 / 68**（BM25 不参与，本就该不变） |
+| 新 9 条 hybrid | 7 @1 / 7 @5 | **9 / 9** |
+| 新 9 条 sparse | 6 @1 / 7 @5 | **8 / 9** |
+
+即：对存量 case 是**严格零影响**，对缩写类是从半瞎到全中。`acr-001`「EM algorithm」
+hybrid 下 rank 7 → **@1**，sparse 下 rank 10 → @1；`acr-004`「MI vs RI」sparse 从
+top-10 外 → @1。dense 在 `acr-001`/`acr-007` 上是 rank=None——缩写正是 BM25 主场，
+这批 case 同时也给「dense 全面优于 hybrid」那个读法补了反例。
+
+**全量 84 条现基线（hybrid，2026-08-23）**：@1 **62/84**、@5 **72/84**。
+
+**同批还改了** `embeddings.py` 的请求体（⚠️-1）：显式 `truncate: false` +
+`options.num_batch=8192`。llama.cpp 对 embedding 的 num_batch 默认 2048，与模型 8192 的
+上下文无关，超出部分被静默截断。**该改动不触发重嵌**——实测新旧请求体对真库 chunk
+产出的向量逐位相同（max|Δ|=0.000e+00，与库内已存向量 cos=1.0），22592 条向量继续有效。
