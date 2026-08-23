@@ -15,7 +15,9 @@ case 文件每行一个 JSON 对象：
   原有 75 条 case 无一含两字母缩写，这类失明 bench 根本测不出来（2026-08-23 对标
   审计发现，见 docs/decisions/oss_alignment_audit_2026-08.md ⚠️-2）。故意混入
   歧义样本：MIMIC-IV 的 IV 是版本号罗马数字、Microsoft 数据集也简称 MI，缩写召回
-  不能靠放宽词面换来假阳性。
+  不能靠放宽词面换来假阳性。acr-010~012 是**全小写**变体：首版修复只补 `[A-Z]{2}`，
+  小写 `em algorithm` 原封不动还是病态结果，而当时 9 条 case 全大写、照样满分——
+  同一个"bench 测不出的东西会无声退化"的坑连踩两次，故把大小写两侧都钉进 case 集。
 - gold 是 citekey 列表，命中任一即算对（同主题多篇时避免 @1 判定过严）
 
 评测口径：每条 query 起一个 notes_search.py 子进程（--json --limit 10，默认

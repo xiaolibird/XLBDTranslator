@@ -187,3 +187,57 @@ top-10 外 → @1。dense 在 `acr-001`/`acr-007` 上是 rank=None——缩写�
 `options.num_batch=8192`。llama.cpp 对 embedding 的 num_batch 默认 2048，与模型 8192 的
 上下文无关，超出部分被静默截断。**该改动不触发重嵌**——实测新旧请求体对真库 chunk
 产出的向量逐位相同（max|Δ|=0.000e+00，与库内已存向量 cos=1.0），22592 条向量继续有效。
+
+---
+
+## 2026-08-23 R1 复审追记：缩写修复只修对了一半，case 集 84 → 87
+
+上面那版修复（只补 `[A-Z]{2}`）在同日的两轮复审里被真库打脸两次，**两条同源**：
+
+**R1-D 小写查询整条失效**。`em algorithm`（不按 shift）的 hybrid top5 原封不动还是
+修复前的病态结果——`kerschke2019Automated` / `tornede2022Algorithm` /
+`kotthoff2014Algorithm` 那批 Algorithm Selection 泛词命中。而当时新加的 9 条 acronym
+case **全是大写**，照样满分 9/9。这是"bench 测不出的东西会无声退化"**同一个坑连踩两次**：
+R3 提醒过要补缩写类 case，补了；但没想到还要补大小写两侧。
+
+**R1-C 全大写反而制造假阳性**。只补大写导致 df 畸变：`of` 只有在全大写标题
+（"DESIDERATA FOR THE DEVELOPMENT OF…"）里才被收，df 被压到 12 → IDF **7.50**，
+比真缩写 `em` 的 6.16 还高。后果是 `MODELS OF CARE` 比 `models of care` 凭空多召回
+一篇靠 `of` 命中的无关文献（`chen2025Phenotypic` 挤进 sparse top2）。
+
+**改法**：两字母词**不论大小写全收**，让 IDF 自己决定权重——这本来就是 BM25 的设计
+哲学。硬删虚词反而要维护一张黑名单，而真库里 OR/US/AS/AT/IS/IF/AN 恰恰**都是真缩写**
+（odds ratio、adversarial training、homomorphic encryption、inversion score…），
+删了就是丢信号。
+
+| token | df(仅大写) | IDF | df(全收) | IDF |
+|---|---|---|---|---|
+| em | 47 | 6.16 | 49 | **6.12** |
+| iv | 538 | 3.74 | 541 | **3.73** |
+| mi | 113 | 5.29 | 125 | **5.19** |
+| of | 12 | **7.50** | 3011 | **2.02** |
+| on | 1 | **9.62** | 1419 | **2.77** |
+| by | 10 | 7.67 | 840 | 3.29 |
+
+真缩写 IDF 几乎不动，虚词被自动压平。代价 doc_len 仅 +3.3%（60.7 → 62.7），
+sparse 查询耗时 0.96s 不变。
+
+**回归（87 case 前先按存量 84 条同口径对比）**：hybrid / sparse / dense 的 @1、@5
+**全部不变**，逐 case 只有 5 处 top10 内名次微动，其中 `enpara-005` 从 miss → rank 10
+是净改善。dense 逐 case **完全全等**（它不走 BM25，本就该如此）。
+
+**case 集 84 → 87**：新增 `acr-010~012` 三条**全小写**哨兵（`em algorithm`、
+`mi vs ri for handling missing data`、`test of mcar for multivariate data…`），
+当前 rank 2 / 2 / 1。选它们的判据是"当前能过、一旦改回只认大写就会掉出 top5"——
+死 case 和满分 case 都当不了哨兵。大小写等价性另有单测
+`test_bm25_tokenize_is_case_insensitive` 直接钉死。
+
+**全量 87 条现基线（2026-08-23）**：
+
+| 模式 | @1 | @5 |
+|---|---|---|
+| hybrid | **63/87** | **75/87** |
+| sparse | 58/87 | 66/87 |
+| dense | 65/87 | 79/87 |
+
+（存量 84 条部分仍是 hybrid 62/72，与上一节完全一致。）

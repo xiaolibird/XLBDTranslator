@@ -348,12 +348,55 @@ def test_bm25_tokenize_keeps_two_letter_acronyms():
     assert ns.bm25_tokenize("EHR data").count("ehr") == 1
 
 
-def test_bm25_tokenize_ignores_lowercase_and_single_letters():
-    """只认全大写的恰好两字母：小写 em 是普通词尾（如 "them" 已被停用词管），
-    单字母噪音太大。放宽这两条会把词面噪音当术语召回。"""
-    toks = ns.bm25_tokenize("em dash and a b c")
-    assert "em" not in toks
+def test_bm25_tokenize_ignores_single_letters():
+    """恰好两字母才收：单字母（公式里的 a/b/c/n/k）噪音太大，收进来等于给 BM25 灌词。"""
+    toks = ns.bm25_tokenize("a b c EM x")
+    assert "em" in toks
     assert not any(len(t) == 1 for t in toks)
+
+
+def test_bm25_tokenize_is_case_insensitive():
+    """R1-C 锚：大小写必须产出同一套 token。
+
+    初版只补 `[A-Z]{2}` 时，`of` 仅在全大写标题里才被收，df 被压到 12 → IDF 7.50
+    比真缩写 `em` 的 6.16 还高，于是 `MODELS OF CARE` 比 `models of care` 凭空多召
+    一篇靠 `of` 命中的无关文献。改回只认大写就会重现这条假阳性。
+    """
+    assert ns.bm25_tokenize("MODELS OF CARE") == ns.bm25_tokenize("models of care")
+    assert ns.bm25_tokenize("EM algorithm") == ns.bm25_tokenize("em algorithm")
+
+
+def test_bm25_tokenize_lowercase_acronym_query_works(monkeypatch, capsys):
+    """R1-D 锚：小写打字的用户也得吃到缩写召回。
+
+    初版只补大写，`em algorithm` 的 hybrid top5 原封不动还是修复前的病态结果
+    （全是 Algorithm Selection 泛词命中）——修复只对按了 shift 的人生效。
+    """
+    from pathlib import Path as _P
+    globals().setdefault("Path", _P)
+    records = [_rec("paper", "emPaper"), _rec("paper", "genericPaper")]
+    records[0]["text"] = "Causal discovery\nEM algorithm 联合插补与结构学习"
+    records[1]["text"] = "Algorithm selection survey\nalgorithm algorithm algorithm 算法选择"
+    mat = np.stack([_unit(c, np.sqrt(1 - c * c), 0.0) for c in (0.50, 0.50)])
+    store = VectorStore(meta={"model": "test", "dim": "3"}, records=records, mat=mat)
+    _rc, out = _run_main(monkeypatch, capsys, store,
+                         ["em", "algorithm", "--json", "--mode", "sparse"], min_score="0.0")
+    assert json.loads(out)["results"][0]["citekey"] == "emPaper"
+
+
+def test_bm25_tokenize_boundaries():
+    """两字母只在**独立成词**时才收：粘在词里的不算，标点/连字符/中文都算边界。
+
+    `AImodel` 切出 `ai` 会把 AI 灌进一切含该字母对的词；反过来 `EM-algorithm`、
+    `(EM)`、`EM's`、中文夹用的 `用EM法` 都是真·独立缩写，必须收得到。
+    """
+    assert "ai" not in ns.bm25_tokenize("AImodel")          # 粘在词里，不切
+    assert "em" in ns.bm25_tokenize("EM-algorithm")         # 连字符是边界
+    assert "em" in ns.bm25_tokenize("(EM)")                 # 括号是边界
+    assert "em" in ns.bm25_tokenize("EM's")                 # 撇号是边界
+    assert "em" in ns.bm25_tokenize("用EM法做插补")           # 中文是边界
+    for junk in ("", " ", "a", "A B", "123", "R²", "🙂", "\n\t"):
+        assert ns.bm25_tokenize(junk) == [] or all(len(t) > 1 for t in ns.bm25_tokenize(junk))
 
 
 def test_bm25_tokenize_superset_of_vault_tokenize():

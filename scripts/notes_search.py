@@ -70,11 +70,11 @@ RRF_K = 60
 TOP_K_PER_LEVEL = 200  # RRF 只融合列表内名次；截断越小越易漏掉"两路都中等但 RRF 真值高"的条目。argpartition O(n) 成本≈0
 
 
-_ACRONYM = re.compile(r"(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])")
+_TWO_LETTER = re.compile(r"(?<![A-Za-z])([A-Za-z]{2})(?![A-Za-z])")
 
 
 def bm25_tokenize(text: str) -> List[str]:
-    """BM25 专用分词 = vault.tokenize + 补回两字母大写缩写。
+    """BM25 专用分词 = vault.tokenize + 补回所有独立的两字母词（小写归一）。
 
     vault.tokenize 的英文正则是 `[a-z]{3,}`，恰好两字母的 EM/MI/IV/RR 被整个丢掉，
     而它们正是本库里 IDF 最高、BM25 本该最出力的术语（真库：含独立 EM/MI/IV 的
@@ -83,7 +83,19 @@ def bm25_tokenize(text: str) -> List[str]:
     RRF 把这批泛词命中送进 hybrid 默认结果（实测 2026-08-23，见
     docs/decisions/oss_alignment_audit_2026-08.md ⚠️-2）。
 
-    只补**恰好两个**大写字母：单字母噪音太大；三字母及以上（EHR/MNAR）本就被
+    **不论大小写全收，让 IDF 去决定权重**——这条是 R1 复审改过来的，初版只补大写
+    (`[A-Z]{2}`)，两个方向都被实测打脸（同日，见该报告 R1-C/R1-D）：
+      - 小写查询整条失效：`em algorithm` 的 hybrid top5 原封不动还是修复前的病态
+        结果（Algorithm Selection 那批泛词命中），修复只对按了 shift 的用户生效；
+      - 更隐蔽的是 df 畸变。`of` 只在全大写标题里才被收，df 被压到 12 → IDF 7.50
+        比 `em` 的 6.16 还高，摇身变成假阳性源：`MODELS OF CARE` 比 `models of
+        care` 凭空多召回一篇靠 `of` 命中的无关文献。
+    全收后 IDF 自动归位：`of` 7.50→2.02、`on` 9.62→2.77 被压平，而真缩写几乎不动
+    （`em` 6.16→6.12、`iv` 3.74→3.73），doc_len 仅 +3.3%（60.7→62.7）。硬删虚词
+    反而要维护一张黑名单，而真库里 OR/US/AS/AT/IS/IF/AN 恰恰都是真缩写
+    （odds ratio、adversarial training、homomorphic encryption…），删了就是丢信号。
+
+    仍只补**恰好两个**字母：单字母噪音太大；三字母及以上（EHR/MNAR）本就被
     `[a-z]{3,}` 收着，再补一份等于给它们双倍词频。小写后不与任何既有 token 撞车
     ——`[a-z]{3,}` 产不出两字母词，中文 2-gram 只产汉字对，_STOP 里也没有两字母词。
 
@@ -91,7 +103,7 @@ def bm25_tokenize(text: str) -> List[str]:
     两处已标定的相似度分布。文档侧与查询侧必须共用本函数，否则 query 有 `em` 而
     文档没有，等于白补。
     """
-    return tokenize(text) + [m.lower() for m in _ACRONYM.findall(text)]
+    return tokenize(text) + [m.lower() for m in _TWO_LETTER.findall(text)]
 
 
 def _split_paper_text(text: str):

@@ -82,3 +82,6 @@
 {"id": "acr-007", "type": "acronym", "query": "IV 工具变量识别因果效应", "gold": ["wu2024Learning"]}
 {"id": "acr-008", "type": "acronym", "query": "ROME-EM mixed model distributionally robust aggregation", "gold": ["li2025Robust"]}
 {"id": "acr-009", "type": "acronym", "query": "MI-prior-IMV MI-during-IMV internal model validation", "gold": ["awounvo2025Combining"]}
+{"id": "acr-010", "type": "acronym", "query": "em algorithm", "gold": ["li2025Causal", "little1988Test", "li2025Robust", "sui2022Find", "morvan2020Neumiss", "qiao2023Identification"]}
+{"id": "acr-011", "type": "acronym", "query": "mi vs ri for handling missing data", "gold": ["sisk2023Imputation"]}
+{"id": "acr-012", "type": "acronym", "query": "test of mcar for multivariate data with missing values", "gold": ["little1988Test"]}
