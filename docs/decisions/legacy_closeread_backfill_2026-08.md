@@ -116,7 +116,55 @@ rollout 文档说 p90 约 14 万字符，故长论文仍会截尾——这是独
 - 原文重抓：这批 `reading_source` 是 arxiv 162 / unpaywall 145 / europepmc 27，
   本地 `output/scholar_pdfs` 是 hash 命名，命中率未核
 
-## 七、待定
+## 七、工具与首篇全链路验证（2026-08-23 完成）
 
-执行与否、执行范围需用户决定。若做，建议先用 1 篇走完**含写回**的全链路
-（可 git 回滚），确认 md/sidecar/索引/向量库四处都对得上，再批量。
+按第五节的方案落地了 `scripts/backfill_deepread.py`（文本级手术 + 账本断点续跑 +
+自带备份），并用 `meng2021Mimicif` 走完了**含写回**的全链路。
+
+### 实测结果
+
+| 环节 | 结果 |
+|---|---|
+| 重读 | 可取证句 **6 → 73**，section 3 → 8（11 块分块深读，约 7 分钟） |
+| md 手术 | 精读节 41 → 91 行；同文件 30 篇论文里**其余 29 篇字节全等**，篇内标题/裁决/摘要原样 |
+| sidecar | 只有目标条目变化，正确补上 `fulltext_chars=120000` / `_raw=167539` / `_truncated=True` / `reading_depth=chunked` |
+| 索引 | 增量**只重解析 1 个文件、沿用 82**；highlights 6 → 42；`tag_counts` 由 `{method:3,citable:3}` 变为 `{method:18,citable:12,refutable:12}` |
+| **citekey 稳定性** | `citekey` / `citekey_source` / `dedup_key` / `note_line` **全部未变**（这正是绕开 run_ingest 要防的） |
+| 向量库 | 42 条 highlight chunk，text_hash 全匹配、L2 范数=1、抽样重嵌余弦=1.0 |
+| 全库口径 | unknown-legacy 334 → **333**，chunked 253 → **254** |
+
+### 端到端检索验证（最有说服力的一条）
+
+拿只有新精读才有的内容去查，`--limit 3`：
+
+- `Equal Opportunity 与 Equalized Odds 公平性定义` → **@1，余弦 0.8211**，
+  命中句正是新精读的「公平性定义采用两种常用标准：Equal Opportunity（跨群体真阳性率
+  相等）与 Equalized Odds（在此基础上再要求假阳性率相等）」
+- `去偏方法分为预处理 处理中 后处理三类` → **@1，余弦 0.8104**
+
+这两条在旧精读里**完全不存在**（旧的只有 6 条、3 节）。
+
+### 一个值得记的收获：旧精读缺的不只是量
+
+`tag_counts` 从 `{method:3, citable:3}` 变成含 **`refutable:12`**——**旧精读一条
+「可反驳观点」都没有**。写作时找反驳材料正靠这一类，这是比「条数少」更要命的结构性缺失。
+
+### 踩到的坑
+
+- `PaperMetadata` **没有 `abstract` 字段**（摘要挂在 `PaperSegment.original_abstract`）。
+  pydantic 静默吞掉未知入参，直到读取时才 `AttributeError`。
+- `_collect_highlights` 的三元组顺序是 **`(heading, tag, text)`**，不是 `(heading, text, tag)`。
+- `notes_index.py` 收尾会调 `sync_store_best_effort` **自动同步向量库**，所以之后再跑
+  `notes_embed.py` 报「新嵌 0」是幂等的正确表现，不是没同步——一度被这个误导，
+  靠 rowid（新 chunk 位于表尾最大的 42 条）才确认插入确实发生过。
+
+### 回归
+
+`test/test_backfill_deepread.py` 9 条，重点不是「能不能改对」而是**「会不会改到别人」**：
+越界检测、篇内边界、渲染与解析无损往返、同 citekey 重复时拒绝盲猜、sidecar 三种形态。
+全量 **1677 passed**。
+
+## 八、待定
+
+剩余 108 篇（INCLUDE+high）/ 333 篇（全量）的批量执行待用户挑时间。
+按首篇实测约 7 分钟/篇，批量可用 `--limit` 分批，账本自动跳过已完成的。
