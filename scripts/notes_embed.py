@@ -142,7 +142,10 @@ def main() -> int:
         try:
             stats = sync_store(db_path, index, client, dry_run=True, full=args.full)
         except VectorStoreError as e:
-            print("❌ 向量库/索引异常：{}".format(e), file=sys.stderr)
+            # 并发避让不是「库坏了」，措辞要分开——两者都走 VectorStoreError/退出码 2，
+            # 但一个是保护生效（库完好），一个是真损坏，统一叫「异常」会让人以为库废了。
+            print("{}：{}".format("⚠️ 同步避让" if "并发写入避让" in str(e)
+                                  else "❌ 向量库/索引异常", e), file=sys.stderr)
             return 2
         except sqlite3.DatabaseError as e:
             # 与正式路径同款：dry-run 同样要开 sqlite 连接做 diff，坏库/坏 schema
@@ -172,7 +175,8 @@ def main() -> int:
     try:
         stats = sync_store(db_path, index, client, full=args.full, progress_cb=_progress)
     except VectorStoreError as e:
-        print("❌ 向量库/索引异常：{}".format(e), file=sys.stderr)
+        print("{}：{}".format("⚠️ 同步避让" if "并发写入避让" in str(e)
+                              else "❌ 向量库/索引异常", e), file=sys.stderr)
         return 2
     except EmbeddingError as e:
         print("❌ Ollama embedding 调用失败：{}".format(e), file=sys.stderr)

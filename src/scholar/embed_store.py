@@ -641,8 +641,13 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     diff_ids = [cid for cid in set(current) | set(existing_hash)
                                 if current.get(cid) != existing_hash.get(cid)]
                     raise VectorStoreError(
-                        "向量库在 diff 快照后被并发修改（{} 处）。本次同步已放弃，"
-                        "请重试（重跑 notes_embed.py）。".format(len(diff_ids)))
+                        "并发写入避让：另一个进程在本次 diff 快照之后改了向量库（{} 处），"
+                        "本次同步主动放弃，**库没有损坏、数据没有丢失**。\n"
+                        "常见成因：手动跑 notes_embed.py 的同时，launchd 的 "
+                        "com.xlbd.scholar-embed 被 literature_index.json 变动触发，两者叠跑。\n"
+                        "对方那次同步已经把改动写进去了；要确认最终状态是否齐活，"
+                        "跑 `notes_embed.py --dry-run` 看待嵌/待删是否为 0 即可。"
+                        .format(len(diff_ids)))
 
             if to_embed_ids:
                 upsert_sql = (

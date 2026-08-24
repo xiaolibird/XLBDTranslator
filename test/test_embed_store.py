@@ -397,8 +397,11 @@ def test_sync_store_snapshot_recheck_catches_concurrent_write(tmp_path):
     idx = {"papers": [_paper("a2024A"), _paper("b2024B")]}
     sync_store(db, idx, _FakeEmbedClient())
     idx2 = {"papers": [_paper("a2024A"), _paper("b2024B"), _paper("c2024C")]}
-    with pytest.raises(VectorStoreError, match="并发修改"):
+    with pytest.raises(VectorStoreError, match="并发写入避让") as ei:
         sync_store(db, idx2, _RaceEmbedClient(db))
+    # 文案必须自证「库没坏」：这条真实触发过（手动跑撞上 launchd 的 scholar-embed job），
+    # 而它和「库损坏」共用 VectorStoreError + 退出码 2，措辞含糊就会被读成数据完蛋了。
+    assert "库没有损坏" in str(ei.value)
 
 
 def test_sync_store_incremental_shrink_guard(tmp_path):
