@@ -157,6 +157,63 @@ def segment_from_entry(entry: dict, sid: int, abstracts: Optional[Dict[str, str]
     return seg
 
 
+def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str):
+    """用**本地** PDF 走深读，绕开 OA 解析与下载。返回 CloseReading 或 None。
+
+    为什么需要这条通道：`close_read_one` 的全文来源只有两个——`resolve_oa_pdf` 给的
+    pdf_url，或 Europe PMC 的 XML；出版商站点（Thieme/Springer/PLOS/HAL 等）对机器人
+    403 时两条都断，而 `download_pdf` **每次强制重下、不复用已存在文件**，所以把 PDF
+    手工丢进 `output/scholar_pdfs/` 也接不上。更要命的是本库 `abstracts.json` 只收录
+    3 篇，全文一断就连降级用的摘要都是空的 —— 精读必然零产出（8 篇 `no_output` 全是
+    这个机制，不是精读质量问题）。
+
+    刻意复用 `deep_close_read` + `verify_citable_numbers` 这两个原装件，只把「怎么拿到
+    正文」换掉：分块策略、提示词、数字回查闸全部与自动链路逐字一致，人工补的 PDF 不能
+    享受另一套（更松的）标准。
+    """
+    from src.scholar.closereading import (AUTO_PAGE_MAX_CHARS, _pdf_text_with_stats,
+                                          deep_close_read, verify_citable_numbers)
+    text, raw = _pdf_text_with_stats(
+        pdf, max_chars=proc.closeread_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
+    if not text.strip():
+        logger.warning("  本地 PDF 抽不出文字层（可能是扫描件）：{}".format(pdf.name))
+        return None
+    cr = deep_close_read(seg, text, proc.research_interests, llm, model=model,
+                         source="local-pdf", from_full_text=True,
+                         max_chunks=proc.closeread_max_chunks)
+    if cr is None:
+        return None
+    cr.body_chars = len(text)
+    cr.body_chars_raw = raw
+    cr.truncated = (raw is not None and raw > len(text))
+    verify_citable_numbers(cr, text, seg.paper_id[:8])
+    return cr
+
+
+def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
+    """在 --pdf-dir 里按 citekey / doi / arxiv_id 找手工下载的 PDF（大小写不敏感）。
+
+    多种命名都认，省得用户改名：`<citekey>.pdf` 最稳；DOI 里的 `/` 换成 `_` 或 `-`
+    也认（浏览器另存常见）；arXiv 用编号（`2410.17506.pdf`）。
+    """
+    if not pdf_dir or not pdf_dir.is_dir():
+        return None
+    cands = {(entry.get("citekey") or "").lower()}
+    doi = (entry.get("doi") or "").lower()
+    if doi:
+        cands |= {doi.replace("/", "_"), doi.replace("/", "-"), doi.split("/")[-1]}
+    ax = (entry.get("arxiv_id") or "").lower()
+    if ax:
+        cands |= {ax, "arxiv" + ax, ax.replace(".", "_")}
+    cands.discard("")
+    for p in pdf_dir.iterdir():
+        if p.suffix.lower() != ".pdf":
+            continue
+        if p.stem.lower() in cands:
+            return p
+    return None
+
+
 # ---------------- md 渲染 / 手术 ----------------
 
 def _render_closeread(cr, level: int = 2) -> List[str]:
@@ -359,7 +416,14 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             if not targets:
                 return 2
     led = load_ledger(notes_dir)
-    if not args.redo:
+    if getattr(args, "only_failed", False):
+        # 失败过的多半是全文抓不到（本库 abstracts.json 只有 3 篇，全文一断就零产出），
+        # 补了 PDF 再来一轮才有意义；已成功的不动。
+        targets = [e for e in targets if e.get("citekey") in led["failed"]]
+        if not targets:
+            print("账本里没有失败条目。", file=sys.stderr)
+            return 1
+    elif not args.redo:
         targets = [e for e in targets if e.get("citekey") not in led["done"]]
     if args.limit:
         targets = targets[: args.limit]
@@ -383,6 +447,10 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
     from src.scholar.closereading import close_read_segments
     from src.scholar.llm_client import LLMClient
     proc = settings.processing
+    pdf_dir = Path(args.pdf_dir).expanduser() if getattr(args, "pdf_dir", "") else None
+    if pdf_dir and not pdf_dir.is_dir():
+        print("--pdf-dir 不是目录：{}".format(pdf_dir), file=sys.stderr)
+        return 2
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     ok = fail = 0
     streak = 0          # 连续失败计数——限流/欠费是通路级故障，见下方熔断
@@ -392,14 +460,22 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         print("\n[{}/{}] {} …".format(n, len(targets), ck), flush=True)
         seg = segment_from_entry(entry, n, abstracts)
         llm = LLMClient(settings.llm)
+        local = find_local_pdf(pdf_dir, entry)
         try:
-            done = close_read_segments(
-                [seg], proc.research_interests, llm, top_n=1,
-                email=proc.zotero_email or proc.external_email or "",
-                model=(settings.llm.closeread_model or settings.llm.model),
-                scratch_dir=Path("output/scholar_pdfs"),
-                deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-                max_chunks=proc.closeread_max_chunks)
+            if local is not None:
+                print("   📄 用本地 PDF：{}".format(local.name), flush=True)
+                seg.close_reading = deep_read_local_pdf(
+                    seg, local, proc, llm,
+                    settings.llm.closeread_model or settings.llm.model)
+                done = 1 if seg.close_reading else 0
+            else:
+                done = close_read_segments(
+                    [seg], proc.research_interests, llm, top_n=1,
+                    email=proc.zotero_email or proc.external_email or "",
+                    model=(settings.llm.closeread_model or settings.llm.model),
+                    scratch_dir=Path("output/scholar_pdfs"),
+                    deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
+                    max_chunks=proc.closeread_max_chunks)
         except Exception as e:                        # noqa: BLE001
             logger.warning("  重读异常：{}".format(e))
             done = 0
@@ -469,6 +545,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             continue
         print("   💾 md 精读节 {} 行 → {} 行 | {} | 备份 {}".format(
             o_lines, n_lines, note, bdir.name))
+        led["failed"].pop(ck, None)   # 重试成功就不再挂在失败清单上
         led["done"][ck] = {"at": stamp, "old": old_n, "new": new_n,
                            "note_file": entry.get("note_file"), "backup": bdir.name}
         ok += 1
@@ -495,6 +572,11 @@ def main() -> int:
     r.add_argument("--limit", type=int, default=0)
     r.add_argument("--apply", action="store_true", help="真写盘（默认只干跑）")
     r.add_argument("--redo", action="store_true", help="连账本里已完成的也重跑")
+    r.add_argument("--pdf-dir", default="",
+                   help="手工下载的 PDF 目录（文件名用 citekey/doi/arxiv 均可）；命中即用本地 "
+                        "PDF 深读，绕开被反爬挡死的出版商站点")
+    r.add_argument("--only-failed", action="store_true",
+                   help="只跑账本里失败过的（配 --pdf-dir 补全文后重试）")
     s = sub.add_parser("restore", help="从备份还原")
     s.add_argument("backup", help="备份目录名或绝对路径")
     args = ap.parse_args()
