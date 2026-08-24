@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.scholar.settings import load_scholar_settings   # noqa: E402
 from src.scholar.embed_store import INDEX_NAME           # noqa: E402
 from src.scholar.notes_index import _SECTION_RE          # noqa: E402
-from scripts.backfill_deepread import BACKUP_DIR, LEDGER_NAME  # noqa: E402
+from scripts.backfill_deepread import BACKUP_DIR, LEDGER_NAME, TARGET_DEPTH  # noqa: E402
 
 
 def split_papers(text: str):
@@ -52,7 +52,11 @@ def main() -> int:
         print("账本里没有已完成的条目，无可验收。", file=sys.stderr)
         return 1
     idx = json.loads((nd / INDEX_NAME).read_text(encoding="utf-8"))
-    by_ck = {e["citekey"]: e for e in idx["papers"] if e.get("citekey")}
+    # 只认 keeper：同一篇跨月重复时索引里有多条，duplicate 那条的 highlights 是另一份
+    # 札记的旧内容。不排除的话字典会被后出现的 duplicate 覆盖，把「已改厚的 keeper」
+    # 误报成变薄（bauer2025Sepsis 实测 29 条被读成 6 条）。
+    by_ck = {e["citekey"]: e for e in idx["papers"]
+             if e.get("citekey") and not e.get("duplicate_of")}
     problems = []
 
     # 前置闸：索引比最后一次写盘还旧时，第 3、4 项读到的全是改动前的旧值，会把
@@ -123,11 +127,23 @@ def main() -> int:
         if now < old_n:
             problems.append("{}：现有 {} 条 < 改前 {} 条".format(ck, now, old_n))
             thin += 1
-        if e.get("reading_depth") != "chunked":
-            problems.append("{}：reading_depth 仍是 {!r}".format(ck, e.get("reading_depth")))
+        # 只把仍是 unknown-legacy 的算没翻新。深读失败会**回落单跳**并如实标
+        # single-call（sathe2021Identification 即是：仍从 10 条涨到 38 条），
+        # 那是准确标注不是错误，苛求 chunked 等于逼工具谎报读法。
+        if e.get("reading_depth") in (None, TARGET_DEPTH):
+            # 83 篇 md 只有 40 篇有 sidecar。无 sidecar 时 notes_index 走 md-parse 分支，
+            # 而 md 里**没有任何地方能表达 reading_depth**，它会按老规则重新推断成
+            # unknown-legacy。这是格式的固有限制，不是本次改动出错——highlights 与向量库
+            # 都已正确更新（实测未翻新的 65 篇里 64 篇正是无 sidecar 的）。故只计数提示，
+            # 不判失败；「这篇跑没跑过」的真相源是账本，不是这个标签。
+            sc = nd / (Path(e.get("note_file") or "").stem + ".index.json")
+            if sc.exists():
+                problems.append("{}：有 sidecar 却没翻新 reading_depth（{!r}）".format(
+                    ck, e.get("reading_depth")))
             depth_bad += 1
     if not stale:
-        print("   变薄 {} 篇；reading_depth 未翻新 {} 篇".format(thin, depth_bad))
+        print("   变薄 {} 篇；reading_depth 未翻新 {} 篇（无 sidecar 的文件承载不了该字段，"
+              "属已知限制，见代码注释）".format(thin, depth_bad))
         print("   合计可取证句：{} → {}（{:.1f}x）".format(
             tot_o, tot_n, tot_n / tot_o if tot_o else 0))
 

@@ -389,14 +389,21 @@ def cmd_restore(notes_dir: Path, src: str) -> int:
 
 def cmd_scan(notes_dir: Path, index: dict) -> int:
     import collections
-    all_t = select_targets(index)
     led = load_ledger(notes_dir)
-    print("reading_depth={} 且做过全文精读：{} 篇".format(TARGET_DEPTH, len(all_t)), flush=True)
-    print("  已完成（账本）：{}   失败：{}".format(len(led["done"]), len(led["failed"])), flush=True)
+    # 一律扣掉账本已完成的：无 sidecar 的札记里 reading_depth 写不回去（md 没有字段承载
+    # 它，notes_index 会按老规则推回 unknown-legacy），只看索引的话已重跑过的会永远赖在
+    # 目标集里，scan 的数字就永远失真（实测 99 篇跑完后仍有 65 篇顶着旧标签）。
+    # **账本才是「跑没跑过」的真相源**，这个标签不是。
+    done = led["done"]
+    all_t = [e for e in select_targets(index) if e.get("citekey") not in done]
+    print("reading_depth={} 且做过全文精读、账本未完成：{} 篇".format(
+        TARGET_DEPTH, len(all_t)), flush=True)
+    print("  已完成（账本）：{}   失败：{}".format(len(done), len(led["failed"])), flush=True)
     for label, kw in (("INCLUDE", {"decision": "INCLUDE"}),
                       ("tier=high", {"tier": "high"}),
                       ("INCLUDE+high", {"decision": "INCLUDE", "tier": "high"})):
-        print("  {:<14} {} 篇".format(label, len(select_targets(index, **kw))), flush=True)
+        sub = [e for e in select_targets(index, **kw) if e.get("citekey") not in done]
+        print("  {:<14} 待跑 {} 篇".format(label, len(sub)), flush=True)
     hl = [len(e.get("highlights") or []) for e in all_t]
     print("  现有可取证句：合计 {}，平均 {:.1f}".format(sum(hl), sum(hl) / len(hl) if hl else 0), flush=True)
     print("  涉及札记文件：{} 个".format(len(collections.Counter(e.get("note_file") for e in all_t))), flush=True)
@@ -483,7 +490,13 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             llm.close()
 
         cr = seg.close_reading
-        new_n = sum(len(s.sentences) for s in cr.sections) if (cr and cr.sections) else 0
+        # 与 old_n 同口径：old_n 来自索引的 highlights，那里**只收带 role tag 的句子**
+        # （_collect_highlights 丢弃无 tag 与映射为 None 的）。早先这里数的是全部句子，
+        # 两个口径对比，让「净变差不写盘」那道闸形同虚设——实测 rekkas2023Standardized
+        # 带 tag 从 34 掉到 30，却因为总句数 50 > 34 而被判成增长照常写盘。
+        new_n = (sum(1 for s in cr.sections for st in s.sentences if st.tag in _TAG_MARK)
+                 if (cr and cr.sections) else 0)
+        all_n = sum(len(s.sentences) for s in cr.sections) if (cr and cr.sections) else 0
         old_n = len(entry.get("highlights") or [])
         if not done or not cr or not cr.sections or new_n == 0:
             print("   ❌ 重读未产出，跳过（不写盘）", flush=True)
@@ -510,9 +523,8 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             streak += 1     # 退化多半也是抓全文失败退化成摘要级，同样按通路故障计
             continue
 
-        tagged = sum(1 for s in cr.sections for st in s.sentences if st.tag in _TAG_MARK)
-        print("   ✅ {} → {} 条（带 role tag {}）| 全文={} 源={} 块={} {}".format(
-            old_n, new_n, tagged, cr.from_full_text, cr.source,
+        print("   ✅ 带tag {} → {} 条（总句 {}）| 全文={} 源={} 块={} {}".format(
+            old_n, new_n, all_n, cr.from_full_text, cr.source,
             getattr(cr, "n_chunks", "?"),
             "截断" if getattr(cr, "truncated", False) else ""))
         print("      sections: {}".format(
@@ -546,7 +558,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         print("   💾 md 精读节 {} 行 → {} 行 | {} | 备份 {}".format(
             o_lines, n_lines, note, bdir.name))
         led["failed"].pop(ck, None)   # 重试成功就不再挂在失败清单上
-        led["done"][ck] = {"at": stamp, "old": old_n, "new": new_n,
+        led["done"][ck] = {"at": stamp, "old": old_n, "new": new_n, "all": all_n,
                            "note_file": entry.get("note_file"), "backup": bdir.name}
         ok += 1
         streak = 0
