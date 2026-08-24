@@ -66,6 +66,7 @@ logger = get_logger("backfill_deepread")
 LEDGER_NAME = "backfill_deepread_progress.json"
 BACKUP_DIR = ".backfill_deepread_backup"
 TARGET_DEPTH = "unknown-legacy"
+_FAIL_STREAK_STOP = 3   # 连续失败几篇就判通路级故障并中止（见 cmd_run 的熔断）
 
 
 # ---------------- 目标集 ----------------
@@ -322,8 +323,8 @@ def cmd_restore(notes_dir: Path, src: str) -> int:
         if f.is_file():
             shutil.copy2(f, notes_dir / f.name)
             n += 1
-            print("  还原 {}".format(f.name))
-    print("已从 {} 还原 {} 个文件。记得重跑索引与向量库同步。".format(d, n))
+            print("  还原 {}".format(f.name), flush=True)
+    print("已从 {} 还原 {} 个文件。记得重跑索引与向量库同步。".format(d, n), flush=True)
     return 0
 
 
@@ -333,16 +334,16 @@ def cmd_scan(notes_dir: Path, index: dict) -> int:
     import collections
     all_t = select_targets(index)
     led = load_ledger(notes_dir)
-    print("reading_depth={} 且做过全文精读：{} 篇".format(TARGET_DEPTH, len(all_t)))
-    print("  已完成（账本）：{}   失败：{}".format(len(led["done"]), len(led["failed"])))
+    print("reading_depth={} 且做过全文精读：{} 篇".format(TARGET_DEPTH, len(all_t)), flush=True)
+    print("  已完成（账本）：{}   失败：{}".format(len(led["done"]), len(led["failed"])), flush=True)
     for label, kw in (("INCLUDE", {"decision": "INCLUDE"}),
                       ("tier=high", {"tier": "high"}),
                       ("INCLUDE+high", {"decision": "INCLUDE", "tier": "high"})):
-        print("  {:<14} {} 篇".format(label, len(select_targets(index, **kw))))
+        print("  {:<14} {} 篇".format(label, len(select_targets(index, **kw))), flush=True)
     hl = [len(e.get("highlights") or []) for e in all_t]
-    print("  现有可取证句：合计 {}，平均 {:.1f}".format(sum(hl), sum(hl) / len(hl) if hl else 0))
-    print("  涉及札记文件：{} 个".format(len(collections.Counter(e.get("note_file") for e in all_t))))
-    print("  来源分布：{}".format(collections.Counter(e.get("reading_source") for e in all_t).most_common()))
+    print("  现有可取证句：合计 {}，平均 {:.1f}".format(sum(hl), sum(hl) / len(hl) if hl else 0), flush=True)
+    print("  涉及札记文件：{} 个".format(len(collections.Counter(e.get("note_file") for e in all_t))), flush=True)
+    print("  来源分布：{}".format(collections.Counter(e.get("reading_source") for e in all_t).most_common()), flush=True)
     return 0
 
 
@@ -366,7 +367,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         print("没有待处理的论文。", file=sys.stderr)
         return 1
 
-    print("待处理 {} 篇{}：".format(len(targets), "" if args.apply else "（**干跑**，不写盘）"))
+    print("待处理 {} 篇{}：".format(len(targets), "" if args.apply else "（**干跑**，不写盘）"), flush=True)
     for e in targets:
         print("   {:<28} 现有 {:>3} 条 | {}".format(
             e["citekey"], len(e.get("highlights") or []), (e.get("title") or "")[:52]))
@@ -384,10 +385,11 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
     proc = settings.processing
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     ok = fail = 0
+    streak = 0          # 连续失败计数——限流/欠费是通路级故障，见下方熔断
 
     for n, entry in enumerate(targets, start=1):
         ck = entry["citekey"]
-        print("\n[{}/{}] {} …".format(n, len(targets), ck))
+        print("\n[{}/{}] {} …".format(n, len(targets), ck), flush=True)
         seg = segment_from_entry(entry, n, abstracts)
         llm = LLMClient(settings.llm)
         try:
@@ -408,16 +410,28 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         new_n = sum(len(s.sentences) for s in cr.sections) if (cr and cr.sections) else 0
         old_n = len(entry.get("highlights") or [])
         if not done or not cr or not cr.sections or new_n == 0:
-            print("   ❌ 重读未产出，跳过（不写盘）")
+            print("   ❌ 重读未产出，跳过（不写盘）", flush=True)
             led["failed"][ck] = {"at": stamp, "reason": "no_output"}
             fail += 1
+            streak += 1
+            # 熔断：单篇失败是常事（抓不到全文/解析不出），但**连着**失败几乎只有一种
+            # 成因——通路级故障（订阅限流、欠费、Ollama 挂）。这批要跑十来个小时且每篇
+            # 都真花额度，不熔断就会在故障期间把剩下几十篇全烧成 failed，还得人工挑出来
+            # 重跑。账本已落盘，修好后原样重跑即可，会自动跳过已完成的。
+            if streak >= _FAIL_STREAK_STOP:
+                save_ledger(notes_dir, led)
+                print("\n⛔ 连续 {} 篇失败，判定通路级故障（限流/欠费/服务不可用），中止。\n"
+                      "   已完成的都在账本里，修好后重跑本命令会自动续上。".format(streak),
+                      file=sys.stderr)
+                return 1
             continue
         # 净变差就不写：深读产出反而少于既有，多半是这次抓全文失败退化成摘要级，
         # 写进去等于用坏数据覆盖好数据。宁可留旧的，让它下次再来。
         if new_n < old_n:
-            print("   ❌ 新产出 {} 条 < 既有 {} 条，判定退化，不写盘".format(new_n, old_n))
+            print("   ❌ 新产出 {} 条 < 既有 {} 条，判定退化，不写盘".format(new_n, old_n), flush=True)
             led["failed"][ck] = {"at": stamp, "reason": "fewer:{}<{}".format(new_n, old_n)}
             fail += 1
+            streak += 1     # 退化多半也是抓全文失败退化成摘要级，同样按通路故障计
             continue
 
         tagged = sum(1 for s in cr.sections for st in s.sentences if st.tag in _TAG_MARK)
@@ -433,7 +447,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
 
         md_path = notes_dir / (entry.get("note_file") or "")
         if not md_path.exists():
-            print("   ❌ 札记文件不存在：{}".format(md_path))
+            print("   ❌ 札记文件不存在：{}".format(md_path), flush=True)
             led["failed"][ck] = {"at": stamp, "reason": "no_md"}
             fail += 1
             continue
@@ -448,7 +462,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             tmp.replace(md_path)
             note = update_sidecar(sc_path, ck, cr)
         except Exception as e:                        # noqa: BLE001
-            print("   ❌ 写盘失败：{}\n      备份在 {}，可用 restore 还原".format(e, bdir))
+            print("   ❌ 写盘失败：{}\n      备份在 {}，可用 restore 还原".format(e, bdir), flush=True)
             led["failed"][ck] = {"at": stamp, "reason": "write:{}".format(e)}
             fail += 1
             save_ledger(notes_dir, led)
@@ -458,13 +472,14 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         led["done"][ck] = {"at": stamp, "old": old_n, "new": new_n,
                            "note_file": entry.get("note_file"), "backup": bdir.name}
         ok += 1
+        streak = 0
         save_ledger(notes_dir, led)
 
     save_ledger(notes_dir, led)
     print("\n完成：成功 {} / 失败 {}{}".format(
         ok, fail, "" if args.apply else "（干跑，未写盘）"))
     if ok and args.apply:
-        print("下一步（本脚本不自动做）：刷新 literature_index → 跑 notes_embed.py 同步向量库")
+        print("下一步（本脚本不自动做）：刷新 literature_index → 跑 notes_embed.py 同步向量库", flush=True)
     return 0 if fail == 0 else 1
 
 
