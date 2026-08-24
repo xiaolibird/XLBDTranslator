@@ -17,7 +17,13 @@ from src.utils.notify import notify
 
 
 def _capture_cmd(monkeypatch):
-    """替换 notify 模块内的 subprocess.run，截获它拼出的 osascript 命令。"""
+    """替换 notify 模块内的 subprocess.run，截获它拼出的 osascript 命令。
+
+    顺带**显式退出 pytest 静默**：notify 现在跑在测试里会直接 return（2026-08-24 加，
+    防止 best-effort 路径的异常把测试噪音推进用户通知中心，见 notify 的 docstring）。
+    本文件这几个用例要验的恰恰是「真发出去时拼的命令对不对」，所以必须先摘掉那道闸。
+    """
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     calls = []
     monkeypatch.setattr(notify_mod.subprocess, "run",
                         lambda cmd, *a, **k: calls.append(cmd))
@@ -70,3 +76,39 @@ def test_osascript_missing_is_silent(monkeypatch):
         raise OSError("osascript not found")
     monkeypatch.setattr(notify_mod.subprocess, "run", _boom)
     notify("标题", "正文")  # 不抛即通过
+
+
+# ---------------- pytest 内静默（2026-08-24 加） ----------------
+
+def test_silent_under_pytest(monkeypatch):
+    """跑在 pytest 里绝不真弹通知。
+
+    这不是洁癖：`embed_store.sync_store_best_effort` 会把任何异常翻译成一条系统通知，
+    而测试正是靠喂残缺对象去触发那条异常路径的（`test_read_pdf_cli._FakeSettings` /
+    `test_pdf_ingest._Settings` 都不带 `llm`）。不拦的话每跑一次全量测试就往用户通知
+    中心推几条「向量库同步失败：'_FakeSettings' object has no attribute 'llm'」——
+    2026-08-24 用户就是被这个骚扰到来问的。告警面被测试噪音污染，等于告警失效。
+    """
+    calls = []
+    monkeypatch.setattr(notify_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+    notify("不该出现的标题", "不该出现的正文")
+    assert calls == [], "跑在 pytest 里却真的执行了 osascript"
+
+
+def test_best_effort_sync_failure_does_not_notify_in_tests(monkeypatch):
+    """端到端复现那条真实骚扰路径：残缺 settings → 异常 → best-effort 兜底 → 本应弹窗。
+
+    钉住的是「测试环境下这条路不弹」，而不是「这条路不存在」——生产里它必须照弹。
+    """
+    from src.scholar.embed_store import sync_store_best_effort
+
+    calls = []
+    monkeypatch.setattr(notify_mod.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    class _NoLlm:            # 与 test_read_pdf_cli._FakeSettings 同款：没有 .llm
+        pass
+
+    got = sync_store_best_effort("/nonexistent", {"papers": []}, _NoLlm(),
+                                 notify_title="Scholar 手动精读", context="手动精读归档")
+    assert got is None       # 契约：异常吞掉、返回 None、不改调用方退出码
+    assert calls == [], "测试里触发 best-effort 失败竟然真弹了系统通知"

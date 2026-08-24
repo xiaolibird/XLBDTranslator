@@ -177,6 +177,9 @@ def test_main_month_error_exits_1_and_notifies(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # progress 文件写进 tmp，别污染仓库 output/
     calls = []
     import src.utils.notify as notify_mod
+    # 本例要验的正是「真发出去」这条契约，先摘掉 pytest 静默闸（2026-08-24 加，
+    # 防止 best-effort 路径的测试噪音推进用户通知中心，见 notify 的 docstring）。
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setattr(notify_mod.subprocess, "run",
                         lambda cmd, *a, **k: calls.append(cmd))
     monkeypatch.setattr(bn, "run_month",
