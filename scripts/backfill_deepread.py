@@ -507,7 +507,10 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             # 成因——通路级故障（订阅限流、欠费、Ollama 挂）。这批要跑十来个小时且每篇
             # 都真花额度，不熔断就会在故障期间把剩下几十篇全烧成 failed，还得人工挑出来
             # 重跑。账本已落盘，修好后原样重跑即可，会自动跳过已完成的。
-            if streak >= _FAIL_STREAK_STOP:
+            # --only-failed 跑的本来就是「上一轮抓不到全文」的篇目，连续失败是预期常态
+            # 而非通路故障信号，此时熔断纯属误伤（实测一进去就连挂 3 篇直接中止，
+            # 后面能捞回来的根本没轮到）。只在正常批跑时熔断。
+            if streak >= _FAIL_STREAK_STOP and not getattr(args, "only_failed", False):
                 save_ledger(notes_dir, led)
                 print("\n⛔ 连续 {} 篇失败，判定通路级故障（限流/欠费/服务不可用），中止。\n"
                       "   已完成的都在账本里，修好后重跑本命令会自动续上。".format(streak),
