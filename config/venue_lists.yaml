@@ -1,0 +1,166 @@
+# 发表源白/黑名单（三态：white / black / gray）
+#
+# 为什么用人工名单而不是算法判据 —— 2026-08-24 审计逐条证伪了自动方案
+# （全文见 docs/decisions/venue_quality_audit_2026-08.md）：
+#   · 刊名正则：命中的 28 个「可疑刊名」里绝大多数是正经刊，
+#     International Journal of Computer Vision 是 CV 顶刊 IJCV。
+#   · h-index：被发文量稀释。IJCA（公认水刊）h=113，因为它发了 28094 篇。
+#   · 刊级 IF：OpenAlex 不给会议算，KDD / WWW 一律返 0.0，按 IF 断层删先杀顶会。
+#   · 单篇被引：测的是「这篇影响力」不是「这个 venue 是不是野鸡」——
+#     实测把 3 篇真 AAAI/NeurIPS 冷门论文判成了可疑
+#     （eiben2021Parameterized 是理论 CS，5 年 2 引）。
+# 而本领域的 venue 就那么几十个，人工定一次比任何算法都准。
+#
+# **gray 是常态，不是问题**：库内 727 个 venue 里 484 个只出现 1 次，top45 才覆盖
+# 40.8%。白名单不可能列全，它只负责标出「确定可信」；没列到的一律 gray，
+# 既不加分也不减分。**绝不要把 gray 当成 black 来处置。**
+#
+# 匹配优先级：issn > doi_prefix > name_regex。ISSN 最准（不受刊名变体/大小写影响），
+# 来自 Crossref 缓存 output/scholar_notes/crossref_works_cache.json。
+# 会议大多没有 ISSN，只能靠 name_regex。
+#
+# 维护提示：新增 black 条目务必写清依据（除名/撤稿批量/论文工厂报道），
+# 这张表会决定文献被不被踢出向量库，含糊的「我觉得不太行」不要进 black，放 gray。
+
+black:
+  # 出版商级：按 DOI 前缀判。**不能按 Crossref 的 publisher 字段**——
+  # Hindawi 被 Wiley 收购后 publisher 显示为 "Wiley"，按它判会漏掉全部 Hindawi 刊。
+  doi_prefix:
+    "10.1155": "Hindawi：2022-2023 论文工厂丑闻，Wiley 关停该品牌并撤稿逾 1.1 万篇，多刊被 Clarivate 除名"
+    "10.5120": "International Journal of Computer Applications / Foundation of Computer Science：公认水刊，IF 0.42 而发文 28094"
+    "10.4236": "SCIRP (Scientific Research Publishing)：公认掠夺性出版商"
+    "10.4172": "OMICS International：公认掠夺性，2019 年被美国 FTC 判罚 5010 万美元"
+    "10.19026": "Science Publishing Group：公认掠夺性"
+    "10.5281": "Zenodo 自助上传：非同行评审平台，任何人可发布（≠ 预印本服务器）"
+  issn: {}
+  # 刊名精确匹配（小写比较）。留给「出版商整体没问题、个别刊出事」的情况。
+  name_exact: {}
+
+white:
+  # ---- 医学信息学 / 数字健康（本库主战场）----
+  issn:
+    "2398-6352": npj Digital Medicine
+    "1527-974X": Journal of the American Medical Informatics Association (JAMIA)
+    "2574-2531": JAMIA Open
+    "1532-0464": Journal of Biomedical Informatics
+    "2168-2194": IEEE Journal of Biomedical and Health Informatics
+    "1438-8871": Journal of Medical Internet Research (JMIR)
+    "2291-9694": JMIR Medical Informatics
+    "1386-5056": International Journal of Medical Informatics
+    "0933-3657": Artificial Intelligence in Medicine
+    "1472-6947": BMC Medical Informatics and Decision Making
+    "2509-4971": Journal of Healthcare Informatics Research
+    "2589-7500": The Lancet Digital Health
+    # ---- 综合 / 临床顶刊 ----
+    "2041-1723": Nature Communications
+    "1078-8956": Nature Medicine
+    "2574-3805": JAMA Network Open
+    "1364-8535": Critical Care
+    "1471-2288": BMC Medical Research Methodology
+    "0140-6736": The Lancet
+    "0028-4793": New England Journal of Medicine
+    "1759-4774": Nature Reviews Clinical Oncology
+    # ---- 机器学习 / 数据挖掘 ----
+    "1041-4347": IEEE Transactions on Knowledge and Data Engineering
+    "2162-237X": IEEE Transactions on Neural Networks and Learning Systems
+    "0162-8828": IEEE Transactions on Pattern Analysis and Machine Intelligence
+    "1566-2535": Information Fusion
+    "2666-3899": Patterns
+    "1532-4435": Journal of Machine Learning Research
+    "1556-4681": ACM Transactions on Knowledge Discovery from Data
+    "0885-6125": Machine Learning
+    "1384-5810": Data Mining and Knowledge Discovery
+    # ---- 统计 / 方法学（缺失数据、因果推断的本行）----
+    "0962-2802": Statistical Methods in Medical Research
+    "0277-6715": Statistics in Medicine
+    "1369-7412": Journal of the Royal Statistical Society Series B
+    "0006-341X": Biometrics
+    "1465-4644": Biostatistics
+    "0895-4356": Journal of Clinical Epidemiology（TRIPOD 等预测模型报告规范的发表地）
+    "0269-5022": Paediatric and Perinatal Epidemiology
+
+    # ---- 以下为 2026-08-24 审计扩充：库内 ≥3 篇、判定为领域公认可信的灰态刊 ----
+    # 扩充原则同上：只收把握确定的，拿不准的宁可留 gray。
+    # 医学信息学 / 数字健康
+    "2589-5370": eClinicalMedicine（Lancet 旗下）
+    "2730-664X": Communications Medicine（Nature 旗下）
+    "2836-9386": NEJM AI（NEJM 旗下）
+    "2767-3170": PLOS Digital Health
+    "0169-2607": Computer Methods and Programs in Biomedicine
+    "0010-4825": Computers in Biology and Medicine
+    "1573-689X": Journal of Medical Systems
+    "2473-4276": JCO Clinical Cancer Informatics
+    "0926-9630": Studies in Health Technology and Informatics（MEDINFO/MIE 会议集，本领域标准渠道）
+    "2055-2076": DIGITAL HEALTH (SAGE)
+    "0018-9294": IEEE Transactions on Biomedical Engineering
+    # 重症医学 / 临床（本库 ICU 预测方向的主战场）
+    "0342-4642": Intensive Care Medicine
+    "0090-3493": Critical Care Medicine
+    "2110-5820": Annals of Intensive Care
+    "2639-8028": Critical Care Explorations
+    "1073-2322": Shock
+    "0168-8278": Journal of Hepatology
+    "0165-0327": Journal of Affective Disorders
+    "1201-9712": International Journal of Infectious Diseases
+    "1434-6621": Clinical Chemistry and Laboratory Medicine
+    "0009-921X": Clinical Orthopaedics & Related Research
+    "2044-6055": BMJ Open
+    "1472-6963": BMC Health Services Research
+    "2589-0042": iScience
+    # 机器学习 / 数据挖掘 / 模式识别
+    "0950-7051": Knowledge-Based Systems
+    "0957-4174": Expert Systems with Applications
+    "0020-0255": Information Sciences
+    "0893-6080": Neural Networks
+    "0925-2312": Neurocomputing
+    "0031-3203": Pattern Recognition
+    "0952-1976": Engineering Applications of Artificial Intelligence
+    "0924-669X": Applied Intelligence
+    "0219-1377": Knowledge and Information Systems
+    "2332-7790": IEEE Transactions on Big Data
+    "2327-4662": IEEE Internet of Things Journal
+    "2157-6904": ACM Transactions on Intelligent Systems and Technology
+    "1046-8188": ACM Transactions on Information Systems
+    "0306-4379": Information Systems
+    "0738-4602": AI Magazine (AAAI)
+    # 生物信息学
+    "1467-5463": Briefings in Bioinformatics
+    "1471-2105": BMC Bioinformatics
+
+  # 会议基本没有 ISSN，用刊名正则（大小写不敏感，对 Crossref 的 container-title 匹配）。
+  # 只收本领域公认的 A 类会议与顶级 workshop，宁缺毋滥——漏掉的落 gray 不吃亏。
+  name_regex:
+    - "neural information processing systems|NeurIPS"
+    - "international conference on machine learning|ICML"
+    - "international conference on learning representations|ICLR"
+    - "AAAI conference on artificial intelligence"
+    - "international joint conference on artificial intelligence|IJCAI"
+    - "SIGKDD"
+    - "the web conference|world wide web conference|WWW '"
+    - "computer vision and pattern recognition|CVPR"
+    - "international conference on computer vision|ICCV"
+    - "european conference on computer vision|ECCV"
+    - "association for computational linguistics|ACL"
+    - "empirical methods in natural language processing|EMNLP"
+    - "machine learning for health|ML4H"
+    - "conference on health, inference, and learning|CHIL"
+    - "AMIA .*symposium|AMIA annual"
+    - "conference on uncertainty in artificial intelligence|UAI"
+    - "artificial intelligence and statistics|AISTATS"
+    - "ACM conference on fairness, accountability|FAccT"
+
+# ---- 2026-08-24 联网核实过、结论是「不是野鸡但也不进白名单」的 ----
+#   Computers, Materials & Continua (Tech Science Press) — 仍在 WoS/Scopus，IF 2.4，
+#     影响力一般，留 gray（曾怀疑被除名，实查未发现）
+#   Informatics in Medicine Unlocked (Elsevier) — 仍活跃、仍被 Scopus 索引
+#     （曾怀疑被除名，实查未发现）
+#
+# 明确**不进白名单**的争议 venue（放这里只为留档，行为上等同 gray）：
+#   Scientific Reports (2045-2322)  — Nature 旗下但审稿以宽松著称
+#   IEEE Access (2169-3536)         — open access、审稿快，质量方差大
+#   PLOS ONE (1932-6203)            — 只审「方法是否正确」不审「是否重要」
+#   Sensors / Journal of Clinical Medicine 等 MDPI 刊 (10.3390)
+#   Frontiers 系 (10.3389)          — Frontiers in Medicine IF 2.46，不算差但方差大
+#   Lecture Notes in Computer Science (0302-9743) — 丛书，从顶会到 workshop 什么都有
+# 它们既不该被当野鸡踢，也不该被当顶刊加权，gray 就是最诚实的位置。
+gray_note: "未列入白/黑名单的一律 gray：不加分不减分，不作任何处置依据。"
