@@ -197,3 +197,46 @@ def test_sidecar_with_highlights_must_be_synced(tmp_path):
     assert "highlights 同步" in msg
     assert [h["text"] for h in e["highlights"]] == ["新句。"]
     assert e["tag_counts"] == {"method": 1}
+
+
+# ---------------- 本地 PDF 认领（--pdf-dir）----------------
+
+def test_find_local_pdf_by_filename(tmp_path):
+    """文件名等于 citekey / DOI 后半段 / arXiv 号时直接认，不必读 PDF。"""
+    (tmp_path / "alpha2021One.pdf").write_bytes(b"%PDF-1.4")
+    (tmp_path / "s-0041-1733908.pdf").write_bytes(b"%PDF-1.4")
+    (tmp_path / "2410.17506.pdf").write_bytes(b"%PDF-1.4")
+    assert bd.find_local_pdf(tmp_path, {"citekey": "alpha2021One"}).name == "alpha2021One.pdf"
+    assert bd.find_local_pdf(tmp_path, {"citekey": "x", "doi": "10.1055/s-0041-1733908"}
+                             ).name == "s-0041-1733908.pdf"
+    assert bd.find_local_pdf(tmp_path, {"citekey": "y", "arxiv_id": "2410.17506"}
+                             ).name == "2410.17506.pdf"
+
+
+def test_find_local_pdf_falls_back_to_title(tmp_path, monkeypatch):
+    """真实下载几乎都是浏览器默认名——实测 6 个文件只有 2 个恰好等于 DOI 后半段，
+    其余是 `10262_The_Illusion_of_Generali.pdf`、`786a7b62-...pdf`、`Fekih  et al.pdf`。
+    认不出就得读首页按标题认（实测这 6 个的标题词重合度全部 100%）。"""
+    (tmp_path / "786a7b62-c8b8-403e.pdf").write_bytes(b"%PDF-1.4")
+    (tmp_path / "unrelated.pdf").write_bytes(b"%PDF-1.4")
+    heads = {"786a7b62-c8b8-403e.pdf": "Evaluating the Impact of Covariate Lookback Times",
+             "unrelated.pdf": "Totally different paper about quantum widgets"}
+    monkeypatch.setattr("src.scholar.closereading._pdf_text_with_stats",
+                        lambda p, **kw: (heads[p.name], len(heads[p.name])))
+    bd._PDF_HEAD_CACHE.clear()
+    got = bd.find_local_pdf(tmp_path, {"citekey": "anon2021Evaluating",
+                                       "title": "Evaluating the Impact of Covariate "
+                                                "Lookback Times on Performance"})
+    assert got is not None and got.name == "786a7b62-c8b8-403e.pdf"
+
+
+def test_find_local_pdf_refuses_weak_title_match(tmp_path, monkeypatch):
+    """重合度不够就认不出——宁可让这篇失败，也不能把 A 的 PDF 喂给 B 的精读。"""
+    (tmp_path / "somefile.pdf").write_bytes(b"%PDF-1.4")
+    monkeypatch.setattr("src.scholar.closereading._pdf_text_with_stats",
+                        lambda p, **kw: ("Totally unrelated quantum widgets paper", 40))
+    bd._PDF_HEAD_CACHE.clear()
+    assert bd.find_local_pdf(tmp_path, {"citekey": "x",
+                                        "title": "Deep learning for sepsis prediction"}) is None
+    # 标题太短时直接放弃词面匹配（词少了随便撞上几个就超阈值）
+    assert bd.find_local_pdf(tmp_path, {"citekey": "x", "title": "AI"}) is None

@@ -190,14 +190,32 @@ def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str):
     return cr
 
 
-def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
-    """在 --pdf-dir 里按 citekey / doi / arxiv_id 找手工下载的 PDF（大小写不敏感）。
+_TITLE_MATCH_MIN = 0.6      # 首页标题词重合到几成才认（实测正确配对普遍 100%）
+_PDF_HEAD_CACHE: Dict[str, set] = {}
 
-    多种命名都认，省得用户改名：`<citekey>.pdf` 最稳；DOI 里的 `/` 换成 `_` 或 `-`
-    也认（浏览器另存常见）；arXiv 用编号（`2410.17506.pdf`）。
+
+def _title_tokens(text: str) -> set:
+    import re
+    return set(re.findall(r"[a-z]{4,}", (text or "").lower()))
+
+
+def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
+    """在 --pdf-dir 里找手工下载的 PDF。先按文件名认，认不出就**读首页按标题认**。
+
+    文件名这条认 `<citekey>.pdf`、DOI（`/` 换 `_` 或 `-`，或只留后半段）、arXiv 编号。
+    但真实下载几乎都是浏览器给的默认名——实测 6 个文件里只有 2 个恰好等于 DOI 后半段，
+    其余是 `10262_The_Illusion_of_Generali.pdf`、`786a7b62-c8b8-...pdf`、`Fekih  et al.pdf`
+    这种。与其要求用户改名（每批都得改，还容易改错配错篇），不如让工具读第一页去认：
+    实测这 6 个文件的首页标题词重合度**全部 100%**，判据比文件名可靠得多。
+
+    只在文件名匹配失败时才读 PDF，且每个文件只读一次（缓存），所以批量跑时开销可忽略。
     """
     if not pdf_dir or not pdf_dir.is_dir():
         return None
+    pdfs = sorted(p for p in pdf_dir.iterdir() if p.suffix.lower() == ".pdf")
+    if not pdfs:
+        return None
+
     cands = {(entry.get("citekey") or "").lower()}
     doi = (entry.get("doi") or "").lower()
     if doi:
@@ -206,11 +224,30 @@ def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
     if ax:
         cands |= {ax, "arxiv" + ax, ax.replace(".", "_")}
     cands.discard("")
-    for p in pdf_dir.iterdir():
-        if p.suffix.lower() != ".pdf":
-            continue
+    for p in pdfs:
         if p.stem.lower() in cands:
             return p
+
+    want = _title_tokens(entry.get("title") or "")
+    if len(want) < 3:                      # 标题太短，词面匹配不可靠，宁可不认
+        return None
+    from src.scholar.closereading import _pdf_text_with_stats
+    best, best_score = None, 0.0
+    for p in pdfs:
+        key = str(p)
+        if key not in _PDF_HEAD_CACHE:
+            try:
+                head, _ = _pdf_text_with_stats(p, max_chars=1500, page_max_chars=1500)
+            except Exception:              # noqa: BLE001  坏 PDF 不该拖垮整批
+                head = ""
+            _PDF_HEAD_CACHE[key] = _title_tokens(head[:900])
+        score = len(want & _PDF_HEAD_CACHE[key]) / len(want)
+        if score > best_score:
+            best, best_score = p, score
+    if best is not None and best_score >= _TITLE_MATCH_MIN:
+        logger.info("  按首页标题认出 {} → {}（重合 {:.0%}）".format(
+            best.name, entry.get("citekey"), best_score))
+        return best
     return None
 
 
