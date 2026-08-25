@@ -52,6 +52,17 @@ def normalize(text: Optional[str]) -> str:
     return _WS_RE.sub(" ", s).strip()
 
 
+def dehyphenate(text: str) -> str:
+    """去掉词内连字符，用于第二轮比对。
+
+    PyMuPDF 抽文会**整个丢掉**某些连字符（实测 Little & Rubin p.101 的
+    "repeated-sampling" 抽成 "repeatedsampling"），这不是断行合并能处理的——原文里
+    根本没有换行。第一轮精确比对失败后用这层重试：仍是精确子串，只是连字符不计，
+    对 ≥32 字符的引句几乎不可能因此撞出假阳性，却能消掉一整类排版假阴性。
+    """
+    return text.replace("-", "")
+
+
 # 页码锚形态："247" / "241-259" / "247,249"。取其中最小与最大页作为检索区间端点。
 _PAGE_NUM_RE = re.compile(r"\d+")
 
@@ -114,6 +125,7 @@ class PageIndex:
 
     def __init__(self, pages: Sequence[str], offset: int = 0):
         self._norm = [normalize(p) for p in pages]
+        self._dehy = [dehyphenate(p) for p in self._norm]
         self.offset = int(offset)
 
     def __len__(self) -> int:
@@ -124,22 +136,35 @@ class PageIndex:
         """(最小, 最大) 可寻址的印刷页码。"""
         return (1 + self.offset, len(self._norm) + self.offset)
 
-    def printed(self, printed_page: int) -> str:
+    def printed(self, printed_page: int, dehyphenated: bool = False) -> str:
         """取某印刷页的归一化文本；越界返回空串。"""
         idx = int(printed_page) - 1 - self.offset
-        return self._norm[idx] if 0 <= idx < len(self._norm) else ""
+        src = self._dehy if dehyphenated else self._norm
+        return src[idx] if 0 <= idx < len(src) else ""
 
     def find(self, needle: str, pages: Sequence[int]) -> Optional[int]:
-        """在给定印刷页集合里找精确子串，返回命中页；未命中返回 None。"""
+        """在给定印刷页集合里找精确子串（连字符不计的第二轮见 dehyphenate）。"""
+        if not needle:
+            return None
         for p in pages:
-            if needle and needle in self.printed(p):
+            if needle in self.printed(p):
+                return p
+        dh = dehyphenate(needle)
+        for p in pages:
+            if dh in self.printed(p, dehyphenated=True):
                 return p
         return None
 
     def find_anywhere(self, needle: str) -> Optional[int]:
         """全书扫描（只用于给未命中的引句写出「其实在第 N 页」的可操作提示）。"""
+        if not needle:
+            return None
         for i, text in enumerate(self._norm):
-            if needle and needle in text:
+            if needle in text:
+                return i + 1 + self.offset
+        dh = dehyphenate(needle)
+        for i, text in enumerate(self._dehy):
+            if dh in text:
                 return i + 1 + self.offset
         return None
 

@@ -323,6 +323,14 @@ class BookManifest:
     split_level: int = 2
     toc_source: str = ""                # native | printed（目录从哪来，覆盖报告要用）
     chapters: List[Dict[str, Any]] = field(default_factory=list)
+    # 本书专属的分诊问题（追加在 config/topics.yaml 的 8 问之后）。
+    # 存在的理由：topics.yaml 是**札记库的概念页轴**，全部围绕缺失机制；而一本书对论文的
+    # 价值未必落在那条轴上。实测 JAMA Users' Guides 按 topics.yaml 分诊，Harm 章得 0 分、
+    # Prognosis 得 1 分——裁决实质正确（那两章确实不谈缺失机制），但结论「整本不用读」是错的：
+    # 用户旧手工 digest 正是拿它做**方法学评价框架**（偏倚判断、预后研究标准）。
+    # 缺这一层，分诊就只会告诉你「这本书回答不了我问的问题」，而不会告诉你它能回答什么。
+    # 每项形如 {"slug": "...", "title": "...", "question": "..."}。
+    extra_questions: List[Dict[str, str]] = field(default_factory=list)
     triage: Dict[str, Any] = field(default_factory=dict)     # {chapter_number: {...}}
     ledger: Dict[str, Any] = field(default_factory=dict)     # {chapter_number: {...}}
     schema_version: int = MANIFEST_SCHEMA_VERSION

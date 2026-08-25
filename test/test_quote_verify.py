@@ -144,3 +144,28 @@ def test_empty_close_reading_passes_vacuously():
     """无引句 = 无可证伪断言，pass_rate 定义为 1.0（不是 0，那会把空章判死）。"""
     rep = verify_close_reading(_cr(), _index())
     assert rep.total == 0 and rep.pass_rate == 1.0
+
+
+# ---------------- 连字符抽文缺陷（实测于 Little & Rubin p.101） ----------------
+
+def test_hyphen_dropped_by_extractor_still_matches():
+    """PyMuPDF 会**整个丢掉**某些连字符（原文无换行，断行合并救不了）。
+
+    实测：Little & Rubin p.101 的 "repeated-sampling operating characteristics"
+    被抽成 "repeatedsampling operating characteristics"。不补这一层，一整类排版
+    造成的假阴性会把真引句判成杜撰。
+    """
+    pages = [""] * 14 + ["through comparisons of their repeatedsampling operating "
+                         "characteristics in realistic settings, not their theoretical etiologies"]
+    idx = PageIndex(pages, offset=-12)
+    q = ("through comparisons of their repeated-sampling operating characteristics "
+         "in realistic settings")
+    assert verify_quote(q, "3", idx).ok
+
+
+def test_dehyphenation_does_not_rescue_altered_text():
+    """去连字符只放过连字符差异，不放过改词——严格性不能被这层削掉。"""
+    pages = [""] * 14 + ["their repeatedsampling operating characteristics in realistic settings"]
+    idx = PageIndex(pages, offset=-12)
+    bad = "their repeated-sampling operating characteristics in unrealistic settings"
+    assert not verify_quote(bad, "3", idx).ok
