@@ -143,11 +143,12 @@ rel = (a - b) / b      # 相对百分比——正文写的到底是哪个？两�
    - 实锤级但未撤稿：在「裁决」行追加一句审查结论（含页码锚），情节重的打 `THREAT`；
    - 「引用卫生建议」里带限定的数字：把限定写进该条的精读节/highlights——
      `scholar-write` 取证时只看得见札记里的话，写在审查报告里它看不见。
-   - 回写后重建索引（在 XLBDTranslator-dev 仓库根）：
-     `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py`。
-2. **报告归档**：落 `output/scholar_notes/`，命名仿既有案例
-   （撤稿定档用 `撤稿案例_<论文>_<venue>.md`，一般审查用 `审查报告_<论文>_<venue>.md`），
-   不要只留在对话里。
+   - 回写后重建索引**并同步向量库**（在 XLBDTranslator-dev 仓库根；只跑 notes_index
+     的话撤稿文献在下一次 embed 同步前仍能被检索召回）：
+     `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py && PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_embed.py`。
+2. **报告归档**：落 `output/scholar_notes/`——撤稿定档用 `撤稿案例_<论文>_<venue>.md`
+   （沿 DynaGraph 案既有先例），一般审查用 `审查报告_<论文>_<venue>.md`（本条新立的约定，
+   此前无先例）。两种命名都不匹配札记索引的文件名正则，不会被误收进索引。不要只留在对话里。
 3. **审的是自己要引的文献时**，提醒用户：该文献所在稿件若已引用它，走 `manuscript-selfcheck`
    的引用卫生轮复核相关句。
 
