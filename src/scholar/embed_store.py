@@ -919,9 +919,10 @@ class VectorStore:
                     "向量库行数 {} 超过内存阈值 {}，建议迁移到 faiss 或分批加载；"
                     "当前仍全量加载，若 OOM 请先清理旧库或缩小索引范围",
                     row_count, cls.MAX_IN_MEMORY_CHUNKS)
-            cols = ("id", "level", "citekey", "role", "tag", "section", "month", "series",
-                    "tier", "bucket", "year", "has_full_text", "note_file", "note_line",
-                    "text", "vec")
+            # 由 _CHUNK_COLUMNS 生成（去掉 text_hash，检索侧用不上）。此前是**第五处**
+            # 手写列名清单，加书籍三列后 records 里就是没有 pages/book_key——检索能召回、
+            # 元数据却凭空消失，比报错更难发现。
+            cols = tuple(c for c in _CHUNK_COLUMNS if c != "text_hash")
             rows = conn.execute("SELECT {} FROM chunks".format(", ".join(cols))).fetchall()
             conn.execute("COMMIT")
         except sqlite3.OperationalError as e:
@@ -939,8 +940,8 @@ class VectorStore:
         mat = np.zeros((n, dim), dtype=np.float32) if dim else np.zeros((n, 0), dtype=np.float32)
         records: List[dict] = []
         for i, row in enumerate(rows):
-            (cid, level, citekey, role, tag, section, month, series, tier, bucket, year,
-             has_full_text, note_file, note_line, text, vec_blob) = row
+            rec = dict(zip(cols, row))
+            cid, vec_blob = rec["id"], rec["vec"]
             if dim:
                 if len(vec_blob) != dim * 4:
                     raise VectorStoreError(
@@ -948,13 +949,10 @@ class VectorStore:
                         "库可能混入旧模型残留，请 `notes_embed.py --full` 重建。"
                         .format(cid, len(vec_blob) // 4, dim, len(vec_blob), dim))
                 mat[i] = np.frombuffer(vec_blob, dtype=np.float32)
-            records.append({
-                "id": cid, "level": level, "citekey": citekey, "role": role, "tag": tag,
-                "section": section, "month": month, "series": series, "tier": tier,
-                "bucket": bucket.split(",") if bucket else [], "year": year,
-                "has_full_text": bool(has_full_text), "note_file": note_file,
-                "note_line": note_line, "text": text,
-            })
+            rec.pop("vec", None)
+            rec["bucket"] = rec["bucket"].split(",") if rec.get("bucket") else []
+            rec["has_full_text"] = bool(rec.get("has_full_text"))
+            records.append(rec)
         return cls(meta=meta, records=records, mat=mat)
 
     def __len__(self) -> int:

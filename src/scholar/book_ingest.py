@@ -32,8 +32,32 @@ MANIFEST_SCHEMA_VERSION = 1
 
 # ---------------- 逐页文本 ----------------
 
+def _page_text_columnwise(page) -> str:
+    """按**栏**读一页，而不是按行跨栏读。
+
+    `get_text("text", sort=True)` 只按纵坐标排序，双栏排版下会把左右两栏**逐行交错**
+    拼在一起（实测 JAMA Users' Guides：一行里前半是左栏、后半是右栏）。后果不是不好看，
+    而是**任何跨行的引句都永远匹配不上**——句子被另一栏的文字从中间劈开了。
+    实测 ch14 的 16 条逐字引句在按行抽取下只有 1 条能回验通过。
+
+    做法：取块级结果，按块中心的横坐标分栏（页宽中线两侧），栏内按纵坐标排序，
+    左栏读完再读右栏。单栏页天然落进同一栏，行为与原来一致。
+    """
+    blocks = [b for b in page.get_text("blocks") if len(b) >= 5 and (b[4] or "").strip()]
+    if not blocks:
+        return ""
+    mid = page.rect.x0 + page.rect.width / 2.0
+    left = [b for b in blocks if (b[0] + b[2]) / 2.0 < mid]
+    right = [b for b in blocks if (b[0] + b[2]) / 2.0 >= mid]
+    out = []
+    for col in (left, right):
+        for b in sorted(col, key=lambda b: (round(b[1], 1), b[0])):
+            out.append(b[4])
+    return "\n".join(out)
+
+
 def extract_pages(pdf_path: Path) -> List[str]:
-    """PDF → 每页一个字符串的列表（下标 0 = PDF 第 1 页）。**不截断**。
+    """PDF → 每页一个字符串的列表（下标 0 = PDF 第 1 页）。**不截断**、**按栏读**。
 
     论文链路的 extract_pdf_text 有 100 万字符上限并静默丢尾——对 726 页的书
     等于砍掉后 43%。书籍链路按章喂 LLM，从来不需要一次性拼全书，故这里不设上限。
@@ -42,7 +66,7 @@ def extract_pages(pdf_path: Path) -> List[str]:
     pages: List[str] = []
     with fitz.open(str(pdf_path)) as doc:
         for page in doc:
-            pages.append(page.get_text("text", sort=True) or "")
+            pages.append(_page_text_columnwise(page))
     return pages
 
 

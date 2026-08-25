@@ -40,16 +40,43 @@ _DASHES = {"‐": "-", "‑": "-", "‒": "-", "–": "-",
 _LINEBREAK_HYPHEN_RE = re.compile(r"([a-z])-\s*\n\s*([a-z])")
 _WS_RE = re.compile(r"\s+")
 
+# 软连字符 U+00AD 与零宽字符：排版用的**不可见**字符，PyMuPDF 原样抽出。
+# 实测 JAMA 的正文里到处是 `\xadliterature`、`\xadketoprofen`——人眼与渲染图上都看不见，
+# 却让逐字比对必然失败。NFKC 不处理它们，必须显式删。
+_INVISIBLE_RE = re.compile(r"[­​‌‍﻿]")
+# 不间断空格等：折叠成普通空格前先归一，否则 _WS_RE 认不出（\xa0 不属于 \s 的部分实现）
+_NBSP_RE = re.compile(r"[   ]")
+
 
 def normalize(text: Optional[str]) -> str:
     """归一到可比对形态：NFKC → 断行连字符合并 → 连字/引号/破折号替换 → 空白折叠。"""
-    s = unicodedata.normalize("NFKC", text or "")
+    s = _INVISIBLE_RE.sub("", text or "")
+    s = _NBSP_RE.sub(" ", s)
+    s = unicodedata.normalize("NFKC", s)
     s = _LINEBREAK_HYPHEN_RE.sub(r"\1\2", s)
     for table in (_LIGATURES, _QUOTES, _DASHES):
         for src, dst in table.items():
             if src in s:
                 s = s.replace(src, dst)
     return _WS_RE.sub(" ", s).strip()
+
+
+def normalize_lines(text: Optional[str]) -> List[str]:
+    """整页文本 → 归一化的行列表（保留行结构，供剔除页眉页脚用）。
+
+    顺序不能颠倒：断行连字符的合并需要 `\\n` 还在场，所以必须**先**在整页上做完
+    不可见字符清理与连字符合并，**再**切行；反过来（先切行再逐行 normalize）会把
+    `impu-\\ntation` 留成 "impu-" 与 "tation" 两行，跨行的词从此永远匹配不上。
+    """
+    s = _INVISIBLE_RE.sub("", text or "")
+    s = _NBSP_RE.sub(" ", s)
+    s = unicodedata.normalize("NFKC", s)
+    s = _LINEBREAK_HYPHEN_RE.sub(r"\1\2", s)
+    for table in (_LIGATURES, _QUOTES, _DASHES):
+        for src, dst in table.items():
+            if src in s:
+                s = s.replace(src, dst)
+    return [_WS_RE.sub(" ", ln).strip() for ln in s.split("\n")]
 
 
 def dehyphenate(text: str) -> str:
@@ -124,8 +151,11 @@ class PageIndex:
     """
 
     def __init__(self, pages: Sequence[str], offset: int = 0):
-        self._norm = [normalize(p) for p in pages]
-        self._dehy = [dehyphenate(p) for p in self._norm]
+        # 保留行结构：normalize 会把换行折成空格，若只存整页归一结果，剔除页眉页脚时
+        # 就没有行可分了（_body 的判据是「短行 + 含页码」）。
+        self._lines = [normalize_lines(p) for p in pages]
+        self._norm = [" ".join(x for x in lines if x) for lines in self._lines]
+        self._dehy = [dehyphenate(t) for t in self._norm]
         self.offset = int(offset)
 
     def __len__(self) -> int:
@@ -142,17 +172,52 @@ class PageIndex:
         src = self._dehy if dehyphenated else self._norm
         return src[idx] if 0 <= idx < len(src) else ""
 
+    def _body(self, printed_page: int, dehyphenated: bool = False) -> str:
+        """一页的正文（剔除页眉/页脚行）。
+
+        跨页拼接必须剔除，否则页眉会**插进句子中间**：实测 JAMA p.305 末句
+        "…often have" 与 p.306 首句 "limited quality…" 之间被 "306 Harm
+        (Observational Studies)" 隔断，跨页引句因此永远匹配不上。
+        判据是「短行 + 含该页页码」——页眉页脚的定义性特征，正文行不会两者都满足。
+        """
+        idx = int(printed_page) - 1 - self.offset
+        if not (0 <= idx < len(self._lines)):
+            return ""
+        num = str(int(printed_page))
+        keep = [ln for ln in self._lines[idx]
+                if ln and not (len(ln) <= 80 and num in ln)]
+        body = " ".join(keep)
+        return dehyphenate(body) if dehyphenated else body
+
+    def _joined(self, pages: Sequence[int], dehyphenated: bool = False) -> str:
+        """相邻页按阅读顺序拼接后的正文（用于跨页引句）。"""
+        return " ".join(self._body(p, dehyphenated) for p in pages)
+
     def find(self, needle: str, pages: Sequence[int]) -> Optional[int]:
-        """在给定印刷页集合里找精确子串（连字符不计的第二轮见 dehyphenate）。"""
+        """在给定印刷页集合里找精确子串，返回命中页；未命中返回 None。
+
+        三轮，逐轮只放宽**排版**差异，不放宽文字差异：
+          1. 单页精确匹配；
+          2. 相邻页拼接后匹配——引句跨页断开是常态（实测 JAMA p.305 末句续到 p.306），
+             单页搜索对这类真引句必然假阴性；
+          3. 去连字符后重跑前两轮（PyMuPDF 会整个丢掉某些连字符）。
+        """
         if not needle:
             return None
-        for p in pages:
+        pgs = list(pages)
+        for p in pgs:
             if needle in self.printed(p):
                 return p
+        for i in range(len(pgs) - 1):
+            if needle in self._joined(pgs[i:i + 2]):
+                return pgs[i]
         dh = dehyphenate(needle)
-        for p in pages:
+        for p in pgs:
             if dh in self.printed(p, dehyphenated=True):
                 return p
+        for i in range(len(pgs) - 1):
+            if dh in self._joined(pgs[i:i + 2], dehyphenated=True):
+                return pgs[i]
         return None
 
     def find_anywhere(self, needle: str) -> Optional[int]:

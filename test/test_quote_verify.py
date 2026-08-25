@@ -169,3 +169,49 @@ def test_dehyphenation_does_not_rescue_altered_text():
     idx = PageIndex(pages, offset=-12)
     bad = "their repeated-sampling operating characteristics in unrealistic settings"
     assert not verify_quote(bad, "3", idx).ok
+
+
+# ---------------- 真实排版缺陷（实测于 JAMA Users' Guides） ----------------
+
+def test_soft_hyphen_is_stripped():
+    """PyMuPDF 原样抽出排版用的软连字符 U+00AD——人眼与渲染图上都看不见。
+    实测 JAMA 正文里到处是 `\\xadliterature`，不删则逐字比对必然失败。"""
+    assert normalize("the ­literature to guide") == "the literature to guide"
+    assert normalize("a​b") == "ab"                      # 零宽空格
+    assert normalize("of Interest") == "of Interest"     # 不间断空格
+
+
+def test_cross_page_quote_matches_with_running_head_removed():
+    """引句跨页是常态，而页眉会插进句子中间——两件事必须同时处理。
+
+    实测 JAMA：p.305 末句 "…often have" 与 p.306 首句 "limited quality…" 之间
+    隔着页眉 "306 Harm (Observational Studies)"。
+    """
+    pages = [
+        "305 Harm (Observational Studies)\nLarge administrative databases, although "
+        "providing a sample size that may allow ascertainment of rare events, often have",
+        "306 Harm (Observational Studies)\nlimited quality of data concerning relevant "
+        "patient characteristics, health care encounters, or diagnoses.",
+    ]
+    idx = PageIndex(pages, offset=304)      # pdf 1 → printed 305
+    q = ("although providing a sample size that may allow ascertainment of rare events, "
+         "often have limited quality of data concerning relevant patient characteristics")
+    assert verify_quote(q, "305-306", idx).ok
+
+
+def test_linebreak_hyphen_join_survives_line_structure():
+    """保留行结构（供剔页眉）不能牺牲断行连字符合并——两者的处理顺序不可颠倒。"""
+    idx = PageIndex(["301 Header\nthe investigators docu-\nment the characteristics "
+                     "of the exposed and nonexposed participants"], offset=300)
+    assert verify_quote("the investigators document the characteristics of the exposed",
+                        "301", idx).ok
+
+
+def test_running_head_removal_does_not_eat_body_lines():
+    """页眉判据是「短行 + 含该页页码」；含数字的正文长句不得被误删。"""
+    body = ("In one study, 24.1% of patients who were given a then-new NSAID, ketoprofen, "
+            "had received peptic ulcer therapy during the previous 2 years compared with "
+            "15.7% of the control population, which is a long body line mentioning 305.")
+    idx = PageIndex(["305 Harm\n" + body], offset=304)
+    assert "24.1%" in idx._body(305)
+    assert "305 Harm" not in idx._body(305)
