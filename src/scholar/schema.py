@@ -74,6 +74,21 @@ class PaperMetadata(BaseModel):
     url: Optional[str] = Field(None, description="论文链接")
     pdf_url: Optional[str] = Field(None, description="PDF下载链接")
     
+    # 书籍/章节（一等公民，2026-08-25）。全部可选且默认 None/空——
+    # entry_type 为 None 即「文章」，存量 bundle 反序列化与产出逐字节不变。
+    #   book    专著整本一条（引用时靠页码定位符，如 [@little2020rubin, p. 247]）
+    #   chapter 编著文集的一章（章作者各异，章才是可引单元）
+    entry_type: Optional[Literal["book", "chapter"]] = Field(
+        None, description="条目类型（None=文章）")
+    isbn: Optional[str] = Field(None, description="ISBN（书/章身份键的来源）")
+    publisher: Optional[str] = Field(None, description="出版社")
+    edition: Optional[str] = Field(None, description="版次，如 3rd")
+    editors: List[str] = Field(default_factory=list, description="编者（编著文集）")
+    book_key: Optional[str] = Field(None, description="章条目所属书的 citekey")
+    container_title: Optional[str] = Field(None, description="章条目所属书名")
+    chapter_number: Optional[int] = Field(None, description="章号")
+    page_range: Optional[str] = Field(None, description="该章在原书的页码范围")
+
     # 分类信息
     field: PaperField = Field(default=PaperField.OTHER, description="论文领域")
     keywords: List[str] = Field(default_factory=list, description="关键词列表")
@@ -308,6 +323,9 @@ class CloseReadSentence(BaseModel):
     """精读正文的一个句子/片段，可带一个句级角色标记。"""
     text: str = Field(description="句子文本（中文）")
     tag: Optional[CloseReadTag] = Field(None, description="句级角色：可引用证据/可反驳观点/方法论借鉴，或无")
+    # 原书页码锚（书籍链路）："247" 或 "241-259"。文章链路恒为 None，渲染与索引均不受影响。
+    # 引用时由此产出 pandoc 定位符 [@key, p. 247]，并由 quote_verify 回验原文页。
+    page: Optional[str] = Field(None, description="原文页码锚（书籍链路）")
 
 
 class CloseReadSection(BaseModel):

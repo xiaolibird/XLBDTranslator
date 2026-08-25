@@ -58,6 +58,7 @@ from src.scholar.settings import load_scholar_settings          # noqa: E402
 from src.scholar.embed_store import INDEX_NAME                   # noqa: E402
 from src.scholar.notes_index import _CLOSEREAD_RE, _SECTION_RE   # noqa: E402
 from src.scholar.notes import _TAG_MARK                          # noqa: E402
+from src.scholar._citekey_utils import render_tag_line           # noqa: E402
 from src.scholar.schema import PaperMetadata, PaperSegment       # noqa: E402
 from src.utils.logger import get_logger                          # noqa: E402
 
@@ -265,8 +266,7 @@ def _render_closeread(cr, level: int = 2) -> List[str]:
     for sec in cr.sections:
         out.append("**【{}】**".format(sec.heading))
         for st in sec.sentences:
-            marker = "〔{}〕".format(st.tag) if st.tag in _TAG_MARK else ""
-            out.append("- {}{}".format(marker, st.text))
+            out.append(render_tag_line(st.tag, st.text, getattr(st, "page", None)))
         out.append("")
     return out
 
@@ -377,8 +377,8 @@ def update_sidecar(path: Path, citekey: str, cr) -> str:
     note = "sidecar 量尺已更新"
     if "highlights" in hit:
         from src.scholar._citekey_utils import _collect_highlights
-        # 三元组顺序是 (heading, tag, text)——不是 (heading, text, tag)。
-        triples = [(sec.heading, st.tag, st.text)
+        # 元组顺序是 (heading, tag, text[, page])——不是 (heading, text, tag)。
+        triples = [(sec.heading, st.tag, st.text, getattr(st, "page", None))
                    for sec in cr.sections for st in sec.sentences]
         try:
             hl, tc = _collect_highlights(triples)

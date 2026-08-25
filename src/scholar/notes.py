@@ -18,7 +18,8 @@ from typing import List, Dict, Any, Optional
 
 from .schema import PaperSegment, PaperMetadata
 from ._citekey_utils import (_fallback_citekey, _priority_tier, _suffix_seq,
-                             entry_from_segment, date_parts)
+                             entry_from_segment, date_parts, build_csl_common,
+                             render_tag_line, TAG_MARK)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -26,8 +27,36 @@ logger = get_logger(__name__)
 # 句级角色标记（渲染为〔〕marker；docx 对应三色）。收新旧六类：
 #   新（换轴后）：可引用证据 / 可反驳观点 / 方法论借鉴
 #   旧（历史 bundle，原样保留以诚实反映当时标注）：方法学创新 / 重要发现 / 研究背景
-_TAG_MARK = {"可引用证据", "可反驳观点", "方法论借鉴",
-             "方法学创新", "重要发现", "研究背景"}
+# 语法（含可选页码锚）由 _citekey_utils 单点持有，渲染走 render_tag_line，解析走 TAG_LINE_RE。
+_TAG_MARK = set(TAG_MARK)
+
+
+def _book_line(meta) -> Optional[str]:
+    """书籍/章条目的容器元数据行；非书条目返回 None（文章渲染逐字节不变）。
+
+    格式契约见 notes_index._parse_book_line —— 两侧必须同改。
+    """
+    if not getattr(meta, "entry_type", None):
+        return None
+    parts: List[str] = []
+    container = meta.container_title or (meta.title if meta.entry_type == "book" else None)
+    if container:
+        parts.append(container)
+    if meta.isbn:
+        parts.append("ISBN {}".format(meta.isbn))
+    if meta.chapter_number is not None:
+        parts.append("第{}章".format(meta.chapter_number))
+    if meta.page_range:
+        parts.append("pp.{}".format(meta.page_range))
+    if meta.publisher:
+        parts.append("出版 {}".format(meta.publisher))
+    if meta.edition:
+        parts.append("{} 版".format(meta.edition))
+    if meta.editors:
+        parts.append("编者 {}".format("; ".join(meta.editors)))
+    if meta.book_key:
+        parts.append("[@{}]".format(meta.book_key))
+    return "**所属书籍**: {}".format(" · ".join(parts)) if parts else None
 
 
 def _slug(text: str, maxlen: int = 60) -> str:
@@ -87,6 +116,9 @@ def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[in
                                             " et al." if len(meta.authors) > 5 else ""))
     if meta.journal:
         body.append("**期刊/来源**: {}".format(meta.journal))
+    book_line = _book_line(meta)
+    if book_line:
+        body.append(book_line)
     if meta.doi:
         body.append("**DOI**: [{0}](https://doi.org/{0})".format(meta.doi))
     elif meta.url:
@@ -105,8 +137,7 @@ def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[in
         for sec in cr.sections:
             body.append("**【{}】**".format(sec.heading))
             for st in sec.sentences:
-                marker = "〔{}〕".format(st.tag) if st.tag in _TAG_MARK else ""
-                body.append("- {}{}".format(marker, st.text))
+                body.append(render_tag_line(st.tag, st.text, getattr(st, "page", None)))
             body.append("")
     elif seg.summary:
         # 无精读时退回摘要级 AI 归纳
@@ -192,45 +223,21 @@ def build_digest_note(segments: List[PaperSegment], citekeys: Dict[str, Optional
 
 def build_csl_item(meta: PaperMetadata, citekey: str) -> Dict[str, Any]:
     """把 PaperMetadata 映射为 CSL-JSON 条目（id=citekey），用于 pandoc 自包含兜底。"""
-    item: Dict[str, Any] = {
-        "id": citekey,
-        "type": "article-journal" if not meta.arxiv_id or meta.doi else "article",
-        "title": meta.title or "",
-    }
-    authors = []
-    for a in (meta.authors or []):
-        n = a.strip()
-        if not n:
-            continue
-        if "," in n:
-            last, _, first = n.partition(",")
-            authors.append({"family": last.strip(), "given": first.strip()})
-        else:
-            parts = n.split()
-            if len(parts) == 1:
-                authors.append({"family": parts[0]})
-            else:
-                authors.append({"family": parts[-1], "given": " ".join(parts[:-1])})
-    if authors:
-        item["author"] = authors
-    if meta.journal:
-        item["container-title"] = meta.journal
-    if meta.doi:
-        item["DOI"] = meta.doi
-    if meta.url:
-        item["URL"] = meta.url
-    if meta.volume:
-        item["volume"] = meta.volume
-    if meta.issue:
-        item["issue"] = meta.issue
-    if meta.pages:
-        item["page"] = meta.pages
+    issued = None
     if meta.publication_date:
         # issued = CSL 的**出版日期**（与 issue 期号无关）。按 date_precision 截断，
         # 别把补出来的占位月日当真——否则参考文献会渲染出论文并不存在的月份。
-        item["issued"] = {"date-parts": date_parts(meta.publication_date,
-                                                   getattr(meta, "date_precision", None))}
-    return item
+        issued = {"date-parts": date_parts(meta.publication_date,
+                                           getattr(meta, "date_precision", None))}
+    return build_csl_common(
+        citekey=citekey, title=meta.title, authors=meta.authors,
+        entry_type=getattr(meta, "entry_type", None), journal=meta.journal,
+        doi=meta.doi, url=meta.url, arxiv_id=meta.arxiv_id,
+        volume=meta.volume, issue=meta.issue, pages=meta.pages,
+        isbn=getattr(meta, "isbn", None), publisher=getattr(meta, "publisher", None),
+        edition=getattr(meta, "edition", None), editors=getattr(meta, "editors", None),
+        container_title=getattr(meta, "container_title", None),
+        page_range=getattr(meta, "page_range", None), issued=issued)
 
 
 def write_notes(

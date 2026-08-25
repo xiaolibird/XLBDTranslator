@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Set
 from ._citekey_utils import (
     _suffix_seq, _priority_tier, _TIER_MAP, _reading_depth,
     _collect_highlights, dedup_key_fields, entry_from_segment, _norm_title,
-    recompute_entry_key,
+    recompute_entry_key, TAG_LINE_RE, BOOK_ENTRY_FIELDS, build_csl_common,
 )
 
 # 向后兼容：旧公开 API
@@ -39,7 +39,7 @@ logger = get_logger(__name__)
 # 'single-call' = auto 单跳；'unknown-legacy' = 仅 auto 存量条目（由回填写入）；
 # 键缺失或 null 只可能出现在 has_full_text_reading == false 的非精读条目上。
 # fulltext_truncated：缺失 = 未知，false = 确认未截断——下游禁止把「缺失」当作「未截断」。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5   # 5: 书籍/章节一等公民（entry_type/isbn/book_key… 全部可选，文章条目形状不变）
 INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"
 AGENTS_MD = "AGENTS.md"
@@ -58,8 +58,10 @@ REPO_OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "config" / DEDUP_OVE
 # 前者如按论文攻防立场组织的深读，后者如按作者语料通读的 2026-07-27-HuiyingLiang）。
 # 批次名不含下划线——`_` 是与系列后缀（全文精读/手动精读）的分隔符，让开不会有歧义。
 # vault.month_key 取前 7 位折回 YYYY-MM，专题批次因此不会在图谱里劈出多余的月度页。
-NOTE_MD_RE = re.compile(r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?(?:-[^_]+)?)_(全文精读|手动精读)\.md$")
-_SERIES_MAP = {"全文精读": "auto", "手动精读": "manual"}
+# _书籍精读=整本书的章节级精读（book_notes.rebuild_book 产出，标签形如 2026-08-25-LittleRubin2020）
+NOTE_MD_RE = re.compile(
+    r"^科研札记_(\d{4}-\d{2}(?:-\d{2})?(?:-[^_]+)?)_(全文精读|手动精读|书籍精读)\.md$")
+_SERIES_MAP = {"全文精读": "auto", "手动精读": "manual", "书籍精读": "book"}
 
 
 def validate_note_label(label: str) -> str:
@@ -143,10 +145,51 @@ _DOI_RE = re.compile(r"^\*\*DOI\*\*: \[([^\]]+)\]")
 _URL_RE = re.compile(r"^\*\*链接\*\*: (\S+)")
 _CLOSEREAD_RE = re.compile(r"^### (全文精读|精读（仅摘要降级）)(?: · 来源 `(.+?)`)?")
 _CR_SECTION_RE = re.compile(r"^\*\*【(.+?)】\*\*\s*$")   # 精读分节标题（供 highlights 溯源 section）
-# 句级角色标记行：捕获 tag（新旧六类）+ 句子文本（供 highlights 从 md 无损回填）
-_TAG_LINE_RE = re.compile(
-    r"^- 〔(可引用证据|可反驳观点|方法论借鉴|方法学创新|重要发现|研究背景)〕(.*)$")
+# 句级角色标记行：捕获 tag（新旧六类）+ 句子文本 + 可选页码锚（供 highlights 从 md 无损回填）。
+# 语法与渲染者共用 _citekey_utils.TAG_LINE_RE，别在此另抄一份（见该常量的文档）。
+_TAG_LINE_RE = TAG_LINE_RE
 _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}|[a-z\-]+/\d{7})")
+
+# 书籍/章条目的容器元数据行（notes._book_line 的格式契约，` · ` 分段）：
+#   **所属书籍**: Users' Guides… · ISBN 9780071790710 · 第14章 · pp.301-313 · 出版 McGraw-Hill · 3rd 版 · 编者 A; B
+# 书系列的权威来源是 sidecar（无损）；这里只保证 md 降级解析也能捞回身份关键字段。
+_BOOK_LINE_PREFIX = "**所属书籍**: "
+_BOOK_ISBN_RE = re.compile(r"^ISBN\s+(\S+)$")
+_BOOK_CHAPTER_RE = re.compile(r"^第(\d+)章$")
+_BOOK_PAGES_RE = re.compile(r"^pp\.(\S+)$")
+_BOOK_PUBLISHER_RE = re.compile(r"^出版\s+(.+)$")
+_BOOK_EDITION_RE = re.compile(r"^(.+?)\s*版$")
+_BOOK_EDITORS_RE = re.compile(r"^编者\s+(.+)$")
+_BOOK_KEY_RE = re.compile(r"^\[@([^\[\]\s]+)\]$")
+
+
+def _parse_book_line(raw: str) -> Dict[str, Any]:
+    """解析 `**所属书籍**:` 行 → 书籍字段子集。认不出的分段忽略（宽进，不炸解析）。"""
+    out: Dict[str, Any] = {}
+    parts = [p.strip() for p in raw.split(" · ") if p.strip()]
+    for i, part in enumerate(parts):
+        if i == 0 and not any(r.match(part) for r in (_BOOK_ISBN_RE, _BOOK_CHAPTER_RE)):
+            out["container_title"] = part
+            continue
+        for regex, field, cast in (
+            (_BOOK_ISBN_RE, "isbn", str),
+            (_BOOK_CHAPTER_RE, "chapter_number", int),
+            (_BOOK_PAGES_RE, "page_range", str),
+            (_BOOK_PUBLISHER_RE, "publisher", str),
+            (_BOOK_KEY_RE, "book_key", str),
+            (_BOOK_EDITION_RE, "edition", str),
+        ):
+            m = regex.match(part)
+            if m:
+                out[field] = cast(m.group(1))
+                break
+        else:
+            m = _BOOK_EDITORS_RE.match(part)
+            if m:
+                out["editors"] = [e.strip() for e in m.group(1).split(";") if e.strip()]
+    if out:
+        out["entry_type"] = "chapter" if out.get("chapter_number") is not None else "book"
+    return out
 
 
 # ---------------- 存量札记：md 解析 + CSL 合并 ----------------
@@ -237,17 +280,23 @@ def parse_note_md(md_path: Path) -> List[Dict[str, Any]]:
         if sm:
             cur["_cur_section"] = sm.group(1).strip()
             continue
+        if line.startswith(_BOOK_LINE_PREFIX):
+            # 书籍/章条目的容器元数据（md 降级解析路径；sidecar 路径是无损的权威来源）
+            cur.update(_parse_book_line(line[len(_BOOK_LINE_PREFIX):].strip()))
+            continue
         tm = _TAG_LINE_RE.match(line)
         if tm:
             hl, tc = _collect_highlights([(cur.get("_cur_section", ""),
-                                           tm.group(1), tm.group(2))])
+                                           tm.group(1), tm.group(2), tm.group(3))])
             for h in hl:
                 cur["highlights"].append(h)
                 cur["tag_counts"][h["role"]] = cur["tag_counts"].get(h["role"], 0) + 1
     for e in entries:
         e.pop("_cur_section", None)
         e["dedup_key"] = dedup_key_fields(e["doi"], e["arxiv_id"], e["title"],
-                                          fallback=e["citekey"], url=e.get("url"))
+                                          fallback=e["citekey"], url=e.get("url"),
+                                          isbn=e.get("isbn"),
+                                          chapter_number=e.get("chapter_number"))
     return entries
 
 
@@ -981,36 +1030,14 @@ def _agents_source() -> Optional[Path]:
 
 def _fallback_csl(entry: Dict[str, Any]) -> Dict[str, Any]:
     """月度 CSL 文件缺条目时，从索引字段构造最小 CSL 条目（authors 为字符串列表）。"""
-    item: Dict[str, Any] = {
-        "id": entry["citekey"],
-        "type": "article-journal" if not entry.get("arxiv_id") or entry.get("doi") else "article",
-        "title": entry.get("title") or "",
-    }
-    authors = []
-    for n in (entry.get("authors") or []):
-        n = (n or "").strip()
-        if not n:
-            continue
-        if "," in n:
-            last, _, first = n.partition(",")
-            authors.append({"family": last.strip(), "given": first.strip()})
-        else:
-            parts = n.split()
-            if len(parts) == 1:
-                authors.append({"family": parts[0]})
-            else:
-                authors.append({"family": parts[-1], "given": " ".join(parts[:-1])})
-    if authors:
-        item["author"] = authors
-    if entry.get("journal"):
-        item["container-title"] = entry["journal"]
-    if entry.get("doi"):
-        item["DOI"] = entry["doi"]
-    if entry.get("url"):
-        item["URL"] = entry["url"]
-    if entry.get("year"):
-        item["issued"] = {"date-parts": [[entry["year"]]]}
-    return item
+    return build_csl_common(
+        citekey=entry["citekey"], title=entry.get("title"), authors=entry.get("authors"),
+        entry_type=entry.get("entry_type"), journal=entry.get("journal"),
+        doi=entry.get("doi"), url=entry.get("url"), arxiv_id=entry.get("arxiv_id"),
+        isbn=entry.get("isbn"), publisher=entry.get("publisher"),
+        edition=entry.get("edition"), editors=entry.get("editors"),
+        container_title=entry.get("container_title"), page_range=entry.get("page_range"),
+        issued=({"date-parts": [[entry["year"]]]} if entry.get("year") else None))
 
 
 def is_missing_citekey(entry: Dict[str, Any]) -> bool:

@@ -156,9 +156,21 @@ def venue_native_id(url: Optional[str]) -> Optional[str]:
     return _pmlr_native_id(host, parts) or _openreview_native_id(host, parts, sp.query)
 
 
+def _norm_isbn(isbn: Optional[str]) -> str:
+    """ISBN 归一：去连字符/空格，统一小写（ISBN-10 校验位 X 归一为 x）。"""
+    return "".join(ch for ch in (isbn or "").lower() if ch.isalnum())
+
+
 def dedup_key_fields(doi: Optional[str], arxiv_id: Optional[str], title: Optional[str],
-                     fallback: str = "", url: Optional[str] = None) -> str:
-    """全局去重键：DOI > arXiv id > 场地原生 id > 规范标题 > fallback。
+                     fallback: str = "", url: Optional[str] = None,
+                     isbn: Optional[str] = None,
+                     chapter_number: Optional[int] = None) -> str:
+    """全局去重键：DOI > arXiv id > ISBN（书/章） > 场地原生 id > 规范标题 > fallback。
+
+    ISBN 档（2026-08-25 书籍一等公民）：仅当条目携带 isbn 字段才触发——存量 2396 条
+    文章条目均无此字段，重算逐字节不变（W0 审计门验证）。编著文集的章以
+    `isbn:<isbn>:ch<NN>` 为键：ISBN+章号由出版方分配、不可变，且比章标题抗解析漂移
+    （与 pmlr: 档同一论证）。专著整本一个 `isbn:<isbn>`。
 
     场地原生 id（PMLR slug / OpenReview id）排在标题之前的理由：它由**出版方分配**、
     不可变、全局唯一，而标题键是派生量——标题被解析截断（本库实测出现过
@@ -180,6 +192,11 @@ def dedup_key_fields(doi: Optional[str], arxiv_id: Optional[str], title: Optiona
         return "doi:" + doi.strip().lower().replace("https://doi.org/", "")
     if arxiv_id:
         return "arxiv:" + arxiv_id.strip().lower()
+    nisbn = _norm_isbn(isbn)
+    if nisbn:
+        if chapter_number is not None:
+            return "isbn:{}:ch{:02d}".format(nisbn, int(chapter_number))
+        return "isbn:" + nisbn
     vid = venue_native_id(url)
     if vid:
         return vid
@@ -202,7 +219,9 @@ def recompute_entry_key(entry: Dict[str, Any]) -> str:
     id: 用 paper_id 兜底，比这里能拿到的 citekey 更稳，重算反而更差。
     """
     rekey = dedup_key_fields(entry.get("doi"), entry.get("arxiv_id"), entry.get("title"),
-                             fallback=entry.get("citekey") or "", url=entry.get("url"))
+                             fallback=entry.get("citekey") or "", url=entry.get("url"),
+                             isbn=entry.get("isbn"),
+                             chapter_number=entry.get("chapter_number"))
     if rekey.startswith("id:") and entry.get("dedup_key"):
         return entry["dedup_key"]
     return rekey
@@ -257,27 +276,58 @@ def date_string(d, precision=None) -> str:
     return d.isoformat()
 
 
+# ---------------- 句级标记行语法（三处共有者的唯一真相源） ----------------
+#
+# 渲染者 notes._paper_section 与 backfill_deepread._render_closeread、解析者
+# notes_index.parse_note_md 曾各抄一份正则/格式串。任一处漏改，下一次 regen 会**静默**
+# 剥掉页码锚（md 是索引与向量库的上游，剥掉即全链路丢失）。故语法收敛到此处：
+#   - 〔可引用证据〕句子文本〔p.247〕
+# 页码锚为可选尾组：不带它的历史行照旧匹配，group(3) 为 None。
+TAG_MARK = ("可引用证据", "可反驳观点", "方法论借鉴",
+            "方法学创新", "重要发现", "研究背景")
+
+TAG_LINE_RE = re.compile(
+    r"^- 〔(" + "|".join(TAG_MARK) + r")〕(.*?)(?:\s*〔p\.([0-9][0-9\-–,\s]*)〕)?\s*$")
+
+
+def render_tag_line(tag: Optional[str], text: str, page: Optional[str] = None) -> str:
+    """渲染一条句级标记行（与 TAG_LINE_RE 严格互逆）。"""
+    marker = "〔{}〕".format(tag) if tag in TAG_MARK else ""
+    anchor = "〔p.{}〕".format(str(page).strip()) if page else ""
+    return "- {}{}{}".format(marker, text, anchor)
+
+
 # ---------------- 句级角色 → highlights（工作流可调取的核心结构） ----------------
 
 def _collect_highlights(triples):
-    """把 (section_heading, tag, text) 三元组流聚合成 highlights[] + tag_counts。
+    """把 (section_heading, tag, text[, pages]) 元组流聚合成 highlights[] + tag_counts。
 
     - tag 经 schema.TAG_TO_ROLE 归一到英文 role slug（citable/refutable/method）；
       映射为 None 的（如旧「研究背景」）丢弃，天然去噪。
-    - highlights 项：{role, tag(原始中文), section, text}，供工作流按 role 跨库 jq 检索。
+    - highlights 项：{role, tag(原始中文), section, text}，供工作流按 role 跨库 jq 检索；
+      书籍链路额外带 pages（原书页码锚，如 "247" / "241-259"），文章条目不写此键
+      ——保持存量 highlights 逐字节不变。
     - tag_counts 键为 role slug，口径与 highlights 一致（历史/新数据可比）。
+
+    元组长度 3 与 4 均接受：三处调用点（entry_from_segment / notes_index.parse_note_md /
+    backfill_deepread.update_sidecar）里只有书籍链路会给第 4 元素。
     """
     from .schema import TAG_TO_ROLE
     highlights: List[Dict[str, Any]] = []
     tag_counts: Dict[str, int] = {}
-    for heading, tag, text in triples:
+    for item in triples:
+        heading, tag, text = item[0], item[1], item[2]
+        pages = item[3] if len(item) > 3 else None
         if not tag:
             continue
         role = TAG_TO_ROLE.get(tag)
         if role is None:
             continue
-        highlights.append({"role": role, "tag": tag,
-                           "section": heading or "", "text": (text or "").strip()})
+        hl: Dict[str, Any] = {"role": role, "tag": tag,
+                              "section": heading or "", "text": (text or "").strip()}
+        if pages:
+            hl["pages"] = str(pages).strip()
+        highlights.append(hl)
         tag_counts[role] = tag_counts.get(role, 0) + 1
     return highlights, tag_counts
 
@@ -293,6 +343,95 @@ def _reading_depth(cr, series: str) -> Optional[str]:
     if series == "manual" or cr.source == "manual-pdf":
         return getattr(cr, "reading_depth", None) or "chunked"
     return getattr(cr, "reading_depth", None)
+
+
+# ---------------- CSL-JSON 构造（notes 与 notes_index 的唯一实现） ----------------
+#
+# 两侧曾各抄一份（notes.build_csl_item / notes_index._fallback_csl），姓名拆分与
+# type 判定逐字重复——书籍分支要改两处，漏一处就出「同一本书在 references.json 里是
+# book、在 all_references.json 里是 article-journal」的产出层分裂。故收敛到此处。
+
+def csl_names(names) -> List[Dict[str, str]]:
+    """人名串列表 → CSL name 对象列表。支持 "Last, First" 与 "First Last" 两种写法。"""
+    out: List[Dict[str, str]] = []
+    for n in (names or []):
+        n = (n or "").strip()
+        if not n:
+            continue
+        if "," in n:
+            last, _, first = n.partition(",")
+            out.append({"family": last.strip(), "given": first.strip()})
+        else:
+            parts = n.split()
+            if len(parts) == 1:
+                out.append({"family": parts[0]})
+            else:
+                out.append({"family": parts[-1], "given": " ".join(parts[:-1])})
+    return out
+
+
+def build_csl_common(*, citekey: str, title: Optional[str], authors=None,
+                     entry_type: Optional[str] = None, journal: Optional[str] = None,
+                     doi: Optional[str] = None, url: Optional[str] = None,
+                     arxiv_id: Optional[str] = None, volume: Optional[str] = None,
+                     issue: Optional[str] = None, pages: Optional[str] = None,
+                     isbn: Optional[str] = None, publisher: Optional[str] = None,
+                     edition: Optional[str] = None, editors=None,
+                     container_title: Optional[str] = None, page_range: Optional[str] = None,
+                     issued=None) -> Dict[str, Any]:
+    """构造 CSL-JSON 条目。entry_type 为 None 时行为与改造前逐字节一致（文章路径）。
+
+    book    → 专著：publisher/edition/ISBN；引用时靠 pandoc 定位符 [@key, p. 247]
+    chapter → 编著文集的一章：章标题与章作者在 title/author，书名在 container-title，
+              书的编者在 editor，章页码范围在 page
+    """
+    if entry_type == "book":
+        csl_type = "book"
+    elif entry_type == "chapter":
+        csl_type = "chapter"
+    else:
+        csl_type = "article-journal" if not arxiv_id or doi else "article"
+
+    item: Dict[str, Any] = {"id": citekey, "type": csl_type, "title": title or ""}
+    names = csl_names(authors)
+    if names:
+        item["author"] = names
+    container = container_title if entry_type == "chapter" else journal
+    if container:
+        item["container-title"] = container
+    ed_names = csl_names(editors)
+    if ed_names:
+        item["editor"] = ed_names
+    if publisher:
+        item["publisher"] = publisher
+    if edition:
+        item["edition"] = edition
+    if isbn:
+        item["ISBN"] = isbn
+    if doi:
+        item["DOI"] = doi
+    if url:
+        item["URL"] = url
+    if volume:
+        item["volume"] = volume
+    if issue:
+        item["issue"] = issue
+    page = page_range if entry_type == "chapter" else pages
+    if page:
+        item["page"] = page
+    if issued:
+        item["issued"] = issued
+    return item
+
+
+# ---------------- 书籍/章节条目字段（一等公民，2026-08-25） ----------------
+#
+# 全部可选：条目**不带**这些键时行为与改造前完全一致（文章路径零影响）。
+# entry_type 缺席 = 文章（不是显式写 "article"），这样存量索引不需要迁移。
+#   book    专著整本一条（Little & Rubin：一个 citekey，引用时用页码定位符）
+#   chapter 编著文集的一章（JAMA Users' Guides：章作者各异，章才是可引单元）
+BOOK_ENTRY_FIELDS = ("entry_type", "isbn", "publisher", "edition", "editors",
+                     "book_key", "container_title", "chapter_number", "page_range")
 
 
 # ---------------- 从内存对象构造条目（write_notes sidecar 复用，无损） ----------------
@@ -312,11 +451,11 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         year = meta.email_received_at.year
 
     highlights, tag_counts = _collect_highlights(
-        (sec.heading, st.tag, st.text)
+        (sec.heading, st.tag, st.text, getattr(st, "page", None))
         for sec in (cr.sections if cr else [])
         for st in sec.sentences)
 
-    return {
+    entry = {
         "citekey": citekey,
         "citekey_source": citekey_source,
         "series": series,
@@ -347,5 +486,13 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "highlights": highlights,
         "dedup_key": dedup_key_fields(meta.doi, meta.arxiv_id, meta.title,
                                       fallback=meta.paper_id,
-                                      url=getattr(meta, "url", None)),
+                                      url=getattr(meta, "url", None),
+                                      isbn=getattr(meta, "isbn", None),
+                                      chapter_number=getattr(meta, "chapter_number", None)),
     }
+    # 书籍字段只在存在时写入：文章条目的 dict 形状（及其 json 落盘）保持逐字节不变。
+    for field in BOOK_ENTRY_FIELDS:
+        val = getattr(meta, field, None)
+        if val:
+            entry[field] = list(val) if isinstance(val, (list, tuple)) else val
+    return entry

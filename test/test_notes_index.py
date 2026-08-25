@@ -601,7 +601,7 @@ def test_validate_note_label_rejects_index_invisible_labels():
             ni.validate_note_label(lab)
 
 
-def test_note_md_re_accepts_both_series_rejects_others():
+def test_note_md_re_accepts_all_series_rejects_others():
     assert ni.NOTE_MD_RE.match("科研札记_2026-07_全文精读.md")
     assert ni.NOTE_MD_RE.match("科研札记_2026-07_手动精读.md")
     assert ni.NOTE_MD_RE.match("科研札记_2026-07_全文精读_validate.md") is None
@@ -609,6 +609,10 @@ def test_note_md_re_accepts_both_series_rejects_others():
     # 专题批次:YYYY-MM-DD 桶（同月另起文件）
     m = ni.NOTE_MD_RE.match("科研札记_2026-07-17_手动精读.md")
     assert m and m.group(1) == "2026-07-17" and m.group(2) == "手动精读"
+    # 书籍系列：一书一文件，标签为 YYYY-MM-DD-<BookSlug>
+    b = ni.NOTE_MD_RE.match("科研札记_2026-08-25-LittleRubin2020_书籍精读.md")
+    assert b and b.group(1) == "2026-08-25-LittleRubin2020"
+    assert ni._SERIES_MAP[b.group(2)] == "book"
 
 
 def test_both_series_coexist_same_month(tmp_path):
@@ -658,8 +662,8 @@ def test_load_seen_keys_excludes_only_auto(tmp_path):
     assert got == {"doi:10.1/manual", "doi:10.1/old"}
 
 
-def test_schema_version_is_v4():
-    assert ni.SCHEMA_VERSION == 4
+def test_schema_version_is_v5():
+    assert ni.SCHEMA_VERSION == 5
 
 
 # ---------------- 阅读深度量尺四键 ----------------
@@ -1771,3 +1775,149 @@ def test_fix_collisions_reports_vector_sync_failure(tmp_path, monkeypatch):
     # 而且会同时留下 synced=True 的自相矛盾态。两条一起断才咬得住。
     assert "向量库同步失败" in (side.get("error") or "")
     assert side.get("synced") is not True, "同步失败时不许同时自称 synced"
+
+
+# ---------------- 书籍/章节一等公民（2026-08-25） ----------------
+
+def _write_book_note(tmp_path, segs, label="2026-08-25-TestBook"):
+    """写一份书籍精读札记（series=book，一书一文件）。"""
+    return write_notes(segs, {s.paper_id: None for s in segs}, out_dir=tmp_path,
+                       digest_title="科研札记 · {}（书籍精读）".format(label),
+                       filename="科研札记_{}_书籍精读".format(label),
+                       fallback_citekeys=True, emit_index_sidecar=True,
+                       index_series="book")
+
+
+def _book_meta(**kw):
+    d = dict(paper_id="bk", title="Statistical Analysis with Missing Data",
+             authors=["Roderick J. A. Little", "Donald B. Rubin"],
+             entry_type="book", isbn="9781119482260", publisher="Wiley",
+             edition="3rd", publication_date=date(2019, 10, 9), date_precision="day")
+    d.update(kw)
+    return PaperMetadata(**d)
+
+
+def _chapter_meta(**kw):
+    d = dict(paper_id="ch14", title="Harm (Observational Studies)",
+             authors=["Gordon Guyatt"], entry_type="chapter", isbn="9780071790710",
+             book_key="guyatt2015users", container_title="Users' Guides to the Medical Literature",
+             chapter_number=14, page_range="301-313", publisher="McGraw-Hill",
+             edition="3rd", editors=["Gordon Guyatt", "Drummond Rennie"])
+    d.update(kw)
+    return PaperMetadata(**d)
+
+
+def test_article_csl_byte_identical_after_book_branch():
+    """金标：文章路径的 CSL 输出（键序与取值）不因书籍分支改变。"""
+    from src.scholar.notes import build_csl_item
+    meta = PaperMetadata(paper_id="pa", title="A Paper", authors=["Jane Doe", "Smith, John"],
+                         journal="JMLR", doi="10.1/aaa", url="https://x/y",
+                         volume="7", issue="2", pages="1-9",
+                         publication_date=date(2025, 3, 1), date_precision="month")
+    item = build_csl_item(meta, "doe2025Paper")
+    assert list(item.keys()) == ["id", "type", "title", "author", "container-title",
+                                 "DOI", "URL", "volume", "issue", "page", "issued"]
+    assert item["type"] == "article-journal"
+    assert item["author"] == [{"family": "Doe", "given": "Jane"},
+                              {"family": "Smith", "given": "John"}]
+    assert item["issued"] == {"date-parts": [[2025, 3]]}
+    # arXiv-only 仍落 "article"
+    arx = build_csl_item(PaperMetadata(paper_id="pb", title="T", arxiv_id="2401.1"), "k")
+    assert arx["type"] == "article"
+
+
+def test_book_and_chapter_csl_types_and_fields():
+    from src.scholar.notes import build_csl_item
+    bk = build_csl_item(_book_meta(), "little2020rubin")
+    assert bk["type"] == "book"
+    assert bk["publisher"] == "Wiley" and bk["edition"] == "3rd"
+    assert bk["ISBN"] == "9781119482260"
+    assert "container-title" not in bk          # 专著没有容器
+
+    ch = build_csl_item(_chapter_meta(), "guyatt2015harm")
+    assert ch["type"] == "chapter"
+    assert ch["container-title"] == "Users' Guides to the Medical Literature"
+    assert ch["editor"] == [{"family": "Guyatt", "given": "Gordon"},
+                            {"family": "Rennie", "given": "Drummond"}]
+    assert ch["page"] == "301-313"              # 章页码范围进 page
+    assert ch["author"] == [{"family": "Guyatt", "given": "Gordon"}]
+
+
+def test_fallback_csl_matches_notes_csl_for_books():
+    """两侧实现已收敛：同一本书经 notes 与 notes_index 两条路产出同型 CSL。"""
+    from src.scholar.notes import build_csl_item
+    meta = _chapter_meta()
+    a = build_csl_item(meta, "guyatt2015harm")
+    b = ni._fallback_csl({"citekey": "guyatt2015harm", "title": meta.title,
+                          "authors": meta.authors, "entry_type": "chapter",
+                          "isbn": meta.isbn, "publisher": meta.publisher,
+                          "edition": meta.edition, "editors": meta.editors,
+                          "container_title": meta.container_title,
+                          "page_range": meta.page_range})
+    for k in ("type", "title", "author", "container-title", "editor", "publisher",
+              "edition", "ISBN", "page"):
+        assert a[k] == b[k], k
+
+
+def test_page_anchor_round_trips_through_md(tmp_path):
+    """页码锚：渲染→解析→highlights 必须原样带回（三处语法共有者的回归锁）。"""
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        CloseReadSection(heading="Ch.1 · pp.3-28 · Introduction", sentences=[
+            CloseReadSentence(text="缺失值背后必须存在有意义的真值。",
+                              tag="可引用证据", page="4"),
+            CloseReadSentence(text="单调缺失可排序。", tag="方法论借鉴", page="8-12"),
+            CloseReadSentence(text="无页码的旧行。", tag="可反驳观点")])])
+    seg = PaperSegment(segment_id=1, paper_id="bk", priority_score=1.0,
+                       metadata=_book_meta(), close_reading=cr)
+    _write_book_note(tmp_path, [seg], label="2026-08-25-LittleRubin2020")
+    md = tmp_path / "科研札记_2026-08-25-LittleRubin2020_书籍精读.md"
+    assert "〔p.4〕" in md.read_text(encoding="utf-8")
+    entries = ni.parse_note_md(md)
+    hl = entries[0]["highlights"]
+    assert [h.get("pages") for h in hl] == ["4", "8-12", None]
+    assert hl[0]["text"] == "缺失值背后必须存在有意义的真值。"    # 锚未混进正文
+    assert hl[2]["text"] == "无页码的旧行。"
+
+
+def test_book_metadata_line_round_trips(tmp_path):
+    """`**所属书籍**:` 行：渲染→解析恢复身份关键字段（md 降级路径）。"""
+    from src.scholar.notes import _book_line
+    line = _book_line(_chapter_meta())
+    got = ni._parse_book_line(line[len(ni._BOOK_LINE_PREFIX):])
+    assert got["entry_type"] == "chapter"
+    assert got["isbn"] == "9780071790710"
+    assert got["chapter_number"] == 14
+    assert got["page_range"] == "301-313"
+    assert got["container_title"] == "Users' Guides to the Medical Literature"
+    assert got["book_key"] == "guyatt2015users"
+    # 专著：无章号 → book
+    assert ni._parse_book_line(
+        _book_line(_book_meta())[len(ni._BOOK_LINE_PREFIX):])["entry_type"] == "book"
+    assert _book_line(PaperMetadata(paper_id="p", title="T")) is None   # 文章不渲染此行
+
+
+def test_book_series_enters_index_with_isbn_key(tmp_path):
+    """书籍札记进索引：series=book，dedup_key 走 ISBN 档，章条目带 :chNN。"""
+    seg = PaperSegment(segment_id=1, paper_id="ch14", priority_score=1.0,
+                       metadata=_chapter_meta(),
+                       close_reading=CloseReading(from_full_text=True, sections=[
+                           CloseReadSection(heading="要点", sentences=[
+                               CloseReadSentence(text="观察性研究的偏倚来源。",
+                                                 tag="可引用证据", page="303")])]))
+    _write_book_note(tmp_path, [seg], label="2026-08-25-JAMAGuide")
+    idx = ni.update_index(tmp_path, full=True)
+    e = next(x for x in idx["papers"] if x["series"] == "book")
+    assert e["dedup_key"] == "isbn:9780071790710:ch14"
+    assert e["entry_type"] == "chapter" and e["book_key"] == "guyatt2015users"
+    assert e["highlights"][0]["pages"] == "303"
+
+
+def test_existing_article_entries_keep_no_book_fields(tmp_path):
+    """文章条目不得因改造长出书籍键（索引形状回归）。"""
+    _write_month(tmp_path, month="2026-07", sidecar=True)
+    idx = ni.update_index(tmp_path, full=True)
+    from src.scholar._citekey_utils import BOOK_ENTRY_FIELDS
+    for e in idx["papers"]:
+        assert not (set(e) & set(BOOK_ENTRY_FIELDS)), e.get("citekey")
+        for h in e.get("highlights") or []:
+            assert "pages" not in h
