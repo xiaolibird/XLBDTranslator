@@ -31,7 +31,8 @@ from .notes_index import INDEX_JSON, is_retracted
 
 logger = get_logger(__name__)
 
-SCHEMA_VERSION = 2  # v2: highlight chunk id 掺入 role+序号，修复同文本覆盖丢数据（老库需 --full 重建）
+SCHEMA_VERSION = 3  # v3: 加 chapter/pages/book_key 三列 + ch: 章节级（老库需 --full 重建）
+# v2: highlight chunk id 掺入 role+序号，修复同文本覆盖丢数据
 
 DB_NAME = "embeddings.sqlite3"  # notes_dir 下的库文件名，全部调用方从这里取，别再各自硬编码
 
@@ -109,7 +110,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   id TEXT PRIMARY KEY, level TEXT NOT NULL, citekey TEXT NOT NULL,
   role TEXT, tag TEXT, section TEXT, month TEXT, series TEXT, tier TEXT,
   bucket TEXT, year INTEGER, has_full_text INTEGER NOT NULL DEFAULT 0,
-  note_file TEXT, note_line INTEGER, text TEXT NOT NULL,
+  note_file TEXT, note_line INTEGER,
+  chapter TEXT, pages TEXT, book_key TEXT,
+  text TEXT NOT NULL,
   text_hash TEXT NOT NULL, vec BLOB NOT NULL
 )
 """
@@ -118,6 +121,9 @@ _CREATE_INDEX_SQL = "CREATE INDEX IF NOT EXISTS idx_chunks_citekey ON chunks(cit
 _CHUNK_COLUMNS = (
     "id", "level", "citekey", "role", "tag", "section", "month", "series",
     "tier", "bucket", "year", "has_full_text", "note_file", "note_line",
+    # 书籍链路（2026-08-26）：章节粒度检索与带定位符的引用。文章条目恒为 None，
+    # 且不进 id 与 text_hash——改页锚不会触发重嵌入，只走 meta UPDATE。
+    "chapter", "pages", "book_key",
     "text", "text_hash", "vec",
 )
 # 元数据列 = 除主键/文本/哈希/向量外的全部列。增量 diff 的 SELECT、meta UPDATE 语句
@@ -185,6 +191,10 @@ class Chunk:
     has_full_text: int   # 0/1
     note_file: Optional[str]
     note_line: Optional[int]
+    # 书籍链路；文章条目恒为 None（列名必须与 _CHUNK_COLUMNS 同名，_meta_tuple 靠 getattr）
+    chapter: Optional[str] = None      # 章节定位，如 "Ch.7 · pp.241-259 · Nonignorable models"
+    pages: Optional[str] = None        # 该句的原书页码锚，如 "247"
+    book_key: Optional[str] = None     # 章条目所属书的 citekey
 
 
 def chunks_from_index(index: dict, abstracts: Optional[Dict[str, str]] = None) -> List[Chunk]:
@@ -267,6 +277,19 @@ def chunks_from_index(index: dict, abstracts: Optional[Dict[str, str]] = None) -
                 note_file=note_file, note_line=note_line,
             ))
 
+        # 章节级 chunk（ch:）——只对专著发射：专著全书只有一条索引条目，没有这一层
+        # 就没有任何「按章召回」的入口（编著的章各自已有 p:/ab:，不需要重复一份）。
+        if e.get("entry_type") == "book":
+            for i, head in enumerate(_chapter_headings(e)):
+                out.append(Chunk(
+                    id="ch:{}:{:02d}".format(citekey, i + 1), level="chapter",
+                    citekey=citekey, text=head,
+                    role=None, tag=None, section=None, month=month, series=series,
+                    tier=tier, bucket=bucket, year=year, has_full_text=has_full_text,
+                    note_file=note_file, note_line=note_line,
+                    chapter=head, book_key=citekey))
+
+        book_key = e.get("book_key") or (citekey if e.get("entry_type") == "book" else None)
         seen_hl: Dict[str, int] = {}
         for h in (e.get("highlights") or []):
             if not isinstance(h, dict):
@@ -287,7 +310,33 @@ def chunks_from_index(index: dict, abstracts: Optional[Dict[str, str]] = None) -
                 role=role, tag=h.get("tag"), section=h.get("section"),
                 month=month, series=series, tier=tier, bucket=bucket, year=year,
                 has_full_text=has_full_text, note_file=note_file, note_line=note_line,
+                chapter=(h.get("chapter") or _chapter_of_section(h.get("section"))),
+                pages=h.get("pages"), book_key=book_key,
             ))
+    return out
+
+
+# 专著的精读分节标题形如 "Ch.7 · pp.241-259 · Nonignorable models · 方法与数据"
+# （book_notes._sections_from 的格式契约）。取前三段即章节定位。
+_CH_HEAD_RE = re.compile(r"^(Ch\.\d+\s·\s[^·]+·[^·]+)")
+
+
+def _chapter_of_section(section: Optional[str]) -> Optional[str]:
+    """从精读分节标题里抽出章节定位；不是书籍分节则返回 None。"""
+    m = _CH_HEAD_RE.match((section or "").strip())
+    return m.group(1).strip() if m else None
+
+
+def _chapter_headings(entry: dict) -> List[str]:
+    """专著条目里出现过的章节定位（按首次出现顺序去重）。"""
+    seen, out = set(), []
+    for h in (entry.get("highlights") or []):
+        if not isinstance(h, dict):
+            continue
+        head = h.get("chapter") or _chapter_of_section(h.get("section"))
+        if head and head not in seen:
+            seen.add(head)
+            out.append(head)
     return out
 
 
@@ -659,10 +708,16 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                             "{0}=excluded.{0}".format(col) for col in _CHUNK_COLUMNS if col != "id"),
                     )
                 )
+                # 值元组也由 _CHUNK_COLUMNS 生成。此前这里是手写的列序，而上面的 SQL
+                # 已经是生成的——2026-08-26 加 chapter/pages/book_key 三列时立刻炸成
+                # 「statement uses 20 bindings, 17 supplied」。手写那一份就是模块头
+                # 注释警告过的第四处列名清单。
+                def _row(c: Chunk, h: str, vec) -> Tuple:
+                    return tuple(vec if col == "vec" else h if col == "text_hash"
+                                 else getattr(c, col) for col in _CHUNK_COLUMNS)
+
                 cur.executemany(upsert_sql, (
-                    (c.id, c.level, c.citekey, c.role, c.tag, c.section, c.month, c.series,
-                     c.tier, c.bucket, c.year, c.has_full_text, c.note_file, c.note_line,
-                     c.text, h, vec_by_id[cid])
+                    _row(c, h, vec_by_id[cid])
                     for cid, (c, h) in ((cid, expected[cid]) for cid in to_embed_ids)
                 ))
 

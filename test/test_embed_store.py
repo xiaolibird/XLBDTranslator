@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.scholar import embed_store as es  # noqa: E402
 from src.scholar.embed_store import chunks_from_index, _text_hash, VectorStore, VectorStoreError  # noqa: E402
 
 
@@ -128,14 +129,19 @@ def _fake_store(db_path, dim, blob_len):
     import sqlite3
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("CREATE TABLE chunks(id TEXT PRIMARY KEY, level TEXT, citekey TEXT, "
-                 "role TEXT, tag TEXT, section TEXT, month TEXT, series TEXT, tier TEXT, "
-                 "bucket TEXT, year INT, has_full_text INT, note_file TEXT, note_line INT, "
-                 "text TEXT, text_hash TEXT, vec BLOB)")
-    conn.execute("INSERT INTO meta VALUES('schema_version','2'),('model','bge-m3'),('dim',?)",
-                 (str(dim),))
-    conn.execute("INSERT INTO chunks VALUES('p:a','paper','a',NULL,NULL,NULL,'2026-08','auto',"
-                 "'high','A',2026,0,NULL,NULL,'t','h',?)", (b"\x00" * blob_len,))
+    # 建表与插值都按**当前** _CHUNK_COLUMNS 生成：写死列清单会让加列后本夹具先炸，
+    # 掩盖它真正要测的维度校验（2026-08-26 加书籍三列时踩到）。
+    conn.execute("CREATE TABLE chunks({})".format(
+        ", ".join("{} {}".format(c, "BLOB" if c == "vec" else "TEXT")
+                  for c in es._CHUNK_COLUMNS)))
+    conn.execute("INSERT INTO meta VALUES('schema_version',?),('model','bge-m3'),('dim',?)",
+                 (str(es.SCHEMA_VERSION), str(dim)))
+    vals = {"id": "p:a", "level": "paper", "citekey": "a", "month": "2026-08",
+            "series": "auto", "tier": "high", "bucket": "A", "year": 2026,
+            "has_full_text": 0, "text": "t", "text_hash": "h", "vec": b"\x00" * blob_len}
+    conn.execute("INSERT INTO chunks({}) VALUES({})".format(
+        ", ".join(es._CHUNK_COLUMNS), ", ".join("?" for _ in es._CHUNK_COLUMNS)),
+        tuple(vals.get(c) for c in es._CHUNK_COLUMNS))
     conn.commit()
     conn.close()
 
@@ -1249,3 +1255,64 @@ def test_orphan_warning_silent_when_paper_left_index(tmp_path):
     finally:
         stop()
     assert "backfill_abstracts" not in "".join(buf)
+
+
+# ---------------- 书籍链路（2026-08-26） ----------------
+
+def _book_entry(**kw):
+    d = dict(citekey="little2020rubin", entry_type="book", title="Statistical Analysis",
+             one_line="缺失数据方法教科书", series="book", month="2026-08",
+             priority_tier="high", year=2019, has_full_text_reading=True,
+             note_file="科研札记_2026-08-25-LittleRubin2020_书籍精读.md", note_line=10,
+             dedup_key="isbn:9781119482260",
+             highlights=[
+                 {"role": "citable", "tag": "可引用证据",
+                  "section": "Ch.7 · pp.151-184 · Factored Likelihood · 方法与数据",
+                  "text": "因子化似然把单调缺失拆成一串完全数据问题。", "pages": "153"},
+                 {"role": "method", "tag": "方法论借鉴",
+                  "section": "Ch.15 · pp.351-404 · MNAR Models · 局限与可质疑点",
+                  "text": "选择模型与模式混合模型的敏感性分析路线。", "pages": "376"},
+             ])
+    d.update(kw)
+    return d
+
+
+def test_book_highlight_chunks_carry_chapter_and_pages():
+    chunks = chunks_from_index({"papers": [_book_entry()]})
+    hl = [c for c in chunks if c.level == "highlight"]
+    assert [c.pages for c in hl] == ["153", "376"]
+    assert hl[0].chapter == "Ch.7 · pp.151-184 · Factored Likelihood"
+    assert all(c.book_key == "little2020rubin" for c in hl)
+
+
+def test_chapter_level_chunks_only_for_monographs():
+    """专著全书一条条目 → 没有 ch: 就没有任何按章召回的入口；编著各章已有 p:，不重复发。"""
+    mono = chunks_from_index({"papers": [_book_entry()]})
+    ch = [c for c in mono if c.level == "chapter"]
+    assert [c.id for c in ch] == ["ch:little2020rubin:01", "ch:little2020rubin:02"]
+    assert ch[0].text.startswith("Ch.7 ·")
+
+    chap_entry = _book_entry(citekey="guyatt2015harm", entry_type="chapter",
+                             book_key="guyatt2015users", chapter_number=14)
+    assert not [c for c in chunks_from_index({"papers": [chap_entry]}) if c.level == "chapter"]
+
+
+def test_article_chunks_keep_book_columns_none():
+    """文章条目不得因书籍改造长出章节元数据（存量 22592 条向量的形状回归）。"""
+    art = {"citekey": "doe2025Paper", "title": "A Paper", "one_line": "x",
+           "series": "auto", "highlights": [{"role": "citable", "tag": "可引用证据",
+                                             "section": "方法与数据", "text": "一句证据。"}]}
+    for c in chunks_from_index({"papers": [art]}):
+        assert c.chapter is None and c.pages is None and c.book_key is None
+
+
+def test_page_anchor_edit_is_meta_update_not_reembed():
+    """改页锚不应触发重嵌入：页码是元数据列，不进 id 也不进 text_hash。"""
+    before = {c.id: c for c in chunks_from_index({"papers": [_book_entry()]})}
+    e = _book_entry()
+    e["highlights"][0]["pages"] = "154"          # 只改页锚，正文一字未动
+    after = {c.id: c for c in chunks_from_index({"papers": [e]})}
+    assert set(before) == set(after)             # id 不变 → 不会删旧嵌新
+    hid = next(i for i in before if i.startswith("h:"))
+    assert before[hid].text == after[hid].text   # 文本不变 → text_hash 不变
+    assert after[hid].pages == "154"

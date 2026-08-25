@@ -117,7 +117,7 @@ def _split_paper_text(text: str):
 
 
 def _build_mask(store: VectorStore, args) -> np.ndarray:
-    """元数据布尔掩码：role/tier/month(前缀)/series/full-text-only。
+    """元数据布尔掩码：role/tier/month(前缀)/series/full-text-only/book。
     role 只对 highlight 级 chunk 有意义——paper 级 chunk 的 role 恒为 None，
     传了 --role 时它们自然被滤掉，不需要单独分支。"""
     n = len(store.records)
@@ -138,6 +138,12 @@ def _build_mask(store: VectorStore, args) -> np.ndarray:
         if args.full_text_only and not r.get("has_full_text"):
             mask[i] = False
             continue
+        if getattr(args, "book", None):
+            # 专著：citekey 本身即书键；编著：各章的 book_key 指向所属书。两者都收，
+            # 否则「--book guyatt2015users」查不到那本书的任何一章（章的 citekey 是章键）。
+            if args.book not in (r.get("book_key"), r.get("citekey")):
+                mask[i] = False
+                continue
     return mask
 
 
@@ -378,6 +384,8 @@ def main() -> int:
                          .format(NOTES_SEARCH_MIN_SCORE))
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
+    ap.add_argument("--book", default=None, metavar="CITEKEY",
+                    help="只看某本书（专著的 citekey，或编著各章所属书的 book_key）")
     ap.add_argument("--json", action="store_true", dest="as_json", help="结构化输出（含 total）")
     ap.add_argument("--paper-lanes", choices=["both", "thin"], default="both",
                     help="paper 侧检索泳道：both=瘦(p:)+厚(ab:摘要)双路 RRF（默认）；"
@@ -550,8 +558,12 @@ def main() -> int:
                 "no_sentence_evidence": row["no_sentence_evidence"],
                 "year": row["year"],
                 "title": row["title"], "one_line": row["one_line"],
-                "hits": [{"text": r["text"], "role": r["role"], "section": r["section"],
-                          "score": round(s, 4), "score_kind": k}
+                "hits": [dict({"text": r["text"], "role": r["role"], "section": r["section"],
+                               "score": round(s, 4), "score_kind": k},
+                              # 书籍链路：章节定位与原书页码。文章命中不带这两个键，
+                              # 消费方（scholar-write）据 pages 产出 [@key, p. N] 定位符。
+                              **{k2: r[k2] for k2 in ("chapter", "pages", "book_key")
+                                 if r.get(k2)})
                          for s, k, _ss, r in row["hits"]],
                 "note_file": row["note_file"], "note_line": row["note_line"],
             } for row in shown],
@@ -562,7 +574,14 @@ def main() -> int:
         if not shown:
             print("无命中", file=sys.stderr)
             return 1
-        print("[" + "; ".join("@{}".format(row["citekey"]) for row in shown) + "]")
+        # 书籍命中带页码定位符：[@little2020rubin, p. 247]。pandoc 的 citeproc 认这个
+        # 语法，而一本 460 页的书不带定位符的引用等于没标出处。
+        def _cite_one(row):
+            pages = next((r.get("pages") for _s, _k, _ss, r in row["hits"] if r.get("pages")),
+                         None)
+            return "@{}{}".format(row["citekey"], ", p. {}".format(pages) if pages else "")
+
+        print("[" + "; ".join(_cite_one(row) for row in shown) + "]")
         if truncated:
             print("⚠️ 共 {} 条命中，仅输出前 {} 条（--limit 调整，0=不限）".format(
                 len(rows), len(shown)), file=sys.stderr)
@@ -599,7 +618,12 @@ def main() -> int:
             print("    （语义命中标题/一句话用处，该篇无精读句级证据）")
         for s, k, _ss, r in row["hits"][:MAX_SHOWN_HITS]:
             hit_kw = "[关键词] " if k != "cosine" else ""
-            print("    [{}·{}] {}{:.2f} {}".format(r["role"], r["section"], hit_kw, s, r["text"]))
+            # 书籍命中优先显示「章 · 页」而不是精读分节名：分节名（方法与数据…）
+            # 对书没有定位价值，读者要的是「第几章第几页」。
+            where = r.get("chapter") or r["section"]
+            page_sfx = " ⟨p.{}⟩".format(r["pages"]) if r.get("pages") else ""
+            print("    [{}·{}] {}{:.2f} {}{}".format(
+                r["role"], where, hit_kw, s, r["text"], page_sfx))
         if len(row["hits"]) > MAX_SHOWN_HITS:
             print("    …还有 {} 条命中句（--json 看全部）".format(len(row["hits"]) - MAX_SHOWN_HITS))
         print("    ↳ {}:{}".format(row["note_file"], row["note_line"]))
