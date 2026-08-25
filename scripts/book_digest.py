@@ -137,6 +137,17 @@ def cmd_manifest(args):
         printed_toc_pages=_page_list(args.printed_toc_pages) if args.printed_toc_pages else None,
         overrides=_kv(args.set))
     bdir = book_dir(_notes_dir(settings), args.slug)
+    # 保留既有的分诊结果与本书专属问题：重建 manifest 常常只是为了修目录/页偏移，
+    # 顺手把几十次 LLM 调用换来的分诊矩阵清空，是纯损失。--reset 才真的清。
+    old = None
+    if (bdir / "book.manifest.json").exists() and not args.reset:
+        from src.scholar.book_ingest import BookManifest
+        old = BookManifest.load(bdir)
+        man.triage = old.triage
+        man.extra_questions = old.extra_questions
+        man.ledger = old.ledger
+        if not args.set and old.citekey and not man.citekey:
+            man.citekey = old.citekey
     path = man.save(bdir)
 
     print("\n📕 {}".format(man.title or man.slug))
@@ -147,6 +158,9 @@ def cmd_manifest(args):
         lo, hi = c.printed_range(man.page_offset)
         print("     {:>2}. pp.{:>4}-{:<4} ({:>3}p)  {}".format(c.number, lo, hi, c.n_pages,
                                                                c.title[:58]))
+    if old is not None:
+        print("   （已保留 {} 章的分诊结果与 {} 条本书专属问题）".format(
+            len(man.triage), len(man.extra_questions)))
     print("\n   manifest → {}".format(path))
     if not man.chapters:
         print("\n   ⚠️ 没切出章节：给 --printed-toc-pages（书自印的目录页 PDF 页码）"
@@ -507,6 +521,8 @@ def main(argv=None):
                    help="原书页码 = PDF 页序 + offset；不给则自动探测")
     m.add_argument("--set", action="append", default=[],
                    help="补书目字段：--set isbn=978... --set authors='A; B'")
+    m.add_argument("--reset", action="store_true",
+                   help="连同已有的分诊结果/本书专属问题一起清空（默认保留）")
     m.set_defaults(func=cmd_manifest)
 
     q = sub.add_parser("questions", help="查看/设置本书专属的分诊问题")

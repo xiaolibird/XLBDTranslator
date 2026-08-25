@@ -189,6 +189,12 @@ _PRINTED_BACKMATTER_RE = re.compile(
     r"^\s*((?:References|Bibliography|Author\s+Index|Subject\s+Index|Index|Glossary|"
     r"Appendi[xc]e?s?(?:\s+[A-Z0-9]+)?)(?:\s+[A-Za-z][\w\s\-]*?)?)\s+(\d{1,4})\s*$", re.I)
 
+# 分行形态的单行 token（块级抽取下目录的三列会拆成独立行）
+_NUM_ONLY_RE = re.compile(r"^\d+(?:\.\d+)*$")
+_PART_ONLY_RE = re.compile(r"^Part\s+([IVXLC]+|\d+)$", re.I)
+_MATTER_ONLY_RE = re.compile(
+    r"^(?:References|Bibliography|Author\s+Index|Subject\s+Index|Index|Glossary)$", re.I)
+
 # 印刷目录里，「章」统一落在 level 2，Part 落在 level 1——与 JAMA 原生书签的
 # Part(L1)/章(L2) 口径一致，于是两本书都用 split_level=2，不必各记一套。
 _PRINTED_PART_LEVEL = 1
@@ -226,45 +232,80 @@ def parse_printed_toc(pages: Sequence[str], toc_pdf_pages: Sequence[int],
             seen.add(dedup)
             items.append({"level": level, "title": title_full, "key": key})
 
+    def emit_matter(title: str, printed: int) -> None:
+        key = printed - page_offset - 1
+        if 0 <= key < len(pages) and (1, title, key) not in seen:
+            seen.add((1, title, key))
+            items.append({"level": 1, "title": title, "key": key})
+
     for p in toc_pdf_pages:
         idx = int(p) - 1
         if not (0 <= idx < len(pages)):
             continue
-        pending_num, pending_title = None, ""
-        for line in (pages[idx] or "").splitlines():
-            if not line.strip() or _TOC_RUNNING_HEAD_RE.match(line):
+        # 状态机：kind ∈ {None, "chapter", "part", "matter"}；num/title 为待收尾的条目
+        kind, num, title = None, "", []
+        for raw in (pages[idx] or "").splitlines():
+            line = raw.strip()
+            if not line or _TOC_RUNNING_HEAD_RE.match(line):
                 continue
+
+            # ── 单行形态（行内含标题与页码）：按行抽取的版式走这里 ──
             pm = _PRINTED_PART_RE.match(line)
             if pm:
-                pending_num = None
+                kind, num, title = None, "", []
                 emit(pm.group(1), pm.group(2).strip(), int(pm.group(3)), True)
                 continue
             bm = _PRINTED_BACKMATTER_RE.match(line)
             if bm:
-                # 与 Part 同级（level 1）：本身不是章，但会给前一章封口
-                pending_num = None
-                key = int(bm.group(2)) - page_offset - 1
-                if 0 <= key < len(pages):
-                    title = bm.group(1).strip()
-                    if (1, title, key) not in seen:
-                        seen.add((1, title, key))
-                        items.append({"level": 1, "title": title, "key": key})
+                kind, num, title = None, "", []
+                emit_matter(bm.group(1).strip(), int(bm.group(2)))
                 continue
             hm = _PRINTED_TOC_HEAD_RE.match(line)
             if hm:
-                # 新条目开始：上一条若仍未收尾（页码没等到），直接丢弃——不猜页码
-                pending_num, rest = hm.group(1), hm.group(2)
-            else:
-                if pending_num is None:
+                tm = _PRINTED_TOC_TAIL_RE.match(hm.group(2))
+                if tm:
+                    emit(hm.group(1), tm.group(1).strip(), int(tm.group(2)), False)
+                    kind, num, title = None, "", []
                     continue
-                rest = line.strip()                      # 折行续接
-            tm = _PRINTED_TOC_TAIL_RE.match(rest)
-            if tm:
-                title = (pending_title + " " + tm.group(1)).strip()
-                emit(pending_num, title, int(tm.group(2)), False)
-                pending_num, pending_title = None, ""
-            else:
-                pending_title = (pending_title + " " + rest).strip()
+                # 有编号无页码：可能是折行条目的首行，交给状态机续接
+                kind, num, title = "chapter", hm.group(1), [hm.group(2).strip()]
+                continue
+
+            # ── 分行形态（编号/标题/页码各占一行）：块级抽取的版式走这里 ──
+            # 这不是退化，反而更规整——列感知抽取把目录的三列拆成了独立块。
+            if _PART_ONLY_RE.match(line):
+                kind, num, title = "part", _PART_ONLY_RE.match(line).group(1), []
+                continue
+            if _NUM_ONLY_RE.match(line):
+                if kind and title:
+                    # 已经攒到标题，这个数就是页码 → 收尾
+                    emit_target = " ".join(title).strip()
+                    if kind == "matter":
+                        emit_matter(emit_target, int(line))
+                    else:
+                        emit(num, emit_target, int(line), kind == "part")
+                    kind, num, title = None, "", []
+                else:
+                    # 还没有标题，这个数是新条目的编号（上一条未收尾则丢弃，不猜页码）
+                    kind, num, title = "chapter", line, []
+                continue
+            if _MATTER_ONLY_RE.match(line):
+                kind, num, title = "matter", "", [line]
+                continue
+            if kind:
+                # 一行式版式的折行条目：页码长在续行的**行尾**（"Weighting Methods  47"），
+                # 既不是纯数字行也不是新条目首行，必须在这里收尾，否则永远等不到 flush。
+                tm = _PRINTED_TOC_TAIL_RE.match(line)
+                if tm and tm.group(1).strip():
+                    parts = title + [tm.group(1).strip()]
+                    body = " ".join(x for x in parts if x).strip()
+                    if kind == "matter":
+                        emit_matter(body, int(tm.group(2)))
+                    else:
+                        emit(num, body, int(tm.group(2)), kind == "part")
+                    kind, num, title = None, "", []
+                    continue
+                title.append(line)                       # 标题续行
         # 页末未收尾的条目跨页续接的情况极少，且宁缺勿猜
 
     items.sort(key=lambda it: (it["key"], it["level"]))

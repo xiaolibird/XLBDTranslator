@@ -197,3 +197,83 @@ def test_chapter_text_carries_page_markers():
     txt = chapter_text(pages, ch)
     assert "[[PDF p.1]]" in txt and "[[PDF p.2]]" in txt
     assert "p3 body" not in txt               # 不越界取下一章的页
+
+
+# ---------------- 分行形态目录（列感知抽取的产物） ----------------
+
+_RUBIN_TOC_BLOCKWISE = """v
+Contents
+
+Preface to the Third Edition
+xi
+
+Part I
+Overview and Basic Approaches
+1
+
+1
+Introduction
+3
+1.1
+The Problem of Missing Data
+3
+
+3
+Complete-Case and Available-Case Analysis, Including
+Weighting Methods
+47
+
+References
+405
+"""
+
+
+def test_printed_toc_parses_blockwise_layout():
+    """列感知抽取把目录的三列拆成独立行（编号/标题/页码各一行）。
+
+    这不是退化而是更规整，但一行式正则认不出——实测切到块级抽取后 Rubin 的
+    印刷目录从 15 章掉到 0 章。两种形态必须都支持。
+    """
+    pages = [""] * 4 + [_RUBIN_TOC_BLOCKWISE] + [""] * 457
+    items = parse_printed_toc(pages, [5], page_offset=-12)
+    by_title = {it["title"]: it for it in items}
+    assert by_title["1 Introduction"]["level"] == 2
+    assert by_title["1 Introduction"]["key"] == 14           # 印刷 3 → PDF 15
+    assert by_title["1.1 The Problem of Missing Data"]["level"] == 3
+    assert by_title["Part I Overview and Basic Approaches"]["level"] == 1
+    # 折行标题在分行形态下靠状态机累加
+    assert ("3 Complete-Case and Available-Case Analysis, Including Weighting Methods"
+            in by_title)
+    assert by_title["References"]["level"] == 1              # 后置材料仍是边界
+
+
+def test_blockwise_toc_ignores_roman_paged_frontmatter():
+    """罗马数字页码的前言不该混成章节（页码不是阿拉伯数字，状态机收不到收尾信号）。"""
+    pages = [""] * 4 + [_RUBIN_TOC_BLOCKWISE] + [""] * 457
+    items = parse_printed_toc(pages, [5], page_offset=-12)
+    assert not any("Preface" in it["title"] for it in items)
+
+
+def test_page_text_columnwise_reads_by_column_not_by_row():
+    """双栏页必须按栏读：按行读会把左右两栏逐行交错，句子被另一栏从中间劈开。"""
+    from src.scholar.book_ingest import _page_text_columnwise
+
+    class _Rect:
+        x0, width = 0.0, 100.0
+
+    class _Page:
+        rect = _Rect()
+
+        def get_text(self, kind):
+            assert kind == "blocks"
+            #  (x0, y0, x1, y1, text, bno, btype)
+            return [
+                (5, 10, 45, 20, "left line one", 0, 0),
+                (55, 10, 95, 20, "right line one", 1, 0),
+                (5, 30, 45, 40, "left line two", 2, 0),
+                (55, 30, 95, 40, "right line two", 3, 0),
+            ]
+
+    out = _page_text_columnwise(_Page())
+    assert out.split("\n") == ["left line one", "left line two",
+                               "right line one", "right line two"]
