@@ -40,6 +40,33 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 输出最末的 **「⚠️ 需要注意」块** 必看：索引里已有同文（别白读一遍几个月前已精读的）、元数据不全（会退化成 `anon*` 键、书目缺卷期页，**单独对那一篇**重跑 `--title "精确标题"`——批量时 `--title` 不生效且会在这里报出来）、ingest 失败。
 
+⚠️ **动手前先查索引里有没有同文——ingest 的「已有同文」提示来得太晚。** 那条提示印在跑完之后，
+此时 LLM 额度已经烧掉了。实测踩过：2026-07 桶里躺着 4 个 ingest 失败留下的 draft 残留，
+看上去像「没读完的欠账」，就 `--force` 重跑了一遍，跑完才被提示这 4 篇**早已在
+`科研札记_2026-07_手动精读.md` 里完整入库**（highlights 25–74 条、`reading_depth=chunked`、
+`reading_source=manual-pdf`），白烧 88 块分块通读。
+**残留的 draft bundle ≠ 待办**：ingest 失败会留下 draft，而那篇论文完全可能后来由别的路径读完了。
+所以看到 draft 先按 citekey / 标题查 `literature_index.json`：
+```bash
+python3 -c "
+import json;ps=json.load(open('output/scholar_notes/literature_index.json'))['papers']
+for p in ps:
+    if '关键词' in (p.get('title') or ''):
+        print(p['citekey'], p.get('series'), p.get('month'), p.get('reading_depth'), len(p.get('highlights') or []))"
+```
+**查到已入库后，分两种情况——不要一律当垃圾清掉**：
+
+- **旧版已是核验过的完整终稿 → 丢弃新草稿**。判据：md 小节里 8 个标准分节齐全、末尾有
+  「交叉核验记录」、highlights 数量与篇幅相称（229 页博论 74 条 / 12.8k 字符是健康的）。
+  此时新跑的脚本草稿只有几十句且未核验，合并只会稀释。把 draft 挪进
+  `manual/_stale_drafts/<时间戳>/`（**带月份前缀**避免跨月同名覆盖），并在同目录写一份
+  `_why.json` 记下依据，免得日后翻到又当成欠账。
+- **旧版明显读得不全 → 合并，别另起炉灶**。判据：分节缺失、没有交叉核验记录、
+  或篇幅与页数严重不匹配（几百页的书只有两三千字）。做法是把新的完整精读写进**同一个
+  bundle** 的 `close_reading_final` 再 finalize——手动深读会成为 keeper、旧条目自动标
+  `duplicate`（ingest 末尾那句「继续 finalize 则手动深读成为 keeper」就是这个机制）。
+  **不要**为了「保留两版」去造第二个 citekey，那会让同一篇论文在库里裂成两个身份。
+
 **看 `draft_status`**：若为 `ok`，走下面正常协议（2–5 步，你亲读核验脚本草稿）；
 若为 **`api_error`**（LLM 无额度/鉴权失败，如 402/401/403），脚本草稿这一轨作废，改走「回退协议」。
 
@@ -80,6 +107,25 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 （保留 bundle 其余字段不动；用 Read 读原 bundle → Write 回写整个 JSON。）
 
+⚠️ **`sections` 不许出现占位符——落盘的才算数。** 实测踩过：一篇 24 页论文精读做完了，
+回写时 `close_reading_final` 却成了 `{"from_full_text": true, "source": "manual-pdf",
+"sections": "SEE_ABOVE_PLACEHOLDER"}`——正文一个字没进文件（同批 `cross_check_report`
+反而写得完整正确，所以从产物上看很像"成功了"）。诱因是**整份 bundle 一次 Write 太长**
+（含 `close_reading_script` 时轻松几万字符），于是把最长的字段偷懒成一句占位符。
+后果是 finalize 判该 bundle 结构非法、**整月拒绝重建并退出码 1**。
+
+**bundle 大（>30KB）或 sections 长时，改分步落盘**：先把 `close_reading_final` 单独写成
+一个临时 JSON 文件（可分多次 Write/Edit 逐节追加），确认它是合法 JSON 后再 merge 回 bundle：
+```python
+import json
+crf = json.load(open('<临时文件>'))                       # 合法性在这一步就暴露
+p = 'output/scholar_notes/manual/<月>/<paper_id>.paper.json'
+d = json.load(open(p)); d['close_reading_final'] = crf; d['status'] = 'final'
+json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+```
+**写完必须自检**：读回 bundle，确认 `close_reading_final['sections']` 是 **list**（不是 str）、
+每个元素是 dict、各节句数与你的终稿对得上，再进第 5 步。
+
 ### 5. finalize —— 归档
 ```bash
 PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py finalize <bundle 路径>
@@ -98,6 +144,20 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
   看到它必须修好那份 JSON 再重跑 finalize，**不要**重做核验。
   另：bundle 的 `month` 字段必须与它所在的 `manual/<月>/` 目录一致，否则 finalize 直接拒绝
   （按月重建会扫空桶，那篇会静默消失）。
+
+⚠️ **finalize 可能在向量库同步那步僵死不退出**（本机 Ollama 没起来时）：四件套与索引其实
+**早已写完**，进程却挂在那里 0% CPU 干等（实测挂了 28 分钟）。判断方法——看
+`科研札记_<月>_手动精读.md` 的 mtime 已更新、`literature_index.json` 能正常解析且含新篇，
+就说明归档已完成，剩下的等待是空转，杀掉即可（退出码 144 = SIGTERM，不是失败）。
+随后起 Ollama 再补跑一次增量同步：
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_embed.py
+```
+验证新篇真的可检索（**dense 模式**，hybrid 按 RRF 名次排序会给假阴性）：
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py "<新篇的核心论断>" --mode dense --min-score 0.62 --limit 5
+```
+（注意是 `--limit`，没有 `--top`。）
 
 ### 6. 汇报
 给用户：归档的 md/docx 路径、本月手动深读篇数、索引撞键组数（非 0 时提示先跑

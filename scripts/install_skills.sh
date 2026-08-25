@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_SKILLS="${REPO_ROOT}/docs/skills"
 INSTALL_SKILLS="${HOME}/.claude/skills"
 
-SKILLS=(read-paper scholar-notes scholar-search scholar-write screen-journal paper-audit manuscript-selfcheck)
+SKILLS=(read-paper read-book scholar-notes scholar-search scholar-write screen-journal paper-audit manuscript-selfcheck)
 
 usage() {
     cat <<'USAGE'
