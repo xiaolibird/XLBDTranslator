@@ -24,7 +24,7 @@ from .schema import (
     PaperSegment, PaperMetadata, PaperField, DigestStatus,
     FilterDecision, CloseReading,
 )
-from .closereading import pdf_to_text, parse_closeread
+from .closereading import pdf_to_text, parse_closeread, _pdf_text_with_stats
 from .research_profile import get_contamination_example_terms
 from ..utils.logger import get_logger
 from ..utils.json_tools import strip_code_fences as _strip_json
@@ -57,6 +57,17 @@ def _generate_paper_id(title: str, authors: Optional[List[str]] = None) -> str:
 def extract_pdf_text(path: Path, max_chars: int = 1_000_000) -> str:
     """抽 PDF 全文纯文本（默认上限极大 ≈ 不截断）。复用 closereading.pdf_to_text。"""
     return pdf_to_text(Path(path), max_chars=max_chars)
+
+
+def extract_pdf_text_with_stats(path: Path, max_chars: int = 1_000_000):
+    """同 extract_pdf_text，但一并返回原始字符数：(text, raw_chars)。
+
+    「默认上限极大 ≈ 不截断」这句话对论文成立，对书**不成立**：本库实测密度约
+    2.4k 字符/页，462 页的 Little & Rubin ≈ 1.13M、726 页的 JAMA ≈ 1.75M，
+    后者会被静默砍掉 43%。丢弃 raw_chars 就等于丢掉唯一能发现这件事的信号，
+    故调用方一律改走这个签名并把 truncated 落进 draft。
+    """
+    return _pdf_text_with_stats(Path(path), max_chars=max_chars)
 
 
 def pdf_page_count(path: Path) -> Optional[int]:
@@ -826,9 +837,15 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     """
     pdf_path = Path(pdf_path)
     logger.info("📄 ingest: {}".format(pdf_path.name))
-    full_text = extract_pdf_text(pdf_path)
+    full_text, raw_chars = extract_pdf_text_with_stats(pdf_path)
     if not full_text.strip():
         raise ValueError("PDF 抽不出文本（可能是扫描件/加密）：{}".format(pdf_path))
+    text_truncated = raw_chars > len(full_text)
+    if text_truncated:
+        # 此前这里静默丢尾（raw_chars 被扔掉）。对论文无感，对书是整段整章消失。
+        logger.warning("  ⚠️ 全文超上限被截断：{} / {} 字符（丢弃 {:.0%}）——"
+                       "书籍请改用 book_digest 按章读，勿走本链路"
+                       .format(len(full_text), raw_chars, 1 - len(full_text) / raw_chars))
     n_pages = pdf_page_count(pdf_path)
     first_pages = full_text[:12000]
     ids = extract_pdf_ids(pdf_path, first_pages)
@@ -880,6 +897,12 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
         # 草稿本身可用，但可能是**裁剪过的**块笔记汇总出来的。这条必须落进 bundle：
         # agent 拿草稿当亲读核验基线，只会核验草稿写了的条目，被裁掉的那部分不会被发现。
         draft_status, draft_note = "ok", budget_info.get("note", "")
+        if text_truncated:
+            # 截断也是草稿不完整的一种，且比块笔记裁剪更严重（整段正文根本没进过 LLM）。
+            # 必须与 budget_info 的裁剪说明并列落进 draft_note，agent 才知道草稿覆盖不到哪。
+            trunc_note = "全文被截断：{}/{} 字符，尾部 {:.0%} 未进入通读".format(
+                len(full_text), raw_chars, 1 - len(full_text) / raw_chars)
+            draft_note = (draft_note + " | " + trunc_note) if draft_note else trunc_note
     elif synth_api_err or (n_api and n_ok == 0):
         draft_status = "api_error"
         draft_note = "LLM 无额度/鉴权失败（如 402），脚本草稿不可用——应回退 subagent 对抗生成"

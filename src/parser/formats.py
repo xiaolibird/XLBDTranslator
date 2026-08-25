@@ -9,7 +9,7 @@ import fitz  # PyMuPDF
 import ebooklib
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List, Dict, Any, Iterator, Tuple
+from typing import List, Dict, Any, Iterator, Tuple, Optional
 
 from ebooklib import epub
 from bs4 import BeautifulSoup
@@ -167,6 +167,70 @@ class BaseDocPipeline(ABC):
 # PDF 解析器
 # ============================================================================
 
+def load_standardized_toc(doc: "fitz.Document",
+                          custom_toc_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """PDF → 标准目录三元组列表 `{'level': int, 'title': str, 'key': 0-based页序}`。
+
+    梯子：CSV 自定义目录（最高优先）→ PDF 原生书签 → 空列表（调用方据此走纯页码回退）。
+
+    独立于 Settings 与 BaseDocPipeline，好让不需要翻译流水线的消费方（书籍 digest 的
+    scholar.book_ingest）直接复用同一套目录解析口径——两处各写一份的话，同一本书在
+    翻译侧与精读侧会切出不同的章节边界。
+    """
+    standardized_items: List[Dict[str, Any]] = []
+
+    # 分支 A: CSV 自定义目录（优先级最高）
+    if custom_toc_path and Path(custom_toc_path).exists():
+        logger.info(f"Loading custom TOC from CSV: {custom_toc_path}")
+        try:
+            # utf-8-sig 兼容 Excel 保存的 CSV
+            with open(custom_toc_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # 健壮性读取：处理 CSV 列名大小写或空格
+                    # 假设标准列名: Page, Title, Level (可选)
+                    row_lower = {k.lower().strip(): v for k, v in row.items()}
+
+                    page_str = row_lower.get('page') or row_lower.get('页码')
+                    if not page_str: continue
+
+                    p_idx = int(page_str) - 1 # 用户习惯 1-based, 内部逻辑 0-based
+
+                    title = row_lower.get('title') or row_lower.get('标题') or f"Page {p_idx+1}"
+                    level_str = row_lower.get('level') or row_lower.get('层级') or "1"
+
+                    if p_idx >= 0:
+                        standardized_items.append({
+                            'level': int(level_str),
+                            'title': title.strip(),
+                            'key': p_idx
+                        })
+        except Exception as e:
+            logger.error(f"Failed to parse CSV TOC: {e}. Falling back to native TOC.")
+            standardized_items = [] # 解析失败，清空以触发回退
+
+    # 分支 B: PDF 原生 TOC（CSV 为空时）
+    if not standardized_items:
+        # fitz.get_toc() 返回: [[lvl, title, page, ...], ...]
+        raw_toc = doc.get_toc()
+        if raw_toc:
+            logger.info("Loading native PDF TOC.")
+            for item in raw_toc:
+                lvl = item[0]
+                title = item[1]
+                page_num = item[2]
+
+                p_idx = page_num - 1
+                if p_idx >= 0:
+                    standardized_items.append({
+                        'level': lvl,
+                        'title': title,
+                        'key': p_idx
+                    })
+
+    return standardized_items
+
+
 class PDFParser(BaseDocPipeline):
     """PDF 文档解析器"""
 
@@ -181,63 +245,8 @@ class PDFParser(BaseDocPipeline):
         """
         self.doc = fitz.open(str(self.file_path))
 
-        # 1. 定义中间层：标准三元组列表
-        # 每一项结构: {'level': int, 'title': str, 'key': int}
-        standardized_items = []
-
-        # =========================================================
-        # 分支 A: 尝试加载 CSV 自定义目录 (优先级最高)
-        # =========================================================
-        # 修正: 从 settings.document 读取最终生效的 TOC 路径
-        if self.settings.document.custom_toc_path and self.settings.document.custom_toc_path.exists():
-            logger.info(f"Loading custom TOC from CSV: {self.settings.document.custom_toc_path}")
-            try:
-                # utf-8-sig 兼容 Excel 保存的 CSV
-                with open(self.settings.document.custom_toc_path, 'r', encoding='utf-8-sig') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        # 健壮性读取：处理 CSV 列名大小写或空格
-                        # 假设标准列名: Page, Title, Level (可选)
-                        row_lower = {k.lower().strip(): v for k, v in row.items()}
-
-                        page_str = row_lower.get('page') or row_lower.get('页码')
-                        if not page_str: continue
-
-                        p_idx = int(page_str) - 1 # 用户习惯 1-based, 内部逻辑 0-based
-
-                        title = row_lower.get('title') or row_lower.get('标题') or f"Page {p_idx+1}"
-                        level_str = row_lower.get('level') or row_lower.get('层级') or "1"
-
-                        if p_idx >= 0:
-                            standardized_items.append({
-                                'level': int(level_str),
-                                'title': title.strip(),
-                                'key': p_idx
-                            })
-            except Exception as e:
-                logger.error(f"Failed to parse CSV TOC: {e}. Falling back to native TOC.")
-                standardized_items = [] # 解析失败，清空以触发回退
-
-        # =========================================================
-        # 分支 B: 尝试加载 PDF 原生 TOC (如果 CSV 为空)
-        # =========================================================
-        if not standardized_items:
-            # fitz.get_toc() 返回: [[lvl, title, page, ...], ...]
-            raw_toc = self.doc.get_toc()
-            if raw_toc:
-                logger.info("Loading native PDF TOC.")
-                for item in raw_toc:
-                    lvl = item[0]
-                    title = item[1]
-                    page_num = item[2]
-
-                    p_idx = page_num - 1
-                    if p_idx >= 0:
-                        standardized_items.append({
-                            'level': lvl,
-                            'title': title,
-                            'key': p_idx
-                        })
+        standardized_items = load_standardized_toc(
+            self.doc, self.settings.document.custom_toc_path)
 
         # =========================================================
         # 分支 C: 纯页码回退模式 (如果以上都为空)

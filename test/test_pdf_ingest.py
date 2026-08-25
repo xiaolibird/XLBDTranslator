@@ -341,7 +341,10 @@ def test_finalize_rebuild_month(tmp_path, monkeypatch):
 
 def _stub_ingest_env(monkeypatch, tmp_path, title="Manual Paper", authors=("Jane Doe",)):
     """把 ingest_pdf 的外部依赖全部打桩，只留「读磁盘上的 bundle → 决定写不写」这条主线。"""
-    monkeypatch.setattr(pi, "extract_pdf_text", lambda p, **k: "full text " * 500)
+    _txt = "full text " * 500
+    monkeypatch.setattr(pi, "extract_pdf_text", lambda p, **k: _txt)
+    # ingest_pdf 走带统计的签名（丢弃 raw_chars 曾让 726 页的书静默丢 43%）
+    monkeypatch.setattr(pi, "extract_pdf_text_with_stats", lambda p, **k: (_txt, len(_txt)))
     monkeypatch.setattr(pi, "pdf_page_count", lambda p: 31)
     monkeypatch.setattr(pi, "extract_pdf_ids",
                         lambda p, t="": {"doi": None, "arxiv_id": None, "title": title})
