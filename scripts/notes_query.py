@@ -28,6 +28,11 @@ from src.scholar.notes_index import INDEX_JSON, is_missing_citekey, load_index_f
 INDEX_PATH = REPO / "output" / "scholar_notes" / INDEX_JSON  # 模块级常量，向后兼容
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
+
+
+def _in_book(entry, book):
+    """该条目是否属于某本书：专著看 citekey，编著的章看 book_key。"""
+    return book in (entry.get("citekey"), entry.get("book_key"))
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
 TIER_EMOJI = {"high": "🔴", "mid": "🟠", "low": "🟢"}
 MONTH_RE = re.compile(r"^\d{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$")  # YYYY[-MM[-DD]]，月份/日语义校验
@@ -73,7 +78,10 @@ def main() -> int:
                     help="只看该角色的句子：citable=可引证据 refutable=可反驳 method=方法借鉴")
     ap.add_argument("--tier", choices=["high", "mid", "low"], help="优先级层过滤")
     ap.add_argument("--month", help="限定月份，YYYY / YYYY-MM / YYYY-MM-DD（前缀匹配）")
-    ap.add_argument("--series", choices=["auto", "manual"], help="auto=流水线精读 manual=手动深读")
+    ap.add_argument("--series", choices=["auto", "manual", "book"],
+                    help="auto=流水线精读 manual=手动深读 book=书籍精读")
+    ap.add_argument("--book", default=None, metavar="CITEKEY",
+                    help="只看某本书（专著的 citekey，或编著各章所属书的 book_key）")
     ap.add_argument("--full-text-only", action="store_true", help="只要有全文精读的条目")
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
@@ -127,6 +135,8 @@ def main() -> int:
             continue
         if args.full_text_only and not e.get("has_full_text_reading"):
             continue
+        if args.book and not _in_book(e, args.book):
+            continue
         m = _match(e, terms, args.role)
         if m:
             results.append((e, m[0], m[1]))
@@ -158,7 +168,13 @@ def main() -> int:
         if not shown:
             print("无命中", file=sys.stderr)
             return 1
-        print("[" + "; ".join("@{}".format(e.get("citekey")) for e, _, _ in shown) + "]")
+        # 书籍命中带 pandoc 页码定位符：[@little2020rubin, p. 247]
+        def _cite_one(e, hits):
+            pages = next((h.get("pages") for h in hits if h.get("pages")), None)
+            return "@{}{}".format(e.get("citekey"),
+                                  ", p. {}".format(pages) if pages else "")
+
+        print("[" + "; ".join(_cite_one(e, hits) for e, hits, _ in shown) + "]")
         if truncated:
             print("⚠️ 共 {} 条命中，仅输出前 {} 条（--limit 调整，0=不限）".format(
                 len(results), len(shown)), file=sys.stderr)
@@ -179,7 +195,11 @@ def main() -> int:
         if src == "title":
             print("    （关键词命中标题/一句话用处，非句级证据）")
         for h in hits[:MAX_SHOWN_HITS]:
-            print("    [{}·{}] {}".format(h.get("role"), h.get("section"), h.get("text")))
+            # 书籍证据显示「章 · 页」：精读分节名（方法与数据…）对一本 460 页的书
+            # 没有定位价值，写作时要的是能直接落进 [@key, p. N] 的页码。
+            where = h.get("chapter") or h.get("section")
+            page_sfx = " ⟨p.{}⟩".format(h["pages"]) if h.get("pages") else ""
+            print("    [{}·{}] {}{}".format(h.get("role"), where, h.get("text"), page_sfx))
         if len(hits) > MAX_SHOWN_HITS:
             print("    …还有 {} 条命中句（--json 看全部）".format(len(hits) - MAX_SHOWN_HITS))
         print("    ↳ {}:{}".format(e.get("note_file"), e.get("note_line")))
