@@ -1764,7 +1764,9 @@ __PAPERS_JSON__
             'papers': self.excluded,
         }
 
-        excluded_path = self.output_dir / f"{self.run_id}_excluded.json"
+        excluded_dir = self.output_dir / "_archive" / "excluded"
+        excluded_dir.mkdir(parents=True, exist_ok=True)
+        excluded_path = excluded_dir / f"{self.run_id}_excluded.json"
         with open(excluded_path, 'w', encoding='utf-8') as f:
             json.dump(sidecar, f, ensure_ascii=False, indent=2, default=str)
         logger.info(f"  🗂️ 排除固化: {excluded_path} ({len(self.excluded)} 篇)")
