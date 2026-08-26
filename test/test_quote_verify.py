@@ -215,3 +215,23 @@ def test_running_head_removal_does_not_eat_body_lines():
     idx = PageIndex(["305 Harm\n" + body], offset=304)
     assert "24.1%" in idx._body(305)
     assert "305 Harm" not in idx._body(305)
+
+
+def test_hyphen_with_inserted_space_still_matches():
+    """抽文会在连字符后插入空格（p.186 的 "Newton–Raphson" 抽成 "Newton- Raphson"）。
+
+    与「连字符被整个丢掉」是同一类破坏的两种形态，去连字符时必须连两侧空白一起吃掉。
+    """
+    pages = [""] * 14 + ["EM does not share with Newton- Raphson or scoring algorithms "
+                         "the property of yielding estimates asymptotically equivalent"]
+    idx = PageIndex(pages, offset=-12)
+    q = ("EM does not share with Newton-Raphson or scoring algorithms the property of "
+         "yielding estimates asymptotically equivalent")
+    assert verify_quote(q, "3", idx).ok
+
+
+def test_hyphen_run_collapse_does_not_rescue_word_change():
+    pages = [""] * 14 + ["EM does not share with Newton- Raphson or scoring algorithms today"]
+    idx = PageIndex(pages, offset=-12)
+    bad = "EM does not share with Newton-Raphson or clustering algorithms today"
+    assert not verify_quote(bad, "3", idx).ok

@@ -79,15 +79,22 @@ def normalize_lines(text: Optional[str]) -> List[str]:
     return [_WS_RE.sub(" ", ln).strip() for ln in s.split("\n")]
 
 
-def dehyphenate(text: str) -> str:
-    """去掉词内连字符，用于第二轮比对。
+# 连字符及其两侧空白。抽文里同一个词可能出现三种形态，必须一并归一：
+#   repeated-sampling → repeatedsampling （连字符被整个丢掉，p.101）
+#   Newton–Raphson    → "Newton- Raphson" （连字符后多出空格，p.186）
+_HYPHEN_RUN_RE = re.compile(r"\s*-\s*")
 
-    PyMuPDF 抽文会**整个丢掉**某些连字符（实测 Little & Rubin p.101 的
-    "repeated-sampling" 抽成 "repeatedsampling"），这不是断行合并能处理的——原文里
-    根本没有换行。第一轮精确比对失败后用这层重试：仍是精确子串，只是连字符不计，
+
+def dehyphenate(text: str) -> str:
+    """去掉连字符**及其两侧空白**，用于第二轮比对。
+
+    PyMuPDF 抽文对连字符有两类不同的破坏，且都不是断行合并能处理的（原文无换行）：
+    整个丢掉（Little & Rubin p.101 的 "repeated-sampling" 抽成 "repeatedsampling"），
+    以及在连字符后插入空格（p.186 的 "Newton–Raphson" 抽成 "Newton- Raphson"）。
+    两侧空白一并吃掉即可同时覆盖两者。仍是精确子串比对，只是连字符与其邻接空白不计；
     对 ≥32 字符的引句几乎不可能因此撞出假阳性，却能消掉一整类排版假阴性。
     """
-    return text.replace("-", "")
+    return _HYPHEN_RUN_RE.sub("", text)
 
 
 # 页码锚形态："247" / "241-259" / "247,249"。取其中最小与最大页作为检索区间端点。
