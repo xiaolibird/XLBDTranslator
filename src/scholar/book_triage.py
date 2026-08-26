@@ -43,6 +43,9 @@ SCORE_LEGEND = {
 # 末页常是小结——这两处最能判定主题，中间的推导对「值不值得读」没有增量。
 PROBE_HEAD_PAGES = 3
 PROBE_TAIL_PAGES = 2
+# 中段每隔几页抽一页。8 页步长下：14 页的章多看 1 页、54 页的章多看 6 页，
+# 探针覆盖率从 9% 升到 20%，而 prompt 长度只增不到一倍。
+PROBE_MID_STRIDE = 8
 PROBE_PAGE_CHARS = 2500
 
 
@@ -64,7 +67,7 @@ _TRIAGE_PROMPT = """{manifest_prefix}
 原书页码：pp.{p_start}-{p_end}（共 {n_pages} 页）
 子节：{subsections}
 
-## 本章正文节选（首尾若干页；中间未给出）
+## 本章正文节选（首尾若干页 + 中段等距抽样；**不是全章**）
 {probe}
 
 # 评分标准（严格按此口径，不要通货膨胀）
@@ -118,11 +121,22 @@ class ChapterTriage:
 
 
 def chapter_probe(pages: Sequence[str], ch: Chapter,
-                  head: int = PROBE_HEAD_PAGES, tail: int = PROBE_TAIL_PAGES) -> str:
-    """取一章的首尾若干页作为分诊探针（每页截断，避免病态页吃光预算）。"""
-    idxs = list(range(ch.pdf_start, min(ch.pdf_start + head, ch.pdf_end + 1)))
-    tail_start = max(ch.pdf_end - tail + 1, idxs[-1] + 1 if idxs else ch.pdf_start)
-    idxs += [p for p in range(tail_start, ch.pdf_end + 1)]
+                  head: int = PROBE_HEAD_PAGES, tail: int = PROBE_TAIL_PAGES,
+                  stride: int = PROBE_MID_STRIDE) -> str:
+    """取一章的首尾 + 中段等距抽样页作为分诊探针（每页截断，避免病态页吃光预算）。
+
+    中段抽样不是可选的锦上添花：首尾各几页对 6 页的章覆盖率是 83%，对 54 页的章
+    只有 9%。实测代价——Little & Rubin 第 15 章（印刷 pp.351-404）在 shadow-variable
+    轴上被判 0 分，而 proxy pattern-mixture（p.378）、subsample ignorable likelihood
+    （pp.379-380）、tipping point 分析（pp.400-402）全都在那一章的中段，正是本项目
+    最需要的内容。首尾探针**结构上**看不见它们。
+    """
+    covered = list(range(ch.pdf_start, min(ch.pdf_start + head, ch.pdf_end + 1)))
+    tail_start = max(ch.pdf_end - tail + 1, (covered[-1] + 1) if covered else ch.pdf_start)
+    covered += list(range(tail_start, ch.pdf_end + 1))
+    mid_lo = (covered[head - 1] + 1) if len(covered) >= head else ch.pdf_start
+    mid = [p for p in range(mid_lo, tail_start, max(1, stride))]
+    idxs = sorted(set(covered) | set(mid))
     out = []
     for p in idxs:
         i = p - 1

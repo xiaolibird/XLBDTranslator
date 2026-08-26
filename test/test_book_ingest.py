@@ -277,3 +277,30 @@ def test_page_text_columnwise_reads_by_column_not_by_row():
     out = _page_text_columnwise(_Page())
     assert out.split("\n") == ["left line one", "left line two",
                                "right line one", "right line two"]
+
+
+# ---------------- 分诊探针的覆盖率（长章盲区） ----------------
+
+def test_probe_samples_middle_of_long_chapters():
+    """首尾探针对长章是结构性盲区：实测 Rubin 第 15 章（54 页）在 shadow-variable
+    轴被判 0 分，而 proxy pattern-mixture / SSIL / tipping point 全在该章中段。"""
+    from src.scholar.book_triage import chapter_probe
+    pages = ["page {} body text".format(i) for i in range(1, 61)]
+    ch = Chapter(number=15, title="15 MNAR", level=2, pdf_start=1, pdf_end=54)
+    import re
+    seen = [int(m) for m in re.findall(r"\[\[PDF p\.(\d+)\]\]", chapter_probe(pages, ch))]
+    assert seen[:3] == [1, 2, 3] and seen[-2:] == [53, 54]      # 首尾仍在
+    mid = [p for p in seen if 3 < p < 53]
+    assert len(mid) >= 5, "长章必须抽到中段页"
+    assert max(mid) > 40, "中段抽样要铺到接近章尾，不能只在前半"
+
+
+def test_probe_on_short_chapter_stays_contiguous():
+    """短章本就被首尾覆盖完，中段抽样不该重复或越界。"""
+    from src.scholar.book_triage import chapter_probe
+    pages = ["p{}".format(i) for i in range(1, 21)]
+    ch = Chapter(number=1, title="short", level=2, pdf_start=5, pdf_end=10)
+    import re
+    seen = [int(m) for m in re.findall(r"\[\[PDF p\.(\d+)\]\]", chapter_probe(pages, ch))]
+    assert seen == sorted(set(seen))                 # 无重复
+    assert min(seen) >= 5 and max(seen) <= 10        # 不越界到邻章
