@@ -107,7 +107,24 @@ PYTHONPATH=. python3.12 scripts/book_digest.py read --slug <Slug> --apply
   它没经过引文回验，且是分块 LLM 通读的产物，与原文冲突时以 PDF 为准；
 - 逐字英文引句用**双引号包裹**并标 `page` 为**原书页码**（不是 PDF 页序）——
   回验会把它 grep 回原文，对不上即拒收；
-- 不要写省略号引文（`"EM ... convergence"`）：那种引句永远无法逐字回验。
+- 不要写省略号引文（`"EM ... convergence"`）：那种引句永远无法逐字回验；
+- 引句里**不要嵌套双引号**（`"…the model is \"just-identified\""`）：抽取器按成对双引号切片，
+  嵌套会把引句劈开，且转义容易把反斜杠写进正文。改用中文引号或改写句式。
+
+**强烈建议：写稿前先批量预验候选引句**。实测这样做能把回验通过率从一次 81% 提到一次 100%，
+且能在落盘前抓出自己的转写错误：
+
+```python
+from src.scholar.book_ingest import BookManifest, page_index_for
+from src.scholar.quote_verify import verify_quote
+idx = page_index_for(BookManifest.load(Path("output/scholar_notes/books/<Slug>")))
+for pg, q in [("377", "the data supply no evidence for λ: …"), ...]:
+    c = verify_quote(q, pg, idx)
+    if not c.ok: print("⛔", pg, c.reason, q[:70])
+```
+
+⚠️ 预验的必须是**最终要落盘的那个片段**。实测踩过：预验时是一整句、写稿时把它拆成
+「引句A」+ 中文 +「引句B」两段，拆出来的新片段没验过，结果三条里两条不匹配。
 
 **写回 bundle**（`books/<Slug>/ch??.chapter.json`）：
 - `close_reading_final`：严格 `CloseReading` JSON，句级 `tag` 只用
