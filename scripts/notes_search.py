@@ -367,7 +367,8 @@ def main() -> int:
                     help="只看该角色的句子：citable=可引证据 refutable=可反驳 method=方法借鉴")
     ap.add_argument("--tier", choices=["high", "mid", "low"], help="优先级层过滤")
     ap.add_argument("--month", help="限定月份，YYYY / YYYY-MM / YYYY-MM-DD（前缀匹配）")
-    ap.add_argument("--series", choices=["auto", "manual"], help="auto=流水线精读 manual=手动深读")
+    ap.add_argument("--series", choices=["auto", "manual", "book"],
+                    help="auto=流水线精读 manual=手动深读 book=书籍精读")
     ap.add_argument("--full-text-only", action="store_true", help="只要有全文精读的条目")
     ap.add_argument("--mode", choices=["dense", "hybrid", "sparse"], default="hybrid",
                     help="检索模式（默认 hybrid）：dense=纯向量余弦(paper 侧瘦/厚泳道按原始"
