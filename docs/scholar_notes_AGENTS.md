@@ -14,10 +14,12 @@
 | `all_references.json` | **全局书目**(全库去重合并的 CSL-JSON,pandoc 直接挂;自动刷新,勿手改。只含 `duplicate_of==null` 的键——渲染月度 md 本身请仍用同月 references.json) |
 | `科研札记_YYYY-MM_全文精读.md` | **自动**月度札记(`series:"auto"`):Gmail/检索 → 三态筛选 → top-5 全文精读 |
 | `科研札记_YYYY-MM_手动精读.md` | **手动**深度精读(`series:"manual"`):人给 PDF,agent 亲读整本 + 脚本交叉核验,通读更彻底 |
+| `科研札记_YYYY-MM-DD-<BookSlug>_书籍精读.md` | **书籍**按章精读(`series:"book"`):整本教科书/工具书按目录切章 → 对研究问题分诊 → 只深读值得读的章 → 逐字引句 grep 回原文回验。句级证据带原书页码锚,引用须用定位符 `[@key, p. N]` |
 | `科研札记_YYYY-MM_{全文,手动}精读.references.json` | 该札记 CSL-JSON 参考文献(pandoc 可直接用) |
 | `科研札记_YYYY-MM_{全文,手动}精读.index.json` | 该札记结构化 sidecar(索引数据源,一般不用直接读) |
 | `科研札记_YYYY-MM_{全文,手动}精读.docx` | 样式化 Word 版(人读,agent 勿解析) |
 | `manual/YYYY-MM/*.paper.json` | 手动精读的中间 bundle(内部用,勿检索) |
+| `books/<BookSlug>/` | 书籍精读的工作区(`book.manifest.json` 书目+目录+页偏移+分诊矩阵、`chNN.chapter.json` 章 bundle、`triage.md` 热力图;内部用,勿检索) |
 | `topics/<slug>.md` | **概念页**(按概念横切全库的活综述,见下) |
 | `topics/INDEX.md` | 概念页目录 |
 
@@ -319,10 +321,10 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
 
 ## 索引 schema(`papers[]` 每条)
 
-`citekey, citekey_source("zotero"|"fallback"|"unknown"|"missing"——missing=占位键勿引用), series("auto"自动流水线|"manual"手动深读), doi, arxiv_id, title, title_zh, authors[], year, month("YYYY-MM"), journal, url, priority_tier("high"|"mid"|"low"), priority_rank, priority_score, decision("INCLUDE"|"MAYBE"), one_line(一句话用处), bucket[], role(筛选角色,非句级), confidence, flags[], has_full_text_reading, reading_source, tag_counts{role计数:citable/refutable/method}, highlights[](句级可调取,见下), note_file, note_line, note_heading, references_json, dedup_key, duplicate_of(非 null=重复条目,检索时应过滤), duplicate_months[]`
+`citekey, citekey_source("zotero"|"fallback"|"unknown"|"missing"——missing=占位键勿引用), series("auto"自动流水线|"manual"手动深读|"book"书籍按章精读), doi, arxiv_id, title, title_zh, authors[], year, month("YYYY-MM"), journal, url, priority_tier("high"|"mid"|"low"), priority_rank, priority_score, decision("INCLUDE"|"MAYBE"), one_line(一句话用处), bucket[], role(筛选角色,非句级), confidence, flags[], has_full_text_reading, reading_source, tag_counts{role计数:citable/refutable/method}, highlights[](句级可调取,见下), note_file, note_line, note_heading, references_json, dedup_key, duplicate_of(非 null=重复条目,检索时应过滤), duplicate_months[]`
 
 **`highlights[]`——句级取证的核心**:每项 `{role, tag, section, text}`。`role` 是按**对后续工作流的用途**的三分:
-`citable`(可引用证据:含数字/效应量/可溯源结果)、`refutable`(可反驳观点:作者主张/可质疑处,写 critique 的靶子;手动精读还含对抗核验的纠错条)、`method`(方法论借鉴:可迁移的方法思路)。`tag` 是对应的中文原标记,`section` 是精读分节名(溯源用)。工作流按 role 跨全库直取句子,无需打开 md。历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃),新精读由 LLM/subagent 直接精确产出。
+`citable`(可引用证据:含数字/效应量/可溯源结果)、`refutable`(可反驳观点:作者主张/可质疑处,写 critique 的靶子;手动精读还含对抗核验的纠错条)、`method`(方法论借鉴:可迁移的方法思路)。`tag` 是对应的中文原标记,`section` 是精读分节名(溯源用)。**书籍条目的 highlights 额外带 `pages`**(原书页码锚,如 "247"/"241-259"),写作时据此产出 pandoc 定位符 `[@key, p. 247]`;专著的 `section` 形如 `Ch.7 · pp.151-184 · <章名> · <分节>`,可直接溯源到章。工作流按 role 跨全库直取句子,无需打开 md。历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃),新精读由 LLM/subagent 直接精确产出。
 
 顶层还有 `months{}`(按**文件 stem** 键,含 month/series)、`citekey_collisions[]`(撞键警告,见下)与
 `title_near_duplicates[]`(疑似同文待人工确认,见下)。

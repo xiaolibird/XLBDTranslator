@@ -239,12 +239,13 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 | `citekey` / `doi` / `arxiv_id` | 身份键(citekey 是引用键;跨源身份是 `dedup_key`) |
 | `title` / `title_zh` / `year` / `journal` | 基本书目 |
 | `month` | 归属月份键(仅分组用,**定位文件用 note_file**) |
-| `series` | `auto`(月度回填+周札记) / `manual`(手动精读) 二分 |
+| `series` | `auto`(月度回填+周札记) / `manual`(手动精读) / `book`(整本书按章精读) **三分** |
 | `note_file` / `note_line` / `note_heading` | 札记定位:裸文件名 / 标题行号(1-based) / 标题行原文 |
 | `decision` / `priority_tier` / `one_line` | 筛选裁决 / 优先级档 / 一句话判词 |
 | `role` / `bucket` / `flags` | 主 role 轴 / 研究维度 / 旗标(含 `⚑ RETRACTED`) |
 | `has_full_text_reading` / `reading_depth` | 是否有全文精读 / 精读深度 |
-| `highlights[]` | 句级证据 `{role, tag, section, text}` |
+| `highlights[]` | 句级证据 `{role, tag, section, text}`；书籍条目**额外带 `pages`**(原书页码锚)与 `chapter` |
+| 书籍/章节字段 | `entry_type`(`book`专著/`chapter`编著的一章，缺席=文章) / `isbn` / `publisher` / `edition` / `editors[]` / `book_key`(章所属书的 citekey) / `container_title` / `chapter_number` / `page_range` |
 | `duplicate_of` | 非 null = 重复条目(指向 keeper 的 dedup_key)——**取数一律过滤掉** |
 
 ## 语义检索
@@ -253,8 +254,10 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 "informative missingness"）。这类场景改用语义检索（在 XLBDTranslator-dev 仓库根目录跑）：
 
 ```bash
-PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py <中文或英文查询...> [--role citable|refutable|method] [--limit N] [--cite] [--json]
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py <中文或英文查询...> [--role citable|refutable|method] [--series auto|manual|book] [--book CITEKEY] [--limit N] [--cite] [--json]
 ```
+
+**书籍证据**：`--series book` 只看书、`--book <citekey>` 只看某一本（专著传书的 citekey，编著传所属书的 `book_key`，两侧都收）。书籍命中的句子在人读模式显示为 `⟨p.247⟩`，`--cite` 会产出带 pandoc 页码定位符的引用串 `[@little2020rubin, p. 247]`——**引用几百页的书必须带定位符**，不带等于没标出处。
 
 `--mode` 默认 `hybrid`（向量 + BM25 关键词 RRF 融合，也可 `--mode dense`/`--mode sparse`；
 `sparse` 查询时不需要 Ollama，但仍要求向量库已构建）。分工：确切术语/citekey/role 硬门槛

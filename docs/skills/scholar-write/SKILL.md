@@ -28,7 +28,14 @@ description: 用本机科研札记文献库支撑论文写作：按 role 轴(可
 
 常用选项：`--tier high`（只看高优先级）、`--full-text-only`（只要有全文精读的）、
 `--series manual`（只要手动深读 keeper，证据最厚）、`--month 2026-07`（也接受 `2026`）、
-`--limit N`（0=不限）、`--cite`（吐可直接粘贴的 `[@a; @b]`）、`--json`（结构化，带 `total`）。
+`--limit N`（0=不限）、`--cite`（吐可直接粘贴的 `[@a; @b]`）、`--json`（结构化，带 `total`）、
+`--series auto|manual|book`、`--book CITEKEY`（只看某一本书）。
+
+⚠️ **引书必须带页码定位符**。库里现有整本书的按章精读（`series=book`，CSL type 为 `book`/`chapter`），
+其句级证据带 `pages` 字段。`--cite` 会自动产出 `[@little2020rubin, p. 247]` 这种 pandoc 定位符语法；
+手写引用时也要补上——一本 460 页的书只写 `[@little2020rubin]` 等于没标出处，审稿人无法核对。
+编著文集（如 JAMA Users' Guides）按**章**引用，各章有独立 citekey（`levine2015Harm`），
+不要引整本书的 key。
 
 **匹配语义**：入选要求每个关键词都出现在 标题/一句话用处/任一 highlight 句中；但**传了
 `--role` 时必须有该 role 的句子真含关键词**才入选——否则会拿到文不对题的句子当证据
