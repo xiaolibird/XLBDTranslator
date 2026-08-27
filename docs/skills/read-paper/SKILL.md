@@ -126,6 +126,21 @@ json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
 **写完必须自检**：读回 bundle，确认 `close_reading_final['sections']` 是 **list**（不是 str）、
 每个元素是 dict、各节句数与你的终稿对得上，再进第 5 步。
 
+⚠️ **句级 `page` 必须是字符串，写成整数会让整月重建把这篇拒收。** `CloseReadSentence.page`
+的类型是 `Optional[str]`（书籍链路要放 `"241-259"` 这种区间，所以是 str 不是 int）。标页码时
+很容易顺手写 `"page": 7`，pydantic 会对每一句报 `Input should be a valid string`——一篇 82 句
+的精读就是 77 条 validation error，finalize 打印 `⛔ bundle 结构非法，跳过` 然后**按剩下的
+bundle 重建整月**，这篇静默不在产物里。实测踩过：DrFuse 那篇核验全做完了，第一次 finalize
+出来 95 篇、它不在其中，回看日志才发现。
+自检时把 `page` 一并查了（顺带查 `tag` 只用三值或 null）：
+```python
+tp = {type(x.get('page')).__name__ for s in crf['sections'] for x in s['sentences']}
+tg = {x.get('tag') for s in crf['sections'] for x in s['sentences']}
+assert tp <= {'str', 'NoneType'}, tp          # 整数会被拒收
+assert tg <= {'可引用证据', '可反驳观点', '方法论借鉴', None}, tg
+```
+`cross_check_report` 里 `corrected[].page` 是另一回事，那里用 int 正常——别把两处搞混。
+
 ### 5. finalize —— 归档
 ```bash
 PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/read_pdf.py finalize <bundle 路径>
