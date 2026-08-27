@@ -70,10 +70,12 @@ from .notes_index import write_if_changed
 from .topics import (
     DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, DEFAULT_USER_ZONE, GEN_BEGIN,
     GEN_END, TOPICS_DIRNAME, TopicError, TopicSpec, ValidationReport, _CITE_RE,
-    _EVIDENCE_ROW_RE, _clean_text, _render_frontmatter, _resolve_refs,
+    _EVIDENCE_ROW_RE, _check_grounding, _clean_text, _render_frontmatter, _resolve_refs,
+    flatten_linebreaks,
     parse_synthesis, read_existing, render_evidence_block, retrieve_evidence,
     select_evidence, to_wiki_links,
 )
+from .thresholds import QA_GAP_EVIDENCE_MIN_SIM
 from .vault import (
     GEN_BEGIN_RE, ROLE_LABEL, _gen_hash, extract_user_zone,
     generated_block_tampered, split_frontmatter, tokenize,
@@ -607,6 +609,11 @@ def validate_qa(data: dict, evidences) -> Tuple[dict, ValidationReport]:
                 continue
             # 整条被丢弃时它正文里的编号也随之消失，不能算"被引用过"
             inline.update(mine)
+            # 数字接地（P1 第一层）：正文里已回译成 [@key] 的编号也要算进匹配池的
+            # 来源，故把 refs 与 mine 并起来——否则"引用写在正文里"的那些论断会
+            # 因为池子太小而被误判失真。
+            _check_grounding(text, sorted(set(refs) | mine, key=lambda r: int(r[1:])),
+                             ev_map, report, len(evidences), "论断")
             out.append({"text": text, "refs": refs, "citekeys": _refs_to_keys(refs)})
             report.kept_claims += 1
         return out
@@ -795,7 +802,7 @@ def render_qa_block(question: str, qa: dict, evidences, *,
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
             L.append("  <small>{}</small>".format(e.title))
-        L.append("  > {}".format(e.text.strip().replace("\n", " ")))
+        L.append("  > {}".format(flatten_linebreaks(e.text.strip())))
     if nearby_papers:
         # B2：窄而深让 11 名之后的论文从页面上**彻底消失**，连被肉眼逮到的机会都没有。
         # 旧版至少让它们以 ○ 的身份躺在证据表里（上一轮验收方逮到 `little1988Test`
@@ -853,6 +860,8 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
         "dropped_claims": report.dropped_claims,
         "invalid_refs": report.invalid_refs,
         "stripped_cites": report.stripped_cites,
+        "numbers_checked": report.numbers_checked,
+        "ungrounded_numbers": report.ungrounded_numbers,
         "tags": ["札记/问答归档"],
     }
     items = dict(managed)
@@ -998,31 +1007,14 @@ def strip_gap_scaffold(gap: str) -> str:
 # 两档之间完全不重叠——**这条通道本来就是干净的，本轮一个字不改**。
 DEFAULT_GAP_TOPIC_MIN_SIM = DEFAULT_MIN_SIM
 
-# 句级证据通道的命中阈值。**必须比概念页通道高**，而且必须配合脚手架剥离才成立。
+# 句级证据通道的命中阈值。**必须比概念页通道高**，而且必须配合脚手架剥离
+# （`strip_gap_scaffold`）才成立——首版与概念页通道共用 0.55 时，在"库里绝对没有"的
+# gap 上假阳性 5/5。
 #
-# 首版与概念页通道共用 0.55，实测在"库里绝对没有"的 gap 上假阳性 **5/5**：
-# 「AlphaFold 置信度校准」命中 0.651、「量子退火加速比」0.634、「中世纪欧洲农业史」
-# 0.590、「NICU 喂养耐受性量表」0.673、「机器人抓取样本效率」0.675——
-# 而真实 gap 的命中分是 0.699~0.728。**重叠，没有任何阈值能分开。**
-# 这条防线存在的理由恰恰是"答错了还能核对，指错方向不会去核对"，
-# 假阳性 5/5 等于用户按它去看 5 次白跑 5 次，比没有这条还坏。
-#
-# 剥掉否定脚手架（`strip_gap_scaffold`）之后重新标定
-# （bge-m3，8 条真实 gap + 8 条构造成"库里绝对没有"的 gap，全库 17775 条 highlight）：
-#   真 gap 句级 top1： min 0.649  中位 0.695  max 0.753
-#   假 gap 句级 top1： min 0.334  中位 0.575  max 0.641
-#   阈值 0.55: 真 8/8 | 假 5/8
-#   阈值 0.60: 真 8/8 | 假 3/8
-#   阈值 0.65: 真 7/8 | 假 0/8      ← 取这个
-#   阈值 0.69: 真 4/8 | 假 0/8
-#   阈值 0.75: 真 1/8 | 假 0/8
-# 两档的实测边界是 0.641/0.649，中间只有 0.008 宽；取 0.65 是**偏向精确率**的选择：
-# 这一节的价值全在"它响的时候值得去看"，多漏一条真 gap 只是少一行提示，
-# 多响一条假 gap 会把整条防线的可信度打掉。
-#
-# ⚠️ 与 notes_search 的 0.65 数值相同**纯属巧合**：那个是 paper 级口径（标题+一句话），
-# 这个是 highlight 级 + 剥完脚手架的名词短语。不要因为"都是 0.65"就把两处并到一起。
-DEFAULT_GAP_EVIDENCE_MIN_SIM = 0.65
+# 值与完整标定档案（真/假 gap 各 8 条的阈值扫描表、为何偏向精确率、为何不能与
+# notes_search 的同名数值并档）已于 2026-08-27 搬到 thresholds.QA_GAP_EVIDENCE_MIN_SIM。
+# 这里只保留别名：改值请去那里，并按档案复跑标定。
+DEFAULT_GAP_EVIDENCE_MIN_SIM = QA_GAP_EVIDENCE_MIN_SIM
 
 # 每条 gap 最多贴几条命中。从 2 提到 4：实测某条 gap 的**第 3 名**命中是
 # `toye2025Benchmarking` 0.722，原句「全文 0 次出现 identifiability、ignorability、
@@ -1657,7 +1649,7 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
     for p in (index.get("papers") or []):
         if isinstance(p, dict) and p.get("citekey"):
             hl_by_key.setdefault(p["citekey"], set()).update(
-                (h.get("text") or "").strip().replace("\n", " ")
+                flatten_linebreaks((h.get("text") or "").strip())
                 for h in (p.get("highlights") or []) if isinstance(h, dict))
     out: List[QAAudit] = []
     for path in sorted(Path(qa_dir).glob("*.md")):

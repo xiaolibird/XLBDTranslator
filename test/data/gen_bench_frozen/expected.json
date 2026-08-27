@@ -1,0 +1,23 @@
+{
+  "qa-mnar-ehr-1f424623.md": {
+    "n_claims": 19,
+    "numeric_total": 12,
+    "numeric_grounded": 11,
+    "numeric_derived": 0,
+    "numeric_ungrounded": 1
+  },
+  "icu-benchmarks.md": {
+    "n_claims": 51,
+    "numeric_total": 318,
+    "numeric_grounded": 306,
+    "numeric_derived": 9,
+    "numeric_ungrounded": 3
+  },
+  "shadow-variable.md": {
+    "n_claims": 45,
+    "numeric_total": 20,
+    "numeric_grounded": 20,
+    "numeric_derived": 0,
+    "numeric_ungrounded": 0
+  }
+}

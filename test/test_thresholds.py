@@ -30,3 +30,15 @@ def test_qa_gap_threshold_follows_topics():
     """qa 的概念页通道阈值挂在 topics.DEFAULT_MIN_SIM 上，链条不允许中断。"""
     from src.scholar import qa as Q
     assert Q.DEFAULT_GAP_TOPIC_MIN_SIM is TH.TOPICS_MIN_SIM
+
+
+def test_qa_gap_evidence_threshold_is_wired():
+    """句级通道阈值 2026-08-27 从 qa.py 的字面量搬进 thresholds。
+
+    这条通道与概念页通道**有意不同档**（前者剥完脚手架后真/假 gap 只差 0.008，
+    取值偏向精确率），所以它是独立常量而非挂在 TOPICS_MIN_SIM 上——但必须引用
+    thresholds，否则换 embedding 重标定时又会被漏掉。
+    """
+    from src.scholar import qa as Q
+    assert Q.DEFAULT_GAP_EVIDENCE_MIN_SIM is TH.QA_GAP_EVIDENCE_MIN_SIM
+    assert TH.QA_GAP_EVIDENCE_MIN_SIM > TH.TOPICS_MIN_SIM

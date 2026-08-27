@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
+from .grounding import build_pool, check_numbers
 from .notes_index import write_if_changed
 from .thresholds import TOPICS_MIN_SIM, TOPICS_RELATIVE_ALPHA
 from .vault import (
@@ -356,7 +357,7 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
             # （失锚比对基准）此前都没做——一旦某条 highlight 真带了内嵌换行（notes_index.py
             # 记录过"多行标题"这类邮件解析产物历史上真实出现过），页面上已折叠成单行的引文
             # 与这里原始带换行的字符串就永远逐字对不上，会把完全正常的证据误报成"失锚"（G8）。
-            text = (r["text"] or "").strip().replace("\n", " ")
+            text = flatten_linebreaks((r["text"] or "").strip())
             best[cid] = Evidence(
                 ref="", citekey=r["citekey"], text=text, role=r.get("role"),
                 section=r.get("section"), note_file=r.get("note_file"),
@@ -806,6 +807,14 @@ class ValidationReport:
     stripped_cites: int = 0        # 正文里被剥掉的引用标记（[@key] 与不带方括号的裸 @key）
     dropped_disputes: int = 0
     used_refs: int = 0             # 实际被引用到的证据条数（覆盖率分子）
+    # --- 数字接地（P1 第一层，2026-08-27） -------------------------------
+    # 编号校验只保证"引的文献存在"，保证不了"转述没失真"。这三个字段补的是后者里
+    # 可确定性检验的那一半：论断里的数字能不能在它所引证据里找到。
+    # 抓不了措辞失真/立场反转/因果方向倒置——那是第二层（LLM 蕴含）的活。
+    numbers_checked: int = 0       # 检出的数字总数（含派生量）
+    numbers_derived: int = 0       # 论断自己算出的比值/百分点差，不计入失分
+    ungrounded_numbers: int = 0    # 找不到出处的数字 —— **非零就该去看**
+    ungrounded_claims: int = 0     # 含未接地数字的论断条数
 
 
 def _clean_text(s: Any, report: ValidationReport) -> str:
@@ -817,6 +826,13 @@ def _clean_text(s: Any, report: ValidationReport) -> str:
     cleaned, n = _BARE_CITE_RE.subn("", text)
     if n:
         report.stripped_cites += n
+    # ⚠️ 换行必须先归一成空格（2026-08-27 对抗审核抓出）：只压缩 `\s{2,}` 会让
+    # **单个** \n 原样留在论断里，渲染成 `- 前半句\n后半句 [@key]` 两个物理行。
+    # 而 page_parse 收论断的判据是「以 `- ` 开头**且**行内含 [@key]」——第一行没
+    # 引用、第二行没前缀，**两行都被跳过，整条论断从两个审计器里消失**。实测生产
+    # 侧正确抓到了那条的失真，事后审计却解析出 0 条论断，还顺带制造一条假 mismatch。
+    # 口径与渲染证据表、构造 Evidence 两处共用 flatten_linebreaks，不许各写一套。
+    cleaned = flatten_linebreaks(cleaned)
     # 剥引用后可能留下 "……方法 ，" 之类的空档
     return re.sub(r"\s{2,}", " ", cleaned).strip().rstrip("，,、 ")
 
@@ -840,6 +856,55 @@ def _resolve_refs(refs: Any, ev_map: Dict[str, Evidence],
         else:
             report.invalid_refs += 1
     return out
+
+
+def flatten_linebreaks(s: str) -> str:
+    """把一切会被 `str.splitlines()` 断行的字符归一成空格。
+
+    只 `.replace("\\n", " ")` 是不够的——`splitlines()` 还认 `\\r`、`\\x0b`、`\\x0c`、
+    `\\u2028`、`\\u2029`。任何一个漏网，落盘页面里那条就会被 `page_parse` 拦腰截断：
+    证据原句尾段（连同它携带的数字）从匹配池里消失，制造假失真 + 假 mismatch。
+    渲染证据表、构造 Evidence、清洗论断三处必须用同一个口径。
+    """
+    # re 支持 \uXXXX 转义；这里**必须**写转义而不是裸字符——把 U+2028/U+2029
+    # 直接敲进源码，编辑这个文件的工具自己就会在那里断行（改这段注释时实际踩过）。
+    return re.sub(r"[\r\n\x0b\x0c\u2028\u2029]+", " ", s or "")
+
+
+def _check_grounding(text: str, refs: Sequence[str], ev_map: Dict[str, Evidence],
+                     report: ValidationReport, n_evidence: int,
+                     where: str = "") -> None:
+    """数字接地检查：论断里的数字必须能在它所引证据里找到。
+
+    只记账不拦截——**先观察一轮再决定要不要收紧**。理由是这一层的误报代价很实在：
+    一旦开始拒绝落盘，规则里任何一个没想到的合法写法（专名里的数字、论断自己算的
+    比值、页面元信息）都会静默吃掉真论断。当前基线 538/542 接地、3 条报警且都
+    已判读，样本仍不够支撑"直接拦"这个决定。
+
+    匹配池只有 **原句 + 标题**（口径见 grounding.build_pool）——曾并入 citekey /
+    年份 / 出处，实测对接地贡献为 0 而假接地可测，已删。
+    """
+    if not text or not refs:
+        return
+    # 池只放证据原句与标题——citekey / 年份 / 出处实测贡献 0 个接地数字，
+    # 却制造可测的假接地。口径与 page_parse.EvidenceRow.pool 一致。
+    pool = build_pool(*(
+        part for r in refs for part in (ev_map[r].text, ev_map[r].title)
+    ))
+    # 元数字豁免："这 60 条证据中仅一条……"说的是本页证据条数，来源是页面元信息
+    chk = check_numbers(text, pool, exempt=[n_evidence])
+    report.numbers_checked += chk.total
+    report.numbers_derived += len(chk.derived)
+    if chk.ungrounded:
+        report.ungrounded_numbers += len(chk.ungrounded)
+        report.ungrounded_claims += 1
+        logger.warning(
+            "  ⚠️ 数字未接地{}：{} · 引用 {} · {}",
+            "（{}）".format(where) if where else "",
+            "、".join(chk.ungrounded),
+            " ".join(ev_map[r].citekey for r in refs[:4]),
+            text[:90],
+        )
 
 
 def validate_synthesis(data: dict, evidences: Sequence[Evidence]
@@ -875,6 +940,7 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
             if not text or not refs:
                 report.dropped_claims += 1
                 continue
+            _check_grounding(text, refs, ev_map, report, len(evidences), "论断")
             claims.append({"text": text, "refs": refs, "citekeys": _refs_to_keys(refs)})
             report.kept_claims += 1
         if claims:
@@ -902,6 +968,9 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
         if {ev_map[r].citekey for r in refs_a} == {ev_map[r].citekey for r in refs_b}:
             report.dropped_disputes += 1
             continue
+        # 分歧两侧同样带数字，同样会失真——bench 是在渲染后的页面上测的，两侧都算
+        _check_grounding(pos_a, refs_a, ev_map, report, len(evidences), "分歧·一方")
+        _check_grounding(pos_b, refs_b, ev_map, report, len(evidences), "分歧·另一方")
         disputes.append({
             "issue": issue,
             "position_a": pos_a, "refs_a": refs_a, "citekeys_a": _refs_to_keys(refs_a),
@@ -988,7 +1057,7 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
             lines.append("  <small>{}</small>".format(e.title))
-        lines.append("  > {}".format(e.text.strip().replace("\n", " ")))
+        lines.append("  > {}".format(flatten_linebreaks(e.text.strip())))
     return "\n".join(lines)
 
 
@@ -1044,6 +1113,8 @@ def build_frontmatter(spec: TopicSpec, synthesis: dict, evidences: Sequence[Evid
         "dropped_claims": report.dropped_claims,
         "invalid_refs": report.invalid_refs,
         "stripped_cites": report.stripped_cites,
+        "numbers_checked": report.numbers_checked,
+        "ungrounded_numbers": report.ungrounded_numbers,
         "tags": ["札记/概念页", "概念/{}".format(spec.slug)],
     }
     items = dict(managed)
@@ -1453,7 +1524,7 @@ def audit_topic_pages(topics_dir: Path, index: dict) -> List[PageAudit]:
             # "失锚"（G8）。目前全库 highlight 都不含内嵌换行，不是活 bug，但
             # notes_index.py 记录过"多行标题"（邮件解析产物）历史上真实出现过。
             hl_by_key.setdefault(p["citekey"], set()).update(
-                (h.get("text") or "").strip().replace("\n", " ")
+                flatten_linebreaks((h.get("text") or "").strip())
                 for h in (p.get("highlights") or []) if isinstance(h, dict))
     idx_at = str(index.get("generated_at") or "")
 

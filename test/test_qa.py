@@ -1551,14 +1551,24 @@ def test_below_threshold_reference_is_empty_once_something_fires(tmp_path):
 def test_threshold_constants_carry_their_calibration_table():
     """P3 那次 `min_sim` 的教训：形状锁住了、数值没锁。这一条要求每个阈值旁边
     都留下**实测分档表**（格式对齐 `topics.DEFAULT_MIN_SIM`），
-    否则下一个人只能靠拍脑袋调它。"""
-    src = Path("src/scholar/qa.py").read_text(encoding="utf-8")
-    for name in ("DEFAULT_TOPIC_MATCH_THRESHOLD", "DEFAULT_SIMILAR_EMBED_THRESHOLD",
-                 "DEFAULT_GAP_EVIDENCE_MIN_SIM"):
+    否则下一个人只能靠拍脑袋调它。
+
+    档案跟着值走：2026-08-27 起 gap 句级通道的值搬进 thresholds.py，分档表也一并
+    搬过去了，所以这里按"值定义在哪个文件、就去哪个文件查它的表"来断言——查的是
+    档案在不在，不是档案在哪个文件里。
+    """
+    # (常量名, 定义它的源文件)
+    for name, path in (
+        ("DEFAULT_TOPIC_MATCH_THRESHOLD", "src/scholar/qa.py"),
+        ("DEFAULT_SIMILAR_EMBED_THRESHOLD", "src/scholar/qa.py"),
+        ("QA_GAP_EVIDENCE_MIN_SIM", "src/scholar/thresholds.py"),
+    ):
+        src = Path(path).read_text(encoding="utf-8")
         head = src[:src.index("\n{} =".format(name))]
         block = head[head.rindex("\n\n"):]
-        assert "阈值 0." in block, "{} 缺实测分档表".format(name)
-        assert "bge-m3" in block, "{} 的分档表没写清楚是拿什么模型标的".format(name)
+        assert "阈值 0." in block, "{} 缺实测分档表（{}）".format(name, path)
+        assert "bge-m3" in block, \
+            "{} 的分档表没写清楚是拿什么模型标的（{}）".format(name, path)
 
 
 # ---------------------------------------------------------------------------
