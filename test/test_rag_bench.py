@@ -102,6 +102,45 @@ def test_cli_entry_passes_through_normal_return(monkeypatch):
     assert ns.cli_entry() == 0
 
 
+# ---------------- --rerank 三档透传（A/B 对照的命令行接线）----------------
+
+def _capture_cmd(monkeypatch):
+    """桩 subprocess.run，记录 rag_bench 拼出的 notes_search 命令行。"""
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(list(cmd))
+        return _fake_proc(0, stdout=json.dumps({"results": []}))
+    monkeypatch.setattr(rb.subprocess, "run", fake_run)
+    return cmds
+
+
+def test_rerank_auto_passes_no_flag(monkeypatch):
+    """auto=跟随 notes_search 自己的默认：命令行上不出现任何 rerank 开关。"""
+    cmds = _capture_cmd(monkeypatch)
+    rb.run_one("q", "hybrid", "auto", 10, rerank="auto")
+    assert "--rerank" not in cmds[0] and "--no-rerank" not in cmds[0]
+
+
+def test_rerank_default_param_is_auto(monkeypatch):
+    """不传 rerank 参数 = auto（锁默认值，防止改签名时悄悄变成强制开/关）。"""
+    cmds = _capture_cmd(monkeypatch)
+    rb.run_one("q", "hybrid", "auto", 10)
+    assert "--rerank" not in cmds[0] and "--no-rerank" not in cmds[0]
+
+
+def test_rerank_on_passes_rerank_flag(monkeypatch):
+    cmds = _capture_cmd(monkeypatch)
+    rb.run_one("q", "dense", "auto", 10, rerank="on")
+    assert "--rerank" in cmds[0] and "--no-rerank" not in cmds[0]
+
+
+def test_rerank_off_passes_no_rerank_flag(monkeypatch):
+    cmds = _capture_cmd(monkeypatch)
+    rb.run_one("q", "hybrid", "auto", 10, rerank="off")
+    assert "--no-rerank" in cmds[0] and "--rerank" not in cmds[0]
+
+
 # ---------------- nDCG@10 / MRR（对齐 BEIR/MTEB 口径）----------------
 
 def test_ndcg_perfect_and_empty():

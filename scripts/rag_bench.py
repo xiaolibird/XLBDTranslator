@@ -93,12 +93,17 @@ def load_cases(path: Path):
     return cases
 
 
-def run_one(query: str, mode: str, level: str, limit: int, lanes: str = "both"):
+def run_one(query: str, mode: str, level: str, limit: int, lanes: str = "both",
+            rerank: str = "auto"):
     """跑一条 query，返回 (rank(1-based，未命中 None 用于 gold 判定的候选列表), error)。"""
     cmd = [sys.executable, str(SEARCH_SCRIPT), query,
            "--json", "--mode", mode, "--limit", str(limit), "--paper-lanes", lanes]
     if level != "auto":
         cmd += ["--level", level]
+    if rerank == "on":
+        cmd += ["--rerank"]
+    elif rerank == "off":
+        cmd += ["--no-rerank"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO), timeout=120)
     except subprocess.TimeoutExpired:
@@ -136,6 +141,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=10, help="每条 query 取前 N 位（默认 10）")
     ap.add_argument("--paper-lanes", choices=["both", "thin"], default="both",
                     help="透传 notes_search：thin=喂厚前行为（A/B 对照）")
+    ap.add_argument("--rerank", choices=["auto", "on", "off"], default="auto",
+                    help="透传 notes_search 的重排开关（A/B 对照）：auto=跟 notes_search "
+                         "默认（hybrid 开、dense/sparse 关）；on/off=显式 --rerank/--no-rerank")
     ap.add_argument("--json", action="store_true", dest="as_json")
     args = ap.parse_args()
 
@@ -158,7 +166,7 @@ def main() -> int:
     try:
         for c in cases:
             ranked, err = run_one(c["query"], args.mode, args.level, args.limit,
-                                  lanes=args.paper_lanes)
+                                  lanes=args.paper_lanes, rerank=args.rerank)
             if ranked is None:
                 results.append({**c, "rank": None, "error": err})
                 continue

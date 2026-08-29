@@ -21,7 +21,8 @@ citekey/role 硬门槛场景用它）；本工具是语义检索，专治"中文
   hybrid ：默认模式。highlight 侧 dense+BM25 两路、paper 侧瘦(p:)/厚(ab:摘要) dense
            +BM25 三路，各取 top-200（TOP_K_PER_LEVEL）后 RRF(k=60) 融合排序；展示用的
            score 优先给 dense 余弦（人更好理解 0~1 的数），只有 dense 没命中、纯靠
-           关键词命中的条目才展示 RRF 分并标 [关键词]。
+           关键词命中的条目才展示 RRF 分并标 [关键词]。最终展示集默认再经
+           bge-reranker-v2-m3 交叉编码器重排（--no-rerank 关，语义见 --rerank）。
            注意：--min-score 在 hybrid 下**同样约束 BM25 单路命中**（回查其余弦，见
            _gate_sparse），所以显式传门槛时 [关键词]/score_kind="rrf" 这条展示路径
            基本不会再出现——纯关键词命中的余弦按定义低于门槛。
@@ -58,6 +59,7 @@ from src.scholar.embeddings import (                                      # noqa
 )
 from src.scholar.embed_store import DB_NAME, INDEX_NAME, VectorStore, VectorStoreError, model_matches  # noqa: E402
 from src.scholar.vault import tokenize                                    # noqa: E402
+from src.scholar import reranker                                          # noqa: E402
 
 ROLE_HINT = {"citable": "可引用证据", "refutable": "可反驳观点", "method": "方法论借鉴"}
 TIER_ORDER = {"high": 0, "mid": 1, "low": 2}
@@ -68,6 +70,7 @@ BM25_K1 = 1.2
 BM25_B = 0.75
 RRF_K = 60
 TOP_K_PER_LEVEL = 200  # RRF 只融合列表内名次；截断越小越易漏掉"两路都中等但 RRF 真值高"的条目。argpartition O(n) 成本≈0
+RERANK_CAP = 100       # 展示集超过它时只重排前 100 条（--limit 0 或大 limit 都会触发，其余保持原序拼在后面）；每对 ~30ms，100 条 ~3s 是上限
 
 
 _TWO_LETTER = re.compile(r"(?<![A-Za-z])([A-Za-z]{2})(?![A-Za-z])")
@@ -381,8 +384,19 @@ def main() -> int:
                     help="最低余弦相似度（默认 {}，集中在 thresholds.py）。dense 与 hybrid "
                          "下**全部候选**都受它约束（hybrid 的 BM25 单路命中回查余弦后过滤）；"
                          "--mode sparse 不算 query 向量，不生效。注意它只管过滤，不管排序——"
-                         "hybrid 仍按 RRF 名次排序，要按分数看排名请用 --mode dense"
+                         "hybrid 按 RRF 名次再经 reranker 重排，要按分数看排名请用 "
+                         "--mode dense（dense 默认不重排，见 --rerank）"
                          .format(NOTES_SEARCH_MIN_SCORE))
+    ap.add_argument("--rerank", action=argparse.BooleanOptionalAction, default=None,
+                    help="对最终展示集用 bge-reranker-v2-m3 交叉编码器重排（试验依据 "
+                         "docs/decisions/rerank_hyde_experiment_2026-08.md：hybrid 87 case "
+                         "66→75@1）。默认 auto：hybrid 开、dense/sparse 关——dense 的"
+                         "「按余弦分看排名」契约是 scholar-search 判重流程的依赖，重排会破坏"
+                         "分数单调性。只重排、不改集合成员，--min-score 过滤在重排之前按余弦"
+                         "执行；rerank 分与任何 min_sim 门槛**不可比**。模型不可用/打分异常时"
+                         "自动降级回原排序（stderr 提示，退出码不变）。注意：--role/--book 等"
+                         "过滤组合下的重排未经 bench 标定（doc 文本恒取篇级摘要/瘦文本，"
+                         "不是命中的句级证据）")
     ap.add_argument("--limit", type=int, default=10, help="最多显示条数（默认 10，0=不限）")
     ap.add_argument("--cite", action="store_true", help="只输出可直接粘贴的 [@a; @b] 引用串")
     ap.add_argument("--book", default=None, metavar="CITEKEY",
@@ -540,13 +554,60 @@ def main() -> int:
     shown = rows if args.limit == 0 else rows[:args.limit]
     truncated = len(rows) - len(shown)
 
+    # ---- post-retrieval 重排（纯重排：不改集合成员、不动余弦展示分/门槛语义）----
+    # 默认 auto：hybrid 开（试验 66→75@1）、dense/sparse 关（dense 保「按分数看排名」契约，
+    # sparse 未做过 bench 验证）。doc 文本优先厚 chunk（ab:，title+判词+摘要），无摘要篇
+    # 退瘦文本——与试验口径一致。
+    rerank_on = args.rerank if args.rerank is not None else (args.mode == "hybrid")
+    reranked = False
+    if rerank_on and len(shown) >= 2:
+        abstract_texts = {r["citekey"]: r["text"]
+                          for r in store.records if r["level"] == "abstract"}
+        head = shown[:RERANK_CAP]
+        docs = [abstract_texts.get(row["citekey"]) or paper_meta[row["citekey"]]["text"]
+                for row in head]
+        scores = None
+        try:
+            scores = reranker.rerank_scores(query, docs)
+        except reranker.RerankUnavailable as e:
+            print("⚠️ reranker 不可用（{}），按原排序输出；--no-rerank 可关掉本提示"
+                  .format(e), file=sys.stderr)
+        except Exception:  # noqa: BLE001 —— 铁律：reranker 任何失败都不得挡住检索主路径
+            # 打分期异常（MPS 数值故障/OOM/tokenizer 炸）≠ 程序错误：检索本身已成功，
+            # exit 4 会把到手的结果全丢，还会连坐杀死 rag_bench 整轮（它把 4 当崩溃）。
+            # traceback 打全保可视性，然后降级——可视性与主路径不二选一。
+            import traceback
+            traceback.print_exc()
+            print("⚠️ reranker 打分异常（见上方 traceback），按原排序输出", file=sys.stderr)
+        if scores is not None and not all(math.isfinite(s) for s in scores):
+            print("⚠️ reranker 产出非有限分数（NaN/inf，疑似数值故障），按原排序输出",
+                  file=sys.stderr)
+            scores = None
+        if scores is not None:
+            for row, s in zip(head, scores):
+                row["rerank_score"] = s
+            # 并列分极多是本库常态（08-22 回测：47 篇里 33 篇并列）——rerank 分并列时
+            # 保原序（sort 稳定），不引入新的迭代序随机性
+            head.sort(key=lambda row: -row["rerank_score"])
+            shown = head + shown[RERANK_CAP:]
+            reranked = True
+            if len(shown) > RERANK_CAP:
+                print("⚠️ 展示超过 {} 条，仅前 {} 条参与重排（其余保持原序拼在后面）"
+                      .format(RERANK_CAP, RERANK_CAP), file=sys.stderr)
+
     if args.as_json:
         print(json.dumps({
             "total": len(rows), "shown": len(shown), "truncated": truncated,
             "query": query, "mode": args.mode,
+            # reranked=true 时 results 按 rerank 分排序，score（余弦）不再单调递减；
+            # 判重等按分数的流程读 score 字段即可，与顺序无关
+            "reranked": reranked,
             "results": [{
                 "citekey": row["citekey"], "score": round(row["score"], 4),
                 "score_kind": row["score_kind"],
+                # rerank 分是交叉编码器 logit，仅用于排序，与 score/min_sim 不可比
+                **({"rerank_score": round(row["rerank_score"], 4)}
+                   if "rerank_score" in row else {}),
                 # 展示分取自篇级还是句级。skill 的「≥0.62 判库内疑似同篇」判据**只对
                 # score_from=="paper" 成立**；match_source 回答的是另一个问题（这篇有没有
                 # 句级命中），两者不可互相替代：paper 0.71+句级 0.55 与 paper 0.55+句级 0.71
@@ -599,9 +660,10 @@ def main() -> int:
         else:
             print("无命中（试试换个说法、降低 --min-score、去掉 --role/--tier 过滤）")
         return 1
-    print("语义命中 {} 篇（显示 {}）{}\n".format(
+    print("语义命中 {} 篇（显示 {}）{}{}\n".format(
         len(rows), len(shown),
-        "· role={}({})".format(args.role, ROLE_HINT[args.role]) if args.role else ""))
+        "· role={}({})".format(args.role, ROLE_HINT[args.role]) if args.role else "",
+        " · 已重排(bge-reranker，余弦分不再单调)" if reranked else ""))
     for row in shown:
         row_kw = "[关键词] " if row["score_kind"] != "cosine" else ""
         # 篇级分数必须打出来：句级命中行一直带分，篇级此前只有标题——判"库里是否已有

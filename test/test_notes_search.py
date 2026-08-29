@@ -268,7 +268,12 @@ def test_level_hits_sparse_lane_gated():
 # ---------------- R1：展示分取篇级最高余弦 / score_from 按来源记账 / JSON 导出 ----------------
 
 def _run_main(monkeypatch, capsys, store, argv, min_score="0.4"):
-    """驱动 main()：桩掉配置加载、库加载与 query 嵌入，只测聚组/展示/输出这一段。"""
+    """驱动 main()：桩掉配置加载、库加载与 query 嵌入，只测聚组/展示/输出这一段。
+
+    恒传 --no-rerank：重排默认 auto（hybrid 开），不关掉的话本组测试的结果顺序会
+    取决于跑测试的机器上有没有 bge-reranker 模型缓存——测试结果依赖机器状态是
+    不可接受的。重排行为有自己的专属测试组（下方「reranker 重排」节，全部打桩）。
+    """
     import sys as _sys
     from types import SimpleNamespace
     monkeypatch.setattr(ns, "load_scholar_settings", lambda cfg, **kw: SimpleNamespace(
@@ -282,7 +287,8 @@ def _run_main(monkeypatch, capsys, store, argv, min_score="0.4"):
         def close(self): pass
     monkeypatch.setattr(ns, "EmbeddingClient", lambda **kw: _C())
     monkeypatch.setattr(ns, "resolve_embedding_base_url", lambda llm: "http://x")
-    monkeypatch.setattr(_sys, "argv", ["notes_search.py"] + argv + ["--min-score", min_score])
+    monkeypatch.setattr(_sys, "argv", ["notes_search.py"] + argv
+                        + ["--min-score", min_score, "--no-rerank"])
     rc = ns.main()
     return rc, capsys.readouterr().out
 
