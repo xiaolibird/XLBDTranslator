@@ -177,7 +177,7 @@ PYTHONPATH=. python3.12 scripts/book_digest.py finalize --slug <Slug>
 ⚠️ **净删除止损闸**（同 read-paper）：有 bundle 被拒收且本轮会净删掉上一轮已归档的
 条目时，**整本一字不动**并退出码 2。修好被点名的 bundle 再重跑；确要删加 `--allow-removals`。
 
-随后确认可检索（**dense 模式**，hybrid 按 RRF 名次排序会给假阴性）：
+随后确认可检索（**dense 模式**，hybrid 按 RRF 名次排序、且默认再经 reranker 重排，都会给假阴性；dense 默认不重排、按余弦降序）：
 ```bash
 PYTHONPATH=. python3.12 scripts/notes_embed.py                       # 增量同步
 PYTHONPATH=. python3.12 scripts/notes_search.py "<该章核心论断>" \

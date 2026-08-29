@@ -71,7 +71,7 @@ query → embed → VectorStore.search（暴力余弦 + 布尔 mask）
   → 渲染落盘 → [离线] audit_*_pages
 ```
 
-**全仓 `grep -rn rerank` 零命中。** 检索之后到拼 prompt 之前，全部动作是「按分数排序 + 按 citekey 分配名额」——`select_evidence`（[`topics.py:247`](../../src/scholar/topics.py#L247)）关心的是多样性配额，不是相关性。
+**全仓 `grep -rn rerank` 零命中。**（2026-08-29 追记：notes_search CLI 层已加 bge-reranker 重排，该 grep 不再为零；但 topics/qa 生成侧链路仍无 rerank，本节论证不受影响。）检索之后到拼 prompt 之前，全部动作是「按分数排序 + 按 citekey 分配名额」——`select_evidence`（[`topics.py:247`](../../src/scholar/topics.py#L247)）关心的是多样性配额，不是相关性。
 
 现有把关只有三类，全部是确定性的词面 / 分数 / 编号检查：
 
@@ -209,7 +209,7 @@ query → embed → VectorStore.search（暴力余弦 + 布尔 mask）
 32 个被引用（实测见「现状盘点」的订正）。它的解法是 `select_evidence` 里加一行
 贪心 MMR/阈值抑制，向量已经在 `store.records` 里，零额外成本。
 
-**待定**：用 cross-encoder rerank 还是 LLM 零样本相关性判定，取决于 P0 基线暴露出的失败模式。两者都要先在 bench 上验证再合入。
+**待定**：用 cross-encoder rerank 还是 LLM 零样本相关性判定，取决于 P0 基线暴露出的失败模式。两者都要先在 bench 上验证再合入。（2026-08-29 追记：CLI 检索层已选 cross-encoder 并上线，见 rerank_hyde_experiment_2026-08.md；生成侧证据链是否引入仍待 P0 基线。）
 
 ---
 

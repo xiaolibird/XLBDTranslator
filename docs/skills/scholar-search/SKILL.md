@@ -92,7 +92,8 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 \
 ```
 
 ⚠️ **`--mode dense --min-score 0.62` 两个参数都不能省**，原因是默认模式有个会坑人的性质：
-默认 `hybrid` 按 RRF **融合名次**排序，**不是按分数排序**，所以 `--limit N` 截出来的前 N 条
+默认 `hybrid` 按 RRF **融合名次**排序（2026-08-29 起默认再经 bge-reranker 重排），
+**两者都不是按余弦分数排序**，所以 `--limit N` 截出来的前 N 条
 里可能根本没有分最高的那条（实测：某查询全库唯一一条 ≥0.62 的命中排在 hybrid 第 12 位，
 `--limit 5` 完全看不到它，照着下结论就会漏报库内强近邻）。`--mode dense` 才按分数降序，
 `--min-score` 直接施加阈值、把判据交给脚本而不是靠眼睛看列表。
@@ -100,18 +101,24 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 \
 **两轮用法（推荐）**：先 `--mode dense` 看分数判强弱，若无输出再跑一次 `--mode hybrid`
 补召回——实测两种模式的失败集**完全不相交**（75-case bench 上两者都丢出 top-10 的 = 0 条，
 并集 @10 = 75/75，而单跑最好的模式只有 70/75）。dense 强在概念换述、hybrid 强在纯关键词
-与中文词面命中，任何一个单跑都会漏掉另一个的主场。
+与中文词面命中，任何一个单跑都会漏掉另一个的主场。（2026-08-29 起第二轮 hybrid 的输出
+顺序是 reranker 序而非 RRF 序，但重排不改集合成员，本段的并集召回结论不受影响；
+hybrid 轮只用来补「有没有」，不要读它的排序位次判分数强弱。）
 
 （2026-08-23 更新：`--min-score` 在 `hybrid` 下**已经能真正过滤**了——此前它只约束 dense
 泳道，BM25 单路命中无门槛地占 `--limit` 名额，导致门槛越高结果越脏；离题探针配
-`--min-score 0.95` 曾能返回 108 篇。**但排序仍是 RRF 名次**，所以上面 `--mode dense`
-这条建议一个字都不能省：要按分数看排名，只有 dense。）
+`--min-score 0.95` 曾能返回 108 篇。**但排序仍不是分数序**——hybrid 按 RRF 名次排序、
+且 2026-08-29 起默认再经 bge-reranker 重排（头行标「已重排」，JSON 有
+reranked/rerank_score；rerank 分与 0.62 等任何门槛不可比），所以上面 `--mode dense`
+这条建议一个字都不能省：要按分数看排名，只有 dense（dense 默认不重排）。）
 `--level paper` 默认走瘦+厚双路：既比标题+一句话判词，也比库内回填的原文摘要——
 每条结果的 `match_source` 标注命中来自 `title` 还是 `abstract`（摘要命中判"疑似同篇"更可信）。
 
-`--json` 输出结构：顶层 `{total, shown, truncated, query, mode, results}`，
-`results[]` 每条含 `citekey / score / score_kind / score_from / match_level / match_source /
-year / title / one_line / hits / note_file / note_line`。
+`--json` 输出结构：顶层 `{total, shown, truncated, query, mode, reranked, results}`，
+`results[]` 每条含 `citekey / score / score_kind / rerank_score(仅重排时出现，交叉编码器
+logit，只用于排序，与 score/0.62 门槛不可比) / score_from / match_level / match_source /
+year / title / one_line / hits / note_file / note_line`。推荐命令走 `--mode dense`，
+正常应见 `reranked: false`。
 **`score_from` 必看**：它说明 `score` 取自篇级（`"paper"`）还是句级（`"highlight"`）。
 下面「≥0.62 判库内疑似同篇」那条判据**只对 `score_from == "paper"` 成立**——句级 0.71
 只说明"库里有一句相关证据"，不等于"库里已有这篇"。`match_source` 回答的是另一个问题

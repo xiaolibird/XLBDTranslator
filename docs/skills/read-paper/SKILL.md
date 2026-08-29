@@ -168,7 +168,7 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 ```bash
 PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_embed.py
 ```
-验证新篇真的可检索（**dense 模式**，hybrid 按 RRF 名次排序会给假阴性）：
+验证新篇真的可检索（**dense 模式**，hybrid 按 RRF 名次排序、且默认再经 reranker 重排，都会给假阴性；dense 默认不重排、按余弦降序）：
 ```bash
 PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_search.py "<新篇的核心论断>" --mode dense --min-score 0.62 --limit 5
 ```

@@ -7,7 +7,8 @@
 
 - 评测脚本：`scripts/rag_bench.py`（子进程跑 `notes_search.py --json`，与真实调用路径一致）
 - case 集：`test/data/rag_bench_cases.jsonl`（65 条，进 git）
-- 命令：`python scripts/rag_bench.py --json`（默认 hybrid + level auto + limit 10）
+- 命令：`python scripts/rag_bench.py --json`（默认 hybrid + level auto + limit 10；
+  2026-08-29 起默认还含 auto 重排，复现本文件历史数字须 `--rerank off`）
 
 case 四类：en_title 15（英文标题原文当查询）、zh_oneline 15（中文判词原文）、
 paraphrase 30（人工写的概念换述，不用标题/判词原词）、legacy_5case 5
@@ -266,3 +267,20 @@ min(len(gold), k) 条理想命中算，对齐 pytrec_eval 口径。`--json` 的 
 新指标上任第一件事是裁决 `_STOP` 领域词实验：hit@k 给的是混杂信号（sparse −2@1 但
 hybrid +1@5），nDCG 直接分出了一边明确损失（sparse −0.0103）一边零收益
 （hybrid +0.0008，噪音级）。详见 `oss_alignment_audit_2026-08.md` B4/B5。
+
+---
+
+## 2026-08-29 追记：reranker 上线，本文件 hybrid 数字全部是重排前口径
+
+自 2026-08-29 起 notes_search 默认 auto 重排（hybrid 开、dense/sparse 关，试验与
+落地形态见 `rerank_hyde_experiment_2026-08.md`）。影响本文件三类表述：
+
+1. 上文所有 hybrid 的 @1/@5/nDCG（63/75/0.8102 等）是**重排前口径**，复现须
+   `rag_bench.py --rerank off`；默认复跑得到的是重排后数字（2026-08-29 当日
+   hybrid+rerank 75@1/79@5/0.8642，注意当日库已含新增条目，off 臂同日实测
+   66/76/0.8162）。
+2. 「hybrid 仍按 RRF 名次排序」现应读作「hybrid 的**集合**仍由 RRF/余弦门槛决定，
+   **展示顺序**默认再经 bge-reranker 重排」——无论 RRF 序还是 rerank 序都不是余弦
+   序，「按分数看排名只有 dense」的结论不变、一个字仍不能放宽（dense 默认不重排）。
+3. 「两轮用法」仍成立：rerank 不改集合成员，并集召回论证（75/75）不受影响，仅
+   hybrid 轮次的输出顺序变了——hybrid 轮只用来补「有没有」，不要读它的位次判强弱。

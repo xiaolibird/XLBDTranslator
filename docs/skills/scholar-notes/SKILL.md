@@ -259,7 +259,7 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 
 **书籍证据**：`--series book` 只看书、`--book <citekey>` 只看某一本（专著传书的 citekey，编著传所属书的 `book_key`，两侧都收）。书籍命中的句子在人读模式显示为 `⟨p.247⟩`，`--cite` 会产出带 pandoc 页码定位符的引用串 `[@little2020rubin, p. 247]`——**引用几百页的书必须带定位符**，不带等于没标出处。
 
-`--mode` 默认 `hybrid`（向量 + BM25 关键词 RRF 融合，也可 `--mode dense`/`--mode sparse`；
+`--mode` 默认 `hybrid`（向量 + BM25 关键词 RRF 融合，展示集默认再经 bge-reranker 重排——头行会标「已重排」，余弦分不再单调递减，判强弱看分不看位次；也可 `--mode dense`/`--mode sparse`；
 `sparse` 查询时不需要 Ollama，但仍要求向量库已构建）。分工：确切术语/citekey/role 硬门槛
 用 `notes_query`；中文找英文文献、换述同义词、或 `notes_query` 空手时用 `notes_search`。
 
