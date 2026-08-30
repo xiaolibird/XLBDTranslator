@@ -226,8 +226,11 @@ def test_filter_by_llm_batch_failure_undecided_not_excluded(tmp_path, monkeypatc
     assert output.undecided_segments[0].filter_decision.verdict == "undecided"
 
     # sidecar 仍固化该论文供审计，但 keyword_fallback 路径不得再产生 excluded 裁决
-    sidecar = json.loads(
-        (wf.output_dir / "{}_excluded.json".format(wf.run_id)).read_text(encoding="utf-8"))
+    # （f0880f7 起归档进 _archive/excluded/ 子目录；这里用 rglob 找而不硬编码路径，
+    # sidecar 再搬家时本测试不用跟着改——路径本身由 test_excluded_sidecar_written_
+    # with_audit_fields 按 _write_excluded_sidecar 返回值锚定）
+    sidecar_path = next((wf.output_dir).rglob("{}_excluded.json".format(wf.run_id)))
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     rec = next(p for p in sidecar["papers"] if p["paper_id"] == "paper_2")
     assert rec["stage"] == "keyword_fallback"
     assert rec["decision"]["verdict"] == "undecided"

@@ -802,6 +802,7 @@ def _global_pass(papers: List[Dict[str, Any]],
     clusters: Dict[int, List[int]] = {}
     for i in range(len(papers)):
         clusters.setdefault(find(i), []).append(i)
+    stale_dup_keys: List[str] = []
     for members in clusters.values():
         if len(members) < 2:
             continue
@@ -813,6 +814,22 @@ def _global_pass(papers: List[Dict[str, Any]],
             if e["month"] not in keeper["duplicate_months"]:
                 keeper["duplicate_months"].append(e["month"])
             e["duplicate_of"] = "{}@{}".format(keeper["dedup_key"], keeper["month"])
+            # 陈旧键守卫：duplicate 的行内 citekey 应与 keeper 一致。不一致的成因是
+            # fix_citekey_collisions 只改 live 条目——keeper 被改键后，duplicate 所在
+            # 月的 md 里还留着旧键，而旧键此刻可能在全局书目里指向**另一篇论文**，
+            # 从那页抄 [@旧键] 会安静引错（2026-08-31 实锤：2026-06 的 SOFA-2 节
+            # 残留 liufu2026External，该键 live 指向 2023-03 前列腺论文）。
+            # 只告警不自动改写：md 回写有 RENAME_PARTIAL 半改风险，留给人工。
+            if e.get("citekey") and keeper.get("citekey") and e["citekey"] != keeper["citekey"]:
+                stale_dup_keys.append("{} 的 {}（应为 keeper 的 {}，见 {}:{}）".format(
+                    e["month"], e["citekey"], keeper["citekey"],
+                    e.get("note_file"), e.get("note_line")))
+    if stale_dup_keys:
+        logger.warning("  ⚠️ {} 条 duplicate 条目的行内 citekey 与其 keeper 不一致"
+                       "（从该月札记抄引用会引错论文，须人工把 md/sidecar 改成 keeper 键）："
+                       .format(len(stale_dup_keys)))
+        for s in stale_dup_keys:
+            logger.warning("      {}".format(s))
 
     if review_out is not None:
         distinct = {tuple(sorted(pr)) for pr in distinct_pairs}

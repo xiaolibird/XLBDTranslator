@@ -1921,3 +1921,43 @@ def test_existing_article_entries_keep_no_book_fields(tmp_path):
         assert not (set(e) & set(BOOK_ENTRY_FIELDS)), e.get("citekey")
         for h in e.get("highlights") or []:
             assert "pages" not in h
+
+
+def test_stale_duplicate_citekey_warns():
+    """陈旧键守卫（2026-08-31）：duplicate 条目的行内 citekey 与 keeper 不一致时必须告警。
+    成因：fix_citekey_collisions 只改 live 条目，keeper 改键后 duplicate 所在月的 md
+    还留着旧键，而旧键可能在全局书目里指向另一篇论文——从该月札记抄 [@旧键] 会
+    安静引错（实锤：2026-06 SOFA-2 节残留 liufu2026External，live 指向前列腺论文）。"""
+    lines, _lg, sink = _loguru_lines()
+    try:
+        papers = [
+            {"month": "2026-01", "priority_rank": 1, "citekey": "someKeyN",
+             "dedup_key": "doi:10.1/sofa", "note_file": "a.md", "note_line": 1},
+            {"month": "2026-06", "priority_rank": 2, "citekey": "someKey",   # 旧键残留
+             "dedup_key": "doi:10.1/sofa", "note_file": "b.md", "note_line": 9},
+        ]
+        out = ni._global_pass(papers)
+    finally:
+        _lg.remove(sink)
+    dup = next(e for e in out if e["month"] == "2026-06")
+    assert dup["duplicate_of"] == "doi:10.1/sofa@2026-01"
+    joined = "\n".join(lines)
+    assert "citekey 与其 keeper 不一致" in joined
+    assert "someKey" in joined and "someKeyN" in joined
+
+
+def test_consistent_duplicate_citekey_no_warning():
+    """同键 keeper/duplicate（设计内共享）不得触发陈旧键告警——否则 38 组正常
+    跨月重复会天天刷屏，守卫直接失去可信度。"""
+    lines, _lg, sink = _loguru_lines()
+    try:
+        papers = [
+            {"month": "2026-01", "priority_rank": 1, "citekey": "sameKey",
+             "dedup_key": "doi:10.1/x", "note_file": "a.md", "note_line": 1},
+            {"month": "2026-06", "priority_rank": 2, "citekey": "sameKey",
+             "dedup_key": "doi:10.1/x", "note_file": "b.md", "note_line": 2},
+        ]
+        ni._global_pass(papers)
+    finally:
+        _lg.remove(sink)
+    assert "citekey 与其 keeper 不一致" not in "\n".join(lines)
