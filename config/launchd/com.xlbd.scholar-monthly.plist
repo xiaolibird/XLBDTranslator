@@ -11,7 +11,7 @@
   与 weekly job（com.xlbd.scholar-digest，周一 09:00）的关系：
   - 不冲突、互补：weekly 只出 digest 速览，monthly 出精读札记 + 索引。
   - 时间错开（每月 1 日即使恰逢周一也相差 12.5h）+ 独立 Gmail token 副本
-    （--token-path config/token.monthly.json），无并发写 token 的窗口。
+    （token-path 指到 config/token.monthly.json），无并发写 token 的窗口。
   - 复用同一 python 实体二进制：TCC 完全磁盘访问授权绑定二进制、与参数无关，
     weekly 已授权则 monthly 无需再授权。
 
@@ -44,6 +44,16 @@
         <string>localhost,127.0.0.1,::1</string>
         <key>NO_PROXY</key>
         <string>localhost,127.0.0.1,::1</string>
+        <!-- ⚠️ launchd 默认 PATH 不含 /opt/homebrew/bin，claude CLI 在那里——
+             缺了它 claude-agent provider 静默跳过、回退链落到 gemini 兜底
+             （2026-08-31 周一 09:00 实跑抓到：交互 shell 探活正常、launchd 永远降级，
+             与上面 no_proxy 是同一类「手动能跑、定时退化」坑）。
+             另：claude CLI 的登录态还硬依赖 USER 变量（按 account=$USER 读 login
+             Keychain 的凭据），launchd gui 域自动提供 HOME/USER/LOGNAME/TMPDIR，
+             所以不用显式设；但迁 system domain 或裁剪 env 会以 loggedIn:false
+             静默挂（2026-08-31 审计洁净环境二分实测）。 -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <key>WorkingDirectory</key>

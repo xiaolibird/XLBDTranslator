@@ -9,8 +9,8 @@
 
     向量库的 chunk 上带着 citekey 与 year 两列，是语义检索结果回传给写作侧的**唯一
     身份来源**。它会因为「入库」之外的原因变旧——改键（audit_citekeys_vs_pmlr.py
-    --apply、notes_index.py --fix-collisions）、改元数据、手工重建索引。一旦变旧，
-    notes_search --cite 就会吐出磁盘上已不存在的 citekey，粘进稿子后 pandoc 报
+    apply、notes_index.py 的 fix-collisions 开关）、改元数据、手工重建索引。一旦变旧，
+    notes_search 的 cite 输出就会吐出磁盘上已不存在的 citekey，粘进稿子后 pandoc 报
     citation not found；digest 的近邻注入还会把旧键旧年份喂给 LLM 裁决。
 
     在此之前，唯一的自动同步入口是周度入库 com.xlbd.scholar-weekly-ingest（周一 09:30），

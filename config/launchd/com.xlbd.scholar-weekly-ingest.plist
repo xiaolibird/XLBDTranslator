@@ -10,9 +10,9 @@
   09:30 起跑，留 30 分钟余量；digest 若还没跑完，本轮读到的是上一轮的窗口，
   下周会补上（跨库去重保证不重复）。
 
-  --auto = 本周 digest 入选的全部入库。想人工挑就别用这个 job，手动跑：
-      PYTHONPATH=. python scripts/ingest_notes.py --list
-      PYTHONPATH=. python scripts/ingest_notes.py --pick 2,3,5
+  auto 开关 = 本周 digest 入选的全部入库。想人工挑就别用这个 job，手动跑
+  ingest_notes.py 的 list / pick 模式（参数名前加双连字符；XML 注释里写不了
+  字面双连字符，见 ingest_notes.py -h）。
 
   安装：cp 到 ~/Library/LaunchAgents/ 后 launchctl load -w。
   注意仓库在 ~/Documents 下受 TCC 保护，python 二进制需已在「完全磁盘访问权限」中授权
@@ -48,6 +48,16 @@
         <string>localhost,127.0.0.1,::1</string>
         <key>NO_PROXY</key>
         <string>localhost,127.0.0.1,::1</string>
+        <!-- ⚠️ launchd 默认 PATH 不含 /opt/homebrew/bin，claude CLI 在那里——
+             缺了它 claude-agent provider 静默跳过、回退链落到 gemini 兜底
+             （2026-08-31 周一 09:00 实跑抓到：交互 shell 探活正常、launchd 永远降级，
+             与上面 no_proxy 是同一类「手动能跑、定时退化」坑）。
+             另：claude CLI 的登录态还硬依赖 USER 变量（按 account=$USER 读 login
+             Keychain 的凭据），launchd gui 域自动提供 HOME/USER/LOGNAME/TMPDIR，
+             所以不用显式设；但迁 system domain 或裁剪 env 会以 loggedIn:false
+             静默挂（2026-08-31 审计洁净环境二分实测）。 -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONPATH</key>
         <string>/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev</string>
     </dict>
