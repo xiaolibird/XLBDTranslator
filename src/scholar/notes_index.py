@@ -149,6 +149,14 @@ _CR_SECTION_RE = re.compile(r"^\*\*【(.+?)】\*\*\s*$")   # 精读分节标题�
 # 语法与渲染者共用 _citekey_utils.TAG_LINE_RE，别在此另抄一份（见该常量的文档）。
 _TAG_LINE_RE = TAG_LINE_RE
 _ARXIV_URL_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}|[a-z\-]+/\d{7})")
+# arXiv 版本后缀（vN）：同一次投稿的修订版，比较两条是否「铁证不同篇」时必须先剥掉。
+# 只能用「结尾 vN」的正则，不能用 split("v")[0]——旧式 id 的分类名自带字母 v，
+# "cs.CV/0509001".lower().split("v")[0] == "cs.c"，于是整类 cs.CV/math.CV 老论文
+# 两两比较恒相等、arXiv 冲突守卫永不触发，_title_sim_pairs 少一道拦截。
+# 上面的 _ARXIV_URL_RE 与 pdf_ingest._ARXIV_RE 都能产出这种旧式 id（库内当前 0 条）。
+# 注意：这是**比较层**的归一，不是身份层——dedup_key_fields 的 arxiv 档刻意保留 vN
+# （身份键要精确，冲突守卫要宽松，两者取向相反），别顺手把它也"统一"了。
+_ARXIV_VER_RE = re.compile(r"v\d+$")
 
 # 书籍/章条目的容器元数据行（notes._book_line 的格式契约，` · ` 分段）：
 #   **所属书籍**: Users' Guides… · ISBN 9780071790710 · 第14章 · pp.301-313 · 出版 McGraw-Hill · 3rd 版 · 编者 A; B
@@ -578,7 +586,7 @@ def _identity_conflict(a: Dict[str, Any], b: Dict[str, Any]) -> str:
     if da and db and da != db:
         return "doi"
     xa, xb = (a.get("arxiv_id") or "").strip().lower(), (b.get("arxiv_id") or "").strip().lower()
-    if xa and xb and xa.split("v")[0] != xb.split("v")[0]:
+    if xa and xb and _ARXIV_VER_RE.sub("", xa) != _ARXIV_VER_RE.sub("", xb):
         return "arxiv"
     sa, sb = _first_surname(a), _first_surname(b)
     if sa and sb and sa != sb:

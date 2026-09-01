@@ -476,6 +476,60 @@ def test_title_similarity_blocked_by_identity_conflict():
     assert all(e["duplicate_of"] is None for e in ni._global_pass(author_conflict))
 
 
+def test_arxiv_conflict_strips_only_trailing_version():
+    """arXiv 冲突守卫剥版本号只能剥结尾 vN，不能 split("v")[0]。
+
+    旧式 id 的分类名自带字母 v："cs.CV/0509001".lower().split("v")[0] == "cs.c"，
+    于是 cs.CV/math.CV 这一整类老论文两两比较恒相等、守卫永不触发，
+    _title_sim_pairs 就少了一道拦截，标题相近的两篇不同论文会被静默并成一篇。
+    """
+    # 同一投稿的两个修订版：不是冲突（这是剥版本号的本意）
+    assert ni._identity_conflict({"arxiv_id": "2510.02625v4"},
+                                 {"arxiv_id": "2510.02625v5"}) == ""
+    assert ni._identity_conflict({"arxiv_id": "2602.15159"},
+                                 {"arxiv_id": "2602.15159v1"}) == ""
+    assert ni._identity_conflict({"arxiv_id": " 2401.12345V2 "},
+                                 {"arxiv_id": "2401.12345"}) == ""
+    assert ni._identity_conflict({"arxiv_id": "2401.12345v10"},
+                                 {"arxiv_id": "2401.12345"}) == ""
+    # 不同论文：必须报冲突
+    assert ni._identity_conflict({"arxiv_id": "2510.02625v4"},
+                                 {"arxiv_id": "2510.02626v4"}) == "arxiv"
+    # 旧式 id——回归点：曾被截成 "cs.c" / "math.c" 而恒不冲突
+    assert ni._identity_conflict({"arxiv_id": "cs.CV/0509001"},
+                                 {"arxiv_id": "cs.CV/0601002"}) == "arxiv"
+    assert ni._identity_conflict({"arxiv_id": "math.CV/0309136"},
+                                 {"arxiv_id": "math.GT/0309136"}) == "arxiv"
+    assert ni._identity_conflict({"arxiv_id": "math.CV/0309136v2"},
+                                 {"arxiv_id": "math.CV/0309136"}) == ""
+    # "v" 后无数字不是版本号，不得误剥
+    assert ni._identity_conflict({"arxiv_id": "2401.12345v"},
+                                 {"arxiv_id": "2401.12345"}) == "arxiv"
+
+
+def test_old_style_arxiv_ids_still_block_title_merge():
+    """回归：两篇标题高度相似的旧式 arXiv 论文，不得因 id 被截断而被合并。"""
+    base = "Evaluation of Active Feature Acquisition Methods for {} Feature Settings"
+    papers = [
+        _pe("2025-03", base.format("Static"), "arxiv:cs.cv/0509001",
+            arxiv_id="cs.CV/0509001", authors=["Henrik von Kleist"]),
+        _pe("2025-04", base.format("Time-varying"), "arxiv:cs.cv/0601002",
+            arxiv_id="cs.CV/0601002", authors=["Henrik von Kleist"]),
+    ]
+    assert all(e["duplicate_of"] is None for e in ni._global_pass(papers))
+
+
+def test_dedup_key_keeps_arxiv_version_deliberately():
+    """身份键**保留** vN，与比较层剥 vN 是刻意的非对称，不是待修的不一致。
+
+    身份键要精确（改它会牵动 abstracts.json 的键、sidecar 冻结值与向量库 ab: chunk）；
+    冲突守卫要宽松（不把同一投稿的 v1/v2 当作「铁证不同篇」）。两者取向相反。
+    """
+    from src.scholar._citekey_utils import dedup_key_fields
+    assert dedup_key_fields(None, "2602.15159v1", "T") == "arxiv:2602.15159v1"
+    assert dedup_key_fields(None, "2602.15159", "T") == "arxiv:2602.15159"
+
+
 def test_anon_citekey_is_not_an_author_match():
     """两篇互不相干的 anon 条目不得因 citekey 前缀同为 anon 而被当成同作者。"""
     a = {"citekey": "anon2025Foo", "authors": []}
