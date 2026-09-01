@@ -27,7 +27,10 @@ from pathlib import Path
 
 BBT_RPC = "http://localhost:23119/better-bibtex/json-rpc"
 INDEX_JSON = Path(__file__).resolve().parents[1] / "output" / "scholar_notes" / "literature_index.json"
-SEARCH_DIRS = [Path.home() / "Downloads", Path.home() / "Zotero" / "storage"]
+# 2026-09-01 起按日期命名的论文精读目录（YYYY-MM[-DD][-批次]）统一挪到 ~/Desktop/Lab/Reading/，
+# ~/Downloads 只剩 wanna-read/文献整理 等非精读归档；两处都搜，Zotero 附件目录兜底。
+SEARCH_DIRS = [Path.home() / "Desktop" / "Lab" / "Reading", Path.home() / "Downloads",
+               Path.home() / "Zotero" / "storage"]
 
 CONF_THRESHOLD = 0.45  # Spotlight 兜底低于此分只算低置信候选，不当结果输出
 

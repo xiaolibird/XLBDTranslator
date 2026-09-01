@@ -145,9 +145,44 @@ def commit_vault(vault_dir, counts, conflicts, stamp):
     return 0
 
 
+EXPORT_TIMELINE = REPO / "scripts" / "export_timeline_xlsx.py"
+REAL_NOTES_DIR = "output/scholar_notes"
+
+
+def export_timeline(notes_dir: str, out: str = "") -> int:
+    """子进程调 export_timeline_xlsx.py（同 build_vault 的理由：报告与退出码只有一个出处，
+    且复用 sys.executable 的 TCC 授权）。返回其退出码；异常按 1。
+
+    **只对真实札记库导出**：这个 CLI 会被测试拿临时 notes 目录跑，若不设防，测试数据会直接
+    覆盖用户桌面上的真表（2026-09-01 实测发生过：3 篇假数据盖掉 2449 篇）。notes_dir 不是
+    仓库默认库、又没显式给 --timeline-out 时一律跳过。
+    """
+    is_real = repo_path(notes_dir).resolve() == repo_path(REAL_NOTES_DIR).resolve()
+    if not out and not is_real:
+        log("时间线 xlsx：notes-dir 非真实札记库（{}），不导出".format(notes_dir))
+        return 0
+    argv = [sys.executable, str(EXPORT_TIMELINE), "--notes-dir", notes_dir]
+    if out:
+        argv += ["--out", out]
+    try:
+        r = subprocess.run(argv, cwd=str(REPO), check=False, capture_output=True, text=True, timeout=300)
+        tail = (r.stdout.strip().splitlines() or [""])[-1]
+        log("时间线 xlsx：{}{}".format(tail, "" if r.returncode == 0 else "（exit {}）".format(r.returncode)))
+        if r.returncode != 0:
+            notify("札记时间线 xlsx 未更新", (r.stderr.strip().splitlines() or ["exit {}".format(r.returncode)])[-1][:200])
+        return r.returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("时间线 xlsx 导出异常：{}: {}".format(type(exc).__name__, exc))
+        notify("札记时间线 xlsx 未更新", "{}: {}".format(type(exc).__name__, str(exc)[:150]))
+        return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="札记库 → Obsidian vault 自动同步")
     ap.add_argument("--vault-dir", required=True, help="vault 目录（必填，与 build_vault.py 同）")
+    ap.add_argument("--timeline-out", default="",
+                    help="《札记库入库时间线.xlsx》输出路径（默认 ~/Desktop/Lab/Reading/，且仅当 notes-dir 是真实札记库时导出）")
+    ap.add_argument("--no-timeline", action="store_true", help="不导出时间线 xlsx")
     ap.add_argument("--notes-dir", default="output/scholar_notes")
     ap.add_argument("--force", action="store_true", help="忽略陈旧判定，强制重建")
     ap.add_argument("--dry-run", action="store_true", help="只算不写，也不提交")
@@ -175,6 +210,12 @@ def main():
         log("索引重试后仍解析失败，疑似损坏：{}".format(index_path))
         notify("札记 vault 同步失败", "literature_index.json 重试后仍解析失败，疑似损坏")
         return 2
+
+    # 顺带刷《札记库入库时间线.xlsx》（~/Desktop/Lab/Reading/）：它由索引派生，这个 job 正好被
+    # WatchPaths=literature_index.json 触发，是「索引一变就跟着变」最省事的挂点。自带陈旧判定，
+    # vault 已是最新时它也会独立判断（xlsx 缺了照样补）。best-effort：失败只记日志+通知，不影响 vault。
+    if not args.dry_run and not args.no_timeline:
+        export_timeline(args.notes_dir, args.timeline_out)
 
     stamp = index.get("generated_at")
     cur_topics_mtime = topics_mtime(repo_path(args.notes_dir))

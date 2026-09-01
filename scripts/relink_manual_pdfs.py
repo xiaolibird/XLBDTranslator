@@ -2,7 +2,7 @@
 """把某个手动精读月份的原始 PDF 按 citekey 重命名，并回填 bundle 的 pdf_path。
 
     PYTHONPATH=. python scripts/relink_manual_pdfs.py --month 2026-07-28-TFM \
-        --pdf-dir ~/Downloads/2026-07-28-读书报告联想阅读 --expect 16
+        --pdf-dir ~/Desktop/Lab/Reading/2026-07-28-读书报告联想阅读 --expect 16
     # 默认 dry-run 只打计划表，加 --apply 才动手
 
 为什么要有这一步：citekey 只在 finalize 写 md 时才生成（bundle 的 segment.citekey
