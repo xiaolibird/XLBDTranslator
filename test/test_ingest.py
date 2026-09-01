@@ -639,3 +639,117 @@ def test_no_index_flag_still_suppresses_the_refresh(tmp_path, monkeypatch):
                         ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-index"])
     assert mod.main() == 1
     assert calls == []
+
+
+# ---- enrich_segments → translation_server.resolve_batch：探活 / 告警 / 命中计数 ----
+
+def _plain_seg(i, doi=None):
+    meta = PaperMetadata(paper_id="q{}".format(i), title="T{}".format(i), authors=["A B"], doi=doi)
+    return PaperSegment(segment_id=i, paper_id=meta.paper_id, original_abstract="abs", metadata=meta)
+
+
+def _mute_enrichers(monkeypatch):
+    """把 Crossref / arXiv / PubMed 三路增强全静音，只留 translation-server 这一段可观测。"""
+    import src.scholar.crossref as CR
+    import src.scholar.academic_search as AS
+    monkeypatch.setattr(CR, "enrich_metadata", lambda meta, email="", client=None: False)
+    monkeypatch.setattr(AS, "enrich_from_arxiv", lambda meta, client=None: False)
+    monkeypatch.setattr(AS, "enrich_abstract_from_pubmed", lambda *a, **k: None)
+
+
+def _ts_env(monkeypatch, *, available, resolver):
+    """打桩探活/解析/通知，并清掉进程内「只弹一次」记忆，让每个用例从零开始。"""
+    import src.scholar.translation_server as TS
+    import src.utils.notify as NT
+    _mute_enrichers(monkeypatch)
+    monkeypatch.setattr(TS, "_ALERTED", set())
+    monkeypatch.setattr(TS, "is_available", lambda url, timeout=5.0: available)
+    monkeypatch.setattr(TS, "resolve_and_apply", resolver)
+    sent = []
+    monkeypatch.setattr(NT, "notify", lambda title, text: sent.append((title, text)))
+    return sent
+
+
+def _capture_logs(level="INFO"):
+    from loguru import logger as _lg
+    lines = []
+    hid = _lg.add(lambda m: lines.append(m.record["message"]), level=level)
+    return hid, lines
+
+
+def _boom(*a, **k):
+    raise AssertionError("这条路不该被调用")
+
+
+def test_enrich_segments_ts_offline_notifies_once_and_skips(monkeypatch):
+    sent = _ts_env(monkeypatch, available=False, resolver=_boom)
+    segs = [_plain_seg(i, "10.1/x{}".format(i)) for i in range(3)]
+    assert ING.enrich_segments(segs, "e@x", "http://ts.local:1969") == (0, 0, 0)
+    assert len(sent) == 1
+    title, text = sent[0]
+    assert "translation-server" in text and "3 篇" in text and "ts.local:1969" in text
+    # 同进程再来一批（backfill 逐月循环）：日志照记，通知不再弹
+    assert ING.enrich_segments(segs, "e@x", "http://ts.local:1969") == (0, 0, 0)
+    assert len(sent) == 1
+
+
+def test_enrich_segments_ts_online_counts_hits_logs_and_stays_quiet(monkeypatch):
+    sent = _ts_env(monkeypatch, available=True,
+                   resolver=lambda meta, base_url=None, client=None: {"DOI": meta.doi} if meta.doi else None)
+    hid, lines = _capture_logs()
+    try:
+        segs = [_plain_seg(0, "10.1/a"), _plain_seg(1), _plain_seg(2, "10.1/c")]
+        cr, ax, ts = ING.enrich_segments(segs, "e@x", "http://ts.local:1969")
+    finally:
+        from loguru import logger as _lg
+        _lg.remove(hid)
+    assert ts == 2
+    assert sent == []
+    # 「没跑」与「跑了没命中」必须能从日志分辨
+    assert any("权威解析 2/3 篇" in ln for ln in lines), lines
+
+
+def test_enrich_segments_ts_online_zero_hit_alerts_once(monkeypatch):
+    sent = _ts_env(monkeypatch, available=True,
+                   resolver=lambda meta, base_url=None, client=None: None)
+    hid, lines = _capture_logs(level="WARNING")
+    try:
+        segs = [_plain_seg(0, "10.1/a"), _plain_seg(1, "10.1/b")]
+        assert ING.enrich_segments(segs, "e@x", "http://ts.local:1969") == (0, 0, 0)
+        assert ING.enrich_segments(segs, "e@x", "http://ts.local:1969") == (0, 0, 0)
+    finally:
+        from loguru import logger as _lg
+        _lg.remove(hid)
+    # 探活过了但有标识符的论文 0 命中 = 出网断/限流/翻译器坏：告警一次，warning 每批都有
+    assert len(sent) == 1 and "0/2" in sent[0][1]
+    assert sum(1 for ln in lines if "探活通过但" in ln) == 2
+
+
+def test_enrich_segments_ts_zero_hit_without_identifiers_is_not_an_alert(monkeypatch):
+    sent = _ts_env(monkeypatch, available=True, resolver=_always_miss)
+    segs = [_plain_seg(0), _plain_seg(1)]          # 无 DOI/arXiv/PMID：0 命中是正常结果
+    assert ING.enrich_segments(segs, "e@x", "http://ts.local:1969") == (0, 0, 0)
+    assert sent == []
+
+
+def _always_miss(meta, base_url=None, client=None):
+    return None
+
+
+def test_enrich_segments_ts_unconfigured_never_probes(monkeypatch):
+    sent = _ts_env(monkeypatch, available=True, resolver=_boom)
+    import src.scholar.translation_server as TS
+    monkeypatch.setattr(TS, "is_available", _boom)
+    assert ING.enrich_segments([_plain_seg(0, "10.1/a")], "e@x", "") == (0, 0, 0)
+    assert sent == []
+
+
+def test_enrich_segments_ts_offline_notify_failure_is_swallowed(monkeypatch):
+    _ts_env(monkeypatch, available=False, resolver=_boom)
+    import src.utils.notify as NT
+
+    def _broken(title, text):
+        raise OSError("osascript 不可用")
+    monkeypatch.setattr(NT, "notify", _broken)
+    # 告警面挂了不能把入库弄挂
+    assert ING.enrich_segments([_plain_seg(0, "10.1/a")], "e@x", "http://ts.local:1969") == (0, 0, 0)

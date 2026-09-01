@@ -9,10 +9,15 @@ translation-server 是 Zotero 官方 Docker 服务（`zotero/translation-server`
 我们据此：① 用解析结果回填 PaperMetadata（令札记与 references.json 用权威数据）；
          ② 把权威 item 经连接器写入 Zotero；③ BBT 生成 citekey。
 标识符由 Crossref（DOI）/ arXiv id / PMID 提供；无任何标识符的论文退回自建 item。
+
+批量入口是 `resolve_batch`：探活 → 并行解析 → 结果级告警，ingest（周/月入库）与
+zotero_sync（digest --zotero）共用，停机/失效只在这一处判、只弹一次系统通知。
 """
+import concurrent.futures
 import re
+import threading
 from datetime import date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import httpx
 
@@ -164,12 +169,113 @@ def resolve_and_apply(
 
 
 def is_available(base_url: str = DEFAULT_BASE_URL, timeout: float = 5.0) -> bool:
-    """translation-server 是否在线（探测 /search 端点存在）。"""
+    """translation-server 是否在线——只回答「端口上有没有进程在收请求」。
+
+    用**空 body** 探活：server 在路由层直接回 400 "POST data not provided"，0.04s、
+    零出网。此前用假 DOI "10.0000/probe" 探活会让 server 真去 doi.org 解析一次
+    （实测 0.63s、依赖外网），上游慢或限流时探活会假阴性。
+
+    只有**连接层**失败（拒绝 / 连接超时）才算离线。连上了但读超时、协议异常等
+    一律按在线处理：容器在收请求只是慢，让逐篇解析自己的 30s 超时兜底——否则
+    容器忙时（如 realign 批量重对齐撞上周一 ingest）整批被判离线、跳过权威解析还误报。
+    """
     try:
         with ipv4_client(timeout=timeout) as c:
             r = c.post("{}/search".format(base_url.rstrip("/")),
-                       content=b"10.0000/probe", headers={"Content-Type": "text/plain"})
-            # 端点存在即可（即便这个假 DOI 解析失败返回 400/500）
-            return r.status_code in (200, 300, 400, 500, 501)
-    except Exception:
+                       content=b"", headers={"Content-Type": "text/plain"})
+            # 空 body 正常回 400；200/500 兼容不同版本 server。404/415/502 = 端口上跑的不是它
+            ok = r.status_code in (200, 400, 500)
+            if not ok:
+                logger.debug("translation-server 探活 {} 回 {}（非预期状态，按离线）", base_url, r.status_code)
+            return ok
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # localhost 会先试 ::1，ipv4_client 绑了 0.0.0.0 会先报 Errno 47 再回落 127.0.0.1；
+        # 容器真离线时最终浮出的也是这条而不是 refused——排障看到 Errno 47 别被带偏。
+        logger.debug("translation-server 探活失败（连接层）{}: {}", base_url, e)
         return False
+    except Exception as e:
+        logger.debug("translation-server 探活异常（非连接层，按在线）{}: {}", base_url, e)
+        return True
+
+
+# ---------------- 批量入口：探活 → 并行解析 → 结果级告警 ----------------
+
+ALERT_TITLE = "Scholar 元数据对齐"
+# 进程内每个 (ts_url, 事由) 只弹一次系统通知：backfill 多月循环（默认 41 个月）
+# 若每月弹一条，告警面就被刷成噪音（notify 文档里 2026-08-24 的教训）；日志每批照记。
+_ALERTED: Set[Tuple[str, str]] = set()
+_ALERT_LOCK = threading.Lock()
+
+
+def _alert_once(base_url: str, kind: str, text: str) -> bool:
+    with _ALERT_LOCK:
+        key = (base_url, kind)
+        if key in _ALERTED:
+            return False
+        _ALERTED.add(key)
+    try:
+        from ..utils.notify import notify
+        notify(ALERT_TITLE, text)
+    except Exception as e:                       # 告警面挂了不能把入库弄挂
+        logger.debug("notify 失败: {}", e)
+    return True
+
+
+def resolve_batch(
+    metas: Dict[Any, PaperMetadata],
+    base_url: str,
+    workers: int = 4,
+) -> Dict[Any, Optional[Dict[str, Any]]]:
+    """对一批 PaperMetadata 做权威解析并就地回填。返回 {key: 权威 item | None}。
+
+    三段：
+    1. 探活（`is_available`）。不在线 → warning + 系统通知（进程内一次）→ 整批 None。
+       此前逐篇解析各自吞异常只落 stderr WARNING，launchd 日志无人看：2026-08-25→09-01
+       容器停机整周，周一入库照常产出、卷期页全空，直到人翻 references.json 才发现。
+       不抛、不改退出码：权威解析是矫正层不是必需层，札记照常产出，事后用
+       scripts/realign_metadata_ts.py 补对齐。
+    2. 分片并行解析（每 worker 一个连接，复用 TLS）。
+    3. 结果级告警：探活过了但「有标识符的论文 0 命中」= 出网断 / 上游限流 / 翻译器损坏，
+       探活看不出（探活零出网），只能从结果判——同样 warning + 通知一次。
+    """
+    out: Dict[Any, Optional[Dict[str, Any]]] = {k: None for k in metas}
+    if not metas or not base_url:
+        return out
+    n_ident = sum(1 for m in metas.values() if best_identifier(m))
+    if not is_available(base_url):
+        logger.warning("  ⚠️ translation-server 不在线（{}）：本批 {} 篇跳过权威解析，元数据走自建口径；"
+                       "`docker start zotero-translation-server` 后可用 scripts/realign_metadata_ts.py 补对齐"
+                       .format(base_url, len(metas)))
+        _alert_once(base_url, "offline",
+                    "translation-server 不在线，{} 篇未走权威解析（{}）".format(len(metas), base_url))
+        return out
+
+    keys = list(metas)
+    workers = max(1, min(workers, len(keys)))
+    chunks = [keys[i::workers] for i in range(workers)]
+
+    def _run(batch):
+        res = {}
+        with ipv4_client(timeout=30) as c:
+            for k in batch:
+                try:
+                    res[k] = resolve_and_apply(metas[k], base_url=base_url, client=c)
+                except Exception as e:
+                    logger.debug("translation-server 解析失败 [{}]: {}", k, e)
+                    res[k] = None
+        return res
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for r in ex.map(_run, chunks):
+            out.update(r)
+    hits = sum(1 for v in out.values() if v)
+    logger.info("  translation-server 权威解析 {}/{} 篇（{} 篇有标识符）".format(hits, len(metas), n_ident))
+    if hits == 0 and n_ident:
+        # 「探活通过」而非「在线」：URL 拼错（协议/主机名错）时非连接层异常也按在线放行，
+        # 这里是它唯一的告警出口，文案不能把锅甩给上游
+        logger.warning("  ⚠️ translation-server 探活通过但 {} 篇有标识符的论文 0 命中——出网断/上游限流/"
+                       "翻译器异常/URL 配错，元数据走自建口径；事后用 scripts/realign_metadata_ts.py 补对齐"
+                       .format(n_ident))
+        _alert_once(base_url, "zero-hit",
+                    "translation-server 探活通过但 0/{} 命中，元数据未对齐（{}）".format(n_ident, base_url))
+    return out

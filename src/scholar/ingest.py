@@ -66,7 +66,7 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
     from .crossref import enrich_metadata
     from .academic_search import enrich_from_arxiv, enrich_abstract_from_pubmed
     from .fulltext import ipv4_client
-    from .translation_server import resolve_and_apply
+    from .translation_server import resolve_batch
 
     seg_list = list(segs)
     if not seg_list:
@@ -114,17 +114,12 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
 
     ts = 0
     if ts_url:
-        def _ts_batch(batch) -> int:
-            n = 0
-            for seg in batch:
-                try:
-                    if resolve_and_apply(seg.metadata, base_url=ts_url):
-                        n += 1
-                except Exception as e:
-                    logger.debug("translation-server 解析失败 [{}]: {}", seg.paper_id, e)
-            return n
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            ts = sum(executor.map(_ts_batch, chunks))
+        # 探活 / 并行解析 / 停机与 0 命中告警全在 resolve_batch（zotero_sync 同一入口）。
+        # 按位置而非 paper_id 作键：同一批里同 DOI 的近重复文献会有两个 seg，
+        # paper_id 也可能相同（同 PDF 改标题重 ingest），按 id 会吞掉一篇。
+        resolved = resolve_batch({i: seg.metadata for i, seg in enumerate(seg_list)},
+                                 ts_url, workers=workers)
+        ts = sum(1 for v in resolved.values() if v)
     return cr, ax, ts
 
 

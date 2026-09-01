@@ -409,14 +409,13 @@ def sync_segments_to_zotero(
         # 0.5) translation-server 权威解析：把标识符交给 Zotero 翻译器，回填 meta（令札记用权威数据）
         ts_items: Dict[str, Dict[str, Any]] = {}
         if translation_server_url:
-            from .translation_server import resolve_and_apply
-            ts_hit = 0
-            for seg in segments:
-                item = resolve_and_apply(seg.metadata, base_url=translation_server_url)
-                if item:
-                    ts_items[seg.paper_id] = item
-                    ts_hit += 1
-            logger.info("  translation-server 权威解析 {}/{} 篇".format(ts_hit, len(segments)))
+            # 与 ingest.enrich_segments 同一入口：探活、并行、停机/0 命中告警都在 resolve_batch，
+            # 别在这里再写一遍逐篇循环——那样 digest --zotero 这条路停机时又是静默的。
+            from .translation_server import resolve_batch
+            # 按位置作键（同 ingest.enrich_segments）：同批重复 paper_id 按 id 作键会折叠掉一篇
+            resolved = resolve_batch({i: seg.metadata for i, seg in enumerate(segments)},
+                                     translation_server_url)
+            ts_items = {segments[i].paper_id: item for i, item in resolved.items() if item}
 
         # 1) + 2) 解析 OA + 构造 item + 一次性写入（notes-only 时跳过）
         if write_to_zotero:

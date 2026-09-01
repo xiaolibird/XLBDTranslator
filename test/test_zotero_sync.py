@@ -402,3 +402,53 @@ def test_write_notes_counts_missing_citekey(tmp_path):
     summary = notes.write_notes(segs, {"pid1": None}, out_dir=tmp_path)
     assert summary["missing_citekey"] == 1
     assert summary["csl_count"] == 0  # 无 key 不进 CSL
+
+
+# ---- translation-server 接线：digest --zotero 与 ingest 共用 resolve_batch（探活/告警/回填） ----
+
+def _ts_wiring(monkeypatch, *, available):
+    import src.scholar.translation_server as TS
+    import src.utils.notify as NT
+    monkeypatch.setattr(TS, "_ALERTED", set())
+    monkeypatch.setattr(TS, "is_available", lambda url, timeout=5.0: available)
+
+    def _resolve(meta, base_url=None, client=None):
+        if not meta.doi:
+            return None
+        meta.authors = ["Aakash Reddy", "David T Zhu"]          # 就地回填语义
+        return {"itemType": "journalArticle", "title": meta.title, "DOI": meta.doi,
+                "creators": [{"firstName": "Aakash", "lastName": "Reddy", "creatorType": "author"}]}
+    monkeypatch.setattr(TS, "resolve_and_apply", _resolve)
+    sent = []
+    monkeypatch.setattr(NT, "notify", lambda title, text: sent.append(text))
+    return sent
+
+
+def test_sync_segments_ts_online_uses_authoritative_item(monkeypatch):
+    sent = _ts_wiring(monkeypatch, available=True)
+    seg_doi = PaperSegment(segment_id=1, paper_id="pidA", metadata=_meta(doi="10.1/abc"),
+                           original_abstract="abs", status=DigestStatus.PENDING)
+    seg_none = PaperSegment(segment_id=2, paper_id="pidB",
+                            metadata=_meta(doi=None, arxiv_id="2401.99999", source_type="arxiv"),
+                            original_abstract="abs", status=DigestStatus.PENDING)
+    fake = _FakeClient(up=True)
+    zotero_sync.sync_segments_to_zotero([seg_doi, seg_none], client=fake, email="x@y.com",
+                                        enrich_crossref=False, translation_server_url="http://ts.local:1969")
+    assert seg_doi.metadata.authors == ["Aakash Reddy", "David T Zhu"]
+    by_doi = {it.get("DOI"): it for it in fake.saved_items}
+    assert by_doi["10.1/abc"]["creators"][0]["lastName"] == "Reddy"   # 权威 item 直接进 Zotero
+    assert len(fake.saved_items) == 2                                  # 无标识符的照旧走自建 item
+    assert sent == []
+
+
+def test_sync_segments_ts_offline_alerts_once_and_falls_back(monkeypatch):
+    sent = _ts_wiring(monkeypatch, available=False)
+    seg = PaperSegment(segment_id=1, paper_id="pidA", metadata=_meta(doi="10.1/abc"),
+                       original_abstract="abs", status=DigestStatus.PENDING)
+    fake = _FakeClient(up=True)
+    results = zotero_sync.sync_segments_to_zotero([seg], client=fake, email="x@y.com",
+                                                  enrich_crossref=False,
+                                                  translation_server_url="http://ts.local:1969")
+    assert results["pidA"].saved is True and len(fake.saved_items) == 1   # 停机不挡写库
+    assert "creators" not in fake.saved_items[0] or fake.saved_items[0]["creators"][0].get("lastName") != "Reddy"
+    assert len(sent) == 1 and "不在线" in sent[0]

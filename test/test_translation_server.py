@@ -87,3 +87,74 @@ def test_parse_date_variants():
     assert ts._parse_date("7/2026") == date(2026, 7, 1)   # TS 常见 月/年
     assert ts._parse_date("") is None
     assert ts._parse_date("no year here") is None
+
+
+# ---- 探活：空 body、零出网；只有连接层失败才算离线 ----
+
+def _mock_ipv4(monkeypatch, handler):
+    monkeypatch.setattr(ts, "ipv4_client",
+                        lambda timeout=5.0: httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def test_is_available_probes_with_empty_body_and_accepts_400(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append((request.content, request.headers.get("content-type")))
+        assert request.url.path == "/search"
+        return httpx.Response(400, text="POST data not provided")
+    _mock_ipv4(monkeypatch, handler)
+    assert ts.is_available("http://ts.local:1969") is True
+    # 探活不得带真标识符出网——空 body 让 server 在路由层就回 400，不碰 doi.org；
+    # 缺 Content-Type 真 server 回 415 会被判离线，所以头也要钉住
+    assert seen == [(b"", "text/plain")]
+
+
+def test_is_available_false_on_connect_error(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+    _mock_ipv4(monkeypatch, handler)
+    assert ts.is_available("http://ts.local:1969") is False
+
+
+def test_is_available_false_on_connect_timeout(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectTimeout("timed out", request=request)
+    _mock_ipv4(monkeypatch, handler)
+    assert ts.is_available("http://ts.local:1969") is False
+
+
+def test_is_available_true_on_read_timeout(monkeypatch):
+    # 连上了但读超时 = 容器在收请求只是忙（如 realign 批量重对齐撞上周一 ingest）——
+    # 不能判离线，否则整批跳过权威解析还误报
+    def handler(request):
+        raise httpx.ReadTimeout("slow", request=request)
+    _mock_ipv4(monkeypatch, handler)
+    assert ts.is_available("http://ts.local:1969") is True
+
+
+def test_is_available_false_on_unexpected_status(monkeypatch):
+    # 404/415/502 之类 = 端口上跑的不是 translation-server（反代 / 别的服务占了端口）
+    for code in (404, 415, 502):
+        _mock_ipv4(monkeypatch, lambda r, c=code: httpx.Response(c, text="nope"))
+        assert ts.is_available("http://ts.local:1969") is False
+
+
+# ---- resolve_batch：与 zotero_sync 共用的入口，键任意、就地回填 ----
+
+def test_resolve_batch_returns_items_keyed_and_applies(monkeypatch):
+    monkeypatch.setattr(ts, "_ALERTED", set())
+    monkeypatch.setattr(ts, "is_available", lambda url, timeout=5.0: True)
+    _mock_ipv4(monkeypatch, lambda r: httpx.Response(200, json=[_ITEM]))
+    m1 = _meta(doi="10.1016/j.landig.2026.101043", authors=["riskA Reddy"])
+    m2 = _meta(doi=None)                                  # 无标识符
+    out = ts.resolve_batch({"a": m1, 7: m2}, "http://ts.local:1969", workers=4)
+    assert set(out) == {"a", 7}
+    assert out["a"]["DOI"] == "10.1016/j.landig.2026.101043" and out[7] is None
+    assert m1.authors == ["Aakash Reddy", "David T Zhu"]   # 就地回填
+
+
+def test_resolve_batch_empty_url_or_batch_is_noop(monkeypatch):
+    monkeypatch.setattr(ts, "is_available", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该探活")))
+    assert ts.resolve_batch({}, "http://ts.local:1969") == {}
+    assert ts.resolve_batch({"a": _meta(doi="10.1/x")}, "") == {"a": None}
