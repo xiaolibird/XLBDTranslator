@@ -463,7 +463,7 @@ XLBDTranslator/
 │   │   └── helpers.py    # 辅助函数
 │   ├── translator/       # 翻译引擎（同步/异步）
 │   │   ├── base.py       # 抽象基类与阶段钩子
-│   │   ├── engine.py     # Gemini / OpenAI 兼容(DeepSeek) 引擎
+│   │   ├── engine.py     # 引擎门面（实现在 engine_common/gemini/gemini_async/openai）
 │   │   ├── agent.py      # claude-agent（本机 claude CLI 订阅通路）
 │   │   ├── fallback.py   # 多供应商回退链
 │   │   └── support.py    # 断点续传 / 缓存持久化 / Prompt 管理
