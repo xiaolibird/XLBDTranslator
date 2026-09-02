@@ -8,6 +8,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 from src.scholar.schema import ScholarSettings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -89,7 +91,10 @@ def test_bare_top_level_processing_keys_are_silently_ignored(tmp_path: Path):
 def test_real_scholar_env_uses_nested_prefix_for_processing_keys():
     """锁定真实配置文件：这四项必须写成 PROCESSING__ 前缀形式，不能退回裸键——
     否则用户按注释改配置会静默不生效。"""
-    content = (REPO_ROOT / "config" / "scholar.env").read_text(encoding="utf-8")
+    env_path = REPO_ROOT / "config" / "scholar.env"
+    if not env_path.exists():
+        pytest.skip("本机无真实 config/scholar.env（gitignore，CI/干净环境必缺），跳过实配审计")
+    content = env_path.read_text(encoding="utf-8")
     for bare in ("BATCH_SIZE", "MAX_EMAILS", "DAYS_TO_FETCH", "OUTPUT_DIR"):
         assert not re.search(r"(?m)^{}=".format(bare), content), (
             "config/scholar.env 不应再出现裸键 {}=（须加 PROCESSING__ 前缀，"
@@ -101,7 +106,10 @@ def test_real_scholar_env_processing_values_actually_take_effect(tmp_path: Path)
     """把真实 config/scholar.env 的四个处理配置项替换成非默认值后加载，确认它们
     确实生效——防止"文件里写的是 PROCESSING__ 前缀但恰好等于默认值，掩盖了
     路由仍然失效"的假阴性。"""
-    content = (REPO_ROOT / "config" / "scholar.env").read_text(encoding="utf-8")
+    env_path = REPO_ROOT / "config" / "scholar.env"
+    if not env_path.exists():
+        pytest.skip("本机无真实 config/scholar.env（gitignore，CI/干净环境必缺），跳过实配审计")
+    content = env_path.read_text(encoding="utf-8")
     patched = content
     patched = re.sub(r"(?m)^PROCESSING__BATCH_SIZE=.*$",
                      "PROCESSING__BATCH_SIZE=77", patched)

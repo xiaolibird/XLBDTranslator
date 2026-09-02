@@ -232,6 +232,8 @@ def test_cli_pick_and_auto_are_mutually_exclusive():
 
 
 def test_cli_empty_window_exits_1(tmp_path):
+    if not (REPO / "config" / "scholar.env").exists():
+        pytest.skip("本机无真实 config/scholar.env（gitignore，CI 必缺），CLI 走不到空窗早退")
     r = _run("--digest-dir", str(tmp_path), "--list")
     assert r.returncode == 1
 
@@ -249,6 +251,8 @@ def test_cli_malformed_label_exits_2():
 def test_cli_batch_label_passes_arg_parsing(tmp_path):
     """专题批次标签（如作者语料通读的 2026-07-27-HuiyingLiang）是存量在用的合法形状，
     校验不能收紧误伤——应穿过参数解析走到空窗早退（1），而不是参数错误（2）。"""
+    if not (REPO / "config" / "scholar.env").exists():
+        pytest.skip("本机无真实 config/scholar.env（gitignore，CI 必缺），CLI 走不到空窗早退")
     r = _run("--label", "2026-07-27-HuiyingLiang",
              "--digest-dir", str(tmp_path), "--list")
     assert r.returncode == 1

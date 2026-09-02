@@ -2038,7 +2038,10 @@ def test_trigger_command_shapes(monkeypatch, tmp_path):
         # 连 kwargs 一起断言：只看 cmd 的话，删掉 timeout=（13 分钟挂起事故的直接防线）
         # 或把 cwd 改成别处，测试都照样绿——变异测试实证过。
         assert kw["timeout"] == 2400
-        assert str(kw["cwd"]).endswith("XLBDTranslator-dev")
+        # 断言"cwd 锚在仓库根"这个契约本身，而不是本机目录名（CI checkout 叫
+        # XLBDTranslator、本机叫 XLBDTranslator-dev，写死名字在干净环境必红）。
+        from src.scholar.paths import REPO_ROOT
+        assert Path(kw["cwd"]).resolve() == REPO_ROOT.resolve()
         assert kw["capture_output"] is True and kw["text"] is True
         return types.SimpleNamespace(stdout="", stderr="", returncode=0)
 

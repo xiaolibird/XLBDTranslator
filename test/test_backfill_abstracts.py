@@ -13,6 +13,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
@@ -195,7 +197,10 @@ def test_agents_md_selfheal_doc_matches_watcher():
     不会自动同步。锁三点：提及 abstracts.json 由 backfill 直写不经索引、
     「一网打尽/公共下游」论断已删、派生物清单覆盖 ab:/h: 两种 chunk id 形态。
     """
-    text = (REPO / "output" / "scholar_notes" / "AGENTS.md").read_text(encoding="utf-8")
+    agents_md = REPO / "output" / "scholar_notes" / "AGENTS.md"
+    if not agents_md.exists():
+        pytest.skip("本机无 output/scholar_notes/AGENTS.md（output/ 不进 git，CI 必缺），跳过实文档回归")
+    text = agents_md.read_text(encoding="utf-8")
     # WatchPaths 段：两个文件都要被点名，且写明 abstracts.json 不经索引
     assert "abstracts.json" in text, "AGENTS.md 对 abstracts.json 零提及"
     assert "backfill_abstracts.py" in text
