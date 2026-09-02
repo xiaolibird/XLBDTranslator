@@ -335,15 +335,18 @@ def main() -> int:
         else:
             from src.scholar import lint_freshness as F
             # 时间线路径复用 export_timeline_xlsx 的单一出处（文件名口径二次实现
-            # 漂移 = 永久假阳性）；vault 根复用上面 ack 已解析的 cand（探测成功才用）
+            # 漂移 = 永久假阳性）；vault 根复用上面 ack 已解析的 cand（探测成功才用）；
+            # 备份目录同理复用 backup_snapshot 的常量（scripts→scripts 平级 import，
+            # 命名解析则在 src/scholar/backup_naming 单一出处）
             from scripts.export_timeline_xlsx import DEFAULT_OUT, _meta_path
+            from scripts.backup_snapshot import BACKUP_ROOT
             grace = ({k: args.grace_seconds for k in F.GRACE_DEFAULTS}
                      if args.grace_seconds is not None else None)
             # vault_topics 非 None 恰等价于"cand 存在且其概念页目录探测成功"
             fresh_vault = cand if vault_topics is not None else None
             rep = F.check_freshness(
                 index_path, notes_dir, fresh_vault, DEFAULT_OUT, _meta_path(DEFAULT_OUT),
-                grace_overrides=grace)
+                grace_overrides=grace, backup_dir=BACKUP_ROOT)
             for ln in rep.stdout_lines():
                 print(ln)
             freshness_block = rep.render_block()

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  札记库不可再生核心 → iCloud 周快照（launchd 用户代理）。
+  由 scripts/install_backup.sh 安装：占位符替换后拷入 ~/Library/LaunchAgents/。
+
+  排程语义（与直觉不同，都吃过 PRD 对抗审核的亏）：
+  - StartCalendarInterval 周日 20:00：静态无邻居（digest/ingest 在周一 09:00/09:30、
+    monthly 在 1 号 21:30）。但 launchd 对睡眠期间错过的日历事件会在唤醒时
+    **坍缩补跑**（man launchd.plist）——周日晚合盖、周一早开盖时本 job 与 digest
+    补跑同刻开火是常态，错峰保证不了；一致性靠脚本内"打包前后双读源戳、不一致
+    重试"的主防线，不靠时间表。
+  - RunAtLoad true：**关机**跨过周日的日历事件 launchd 不补（不跨 boot 持久化），
+    没有这条该周静默缺份且无人知道；登录补跑 + 脚本内 6 天守卫（距上次成功快照
+    不足 6 天秒退）防重启刷屏、防真周份被挤出轮换窗。
+  - TCC：写 iCloud Drive（~/Library/Mobile Documents）在完全磁盘访问覆盖内，
+    必须与既有 5 个 job 复用同一 python 实体二进制——换二进制 = 无授权静默 EPERM。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/backup_snapshot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>20</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_backup.err.log</string>
+</dict>
+</plist>

@@ -70,15 +70,23 @@ JOB_LABELS: Dict[str, str] = {
     "vault": "com.xlbd.scholar-vault",
     # xlsx 搭 vault job 的车（sync_vault.py 顺带调 export_timeline），责任 job 相同
     "xlsx": "com.xlbd.scholar-vault",
+    "backup": "com.xlbd.scholar-backup",
 }
 _LOG_DIR = "~/Library/Logs/xlbd-scholar-digest"
 JOB_LOGS: Dict[str, str] = {
     "embed": _LOG_DIR + "/cron_embed.err.log",
     "vault": _LOG_DIR + "/cron_vault.err.log",
     "xlsx": _LOG_DIR + "/cron_vault.err.log",
+    "backup": _LOG_DIR + "/cron_backup.err.log",
 }
 
-_ITEM_LABELS = {"embed": "向量库", "vault": "vault", "xlsx": "时间线xlsx", "refs": "全局书目"}
+# 备份年龄阈值（天）：独立常量，**不受 --grace-seconds 影响**。
+# 14 = 守卫 6 天 + 周期 7 天 + 唤醒补跑漂移的最大健康年龄 ≈13 天——9/10 天阈值会对
+# 健康系统报警；检出时效本受月度 lint 节奏支配，14 与更小值实际无差（PRD 审定）。
+BACKUP_MAX_AGE_DAYS = 14
+
+_ITEM_LABELS = {"embed": "向量库", "vault": "vault", "xlsx": "时间线xlsx",
+                "refs": "全局书目", "backup": "备份快照"}
 
 FRESH, PENDING, STALE = "fresh", "pending", "stale"
 _STATE_ICON = {FRESH: "✅", PENDING: "⌛", STALE: "⚠"}
@@ -307,6 +315,7 @@ def check_freshness(index_path: Path, notes_dir: Path,
                     grace_overrides: Optional[Dict[str, float]] = None,
                     now: Optional[datetime] = None,
                     job_probe: Optional[Callable[[str], Tuple[str, str]]] = None,
+                    backup_dir: Optional[Path] = None,
                     ) -> FreshnessReport:
     """四个子项的新鲜度报告（纯函数式：路径全显式传入，绝不自行探测生产路径——
     生产守卫在 CLI 层，见 scripts/lint_notes.py；A4「单测打到生产」事故的设防）。
@@ -335,7 +344,10 @@ def check_freshness(index_path: Path, notes_dir: Path,
     try:
         from .embed_store import DB_NAME, read_index_generated_at
     except Exception as exc:
-        for key in ("embed", "vault", "xlsx", "refs"):
+        keys = ["embed", "vault", "xlsx", "refs"]
+        if backup_dir is not None:      # backup 子项"整项缺席仅当 backup_dir=None"
+            keys.append("backup")
+        for key in keys:
             rep.items.append(FreshnessItem(
                 key, PENDING, "内部依赖不可用（{}）".format(type(exc).__name__)))
         return rep
@@ -484,6 +496,35 @@ def check_freshness(index_path: Path, notes_dir: Path,
                 "refs", STALE,
                 "all_references.json 损坏（{}），会毒害 pandoc 引用渲染".format(
                     type(exc).__name__)))
+
+    # ---- backup：最新快照年龄（backup_dir=None 时整项缺席，阶段 2 兼容）----
+    # 只按**文件名时间戳**判龄、绝不打开任何快照内容（iCloud 驱逐占位符只认名不认
+    # 内容，读内容会触发同步阻塞或直接失败）；命名解析走 backup_naming 单一出处。
+    # 关机跨过周日的日历事件 launchd 不补跑，快照会静默缺份——这一项就是那道闸。
+    if backup_dir is not None:
+        try:
+            from .backup_naming import latest_snapshot_ts
+            bdir = Path(backup_dir)
+            if not bdir.is_dir():
+                rep.items.append(FreshnessItem(
+                    "backup", PENDING, "备份目录不存在（job 未装或 iCloud 未就绪）"))
+            else:
+                last = latest_snapshot_ts(bdir, now=now)
+                if last is None:
+                    rep.items.append(FreshnessItem(
+                        "backup", PENDING, "目录里还没有快照（首份未产生）"))
+                else:
+                    age_days = (now - last).total_seconds() / 86400
+                    if age_days > BACKUP_MAX_AGE_DAYS:
+                        rep.items.append(FreshnessItem(
+                            "backup", STALE,
+                            "最新快照 {:.1f} 天前（阈值 {} 天，可能静默缺份）。{}".format(
+                                age_days, BACKUP_MAX_AGE_DAYS, _stale_hint("backup"))))
+                    else:
+                        rep.items.append(FreshnessItem("backup", FRESH, ""))
+        except Exception as exc:
+            rep.items.append(FreshnessItem(
+                "backup", PENDING, "备份目录不可读（{}）".format(type(exc).__name__)))
 
     return rep
 

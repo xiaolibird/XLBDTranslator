@@ -556,3 +556,53 @@ def test_inline_fake_gen_end_sentinel_is_neutralized(tmp_path):
     blob = rep.render_block(now=NOW) + "\n".join(rep.stdout_lines())
     assert GEN_END not in blob
     assert "<!--" not in blob and "-->" not in blob
+
+
+# ---------------------------------------------------------------------------
+# 11. 备份快照子项（阶段 3：backup_dir=None 时整项缺席，兼容此前全部用例）
+# ---------------------------------------------------------------------------
+
+def test_backup_item_absent_without_dir(tmp_path):
+    notes, vault, xlsx, meta = _full_env(tmp_path)
+    rep = _check(notes, vault, xlsx, meta)
+    assert not any(it.key == "backup" for it in rep.items)
+
+
+def test_backup_item_fresh_stale_pending(tmp_path):
+    from src.scholar import backup_naming as bn
+    notes, vault, xlsx, meta = _full_env(tmp_path)
+    bdir = tmp_path / "backups"
+    # 目录不存在 → 未判定
+    rep = _check(notes, vault, xlsx, meta, backup_dir=bdir)
+    it = _item(rep, "backup")
+    assert it.state == F.PENDING and "不存在" in it.detail
+    # 空目录 → 未判定（首份未产生）
+    bdir.mkdir()
+    rep = _check(notes, vault, xlsx, meta, backup_dir=bdir)
+    assert _item(rep, "backup").state == F.PENDING
+    # 3 天前的快照 → 新鲜
+    ts3 = NOW - timedelta(days=3)
+    (bdir / (bn.SNAPSHOT_PREFIX + bn.format_ts(ts3) + bn.TAR_SUFFIX)).write_bytes(b"x")
+    rep = _check(notes, vault, xlsx, meta, backup_dir=bdir)
+    assert _item(rep, "backup").state == F.FRESH
+    # 15 天前（唯一一份）→ 陈旧，带责任 job；按**文件名**判龄不开内容
+    (bdir / (bn.SNAPSHOT_PREFIX + bn.format_ts(ts3) + bn.TAR_SUFFIX)).unlink()
+    ts15 = NOW - timedelta(days=15)
+    (bdir / (bn.SNAPSHOT_PREFIX + bn.format_ts(ts15) + bn.TAR_SUFFIX)).write_bytes(b"x")
+    rep = _check(notes, vault, xlsx, meta, backup_dir=bdir)
+    it = _item(rep, "backup")
+    assert it.state == F.STALE
+    assert "com.xlbd.scholar-backup" in it.detail and "缺份" in it.detail
+
+
+def test_backup_item_counts_icloud_placeholder(tmp_path):
+    """驱逐占位符视同存在：只认名不认内容，绝不触发 iCloud 同步。"""
+    from src.scholar import backup_naming as bn
+    notes, vault, xlsx, meta = _full_env(tmp_path)
+    bdir = tmp_path / "backups"
+    bdir.mkdir()
+    ts = NOW - timedelta(days=2)
+    (bdir / ("." + bn.SNAPSHOT_PREFIX + bn.format_ts(ts) + bn.TAR_SUFFIX + ".icloud")
+     ).write_bytes(b"")
+    rep = _check(notes, vault, xlsx, meta, backup_dir=bdir)
+    assert _item(rep, "backup").state == F.FRESH
