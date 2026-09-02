@@ -1,0 +1,4 @@
+# 开发/CI 专用依赖（运行时依赖见 requirements.txt 与 requirements_scholar.txt）
+pytest>=9
+pytest-cov>=7
+ruff>=0.15,<0.16

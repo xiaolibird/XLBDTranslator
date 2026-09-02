@@ -147,3 +147,31 @@ def test_multiline_quoted_value_is_not_a_false_positive(tmp_path: Path):
     )
     s = Settings.from_env_file(env_path)
     assert s.api.openai_base_url == "https://a\nfoo=bar\n"
+
+
+# ============ document_path 校验契约（自 test_error_paths.py 迁入） ============
+
+
+def test_settings_document_path_validation_contract(tmp_path: Path):
+    """document_path 走真实加载路径（from_env_file）的契约：
+    - 未提供时允许为 None（main.py 先 from_env_file 构造、后由 builder 注入路径）
+    - 指向不存在的文件 -> 校验失败（FileNotFoundError 包装为 ValidationError）
+    - 不支持的扩展名 -> 校验失败
+    """
+    from pydantic import ValidationError
+
+    # 未提供 document_path 是合法初始状态
+    s = Settings.from_env_file(_env_file(tmp_path, ""))
+    assert s.files.document_path is None
+
+    # 不存在的文件必须拒绝（before-validator 抛出的 FileNotFoundError 原样传播）
+    with pytest.raises(FileNotFoundError):
+        Settings.from_env_file(
+            _env_file(tmp_path, f"FILES__DOCUMENT_PATH={tmp_path / 'missing.pdf'}\n")
+        )
+
+    # 不支持的格式必须拒绝
+    bad = tmp_path / "doc.docx"
+    bad.write_bytes(b"fake")
+    with pytest.raises(ValidationError):
+        Settings.from_env_file(_env_file(tmp_path, f"FILES__DOCUMENT_PATH={bad}\n"))

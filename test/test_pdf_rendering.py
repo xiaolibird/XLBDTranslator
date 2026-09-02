@@ -167,7 +167,13 @@ def test_actual_translation_file():
     print("=" * 60)
     
     output_dir = project_root / "output"
-    
+    if not output_dir.is_dir():
+        # 注意：本文件的 project_root 锚在 test/ 目录（历史遗留），所以这里查的是
+        # test/output——任何机器上都不存在，本测试实际恒 skip。守卫的价值是防 CI
+        # 在 weasyprint 可用后第一次激活本测试时对缺失目录裸 iterdir 抛 FileNotFoundError。
+        # 不改锚点：改成仓库根会让单测突然遍历 1.5G 真实产物目录并渲染写盘，副作用更大。
+        pytest.skip("test/output 不存在（本测试因锚点历史原因恒 skip，守卫防 CI 裸抛）")
+
     # 找到第一个有 checkpoint 的项目
     for project_dir in output_dir.iterdir():
         if not project_dir.is_dir():

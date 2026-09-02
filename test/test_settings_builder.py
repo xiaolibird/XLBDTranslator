@@ -101,3 +101,13 @@ def test_preset_all_keys_land_somewhere(tmp_path: Path, preset_name: str):
         sub_obj_name, field_name = _SETTING_ROUTES[key]
         actual = getattr(getattr(settings, sub_obj_name), field_name)
         assert actual == expected, f"预设 {preset_name} 的 {key} 落位后值不一致: {actual!r} != {expected!r}"
+
+
+# ==================== 未知 preset 拒绝（自 test_error_paths.py 迁入） ====================
+
+
+def test_settingsbuilder_unknown_preset_raises(tmp_path: Path):
+    base = make_minimal_settings(tmp_path)
+    builder = SettingsBuilder(base)
+    with pytest.raises(ValueError):
+        builder.use_preset('this-does-not-exist')
