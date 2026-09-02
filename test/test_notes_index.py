@@ -2015,3 +2015,92 @@ def test_consistent_duplicate_citekey_no_warning():
     finally:
         _lg.remove(sink)
     assert "citekey 与其 keeper 不一致" not in "\n".join(lines)
+
+
+# ---------------- 改键 → topics/qa/_lint 派生物提醒（rekey_map 扩展） ----------------
+
+def test_announce_rekey_scans_topics_pages_and_hints_with_new_keys(tmp_path):
+    """扫描 topics/*.md 与 qa/ 中含旧键的页，按页聚合；刷新命令必须用**新键**——
+    本函数自己先重刷了索引，旧键已注销，旧键拼的命令会静默匹配不到任何条目。"""
+    topics = tmp_path / "topics"
+    (topics / "qa").mkdir(parents=True)
+    (topics / "mnar.md").write_text(
+        "证据 [@old2024Key] 与 [@other2020Ref]，再引一次 [@old2024Key]。",
+        encoding="utf-8")
+    (topics / "qa" / "qa-1.md").write_text("问答里也引了 [@old2024Key]。", encoding="utf-8")
+    (topics / "clean.md").write_text("这页不含旧键 [@other2020Ref]。", encoding="utf-8")
+    entry = {"citekey": "new2024Key", "month": "2026-08",
+             "note_file": "科研札记_2026-08_全文精读.md"}
+
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(
+            tmp_path, [entry], rekey_map=[("old2024Key", "new2024Key")])
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+
+    pages = {p["page"] for p in out["topics_pages"]}
+    assert pages == {"mnar.md", "qa-1.md"}          # clean.md 不在清单里
+    assert "--affected-by new2024Key" in out["topics_refresh_hint"]
+    assert "old2024Key" not in out["topics_refresh_hint"]   # 绝不能用旧键
+    assert "build_topics.py" in blob
+
+
+def test_announce_rekey_ignores_bare_backtick_keys_in_qa(tmp_path):
+    """边界：qa 页「未纳入的近邻论文」是裸反引号键（刻意非引用形态），不在扫描面。"""
+    topics = tmp_path / "topics"
+    (topics / "qa").mkdir(parents=True)
+    (topics / "qa" / "qa-2.md").write_text(
+        "未纳入的近邻论文：`old2024Key`（不是引用）。", encoding="utf-8")
+    entry = {"citekey": "new2024Key", "month": "2026-08",
+             "note_file": "科研札记_2026-08_全文精读.md"}
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(
+            tmp_path, [entry], rekey_map=[("old2024Key", "new2024Key")])
+    finally:
+        _lg.remove(sink)
+    assert out["topics_pages"] == []
+    assert out["topics_refresh_hint"] is None
+
+
+def test_announce_rekey_flags_lint_md_ack_invalidation(tmp_path):
+    """_lint.md 的孤儿 ID 就是 citekey：出现旧键时要点名 ack 将失效，但 _lint.md
+    不进"待刷新页"清单（它由 lint 自己重生成，不走 build_topics）。"""
+    topics = tmp_path / "topics"
+    topics.mkdir(parents=True)
+    (topics / "_lint.md").write_text(
+        "## 覆盖缺口\n- old2024Key 从未进过证据池\n", encoding="utf-8")
+    entry = {"citekey": "new2024Key", "month": "2026-08",
+             "note_file": "科研札记_2026-08_全文精读.md"}
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(
+            tmp_path, [entry], rekey_map=[("old2024Key", "new2024Key")])
+    finally:
+        _lg.remove(sink)
+    blob = "\n".join(lines)
+    assert out["topics_pages"] == []
+    assert "ack" in blob and "_lint.md" in blob
+
+
+def test_announce_rekey_aggregates_pages_not_key_times_page(tmp_path):
+    """199 键批量场景：输出按页聚合（一页一行），绝不按 键×页 逐行爆炸。"""
+    topics = tmp_path / "topics"
+    topics.mkdir(parents=True)
+    many = ["k{:03d}Old".format(i) for i in range(30)]
+    (topics / "big.md").write_text(
+        " ".join("[@{}]".format(k) for k in many), encoding="utf-8")
+    rekey_map = [(k, k.replace("Old", "New")) for k in many]
+    entry = {"citekey": "whatever", "month": "2026-08",
+             "note_file": "科研札记_2026-08_全文精读.md"}
+    lines, _lg, sink = _loguru_lines()
+    try:
+        out = ni.announce_rekey_side_effects(tmp_path, [entry], rekey_map=rekey_map)
+    finally:
+        _lg.remove(sink)
+    assert len(out["topics_pages"]) == 1
+    assert out["topics_pages"][0]["n_old_keys"] == 30
+    page_lines = [s for s in lines if "big.md" in s]
+    assert len(page_lines) == 1                      # 一页恰好一行

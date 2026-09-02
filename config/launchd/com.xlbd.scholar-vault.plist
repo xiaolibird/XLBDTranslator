@@ -44,10 +44,18 @@
         <string>__REPO_ROOT__</string>
     </dict>
 
-    <!-- 索引一变就跑 -->
+    <!-- 索引或概念页一变就跑。三条缺一不可（W5 事故的完整修复）：
+         此前只盯索引，topic 刷新在索引写盘**之后**异步落页 → 索引不再变 → 不触发
+         → vault 概念页无限期停在旧版；qa/ 归档同理。
+         注意 launchd 的目录 watch **不递归**：只对目录直接子项的增/删/rename 触发
+         （仓库写路径是 tmp+os.replace，rename 会动目录项，能触发；touch 既有文件
+         只改文件自身 mtime、不动目录 vnode，不触发），所以 topics 与 topics/qa
+         必须各列一条，少 qa 那条就是把 W5 教训修一半。 -->
     <key>WatchPaths</key>
     <array>
         <string>__REPO_ROOT__/output/scholar_notes/literature_index.json</string>
+        <string>__REPO_ROOT__/output/scholar_notes/topics</string>
+        <string>__REPO_ROOT__/output/scholar_notes/topics/qa</string>
     </array>
 
     <key>RunAtLoad</key>

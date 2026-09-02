@@ -430,11 +430,11 @@ def main() -> int:
         print("📇 问答目录：{}".format(idx))
 
     if status in ("new", "merged"):
-        # B3：Obsidian 那条发现路径**不会自己被叫起来**——`com.xlbd.scholar-vault` 的
-        # WatchPaths 只盯 `literature_index.json`，而归档一次问答不动索引，
-        # 也没有 StartInterval。实测：最后一次 vault 同步 14:19，问答页 19:01，
-        # 至今没同步过。所以这里必须把命令给出来，而不是让文档写着"去 Obsidian 搜"。
-        print("🔄 Obsidian 那份要等下一次索引重建（周度/月度）才出现。急用先跑：\n"
+        # B3 后续：vault job 的 WatchPaths 已补上 `topics/` 与 `topics/qa/`（W5 完整
+        # 修复），归档落盘会在节流窗口（约 2 分钟）后自动同步进 Obsidian——原来这里
+        # 教用户手动跑的是一件如今已自动化的事。保留兜底命令给"怀疑没触发"的场景。
+        print("🔄 Obsidian 那份会在约 2 分钟内自动同步（vault job 盯着 topics/qa/）。"
+              "没出现再手动跑：\n"
               "   PYTHONPATH=. python scripts/sync_vault.py "
               "--vault-dir ~/Documents/ScholarVault --force")
 

@@ -30,7 +30,7 @@ description: 在本机的科研札记文献库(按月精选+全文精读,MNAR/MA
 一篇论文一个文件 `01-文献/<citekey>.md`,带 YAML frontmatter(citekey/doi/year/bucket/role/flags/
 n_citable 等 30 个字段,**比 grep 月度大文件更适合按属性筛**),正文含句级证据 callout + TF-IDF 相邻文献 +
 `_MOC/` 静态索引页。**它是索引的派生视图,不是真相源**——数字与全文以 `literature_index.json` 和月度 md 为准。
-索引一变即自动同步(launchd `com.xlbd.scholar-vault` 监视 `literature_index.json`);手动补跑:
+索引/概念页/问答一变即自动同步(launchd `com.xlbd.scholar-vault` 监视 `literature_index.json` 与 `topics/`、`topics/qa/` 三条 WatchPaths);手动补跑:
 `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault`(加 `--force` 忽略陈旧判定)。
 ⚠️ 该目录含用户手写内容(`## 我的札记` 与自加的 frontmatter 键/tag),**不要直接编辑或覆盖那部分**。
 
@@ -78,7 +78,7 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 ## 知识层 lint(`topics/_lint.md`)——引到某篇之前先扫一眼
 
 `build_topics.py --verify` 查的是格式(引用还追不追得回去);`scripts/lint_notes.py` 查的是
-**整个库摆在一起看有没有问题**,四项:**撤稿**(OpenAlex `is_retracted` + 标题标记)、
+**整个库摆在一起看有没有问题**,四项(另有派生物新鲜度子项默认随跑,见下):**撤稿**(OpenAlex `is_retracted` + 标题标记)、
 **跨文献对撞**(citable ↔ refutable 的跨论文近邻句对,LLM 分五档裁决)、**陈旧论断**
 (支撑文献最新的一篇也已 5 年前)、**覆盖缺口**(高优先级精读却连证据池都没进过的论文)。
 
@@ -91,6 +91,8 @@ cat "$HOME/Documents/ScholarVault/02-主题/_lint.md"   # vault 里那份副本(
 
 - **先看报告顶部那两行**:「本轮必须处理」只放硬信号(当前只有撤稿,没有就写"无");
   「本轮状态」写四项各自是 ✅ 本轮刚跑 还是 ⏸ 结转自 N 天前,**每项都带绝对日期和条数**。
+- 状态行下方的「🧭 派生物新鲜度」块是独立子项(向量库/vault/时间线xlsx/书目是否落后于索引,
+  三态:新鲜/⌛未判定/陈旧),每轮重算不结转;陈旧行会带责任 launchd job 与日志路径。
   ✅ 只表示"本轮真跑过这一项",**不是从时间戳反推的**——同日先全跑再窄跑时,窄跑那几项
   写的是 ⏸ 结转自今天早些时候。**本轮跳过的一节会把上一次的结果原样结转并标明时效**
   (节标题下方那条 `⏸ 本轮未执行……不代表当前状态`),所以窄跑不会再把别的节清空——

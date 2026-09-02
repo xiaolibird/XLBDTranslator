@@ -20,7 +20,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ._citekey_utils import (
     _suffix_seq, _priority_tier, _TIER_MAP, _reading_depth,
@@ -1372,7 +1372,9 @@ REKEY_RENDER_HINT = "scripts/render_notes.sh"
 
 def announce_rekey_side_effects(notes_dir: Path,
                                 renamed_entries: List[Dict[str, Any]],
-                                *, settings: Any = None) -> Dict[str, Any]:
+                                *, settings: Any = None,
+                                rekey_map: Optional[List[Tuple[str, str]]] = None,
+                                ) -> Dict[str, Any]:
     """改键收尾：把两个**派生物**的失效讲出来，并 best-effort 把向量库同步回去。
 
     改 citekey 只落在 md + references.json + sidecar 三处。另外两样东西也带着 citekey，
@@ -1388,6 +1390,15 @@ def announce_rekey_side_effects(notes_dir: Path,
         注：手动精读那份现在**可以**安全地由 read_pdf.py finalize/regen 重渲染——
         `_reuse_citekeys` 已按 dedup_key 沿用札记侧的现有键（2026-08-15）；
         在那之前 regen 会用 bundle 里的旧元数据重算兜底键、把改过的新键顶回去。
+      - topics/ 概念页与 qa/ 问答页：正文的 `[@citekey]` 引用会指向已注销的旧键，
+        `_lint.md` coverage 节的孤儿 ID（就是 citekey）与对应 ack 会失效。这里只
+        **按页聚合**列清单 + 打印一条用**新键并集**的手动刷新命令（rekey_map 提供
+        old→new；必须用新键——本函数下面就会重刷索引，旧键在索引里已不存在，旧键拼
+        的命令会静默匹配不到任何条目，比不给命令更糟。并集一次调用是 W7 纪律）。
+        **不**自动调 trigger_topic_refresh：那是阻塞 subprocess、timeout 40 分钟、
+        走 LLM 配额，挂进改键收尾会把秒级操作变成小时级任务。
+        边界：qa 页「未纳入的近邻论文」的裸反引号键（qa.py 刻意的非引用形态）不在
+        扫描面内——那些本来就标注"不是引用"。
 
     向量库同步走 best-effort（比照 ingest_notes.py 的挂钩）：Ollama 没起、模型没 pull、
     库被别的进程锁着，都只 log warning 并打出重建命令，绝不改变改键本身的成败。
@@ -1417,6 +1428,58 @@ def announce_rekey_side_effects(notes_dir: Path,
             logger.warning("      {}".format(d["path"]))
         logger.warning("      重渲染：{} <该月 .md>".format(REKEY_RENDER_HINT))
 
+    # ---- topics/qa 页与 _lint.md：按页聚合列清单，刷新命令用新键并集 ----
+    out["topics_pages"] = []
+    out["topics_refresh_hint"] = None
+    if rekey_map:
+        # 去重：撞键组 ≥3 条时同一旧键出现多次（(key,keyb),(key,keyc)），不去重会让
+        # 页面命中计数虚高（审计实证：引一次报 2 个旧键）
+        old_keys = sorted({o for o, _n in rekey_map if o})
+        new_keys = sorted({n for _o, n in rekey_map if n})
+        topics_dir = notes_dir / "topics"
+        affected_new: Set[str] = set()
+        lint_affected = False
+        if topics_dir.is_dir() and old_keys:
+            for page in sorted(topics_dir.rglob("*.md")):
+                try:
+                    text = page.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                hits = [o for o in old_keys if "[@{}]".format(o) in text or
+                        # _lint.md 的孤儿 ID 是裸 citekey（coverage 节）。词边界匹配：
+                        # 撞键消歧的 b/c 后缀让旧键天然是近亲键（smith2024a）的前缀，
+                        # 裸子串会假阳性（审计实证）
+                        (page.name == "_lint.md" and re.search(
+                            r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(o)),
+                            text))]
+                if not hits:
+                    continue
+                if page.name == "_lint.md":
+                    lint_affected = True
+                    continue
+                out["topics_pages"].append(
+                    {"page": page.name, "n_old_keys": len(hits)})
+                affected_new |= {n for o, n in rekey_map if o in hits and n}
+        if out["topics_pages"]:
+            # 199 键批量场景（audit --apply）绝不按 键×页 逐行爆炸：按页聚合一行一个
+            # 措辞覆盖两条路径：audit 路径旧键已注销；撞键路径旧键仍由 keeper 持有、
+            # 但页面引用的归属已歧义（原本指向的那篇现在换了键）
+            logger.warning("  ⚠️ {} 页概念页/问答页含旧 citekey（引用已指向注销键，"
+                           "或归属已歧义）：".format(len(out["topics_pages"])))
+            for p in out["topics_pages"][:20]:
+                logger.warning("      {}（{} 个旧键）".format(p["page"], p["n_old_keys"]))
+            if len(out["topics_pages"]) > 20:
+                logger.warning("      …等共 {} 页".format(len(out["topics_pages"])))
+            cmd_keys = sorted(affected_new) or new_keys
+            out["topics_refresh_hint"] = (
+                "PYTHONPATH=. python scripts/build_topics.py "
+                + " ".join("--affected-by {}".format(k) for k in cmd_keys))
+            logger.warning("      手动刷新（新键并集，一次调用）：{}"
+                           .format(out["topics_refresh_hint"]))
+        if lint_affected:
+            logger.warning("  ⚠️ topics/_lint.md 里出现旧 citekey：coverage 节的孤儿 ID "
+                           "与对应 ack 将失效（下轮 lint 会按新键重报，旧 ack 需手动改）")
+
     from .embed_store import DB_NAME
     db_path = notes_dir / DB_NAME
     if not db_path.exists():
@@ -1436,8 +1499,17 @@ def announce_rekey_side_effects(notes_dir: Path,
             settings = ScholarSettings.from_env_file(cfg) if cfg.exists() else ScholarSettings()
         # 必须拿**改键之后**的索引去同步：磁盘上那份 literature_index.json 此刻还是旧键，
         # 拿它 diff 等于什么都不改。刷完顺手落盘，调用方紧接着的那次重建会自然变成空跑。
+        index_file = notes_dir / INDEX_JSON
+        mtime_before = index_file.stat().st_mtime if index_file.exists() else None
         index_data = update_index(notes_dir)
         write_outputs(index_data, notes_dir)
+        # `_stable` 短路（内容未变不落盘、mtime 不抖）时 WatchPaths 不触发，vault 与
+        # 桌面 xlsx 不会自动跟上——改键路径上这近乎不可达（键变了内容必变），但真发生
+        # 时必须说出来，别让人以为派生链自己会接上。
+        mtime_after = index_file.stat().st_mtime if index_file.exists() else None
+        if mtime_before is not None and mtime_before == mtime_after:
+            logger.warning("  ⚠️ 索引内容未变（_stable 短路未落盘）：vault/时间线 xlsx "
+                           "不会被 WatchPaths 自动同步，需手动跑 scripts/sync_vault.py")
         # 走共享的 best-effort 封装（此前是全仓第 5 份复制，且是唯一不 notify 的那份）。
         # 跑这条路径的是自动权限模式的 agent 会话——stdout 上的 warning 没人看，而失败后果是
         # 向量库留着已注销的旧键，notes_search --cite 吐出的引用粘进 pandoc 渲染成 (key?)。
@@ -1487,6 +1559,7 @@ def fix_citekey_collisions(notes_dir: Path,
     failed: List[str] = []
     partial: List[str] = []
     touched: List[Dict[str, Any]] = []      # 键真落到磁盘上的条目（OK + PARTIAL），供收尾告知派生物
+    rekey_pairs: List[Tuple[str, str]] = []  # (旧键, 新键)，供 topics 扫描与刷新命令用新键
     for key, group in sorted(by_key.items()):
         if not key or len(group) <= 1 or len({e["dedup_key"] for e in group}) <= 1:
             continue
@@ -1504,11 +1577,13 @@ def fix_citekey_collisions(notes_dir: Path,
                 all_keys.add(new)
                 renamed += 1
                 touched.append(e)
+                rekey_pairs.append((key, new))
                 logger.info("  🔧 改键 {} → {}（{}）".format(key, new, e["month"]))
             elif res == RENAME_PARTIAL:
                 all_keys.add(new)                # 键已落在 md 上，绝不能再发给下一条
                 partial.append(desc)
                 touched.append(e)                # 新键已在磁盘上 → 派生物同样失效，一并告知
+                rekey_pairs.append((key, new))
             else:
                 failed.append(desc)
     if partial:
@@ -1523,7 +1598,7 @@ def fix_citekey_collisions(notes_dir: Path,
             logger.warning("      {}".format(s))
     # 派生物（向量库 / docx）不会自己跟着改键走，收尾统一告知 + best-effort 同步。
     # 判据用 touched 而非 renamed：半改条目的新键也已经落在磁盘上，派生物照样失效。
-    side = announce_rekey_side_effects(notes_dir, touched) or {}
+    side = announce_rekey_side_effects(notes_dir, touched, rekey_map=rekey_pairs) or {}
     if side_out is not None:
         # 出参而非改返回值：renamed 这个 int 被 5 处既有测试以 `renamed = ...` 接住并断言。
         # 调用方据此决定退出码——向量库没跟上 = 检索会吐已注销的旧键，exit 0 会让自动权限

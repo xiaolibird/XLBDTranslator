@@ -103,6 +103,7 @@ PYTHONPATH=. python scripts/build_topics.py --topic <上一步列出的 slug>...
 ```bash
 PYTHONPATH=. python scripts/lint_notes.py                     # 四项全跑(对撞要调 LLM,约 8 分钟)
 PYTHONPATH=. python scripts/lint_notes.py --skip-contradictions  # 只跑不花钱的三项(月度自动跑的形状)
+# 「派生物新鲜度」子项默认随跑(向量库/vault/时间线xlsx/书目 vs 索引;--skip-freshness 跳过)
 PYTHONPATH=. python scripts/lint_notes.py --offline --skip-stale --skip-coverage  # 只补跑对撞
 PYTHONPATH=. python scripts/lint_notes.py --offline --dry-run    # 什么都不调用,只看候选统计
 PYTHONPATH=. python scripts/lint_notes.py --vault-dir ~/Documents/ScholarVault  # 显式指定 vault(见下「ack 写在哪」)
@@ -177,6 +178,7 @@ PYTHONPATH=. python scripts/lint_notes.py --vault-dir ~/Documents/ScholarVault  
 **报告的读法有四条要紧的**:
 
 - **先看顶部那行「本轮必须处理」**:只放硬信号(当前只有撤稿),没有就写"无"。
+  状态行下方的「🧭 派生物新鲜度」块每轮重算不结转(陈旧行带责任 job 与日志路径)。
   它下面那行「本轮状态」一行两用——四项各自是 ✅ 本轮刚跑 还是 ⏸ 结转自 N 天前,
   **每项都带绝对日期和条数**(报告是磁盘上的静态文件,月度 launchd 挂了它也不会更新,
   "刚跑"是相对谁说的必须写出来)。**✅ 只认"本轮真跑过"这件事本身,不从时间戳反推**
@@ -288,8 +290,9 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
   都把这类内容传进去,漏传的那个会在下次同步时整批删掉),不是问答这一层单独的取舍。
   找旧问答的三条路:`topics/qa/INDEX.md` 目录页、Obsidian 的 `02-主题/问答/`、
   或者直接再问一次(查重会把旧的那页指给你)。
-- ⚠️ **Obsidian 那份不会立刻出现**:`com.xlbd.scholar-vault` 只盯 `literature_index.json`,
-  而归档问答不动索引,所以要等下一次索引重建(周度/月度)。急用手动跑一次:
+- `com.xlbd.scholar-vault` 的 WatchPaths 现在盯 `literature_index.json` **和**
+  `topics/`、`topics/qa/` 三条——归档问答落盘 qa/ 会在节流窗口(约 2 分钟)后自动
+  同步进 Obsidian,不再需要等下一次索引重建。若急用或怀疑没触发,手动跑:
   ```bash
   PYTHONPATH=. python scripts/sync_vault.py --vault-dir ~/Documents/ScholarVault --force
   ```

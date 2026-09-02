@@ -2506,6 +2506,11 @@ class LintOutcome:
     ok: bool
     alert: bool = False          # 有需要人立刻处理的发现（当前只有撤稿）
     detail: str = ""
+    # freshness 低音量提醒：派生物陈旧（🧭⚠ 前缀行）不改退出码（"只有撤稿退 1"的
+    # 既有约定），但 rc0 时 summarize 原本完全不读 stdout——报警写进一份要靠"死掉的
+    # vault job"才能送达 Obsidian 的报告里，等于没报。这条独立字段让月度调用方能发
+    # 一条普通通知，且与撤稿的 alert 硬信号互不混淆。
+    freshness_alert: str = ""
 
 
 def summarize_lint_run(stdout: str, stderr: str, returncode: int) -> LintOutcome:
@@ -2519,16 +2524,25 @@ def summarize_lint_run(stdout: str, stderr: str, returncode: int) -> LintOutcome
     """
     lines = [ln.strip() for ln in (stdout or "").strip().splitlines()]
     hits = [ln for ln in lines if ln.startswith("🚨")]
+    # freshness 的陈旧行用复合前缀 `🧭⚠`——**只有**这个前缀触发低音量提醒；普通 🧭
+    # 行（新鲜/未判定）不触发，否则每次月度全新鲜也弹通知，告警面被训练成噪音。
+    # 这里绝不抛异常：backfill 的调用点在 try 块外，抛了会吞掉整段通知。
+    try:
+        fresh_hits = [ln for ln in lines if ln.startswith("🧭⚠")]
+        fresh_alert = "；".join(fresh_hits[:3])
+    except Exception:
+        fresh_alert = ""
     err = (stderr or "").strip()
     if returncode == 0:
-        return LintOutcome(ok=True)
+        return LintOutcome(ok=True, freshness_alert=fresh_alert)
     if returncode == 1:
         detail = "发现 {} 篇已撤稿论文仍在库中".format(len(hits) or "若干")
         if err:
             detail += "；stderr：{}".format(err[:200])
         if hits:
             detail += "；{}".format("；".join(hits[:5]))
-        return LintOutcome(ok=True, alert=True, detail=detail)
+        return LintOutcome(ok=True, alert=True, detail=detail,
+                           freshness_alert=fresh_alert)
     detail = "退出码 {}（{}）".format(returncode, LINT_EXIT_CODES.get(returncode, "未知退出码"))
     if err:
         detail += "；stderr：{}".format(err[:300])
@@ -2538,7 +2552,8 @@ def summarize_lint_run(stdout: str, stderr: str, returncode: int) -> LintOutcome
     # 工具故障而丢失。两条都置上，调用方两条通知都发。
     if hits:
         detail += "；{}".format("；".join(hits[:5]))
-    return LintOutcome(ok=False, alert=bool(hits), detail=detail)
+    return LintOutcome(ok=False, alert=bool(hits), detail=detail,
+                       freshness_alert=fresh_alert)
 
 
 @dataclass
@@ -2594,7 +2609,8 @@ def carry_forward_counts(counts: LintCounts,
 
 def build_lint_frontmatter(counts: LintCounts, generated_at: str,
                            preserved: Optional[Dict[str, Any]] = None,
-                           checks_ran_at: Optional[Dict[str, str]] = None) -> str:
+                           checks_ran_at: Optional[Dict[str, str]] = None,
+                           freshness_stale: Optional[int] = None) -> str:
     """受管键覆盖、用户自加键保留，同 topics.build_frontmatter 的约定。
 
     `checks_ran_at`（A1）是 `{section key: ISO 时间}`，本轮跑过的 key 用新时间、
@@ -2623,16 +2639,42 @@ def build_lint_frontmatter(counts: LintCounts, generated_at: str,
         "n_scan_failed_dois": counts.scan_failed_dois,
         "tags": ["札记/知识层lint"],
     }
+    # freshness 的计数与四节的 null 语义体系刻意解耦：它不进 LintCounts/_COUNT_KEYS/
+    # carry_forward（每轮真跑重算、不结转），跳过时**整键缺席**而不是写 null——
+    # "null=从来没执行过"的语义已被 carry_forward_counts 占用，freshness 写 null
+    # 就是在那套体系里说谎。缺席还必须防 preserved 穿透：preserved 是上一版完整
+    # frontmatter，键掉出 managed 后旧值会被当"用户自加键"原样保留（下面那个循环），
+    # 于是 skip 轮会显示上一轮的旧计数且无任何时效标注——这里显式剔除。
+    if freshness_stale is not None:
+        managed["n_freshness_stale"] = freshness_stale
     items = dict(managed)
     for k, v in (preserved or {}).items():
-        if k not in managed:
+        if k not in managed and k != "n_freshness_stale":
             items[k] = v
     return _render_frontmatter(items)
 
 
+def _insert_freshness_block(body: str, block: str) -> str:
+    """把 freshness 文本块插进 body 的**第一个 LINT-SECTION 标记之前**。
+
+    这是唯一安全的位置（PRD 三轮对抗审核独立收敛的结论）：split_lint_sections 丢弃
+    首标记前文本 → 这一块永不被结转、不进 checks_ran_at；拼在 coverage 之后会被吸进
+    该节 buffer、随 --skip-coverage 结转成永久化石；自带标记会污染 frontmatter 的
+    checks_ran_at。找不到任何标记时（理论不可达：render 恒产出四节）追加尾部——
+    此时 body 无节可结转，追加同样安全。
+    """
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if _LINT_SECTION_RE.match(line.strip()):
+            return "\n".join(lines[:i] + [block.rstrip("\n"), ""] + lines[i:])
+    return body.rstrip("\n") + "\n\n" + block.rstrip("\n") + "\n"
+
+
 def write_lint_report(topics_dir, body: str, counts: LintCounts, *,
                       dry_run: bool = False,
-                      now: Optional[datetime] = None) -> Tuple[Optional[Path], str]:
+                      now: Optional[datetime] = None,
+                      freshness_block: Optional[str] = None,
+                      freshness_stale: Optional[int] = None) -> Tuple[Optional[Path], str]:
     """落盘 `topics/_lint.md`，走与概念页同一套哨兵合并。返回 `(路径, 状态)`。
 
     状态取值同 `topics.merge_topic_page`：`new`/`merged`/`conflict`/`unchanged`。
@@ -2651,11 +2693,14 @@ def write_lint_report(topics_dir, body: str, counts: LintCounts, *,
     now = now or datetime.now()
     path = Path(topics_dir) / LINT_REPORT_NAME
     existing, fm, _prev = read_existing(path)
+    if freshness_block:
+        body = _insert_freshness_block(body, freshness_block)
     ran_at = {k: v[0] for k, v in split_lint_sections(body).items() if v[0]}
     content, status = merge_topic_page(
         build_lint_frontmatter(carry_forward_counts(counts, fm),
                                now.isoformat(timespec="seconds"),
-                               preserved=fm, checks_ran_at=ran_at),
+                               preserved=fm, checks_ran_at=ran_at,
+                               freshness_stale=freshness_stale),
         body, existing, generator=LINT_GENERATOR)
     if content is None:
         return path, "conflict"

@@ -50,9 +50,9 @@
 替代的发现路径有三条，都不依赖向量库：
   1. `topics/qa/INDEX.md` 目录页（按最近更新排序，带问题全文）；
   2. vault `02-主题/问答/`——Obsidian 全文搜索 + 关系图，citekey 已转成 wiki 链接，
-     per-paper 笔记因此能反向看到"哪几次问答引用了我"。⚠️ 归档一次问答**不会立刻**
-     出现在那里：`com.xlbd.scholar-vault` 只盯 `literature_index.json`，问答不动索引，
-     所以要等下一次索引重建（周度/月度）。急用先手动跑一次 `scripts/sync_vault.py`；
+     per-paper 笔记因此能反向看到"哪几次问答引用了我"。归档落盘 qa/ 后
+     `com.xlbd.scholar-vault`（WatchPaths 含 `topics/qa/`）会在节流窗口后自动同步进
+     Obsidian；怀疑没触发时手动跑一次 `scripts/sync_vault.py`；
   3. **问之前先查重**（`find_similar_questions`）：新问题与已归档问题算相似度，
      像的先提示"你三个月前问过这个，在 <slug>"。这条最直接地兑现了"探索复合"——
      它拦住的正是"同一个问题被问第四次"。

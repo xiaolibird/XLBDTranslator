@@ -181,6 +181,7 @@ def main():
             len(plan), len(skipped)))
     else:
         touched = []          # 新键真落到磁盘上的条目（OK + PARTIAL），供收尾告知派生物
+        rekey_pairs = []      # (旧键, 新键)，announce 的 topics 扫描/刷新命令要新键
         for e, new in plan:
             # 三态：refused = 三处一处都没改（预检不过，或写盘失败已回滚）；
             # partial = 写盘失败且回滚失败，磁盘半改（「md 改了 refs 没改」会让 pandoc
@@ -189,16 +190,18 @@ def main():
             if res == RENAME_OK:
                 renamed += 1
                 touched.append(e)
+                rekey_pairs.append((e["citekey"], new))
                 print("  🔧 {} → {}".format(e["citekey"], new))
             elif res == RENAME_PARTIAL:
                 partial.append((e["citekey"], new, e.get("note_file")))
                 touched.append(e)     # 新键已在磁盘上 → 派生物同样失效
+                rekey_pairs.append((e["citekey"], new))
             else:
                 failed.append((e["citekey"], new, e.get("note_file")))
         print("\n改键 {} 篇；请重跑 scripts/notes_index.py --full 重建索引".format(renamed))
         # 改键只动 md/references/sidecar 三处；向量库与已渲染 docx 是不会自己跟上的派生物。
         # 不在这里告知，运维就只能靠"某天发现 pandoc 报 citation not found"才知道库旧了。
-        side = announce_rekey_side_effects(notes_dir, touched) or {}
+        side = announce_rekey_side_effects(notes_dir, touched, rekey_map=rekey_pairs) or {}
         if side.get("error"):
             # 向量库没跟上 = 检索会吐已注销的旧键。退出码必须反映它，否则自动权限模式的
             # agent 会话按 exit 0 判定成功继续往下走，而 stdout 上的 warning 没人看。

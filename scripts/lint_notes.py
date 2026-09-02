@@ -6,6 +6,8 @@
 
   python scripts/lint_notes.py                      # 四项全跑（对撞要调 LLM）
   python scripts/lint_notes.py --skip-contradictions  # 只跑不花钱的三项（月度自动跑的形状）
+  （另有「派生物新鲜度」子项默认随跑：向量库/vault/时间线xlsx/书目 vs 索引，纯计算，
+   生产库上才执行；--skip-freshness 跳过。它不在四节的结转机制里，每轮重算。）
   python scripts/lint_notes.py --offline            # 不联网（跳过撤稿检查）
   python scripts/lint_notes.py --dry-run            # 只统计候选，不调 LLM、不落盘
 
@@ -72,6 +74,14 @@ def main() -> int:
                     help="不联网，跳过撤稿检查（报告里会写明这一项本轮未执行）")
     ap.add_argument("--skip-stale", action="store_true", help="跳过陈旧论断检查")
     ap.add_argument("--skip-coverage", action="store_true", help="跳过覆盖缺口统计")
+    ap.add_argument("--skip-freshness", action="store_true",
+                    help="跳过派生物新鲜度子项（向量库/vault/时间线xlsx/书目 vs 索引；"
+                         "纯计算不联网。跳过时报告里整块缺席、frontmatter 整键缺席——"
+                         "它每轮重算，不走四节的结转机制）")
+    ap.add_argument("--grace-seconds", type=int, default=None,
+                    help="覆写 freshness 全部子项的宽限窗（秒）。默认按子项分档"
+                         "（vault/xlsx 600、向量库 1800）；验收/排障时用 0 强制"
+                         "把「源侧刚变」的未判定态压成陈旧态")
     ap.add_argument("--pair-min-sim", type=float, default=L.DEFAULT_PAIR_MIN_SIM,
                     help="对撞候选的相似度下限（默认 {}；**不要照抄概念页召回的 0.55**，"
                          "那是 query↔证据口径，见 lint.DEFAULT_PAIR_MIN_SIM）".format(
@@ -308,6 +318,37 @@ def main() -> int:
         print("✔️ 读到 {} 条 ack（来源：{}）".format(
             len(acks), "、".join(str(p) for p in ack_files)))
 
+    # ---- 派生物新鲜度（freshness；纯计算，不进四节的结转机制）----
+    # 生产守卫用 **exact-match** 口径（同 sync_vault.py 的 is_real——2026-09-01
+    # 假数据盖真表事故的守卫），**不是** notes_dir_is_production 的"output/ 之下"
+    # 口径：freshness 读的是全局单例派生物（真实桌面 xlsx 的 sidecar、
+    # ~/Documents/ScholarVault/_meta.json），output/ 下随便一个副本库拿自己的索引去
+    # 比真实派生物只会得出假"陈旧"，再照报警执行同步就是对生产库误操作。非生产库
+    # 时整块不执行（比"全部未判定"更强的隔离：tmp 库的 CLI 测试报告逐字节不变，
+    # 191 个既有用例的零改动承诺靠它成立）。
+    freshness_block = None
+    freshness_stale = None
+    if not args.skip_freshness:
+        is_prod = notes_dir.resolve() == repo_path("output/scholar_notes").resolve()
+        if not is_prod:
+            print("🧭 freshness：非生产库，本轮未执行（生产守卫，不拿 tmp 索引比对真实派生物）")
+        else:
+            from src.scholar import lint_freshness as F
+            # 时间线路径复用 export_timeline_xlsx 的单一出处（文件名口径二次实现
+            # 漂移 = 永久假阳性）；vault 根复用上面 ack 已解析的 cand（探测成功才用）
+            from scripts.export_timeline_xlsx import DEFAULT_OUT, _meta_path
+            grace = ({k: args.grace_seconds for k in F.GRACE_DEFAULTS}
+                     if args.grace_seconds is not None else None)
+            # vault_topics 非 None 恰等价于"cand 存在且其概念页目录探测成功"
+            fresh_vault = cand if vault_topics is not None else None
+            rep = F.check_freshness(
+                index_path, notes_dir, fresh_vault, DEFAULT_OUT, _meta_path(DEFAULT_OUT),
+                grace_overrides=grace)
+            for ln in rep.stdout_lines():
+                print(ln)
+            freshness_block = rep.render_block()
+            freshness_stale = rep.n_stale
+
     now = datetime.now()
     body = L.render_lint_report(
         verdicts=verdicts, candidates=candidates, verdict_report=vrep,
@@ -334,7 +375,8 @@ def main() -> int:
 
     topics_dir.mkdir(parents=True, exist_ok=True)
     path, status = L.write_lint_report(topics_dir, body, counts, dry_run=args.dry_run,
-                                       now=now)
+                                       now=now, freshness_block=freshness_block,
+                                       freshness_stale=freshness_stale)
     icon = {"new": "🆕", "merged": "✅", "unchanged": "＝", "conflict": "⚠️"}.get(status, "?")
     print("\n{} 报告：{}（{}）".format(icon, path, status))
     conflict_msg = ("⚠️ 报告落盘冲突：哨兵缺失或生成块被手改，本轮报告未写入磁盘"
@@ -355,7 +397,12 @@ def main() -> int:
         print(reminder)
 
     if args.json:
-        print(json.dumps(counts.__dict__, ensure_ascii=False, sort_keys=True))
+        machine = dict(counts.__dict__)
+        # freshness 不进 LintCounts（不结转），但机读摘要不该比 frontmatter 少料；
+        # 与"跳过即缺席"同口径：没跑就没这个键
+        if freshness_stale is not None:
+            machine["n_freshness_stale"] = freshness_stale
+        print(json.dumps(machine, ensure_ascii=False, sort_keys=True))
 
     # counts.retracted 为 None 表示 --offline（没查），不该退 0 也不该退 1——
     # 退 0 就是在说"查过了没问题"。这里退 0 但上面报告与 stdout 都写明了未执行，

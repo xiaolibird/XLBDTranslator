@@ -330,6 +330,16 @@ def _run_knowledge_lint(notes_dir, timeout=900) -> bool:
         logger.warning("知识层 lint 未跑成，回填已完成：{}".format(outcome.detail))
         notify("Scholar 月度回填", "知识层 lint 未跑成（回填已完成）：{}".format(
             outcome.detail[:300]))
+    # freshness 低音量提醒：派生物陈旧不改退出码（"只有撤稿退 1"），而 rc0 时
+    # summarize 此前完全不读 stdout——报警只写进一份要靠"死掉的 vault job"才能送达
+    # Obsidian 的报告里，等于没报。独立字段、独立一条普通通知，与撤稿硬信号不混。
+    # 绝不抛异常：这里在 try 块外，抛了会吞掉上面已决定要发的通知。
+    try:
+        if outcome.freshness_alert:
+            logger.warning("🧭 派生物陈旧：{}".format(outcome.freshness_alert))
+            notify("Scholar 派生物陈旧", outcome.freshness_alert[:300])
+    except Exception:
+        pass
     return outcome.ok
 
 
