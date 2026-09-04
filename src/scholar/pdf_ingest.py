@@ -526,7 +526,12 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
 }}"""
 
 
-_SYNTH_NOTES_BUDGET = 60000
+# 汇总步喂进 synth prompt 的块笔记总预算。与 settings.closeread_max_chars 零和耦合：
+# 每块配额 = 本预算 / 块数。11 块时 60000 给出 5,432/块，而实测块笔记约 5.8k —— 已经在
+# 均摊裁剪（日志「块笔记超汇总预算…均摊裁剪」）。2026-08-28 随 max_chars 137400（12 块）
+# 同步抬到 66000，维持每块 5,500 的配额，避免多读的尾部反噬已读章节的保真度。
+# 改这个数要连着改 settings.closeread_max_chars，并跑 test_closeread_chunk_coupling.py。
+_SYNTH_NOTES_BUDGET = 66000
 
 
 def _shrink_note(note: Dict[str, Any], budget: int) -> Tuple[Dict[str, Any], bool]:

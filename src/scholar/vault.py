@@ -44,6 +44,11 @@ MANAGED_KEYS = (
     "priority_rank", "confidence", "bucket", "role", "flags",
     "has_full_text_reading", "reading_source", "n_highlights",
     "n_citable", "n_refutable", "n_method", "one_line", "origin",
+    # 取证覆盖面量尺（2026-08-28 新增）。**加 front matter 键必须同步加进本元组**：
+    # 否则 build_frontmatter 下面那段会把它当成「用户自加的键」回读并追加到末尾，
+    # 于是同一个键在文件里出现两次、每次重写都变，幂等性直接破（test_vault 的
+    # is_idempotent / untampered_rebuild_is_not_conflict 会红）。
+    "reading_depth", "fulltext_truncated", "fulltext_chars", "fulltext_chars_raw",
     "tags", "cssclasses", "vault_schema",
 )
 # 受管 tag 前缀：以 "/" 结尾的按前缀匹配，其余按整串相等（否则 `scholar` 会吃掉用户的
@@ -340,6 +345,13 @@ def build_frontmatter(e: Dict[str, Any], preserved: Optional[Dict[str, Any]] = N
         ("flags", _y_list(e.get("flags") or [])),
         ("has_full_text_reading", _y(bool(e.get("has_full_text_reading")))),
         ("reading_source", _y(e.get("reading_source"))),
+        # 取证覆盖面量尺：原样透传三态（true/false/null），**不做 bool() 收敛**——
+        # null 是「老条目没装量尺」，与 false「确实没截断」语义不同，Dataview
+        # 按 fulltext_truncated = true 过滤时不能把未知混进来。
+        ("reading_depth", _y(e.get("reading_depth"))),
+        ("fulltext_truncated", _y(e.get("fulltext_truncated"))),
+        ("fulltext_chars", _y(e.get("fulltext_chars"))),
+        ("fulltext_chars_raw", _y(e.get("fulltext_chars_raw"))),
         ("n_highlights", _y(len(hls))),
         ("n_citable", _y(int(tc.get("citable") or 0))),
         ("n_refutable", _y(int(tc.get("refutable") or 0))),

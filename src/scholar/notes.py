@@ -131,6 +131,9 @@ def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[in
     # 全文精读（句级三色联想）——有则优先展示，替代摘要级 AI 归纳
     cr = seg.close_reading
     if cr and cr.sections:
+        # 标题两态，且**必须**保持两态：它是 notes_index._CLOSEREAD_RE 的机读锚点，
+        # 往里塞括号后缀会让「· 来源」那个可选组匹配空，静默丢掉 reading_source
+        # （2026-08-28 实测踩过，回归测试见 test_closeread_chunk_coupling.py）。
         label = "全文精读" if cr.from_full_text else "精读（仅摘要降级）"
         src = " · 来源 `{}`".format(cr.source) if cr.source else ""
         body.extend(["", "{} {}{}".format(sub, label, src), ""])

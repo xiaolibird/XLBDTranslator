@@ -405,6 +405,16 @@ def _rehydrate_close_readings(out_dir: Path, filename: str,
     ck2dk = {e["citekey"]: recompute_entry_key(e)
              for e in sidecar.get("papers", [])
              if isinstance(e, dict) and e.get("citekey")}
+    # 阅读深度量尺：md **不存**这几个字段（本函数 docstring 自陈「回读后为默认值」），
+    # 只从 md 回读的话 truncated/body_chars 恒为 None，同 label 重跑一次就把这篇的量尺
+    # 抹平了——而 vault front matter 与索引统计都读它。sidecar 里这几个字段是齐的
+    # （ck2dk 已经在读同一份文件），顺手带出来回填进 CloseReading。
+    # 注意这只救得了**有 sidecar** 的月份；缺 sidecar 那 43 个月无解，
+    # 见 docs/bugs/2026-09-04-auto-sidecar-missing.md。
+    ck2ruler = {e["citekey"]: (e.get("fulltext_chars"), e.get("fulltext_chars_raw"),
+                               e.get("fulltext_truncated"))
+                for e in sidecar.get("papers", [])
+                if isinstance(e, dict) and e.get("citekey")}
     # md → 按 citekey 收集精读结构（行首锚定，与 parse_note_md 同一状态机走法）
     readings: Dict[str, CloseReading] = {}
     cur_ck: Optional[str] = None
@@ -424,6 +434,8 @@ def _rehydrate_close_readings(out_dir: Path, filename: str,
         if crm:
             cur_cr = CloseReading(from_full_text=(crm.group(1) == "全文精读"),
                                   source=crm.group(2), sections=[])
+            _used, _raw, _trunc = ck2ruler.get(cur_ck, (None, None, None))
+            cur_cr.body_chars, cur_cr.body_chars_raw, cur_cr.truncated = _used, _raw, _trunc
             readings[cur_ck] = cur_cr
             cur_sec = None
             continue
