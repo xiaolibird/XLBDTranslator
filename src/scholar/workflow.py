@@ -153,6 +153,11 @@ class ScholarWorkflow:
 
         # 显式日期区间 [start,end]（按月回填时由 CLI 设置；None=用相对 days_to_fetch）
         self.date_range: Optional[Tuple[date, date]] = None
+        # 月度札记已存在时是否允许整篇覆盖（CLI --overwrite-notes）。默认拒绝：
+        # `digest --month 2023-05 --zotero` 会算出与历史札记**完全相同**的文件名，而 write_notes
+        # 是原子替换、不查存在性，原文件里的精读句/人工修订随之永久消失、退出码 0
+        # （output/ 不在 git 内，无第二份拷贝；见 docs/bugs/2026-09-04-digest-month-overwrite.md）。
+        self.allow_note_overwrite: bool = False
 
         # 幂等标记：过滤裁决加成（THREAT/MUST_ENGAGE 等）是否已经累加过一次。
         # _sort_by_priority 会把加成原地写入 seg.priority_score 并随 digest JSON 落盘，
@@ -1646,10 +1651,34 @@ __PAPERS_JSON__
 
         return output
 
+    def planned_note_stem(self) -> str:
+        """本次 run 若走到 Step 4.5，write_notes 会用的文件名（不含扩展名）。
+
+        与 _step_sync_zotero 内的拼法**必须同源**：CLI 开跑前的存在性预检靠它算目标路径，
+        两处一旦漂移，预检放行、写盘时才发现要覆盖——LLM 额度已经烧掉了。
+        """
+        proc = self.settings.processing
+        cr_fname = "_全文精读" if proc.closeread_enabled else ""
+        label = self.date_range[0].strftime('%Y-%m') if self.date_range \
+            else datetime.now().strftime('%Y-%m-%d')
+        return "科研札记_{}{}".format(label, cr_fname)
+
+    def planned_note_path(self) -> Path:
+        """本次 run 若走到 Step 4.5 将落盘的 md 路径（slug 规则与 write_notes 同源）。"""
+        from .notes import note_file_paths
+        return note_file_paths(Path(self.settings.processing.notes_dir), self.planned_note_stem())["md"]
+
     def _step_sync_zotero(self) -> Optional[Dict[str, Any]]:
         """Step 4.5: 把入选论文写入 Zotero，回查 citekey，生成 pandoc 科研札记。
 
         延迟导入，避免未用 Zotero 联动时也强依赖该模块。Zotero 不可用只 warning、不中断。
+
+        **覆盖护栏**：目标月度札记已存在且未授权 `--overwrite-notes` → 一字不动、error + notify，
+        返回 {"skipped_existing": …}；授权时先把旧四件套备份到 .digest_overwrite_backup/<时间戳>/
+        再覆盖。同类路径 backfill_notes.py（exists()/--force）、read_pdf finalize（止损闸）、
+        backfill_deepread（写前备份）都有护栏，此前唯独这条没有，而 monthly_backfill.sh 走的
+        就是它。护栏放在这里而不是 write_notes：read_pdf regen / backfill --force 的整篇重写
+        是设计内行为。
         """
         logger.info("\n📥 Step 4.5: Zotero 联动（写库 + citekey + 札记）")
         logger.info("-" * 40)
@@ -1658,12 +1687,34 @@ __PAPERS_JSON__
             return None
         try:
             from .zotero_sync import sync_segments_to_zotero
-            from .notes import write_notes
+            from .notes import write_notes, note_file_paths, backup_note_files
         except Exception as e:
             logger.warning("  ⚠️ Zotero 模块导入失败，跳过: {}".format(e))
             return None
 
         proc = self.settings.processing
+        # 护栏排在 Zotero 写库与精读之前：拒绝时不该先往 Zotero 写一批条目、再烧一轮精读 LLM。
+        note_fname = self.planned_note_stem()
+        paths = note_file_paths(Path(proc.notes_dir), note_fname)
+        target_md = paths["md"]
+        # 四件套任一存在即算「已有」：md 缺而 sidecar/references/docx 在（半态）同样会被整篇覆盖，
+        # 而 sidecar 是阅读深度量尺唯一的无损源（第 1 轮压测 S7）。判据与 backup_note_files 同源。
+        existing = [p for p in paths.values() if p.exists()]
+        if existing:
+            if not self.allow_note_overwrite:
+                logger.error(
+                    "  ⛔ 月度札记已存在（{}），拒绝整篇覆盖：{}\n"
+                    "     覆盖会让原文件里的精读句、句级标记、人工修订永久消失（output/ 不在 git 内，"
+                    "无第二份拷贝）。确要重造该月请加 --overwrite-notes（覆盖前会把旧 md/references/"
+                    "sidecar/docx 备份到 {}/<时间戳>/）。本次 Zotero 写库与精读均未执行。"
+                    .format(" / ".join(p.name for p in existing), target_md,
+                            Path(proc.notes_dir) / ".digest_overwrite_backup"))
+                notify("Scholar digest",
+                       "拒绝覆盖已存在的月度札记 {}（加 --overwrite-notes 才会覆盖）".format(target_md.name))
+                return {"skipped_existing": str(target_md), "note_path": str(target_md)}
+            bdir = backup_note_files(Path(proc.notes_dir), note_fname)
+            logger.warning("  ⚠️ 月度札记已存在，--overwrite-notes 生效：旧四件套已备份到 {}，本次将整篇覆盖 {}"
+                           .format(bdir, target_md.name))
         email = proc.zotero_email or proc.external_email or ""
         results = sync_segments_to_zotero(
             self.segments,
@@ -1686,6 +1737,8 @@ __PAPERS_JSON__
                     model=(self.settings.llm.closeread_model or self.settings.llm.model),
                     deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
                     max_chunks=proc.closeread_max_chunks,
+                    extra_routes=getattr(proc, "fulltext_extra_routes", False),
+                    route_delay=getattr(proc, "fulltext_route_delay", 0.0),
                 )
                 # 精读就地写入 segment，重写固化 JSON 使审计文件也带精读（否则 Step 4 的 JSON 为空）
                 if done and getattr(self, "_digest_output", None) is not None:
@@ -1697,13 +1750,11 @@ __PAPERS_JSON__
             except Exception as e:
                 logger.warning("  ⚠️ 全文精读步骤失败（跳过）: {}".format(e))
 
-        # 语义清晰的标题/文件名：月份 + 是否全文精读
+        # 语义清晰的标题/文件名：月份 + 是否全文精读（文件名已在上方护栏处由 planned_note_stem 算出）
         cr_title = "（全文精读）" if proc.closeread_enabled else ""
-        cr_fname = "_全文精读" if proc.closeread_enabled else ""
         label = self.date_range[0].strftime('%Y-%m') if self.date_range \
             else datetime.now().strftime('%Y-%m-%d')
         note_title = "科研札记 · {}{}".format(label, cr_title)
-        note_fname = "科研札记_{}{}".format(label, cr_fname)
         summary = write_notes(
             self.segments,
             citekeys,
@@ -1714,6 +1765,14 @@ __PAPERS_JSON__
             emit_docx=proc.notes_emit_docx,
             cjk_font=proc.notes_docx_cjk_font,
         )
+        if summary.get("sidecar_ok") is False:
+            # 与另外三条入库链路同一口径：量尺永久不可恢复（md 不存那三个字段），
+            # 只留一行 error 日志等于没报。digest 收尾在 execute() 的 try 里，不影响退出码，
+            # 但必须让人看见（2026-09-04 第 3 轮审计：这条链路此前完全不消费 sidecar_ok）。
+            logger.error("  ❌ 本次札记的索引 sidecar 写失败：阅读深度量尺无法从 md 回读、**永久丢失**"
+                         "（{}）".format(summary.get("sidecar_error")))
+            notify("Scholar digest", "札记 sidecar 写失败，阅读深度量尺永久丢失，请查日志")
+
         # 固化同步结果，便于审计/重跑
         sync_path = self.output_dir / f"{self.run_id}_zotero.json"
         try:
@@ -1721,12 +1780,13 @@ __PAPERS_JSON__
                 json.dump({
                     'run_id': self.run_id,
                     'saved': sum(1 for r in results.values() if r.saved),
+                    'unfiled': sum(1 for r in results.values() if r.saved and not r.filed),
                     'resolved_citekey': sum(1 for r in results.values() if r.citekey),
                     'oa_hit': sum(1 for r in results.values() if r.pdf_url),
                     'notes': summary,
                     'papers': [
                         {'paper_id': r.paper_id, 'citekey': r.citekey,
-                         'saved': r.saved, 'oa_status': r.oa_status}
+                         'saved': r.saved, 'filed': r.filed, 'oa_status': r.oa_status}
                         for r in results.values()
                     ],
                 }, f, ensure_ascii=False, indent=2)

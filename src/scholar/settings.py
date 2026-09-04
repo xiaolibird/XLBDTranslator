@@ -178,6 +178,21 @@ class ProcessingSettings(BaseModel):
         "",
         description="Unpaywall 礼貌参数邮箱（联系句柄，非密钥）；为空时复用 external_email"
     )
+    # 取全文的额外通道（2026-09-04，见 docs/bugs/2026-09-04-fulltext-routes-too-narrow.md）。
+    # 主链路此前只走 arXiv 直链 + Unpaywall（+ EPMC 的 JATS 全文 XML），实测对 148 篇"判死"
+    # 篇目另跑四条公开通道能捞回 20 篇（13.5%）：EPMC 渲染版 PDF（与 XML 接口是两套，XML 404
+    # ≠ 没 PDF）、arXiv 按标题检索副本、OpenAlex best_oa_location（含 NCBI PMC → EPMC 换宿主）、
+    # Semantic Scholar openAccessPdf。**默认关**：打开后每篇候选多打 2~3 个 API，月度择优阶段
+    # candidate_factor*top_n 篇会放大成几十次请求，且限流误判需要真网络验证；关闭时主链路
+    # 行为与今天逐字节一致。手动 / 回填批可打开。不做任何绕出版商反爬的事（那类进人工清单）。
+    fulltext_extra_routes: bool = Field(
+        False,
+        description="取全文时在 arXiv/Unpaywall 之后再试 EPMC 渲染 PDF / arXiv 标题检索 / OpenAlex / S2 四路（默认关）"
+    )
+    fulltext_route_delay: float = Field(
+        1.5,
+        description="额外通道每次 API 调用之间的礼貌间隔（秒；仅 fulltext_extra_routes=True 生效）"
+    )
     notes_dir: Path = Field(
         Path("output/scholar_notes"),
         description="pandoc 科研札记输出目录"

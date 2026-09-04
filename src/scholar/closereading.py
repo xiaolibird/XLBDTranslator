@@ -36,8 +36,13 @@ AUTO_PAGE_MAX_CHARS = 20000
 
 
 def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
-                 max_bytes: int = 40_000_000) -> Optional[Path]:
-    """下载 PDF 到 dest。非 200 / 非 PDF / 超限 / 异常 → None（不抛出）。"""
+                 max_bytes: int = 40_000_000, *, validate: bool = False) -> Optional[Path]:
+    """下载 PDF 到 dest。非 200 / 非 PDF / 超限 / 异常 → None（不抛出）。
+
+    validate=True 时加 fulltext.validate_pdf_bytes 三闸（体积 / 可解析页数），并带 PDF Accept 头、
+    对 403/429 做礼貌退避——额外通道（EPMC render / OpenAlex / S2）给的链接反爬页也回 200，
+    存下来会在 _pdf_text_with_stats 炸成空文本。默认 False = 历史行为逐字节不变。
+    """
     if not url:
         return None
     dest = Path(dest)
@@ -45,7 +50,11 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
     own = client is None
     c = client or ipv4_client(timeout=timeout)
     try:
-        r = c.get(url)
+        if validate:
+            from .fulltext import polite_get, PDF_ACCEPT_HEADERS
+            r = polite_get(c, url, follow_redirects=True, headers=PDF_ACCEPT_HEADERS)
+        else:
+            r = c.get(url)
         if r.status_code != 200:
             logger.warning("  ⚠️ 下载 PDF 返回 {}: {}".format(r.status_code, url[:60]))
             return None
@@ -53,9 +62,19 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
         if len(data) > max_bytes:
             logger.warning("  ⚠️ PDF 超过 {}MB，跳过: {}".format(max_bytes // 1_000_000, url[:60]))
             return None
-        if not data[:5].startswith(b"%PDF"):
+        if validate:
+            from .fulltext import validate_pdf_bytes, _PDF_MAGIC_WINDOW
+            magic_ok = b"%PDF-" in data[:_PDF_MAGIC_WINDOW]
+        else:
+            magic_ok = data[:5].startswith(b"%PDF")
+        if not magic_ok:
             logger.warning("  ⚠️ 非 PDF 内容，跳过: {}".format(url[:60]))
             return None
+        if validate:
+            ok, why = validate_pdf_bytes(data)
+            if not ok:
+                logger.warning("  ⚠️ PDF 校验不过（{}），跳过: {}".format(why, url[:60]))
+                return None
         dest.write_bytes(data)
         return dest
     except Exception as e:
@@ -215,19 +234,51 @@ def verify_citable_numbers(cr: CloseReading, body_text: str, label: str = "") ->
     return demoted
 
 
+# 「模型侧挂了」的判据：额度/鉴权终局（401/402/403/quota…）+ 限流（429 / RESOURCE_EXHAUSTED /
+# rate limit / session limit）。前者复用 pdf_ingest.is_credit_error（整词匹配，防 "正文 4021 字符"
+# 这类误触），后者是本函数补的——gemini 免费层耗尽回的正是 429 RESOURCE_EXHAUSTED，
+# claude-agent 的会话上限回的是 "session limit"。
+_RATE_LIMIT_RE = re.compile(r"(?i)\b429\b|resource[_ ]exhausted|rate.?limit|too many requests"
+                            r"|session limit|exceeded your current quota|overloaded")
+
+
+def is_llm_unavailable(exc) -> bool:
+    """这次失败是不是**模型侧**不可用（额度耗尽/限流/鉴权），而不是「这篇没正文可读」。
+
+    两者在账本里此前完全同形（都记 `no_output`）：2026-09-04 那批 260 篇里，35 篇全文明明
+    已经到手、纯粹是 gemini 免费层耗尽，却和「Unpaywall/EPMC 都没有这篇」混在一起进了
+    待下载清单，而 expand 批重跑会跳过 failed——它们就此安静地等一个根本不需要的 PDF。
+    见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md。
+    """
+    from .pdf_ingest import is_credit_error      # 函数内 import：pdf_ingest 模块级 import 本模块
+    if is_credit_error(exc):
+        return True
+    return bool(_RATE_LIMIT_RE.search(str(exc)))
+
+
 def close_read(seg: PaperSegment, body_text: str, research_interests: str,
                llm, model: Optional[str] = None, from_full_text: bool = True,
                source: Optional[str] = None,
-               raw_chars: Optional[int] = None) -> Optional[CloseReading]:
+               raw_chars: Optional[int] = None,
+               diag: Optional[dict] = None) -> Optional[CloseReading]:
     """对单篇论文做精读。llm 为 LLMClient；body_text 为全文或摘要。失败返回 None。
 
     raw_chars 为抽取源的原始长度（未截断），由调用方从抽取环节透传；None = 未知。
+
+    diag：可选出参字典，记下**这次为什么没产出**——`no_body`（既无全文也无摘要）/
+    `llm_error` + `llm_unavailable`（模型侧挂了：额度、限流、鉴权）/ `parse_failed`（返回不可解析）。
+    调用方（backfill_deepread）据此把「真抓不到全文」与「额度耗尽」分开记账、分开熔断。
     """
+    def _note(**kw):
+        if diag is not None:
+            diag.update(kw)
+
     if not body_text or not body_text.strip():
         # 既无 OA 全文又无摘要 → 这篇在札记里会整篇没有精读内容。别静默，否则
         # 只能靠事后数 highlights 才发现（2026-07-27 实测踩过）。
         logger.warning("  ⚠️ 无全文也无摘要，跳过精读({}): {}".format(
             seg.paper_id[:8], (seg.metadata.title or "")[:50]))
+        _note(no_body=True)
         return None
     # 页码规则按输入定：auto 链路喂的 pdf_to_text/EPMC 正文没有 [p.N] 页锚，模型看不见
     # 页边界，此时"可标注页码"的邀请只会诱导编页码（backfill 链踩过的同款教训）。
@@ -246,10 +297,13 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
         resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
         logger.warning("  ⚠️ 精读 LLM 调用失败({}): {}".format(seg.paper_id[:8], e))
+        _note(llm_error="{}: {}".format(type(e).__name__, str(e)[:200]),
+              llm_unavailable=is_llm_unavailable(e))
         return None
     cr = parse_closeread(resp)
     if cr is None:
         logger.warning("  ⚠️ 精读输出解析失败({})".format(seg.paper_id[:8]))
+        _note(parse_failed=True)
         return None
     cr.from_full_text = from_full_text
     cr.model = model
@@ -266,7 +320,8 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
 def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
                     llm, model: Optional[str] = None, source: Optional[str] = None,
                     from_full_text: bool = True,
-                    max_chunks: int = 12) -> Optional[CloseReading]:
+                    max_chunks: int = 12,
+                    diag: Optional[dict] = None) -> Optional[CloseReading]:
     """分块深读：切块 → 逐块通读 → 汇总成扩展分节精读。失败返回 None（调用方回落单跳）。
 
     完全复用 manual 精读的三个纯函数与两个 prompt——分节补齐（结果与效应量 / 图表与补充
@@ -281,8 +336,17 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
 
     chunks = chunk_text(body_text)[:max_chunks]
     if not chunks:
+        if diag is not None:
+            diag["no_body"] = True
         return None
     notes = deep_read_chunks(chunks, llm, model, max_workers=4)
+    if diag is not None:
+        # 块级的额度/鉴权终局由 deep_read_chunks 标 `_api_error`（限流走同一条 except）；
+        # 全部块都挂且带该标记 = 模型侧不可用，不是「这篇没正文」。
+        n_ok = sum(1 for n in notes if not n.get("_error"))
+        if n_ok == 0 and any(n.get("_api_error") for n in notes):
+            diag["llm_unavailable"] = True
+            diag.setdefault("llm_error", "分块通读全部失败且为额度/鉴权/限流类错误")
     # 接住汇总步的预算裁剪信息：max_chunks=12 并不能保证不越 60000 预算（实测 12 块 ×
     # 每块 ~5.8k 字符即超），而 auto 链路没有 manual 那样的亲读核验兜底，裁剪必须留痕——
     # 否则 reading_depth="chunked" / n_chunks=12 是在虚报"完整分块深读"。
@@ -291,6 +355,9 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
                                                    budget_info=_binfo)
     if cr is None:
         # 全块失败或汇总失败：交回调用方走单跳，保证最差不比现状差
+        if diag is not None and _api_err:
+            diag["llm_unavailable"] = True
+            diag.setdefault("llm_error", "汇总步遇额度/鉴权类终局")
         return None
     # synthesize_deep_read 是给 manual 链路写的，它把 source 写死 'manual-pdf'、
     # 并**无条件**置 from_full_text=True。两项都必须由 auto 侧覆写回真实值：
@@ -308,20 +375,32 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     return cr
 
 
+def _route_kwargs(extra_routes: bool, route_delay: float) -> dict:
+    """额外通道开着才产出关键字参数；关着返回空 dict → 下游调用形状与历史版本完全一致。"""
+    return {"extra_routes": True, "route_delay": route_delay} if extra_routes else {}
+
+
 def close_read_segment(seg: PaperSegment, research_interests: str, llm,
                        email: str = "", model: Optional[str] = None,
                        scratch_dir: Optional[Path] = None, oa=None,
                        deep: bool = False, max_chars: Optional[int] = None,
-                       max_chunks: int = 12) -> Optional[CloseReading]:
+                       max_chunks: int = 12, *, extra_routes: bool = False,
+                       route_delay: float = 0.0,
+                       diag: Optional[dict] = None) -> Optional[CloseReading]:
     """端到端精读一篇：解析 OA → 下 PDF → 抽全文 → 精读；无全文则用摘要降级。
 
     oa 非空时复用预解析结果（close_read_segments 择优时已解析，避免重复网络请求）。
     deep=True 时走分块深读（预算放宽到 max_chars），失败回落单跳；默认值即现行行为。
+    extra_routes/route_delay 透传给 resolve_oa_pdf（额外四路，默认关，见 settings.fulltext_extra_routes）。
+    diag：可选出参，透传给 close_read / deep_close_read 记「这次为什么没产出」，
+    并额外记 `from_full_text`（拿没拿到全文）——账本据此区分「全文到手但模型挂了」与「真抓不到全文」。
     """
     from .paths import repo_path
     scratch_dir = repo_path(scratch_dir or "output/scholar_pdfs")  # 锚定仓库根，防 cwd 漂移双树缓存
     if oa is None:
-        oa = resolve_oa_pdf(seg.metadata, email=email)
+        # 额外通道参数只在开关打开时才传：默认路径的调用形状与历史逐字节一致
+        #（既有测试与调用方的 resolve_oa_pdf 桩不认这两个关键字）。
+        oa = resolve_oa_pdf(seg.metadata, email=email, **_route_kwargs(extra_routes, route_delay))
     full_text, from_full, source = "", False, None
     raw_chars: Optional[int] = None
     # 预算必须对 PDF 与 EPMC 两条全文来源同时生效：只放宽 PDF 那条的话，
@@ -329,7 +408,18 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
     eff_max_chars = max_chars if (deep and max_chars) else AUTO_MAX_CHARS
     if oa and oa.pdf_url:
         dest = scratch_dir / "{}.pdf".format(seg.paper_id[:16])
-        pdf = download_pdf(oa.pdf_url, dest)
+        # 额外通道给的是**候选列表**（含 pdf_url 自己），逐个试到一个过校验为止；
+        # 主链路（arXiv/Unpaywall）candidates 为空 → 只试 pdf_url、不加校验，行为不变。
+        cands = getattr(oa, "candidates", None) or []     # 旧式 OA 桩对象没有这个字段
+        urls = list(cands) if cands else [oa.pdf_url]
+        validate = bool(cands)
+        pdf = None
+        for u in urls:
+            pdf = download_pdf(u, dest, validate=True) if validate else download_pdf(u, dest)
+            if pdf:
+                if u != oa.pdf_url:
+                    logger.info("  额外通道候选命中：{}".format(u[:80]))
+                break
         if pdf:
             full_text, pdf_raw = _pdf_text_with_stats(
                 pdf, max_chars=eff_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
@@ -356,11 +446,14 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
     # highlight/向量库/scholar-write 取证链）。数字是语言不变量，对照原摘要既挡精读
     # 幻觉也挡翻译丢位；仅当原摘要缺失才退回译文——此时喂读与对照本就同源，聊胜于无。
     verify_text = (seg.original_abstract or full_text) if not from_full else full_text
+    if diag is not None:
+        diag["from_full_text"] = bool(from_full)
+        diag["source"] = source
     if deep and from_full:
         # 摘要降级篇一律走单跳：几千字符切块无意义，且这是 from_full_text 被污染的唯一入口
         cr = deep_close_read(seg, full_text, research_interests, llm, model=model,
                              source=source, from_full_text=from_full,
-                             max_chunks=max_chunks)
+                             max_chunks=max_chunks, diag=diag)
         if cr is not None:
             cr.body_chars = len(full_text)
             cr.body_chars_raw = raw_chars
@@ -368,7 +461,7 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
             verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
             return cr
     cr = close_read(seg, full_text, research_interests, llm, model=model,
-                    from_full_text=from_full, source=source, raw_chars=raw_chars)
+                    from_full_text=from_full, source=source, raw_chars=raw_chars, diag=diag)
     if cr is not None:
         # 数字回查压在唯一出口上：deep 与单跳两条路径的精读都过同一道闸
         verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
@@ -380,12 +473,17 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                         scratch_dir: Optional[Path] = None,
                         prefer_full_text: bool = True, candidate_factor: int = 4,
                         deep: bool = False, max_chars: Optional[int] = None,
-                        max_chunks: int = 12) -> int:
+                        max_chunks: int = 12, *, extra_routes: bool = False,
+                        route_delay: float = 0.0,
+                        diag: Optional[dict] = None) -> int:
     """对高优先级 top-N 篇做精读，就地写入 seg.close_reading。返回成功篇数。
 
     prefer_full_text=True：在优先级前 candidate_factor*top_n 候选里预解析 OA，
     优先挑「能拿到全文」的高优先级论文（全文精读是核心诉求），不足再用高优先级摘要降级。
     这样避免 top-N 恰好都是付费墙论文导致全文精读 0/5。
+
+    extra_routes=True 时择优阶段的 OA 预解析也走额外四路（每篇候选多打 2~3 个 API，
+    route_delay 节流）；默认关，行为与历史一致。
     """
     ranked = sorted(segments, key=lambda s: s.priority_score, reverse=True)
     n = max(0, top_n)
@@ -397,7 +495,8 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
         with ipv4_client(timeout=20.0) as xc:
             for seg in cand:
                 try:
-                    oa = resolve_oa_pdf(seg.metadata, email=email, client=xc)
+                    oa = resolve_oa_pdf(seg.metadata, email=email, client=xc,
+                                        **_route_kwargs(extra_routes, route_delay))
                 except Exception:
                     oa = None
                 oa_map[id(seg)] = oa
@@ -424,12 +523,21 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
     done = ft = 0
     for seg in chosen:
         try:
+            sub = {} if diag is not None else None
+            if sub is not None:
+                diag[seg.paper_id] = sub
             cr = close_read_segment(seg, research_interests, llm, email=email,
                                     model=model, scratch_dir=scratch_dir,
                                     oa=oa_map.get(id(seg)), deep=deep,
-                                    max_chars=max_chars, max_chunks=max_chunks)
+                                    max_chars=max_chars, max_chunks=max_chunks,
+                                    diag=sub,
+                                    **_route_kwargs(extra_routes, route_delay))
         except Exception as e:
             logger.warning("  ⚠️ 精读失败({}): {}".format(seg.paper_id[:8], e))
+            if diag is not None:
+                diag.setdefault(seg.paper_id, {}).update(
+                    llm_error="{}: {}".format(type(e).__name__, str(e)[:200]),
+                    llm_unavailable=is_llm_unavailable(e))
             cr = None
         if cr:
             seg.close_reading = cr
@@ -441,9 +549,19 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
             # 只告警不抛：整批 0/N 的 RuntimeError 语义（ingest.py）不能因为薄输出而更容易触发。
             n_tagged = sum(1 for sec in cr.sections for st in sec.sentences if st.tag)
             if n_tagged < 8 or cr.truncated:
+                # 截断分两种成因，后果完全不同（见 docs/bugs/2026-09-04-truncated-flag-conflates-two-causes.md）：
+                #   总上限截尾（body_chars 恰好等于 eff_max_chars）—— 丢的是正文**尾部**，抬上限有用；
+                #   单页上限削页（body_chars 小于上限）—— 丢的是某张病态长页的后半，抬总上限**完全无用**。
+                # 索引字段暂不新增（那要五处联动，另开一轮），但日志里先把成因说清楚——
+                # 这一条就够挡住「按覆盖率排序挑最该重跑的几篇」那类误判。
+                cap = max_chars if (deep and max_chars) else AUTO_MAX_CHARS
+                cause = ""
+                if cr.truncated:
+                    cause = ("（已截断·总上限截尾，抬 closeread_max_chars 有用）"
+                             if (cr.body_chars or 0) >= cap
+                             else "（已截断·单页上限削页，抬总上限无用）")
                 logger.warning(
                     "  ⚠️ 精读偏薄({}): 可取证句 {} 条，正文 {}/{} 字符{}".format(
-                        seg.paper_id[:8], n_tagged, cr.body_chars, cr.body_chars_raw,
-                        "（已截断）" if cr.truncated else ""))
+                        seg.paper_id[:8], n_tagged, cr.body_chars, cr.body_chars_raw, cause))
     logger.info("  全文精读 {}/{} 篇（其中真全文 {}，top-{}）".format(done, len(chosen), ft, top_n))
     return done

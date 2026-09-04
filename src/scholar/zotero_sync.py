@@ -210,24 +210,65 @@ class ZoteroConnectorClient:
             logger.warning("  ⚠️ 获取选中分类失败: {}".format(e))
         return None
 
-    def save_items(self, items: List[Dict[str, Any]], uri: str = "") -> bool:
-        """通过连接器写入 items 到当前选中分类。201 视为成功。"""
+    def save_items(self, items: List[Dict[str, Any]], uri: str = "",
+                   target: str = "") -> str:
+        """通过连接器写入 items。返回**三态**（2026-09-04 第 5 轮终审）：
+
+        - `"ok"`      写入成功，且（若给了 target）已归入目标分类；
+        - `"unfiled"` **条目已经写进 Zotero**（落在当前选中处），但 updateSession 没挪成——
+          `require_collection` 这道防呆等于失效，必须让人看见并手动拖；但**别当成没写**，
+          否则最自然的下一步是重跑，而重跑会写出重复条目；
+        - `"failed"`  saveItems 本身没成功，库里没有这批条目。
+
+        旧签名返回 bool，`"ok"` 之外都曾被写成 False——于是「写库 0 篇 / citekey 1 篇」
+        这种自相矛盾的收尾汇总出现过（citekey 能解析出来恰恰证明条目在库里）。
+
+        201 视为 saveItems 成功。
+
+        target 非空时（连接器 target id，如 "C19"，由调用方从 getSelectedCollection 的 targets
+        列表按分类名查得；本地 /api 的 8 位 key 在连接器这边不认，别混用）：
+        写入后再调 /connector/updateSession 把本次会话的条目挪进该分类——这正是浏览器
+        插件「保存到…」下拉的机制。**别把 target 塞进 saveItems 的 payload**：saveItems
+        不认这个字段，会静默落到库根的未归档条目（2026-09-03 踩过）。
+        """
         if not items:
-            return True
+            return "ok"
+        session_id = uuid.uuid4().hex
         payload = {
-            "sessionID": uuid.uuid4().hex,
+            "sessionID": session_id,
             "uri": uri or "https://github.com/xiaolibird/XLBDTranslator",
             "items": items,
         }
         try:
             r = self._client.post(f"{self.base_url}/connector/saveItems", json=payload)
-            if r.status_code in (200, 201):
-                return True
-            logger.warning("  ⚠️ saveItems 返回 {}: {}".format(r.status_code, r.text[:200]))
-            return False
+            if r.status_code not in (200, 201):
+                logger.warning("  ⚠️ saveItems 返回 {}: {}".format(r.status_code, r.text[:200]))
+                return "failed"
         except Exception as e:
             logger.warning("  ⚠️ saveItems 失败: {}".format(e))
-            return False
+            return "failed"
+        if target:
+            try:
+                r2 = self._client.post(
+                    f"{self.base_url}/connector/updateSession",
+                    json={"sessionID": session_id, "target": target, "tags": ""},
+                )
+                if r2.status_code in (200, 201, 204):
+                    logger.info("  已归入分类 target={}".format(target))
+                    return "ok"
+                else:
+                    # saveItems 先落在**当前选中处**（选中分类或库根），挪不动就停在那里。
+                    # 这时**必须回报失败**：调用方是靠 `require_collection` 防呆的——改动前
+                    # 「选中项不符」会一个条目都不写，现在改成「照写再挪」，挪失败却仍报
+                    # saved=True 的话，防呆就被静默放宽成了没有（2026-09-04 第 4 轮审计 CONFIRMED）。
+                    logger.error("  ⛔ updateSession 返回 {}: {}——条目已写入**当前选中处**、未挪入 target={}，"
+                                 "请在 Zotero 里手动拖进目标分类".format(r2.status_code, r2.text[:120], target))
+                    return "unfiled"
+            except Exception as e:
+                logger.error("  ⛔ updateSession 失败: {}——条目已写入**当前选中处**、未挪入 target={}，"
+                             "请在 Zotero 里手动拖进目标分类".format(e, target))
+                return "unfiled"
+        return "ok"
 
     def resolve_citekey(
         self,
@@ -260,6 +301,14 @@ class ZoteroConnectorClient:
             for term in terms:
                 key = self._bbt_search_pick(term, norm_doi, title)
                 if key:
+                    if not key.isascii():
+                        # BBT 会照抄 Crossref 里作者姓氏的 U+2010（如 lado‐baleato2025Testing），
+                        # 而本库兜底键剥掉非字母数字得到 ladobaleato2025Testing——两边键对不上，
+                        # 且 U+2010 在 BibTeX/pandoc 里是雷。此处只告警不改：键是 Zotero 侧权威，
+                        # 手动出路是在条目 Extra 里钉 `Citation Key: <ascii 键>`。
+                        logger.warning("  ⚠️ Zotero/BBT 回查到的 citekey 含非 ASCII 字符：{!r}"
+                                       "（多半是作者姓氏里的 U+2010 连字符；与本库兜底键不一致，"
+                                       "建议在 Zotero 该条目 Extra 里钉 ASCII 键）".format(key))
                     return key
             time.sleep(delay)
         return None
@@ -323,7 +372,8 @@ def pick_citekey(results: List[Dict[str, Any]], norm_doi: str, title: Optional[s
 class SyncResult:
     """单篇论文的同步结果。"""
     paper_id: str
-    saved: bool = False
+    saved: bool = False          # 条目**在库里**（不代表归对了类）
+    filed: bool = True           # 已归入 require_collection 指定的分类；False = 落在当前选中处待人拖
     citekey: Optional[str] = None
     oa_status: str = "unknown"
     pdf_url: Optional[str] = None
@@ -361,6 +411,7 @@ def sync_segments_to_zotero(
             logger.warning("⚠️ Zotero 连接器不可用（Zotero 未开或未允许本机通信），跳过入库")
             return results
 
+        save_target = ""
         if write_to_zotero:
             coll = c.get_selected_collection()
             sel_name = coll.get("name") if coll else None
@@ -368,11 +419,23 @@ def sync_segments_to_zotero(
             if coll:
                 logger.info("  写入目标分类: {} / {}".format(
                     coll.get("libraryName", "?"), "(库根/Unfiled)" if is_root else sel_name))
-            # 防呆：要求指定分类时，选中项必须匹配，否则拒绝写（不污染错误位置）
+            # 指定分类时优先「按名解析 target 后自动归类」（updateSession），解析不到才退回防呆：
+            # 选中项必须匹配，否则拒绝写（不污染错误位置）
             if require_collection:
-                if not coll or sel_name != require_collection:
-                    logger.error("⛔ 当前选中「{}」，与要求的分类「{}」不符——请先在 Zotero 左栏选中「{}」再运行。未写入任何条目。".format(
-                        sel_name or "(无)", require_collection, require_collection))
+                _hits = [t.get("id") for t in (coll.get("targets") or [])
+                         if t.get("name") == require_collection] if coll else []
+                if len(_hits) > 1:
+                    # Zotero 允许不同层级下有同名分类；取首个会把条目静默写进错的那个。
+                    logger.warning("  ⚠️ Zotero 里有 {} 个分类都叫「{}」，将写入第一个（target={}）；"
+                                   "若归错了请改名去重后重跑".format(
+                                       len(_hits), require_collection, _hits[0]))
+                save_target = _hits[0] if _hits else ""
+                if save_target:
+                    logger.info("  指定分类「{}」→ target={}，写入后自动归类（不必手动选中）".format(
+                        require_collection, save_target))
+                elif not coll or sel_name != require_collection:
+                    logger.error("⛔ Zotero 里没找到分类「{}」，且当前选中的是「{}」——请先在左栏选中「{}」再运行。未写入任何条目。".format(
+                        require_collection, sel_name or "(无)", require_collection))
                     return results
             elif is_root:
                 logger.warning("⚠️ 当前写入目标是库根（未选中具体分类），条目将落到 Unfiled Items。"
@@ -441,11 +504,16 @@ def sync_segments_to_zotero(
                         )
                     items.append(item)
 
-            saved = c.save_items(items)
+            outcome = c.save_items(items, target=save_target)
             for seg in segments:
-                results[seg.paper_id].saved = saved
-            if not saved:
+                results[seg.paper_id].saved = outcome in ("ok", "unfiled")
+                results[seg.paper_id].filed = outcome == "ok"
+            if outcome == "failed":
                 logger.warning("⚠️ saveItems 未成功，citekey 解析可能落空")
+            elif outcome == "unfiled":
+                logger.warning("⚠️ 条目已写进 Zotero 但**未归入 {}**（落在当前选中处）："
+                               "请在 Zotero 里手动拖进目标分类。**别重跑**——重跑会写出重复条目"
+                               .format(save_target))
 
         # 3) 逐篇回查 citekey（BBT 异步，首篇多等一会）
         resolved = 0

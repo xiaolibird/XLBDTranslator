@@ -738,7 +738,8 @@ def _load_dedup_distinct(notes_dir: Optional[Path]) -> Set[tuple]:
 
 def _global_pass(papers: List[Dict[str, Any]],
                  notes_dir: Optional[Path] = None,
-                 review_out: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+                 review_out: Optional[List[Dict[str, Any]]] = None,
+                 stale_out: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """全局排序 + 跨月去重标记（keeper 规则见 _keeper_rank）+ 撞键检测的前置排序。
 
     三层合并，用并查集统一成簇（保证传递性：A≈B、B≈C 时三者同簇同 keeper）：
@@ -822,22 +823,39 @@ def _global_pass(papers: List[Dict[str, Any]],
             if e["month"] not in keeper["duplicate_months"]:
                 keeper["duplicate_months"].append(e["month"])
             e["duplicate_of"] = "{}@{}".format(keeper["dedup_key"], keeper["month"])
-            # 陈旧键守卫：duplicate 的行内 citekey 应与 keeper 一致。不一致的成因是
-            # fix_citekey_collisions 只改 live 条目——keeper 被改键后，duplicate 所在
-            # 月的 md 里还留着旧键，而旧键此刻可能在全局书目里指向**另一篇论文**，
-            # 从那页抄 [@旧键] 会安静引错（2026-08-31 实锤：2026-06 的 SOFA-2 节
-            # 残留 liufu2026External，该键 live 指向 2023-03 前列腺论文）。
-            # 只告警不自动改写：md 回写有 RENAME_PARTIAL 半改风险，留给人工。
+            # 陈旧键守卫：duplicate 的行内 citekey 应与 keeper 一致。两种成因、两种形态
+            # （见 _stale_inline_shape）：
+            #   stale-dup     dup 键是错的（fix_citekey_collisions 只改 live 条目——keeper 被
+            #                 改键后 dup 所在月 md 里还留着旧键，而旧键此刻可能在全局书目里
+            #                 指向**另一篇论文**，从那页抄 [@旧键] 会安静引错；2026-08-31 实锤）
+            #                 或是 Scholar 邮件解析截断的作者兜底键；
+            #   suffix-keeper keeper 键 = dup 键 + 消歧后缀（citekey 在去重之前分配，手动精读
+            #                 升级 auto 条目时 keeper 只能拿 `<基键>b`，干净基键从全局书目消失）。
+            # 这里只告警不自动改写（md 回写有 RENAME_PARTIAL 半改风险）；修复走
+            # `scripts/notes_index.py --fix-inline-citekeys`（三处原子齐改，默认 dry-run）。
             if e.get("citekey") and keeper.get("citekey") and e["citekey"] != keeper["citekey"]:
-                stale_dup_keys.append("{} 的 {}（应为 keeper 的 {}，见 {}:{}）".format(
+                stale_dup_keys.append("{} 的 {}（应为 keeper 的 {}，形态 {}，见 {}:{}）".format(
                     e["month"], e["citekey"], keeper["citekey"],
+                    _stale_inline_shape(e["citekey"], keeper["citekey"]),
                     e.get("note_file"), e.get("note_line")))
     if stale_dup_keys:
-        logger.warning("  ⚠️ {} 条 duplicate 条目的行内 citekey 与其 keeper 不一致"
-                       "（从该月札记抄引用会引错论文，须人工把 md/sidecar 改成 keeper 键）："
-                       .format(len(stale_dup_keys)))
+        # error 级 + notify：warning 在自动权限模式的 agent 会话里看不见（同 read_pdf._reuse_citekeys
+        # 的论证）——lin2025Addressing 那条从 2026-09-02 起每轮都在报，一直没人处置就是证据。
+        logger.error("  ⚠️ {} 条 duplicate 条目的行内 citekey 与其 keeper 不一致"
+                     "（从该月札记抄引用会引错论文 / 基键从全局书目消失）：".format(len(stale_dup_keys)))
         for s in stale_dup_keys:
-            logger.warning("      {}".format(s))
+            logger.error("      {}".format(s))
+        logger.error("      → 修复：PYTHONPATH=. python scripts/notes_index.py --fix-inline-citekeys "
+                     "（先看计划；加 --apply 落盘）。工具对 md / .references.json / .index.json 三处"
+                     "原子齐改（43 个 auto 月没有 sidecar，只改存在的两处），别手改——手改漏掉 "
+                     ".references.json 会让下一次重建把旧键读回来。")
+        # **不在这里 notify**：这条件描述的是「库里存在什么」（持久状态），不是「本次发生了什么」。
+        # update_index 被 6 个 launchd job 里的 4 个调用，库里只要有 1 条陈旧键就会**每周每月**
+        # 弹同一条，把告警面训练成噪音（2026-09-04 第 3 轮审计 CONFIRMED：生产库当前正有 1 条）。
+        # 改为挂在索引对象上，由**有人（或 agent）在看**的入口层决定怎么报：
+        # scripts/notes_index.py 打印、read_pdf 的 finalize 回执打印。
+        if stale_out is not None:
+            stale_out.extend(stale_dup_keys)
 
     if review_out is not None:
         distinct = {tuple(sorted(pr)) for pr in distinct_pairs}
@@ -861,6 +879,52 @@ def _global_pass(papers: List[Dict[str, Any]],
                         .format(DEDUP_OVERRIDES_JSON, suppressed))
         review_out.sort(key=lambda r: -r["similarity"])
     return papers
+
+
+def _is_suffix_key(base: str, key: str) -> bool:
+    """key 是否 = base + 纯小写字母消歧后缀（_suffix_seq：b…z, bb…zz，最长 3）。
+
+    ⚠️ 这是**词面**判据，认不出「两个键恰好差一个像后缀的词尾」——`liu2025Predict` 与
+    `liu2025Predicting` 会被判成 suffix 关系（尾巴 `ing` 全在 b–z 内）。这种情形只可能出现在
+    同一去重簇里两个键被人工改岔的场合，且 `fix_inline_citekeys` 默认 dry-run、计划要人过目、
+    改 keeper 前还查过基键没被别的 live 条目占用——所以留作已知边界，由计划输出里的提示兜住
+    （见 scripts/notes_index.py 的 `_print_inline_plan`），不在这里加更脆的启发式。
+    """
+    if not base or not key or not key.startswith(base):
+        return False
+    tail = key[len(base):]
+    return 0 < len(tail) <= 3 and all("b" <= c <= "z" for c in tail)
+
+
+def _stale_inline_shape(dup_key: str, keeper_key: str) -> str:
+    """陈旧行内键的两种形态：suffix-keeper（keeper = dup + 后缀）/ stale-dup（其余）。"""
+    return "suffix-keeper" if _is_suffix_key(dup_key, keeper_key) else "stale-dup"
+
+
+def find_stale_inline_citekeys(index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """列出行内 citekey 与其 keeper 不一致的 duplicate 条目（纯函数，不写盘）。
+
+    返回 [{"entry": dup, "keeper": keeper, "shape": "stale-dup"|"suffix-keeper"}]，
+    与 _global_pass 里那条守卫同判据；keeper 按 `duplicate_of = "<dedup_key>@<month>"` 反查
+    （同 dedup_key+month 若有多条 keeper——不该发生——取先出现的）。
+    """
+    papers = [e for e in (index.get("papers") or []) if isinstance(e, dict)]
+    keepers: Dict[str, Dict[str, Any]] = {}
+    for e in papers:
+        if e.get("duplicate_of") or not e.get("dedup_key") or not e.get("month"):
+            continue
+        keepers.setdefault("{}@{}".format(e["dedup_key"], e["month"]), e)
+    out: List[Dict[str, Any]] = []
+    for e in papers:
+        ref = e.get("duplicate_of")
+        if not ref or not e.get("citekey"):
+            continue
+        k = keepers.get(ref)
+        if not k or not k.get("citekey") or k["citekey"] == e["citekey"]:
+            continue
+        out.append({"entry": e, "keeper": k,
+                    "shape": _stale_inline_shape(e["citekey"], k["citekey"])})
+    return out
 
 
 def _citekey_collisions(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -934,12 +998,18 @@ def update_index(notes_dir: Path, *, full: bool = False,
     for e in papers:
         e.pop("_source", None)
     review_pairs: List[Dict[str, Any]] = []
-    papers = _global_pass(papers, notes_dir=notes_dir, review_out=review_pairs)
+    stale_inline: List[str] = []
+    papers = _global_pass(papers, notes_dir=notes_dir, review_out=review_pairs,
+                          stale_out=stale_inline)
     index = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "months": months_meta,
         "citekey_collisions": _citekey_collisions(papers),
+        # 行内 citekey 与 keeper 不一致的 duplicate 条目（人读描述）。挂在索引上而不是当场 notify：
+        # 这是**持久状态**，每次重建都成立，当场弹窗会让 4 个 launchd job 每周每月刷同一条。
+        # 由有人在看的入口层（scripts/notes_index.py、read_pdf 的 finalize 回执）决定怎么报。
+        "stale_inline_citekeys": stale_inline,
         "title_near_duplicates": review_pairs,
         "papers": papers,
     }
@@ -1073,6 +1143,46 @@ def is_missing_citekey(entry: Dict[str, Any]) -> bool:
     """
     key = entry.get("citekey") or ""
     return key.startswith("MISSING-KEY-") or entry.get("citekey_source") == "missing"
+
+
+def iter_keepers(index: Dict[str, Any], *, include_retracted: bool = True):
+    """索引 keeper 视图：逐条产出 `duplicate_of` 为空、有真实 citekey 的条目。
+
+    `papers` 数组里**同一个 citekey 可以有多条**——跨月重复的论文各月一条，只靠
+    `duplicate_of` 区分（keeper 为 None）。任何 `{e["citekey"]: e for e in papers}` 都会被
+    **最后一条**覆盖，而最后一条经常是 duplicate：它的 has_full_text_reading /
+    reading_source / priority_tier 都可能与 keeper 相反，验收因此两次读出反的结论
+    （2026-08 `bauer2025Sepsis` 11→6 实为 11→29；2026-09-03 两篇「写了但索引没认」
+    实为 keeper 完好；见 docs/bugs/2026-09-04-index-keeper-view-missing.md）。
+    此前 embed_store.chunks_from_index 与 backfill_deepread._keepers 各自实现了一遍
+    同样的过滤，现收敛到这里；写统计/验收代码请一律经此取条目。
+
+    include_retracted=False 时连撤稿条目一起剔除（向量库口径：撤稿踢库但札记保留）。
+    """
+    for e in index.get("papers") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("duplicate_of") or not e.get("citekey"):
+            continue
+        if is_missing_citekey(e):
+            continue
+        if not include_retracted and is_retracted(e):
+            continue
+        yield e
+
+
+def keepers_by_citekey(index: Dict[str, Any], *,
+                       include_retracted: bool = True) -> Dict[str, Dict[str, Any]]:
+    """citekey → keeper 条目。duplicate 一律不进——见 iter_keepers 的说明。
+
+    同一 citekey 若仍出现两条 keeper（撞键态，`index["citekey_collisions"]` 非空），
+    保留**先出现的**（papers 已按 month/rank 排好，先出现 = 最早月），与
+    fix_citekey_collisions「最早月保留原键」的口径一致；撞键本身另由该字段报告。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for e in iter_keepers(index, include_retracted=include_retracted):
+        out.setdefault(e["citekey"], e)
+    return out
 
 
 def build_all_references(index: Dict[str, Any], notes_dir: Path) -> List[Dict[str, Any]]:
@@ -1607,6 +1717,134 @@ def fix_citekey_collisions(notes_dir: Path,
     return renamed
 
 
+def fix_inline_citekeys(notes_dir: Path, *, apply: bool = False,
+                        side_out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """陈旧行内键的善后工具（对齐 --fix-collisions；默认 dry-run 只出计划）。
+
+    两种形态、两种改法（判据见 find_stale_inline_citekeys）：
+      - stale-dup      改 **duplicate** 所在月：`[@dup 键]` → keeper 键（md / .references.json /
+                       .index.json 凡存在者原子齐改）。dup 条目本就不进向量库与全局书目，
+                       派生物只有这三处。
+      - suffix-keeper  改 **keeper** 所在月：`<基键>b` → `<基键>`。这是 write_notes 现在的
+                       规范态（同一论文继承基键，见 notes.write_notes 的 existing_key_owners），
+                       改回基键后此前所有 `[@基键]` 引用自动恢复；keeper 进向量库/概念页/全局
+                       书目，改完由 announce_rekey_side_effects 告知并 best-effort 同步。
+                       前置检查：基键不得被**另一篇**（不同 dedup_key）的 live 条目占着。
+    每条改键走 _rename_citekey_in_note 的三态（OK / REFUSED 磁盘未动 / PARTIAL 半改），
+    半改单列优先展示。apply=True 且有改动时收尾重建索引并 write_outputs。
+    返回 {"planned": [...], "applied": n, "refused": [...], "partial": [...], "skipped": [...]}。
+    """
+    notes_dir = Path(notes_dir)
+    index = update_index(notes_dir)
+    stale = find_stale_inline_citekeys(index)
+    live_owner: Dict[str, Set[str]] = {}
+    for e in index["papers"]:
+        if not e.get("duplicate_of") and e.get("citekey"):
+            live_owner.setdefault(e["citekey"], set()).add(e.get("dedup_key") or "")
+
+    planned: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    seen_plan = set()
+    # 先定 keeper 的**终键**：suffix-keeper 形态会把 keeper 改回基键；同簇里另一条 stale-dup 的目标
+    # 必须是这个终键而不是 keeper 现在的 `<基键>b`，否则要跑两轮才收敛（第 1 轮压测 S5）。
+    keeper_final: Dict[int, str] = {}
+    for item in stale:
+        if item["shape"] != "suffix-keeper":
+            continue
+        dup, keeper = item["entry"], item["keeper"]
+        base = dup["citekey"]
+        others = live_owner.get(base, set()) - {keeper.get("dedup_key") or ""}
+        if others:
+            skipped.append("{} 的 {} → {}：基键被另一篇 live 条目占用（dedup_key {}），拒绝改回"
+                           .format(keeper["month"], keeper["citekey"], base, sorted(others)[0]))
+            continue
+        keeper_final[id(keeper)] = base
+    # 计划之间也要互查：`live_owner` 只反映**改之前**的索引，两个不同簇的 keeper 各自被计划改回
+    # **同一个**基键时（两个 dup 恰好都持有那个键——dup 不是 live，不受唯一性约束），逐条看都合法，
+    # 一起 apply 就当场造出 live 撞键，`build_all_references` 会把该键**整键剔除**，
+    # 两篇论文一起从全局书目消失（第 2 轮压测 CONFIRMED）。宁可都不改。
+    _by_base: Dict[str, List[Any]] = {}
+    for _kid, _base in keeper_final.items():
+        _by_base.setdefault(_base, []).append(_kid)
+    for _base, _kids in _by_base.items():
+        if len(_kids) > 1:
+            _names = []
+            for item in stale:
+                if id(item["keeper"]) in _kids:
+                    k = item["keeper"]
+                    tag = "{} 的 {}".format(k.get("month"), k.get("citekey"))
+                    if tag not in _names:
+                        _names.append(tag)
+            skipped.append("{} 个 keeper 都想改回同一个基键 {}（{}）：一起改会造出 live 撞键、"
+                           "该键会被整键剔出全局书目，全部跳过，请人工裁决"
+                           .format(len(_kids), _base, "、".join(_names)))
+            for _kid in _kids:
+                keeper_final.pop(_kid, None)
+    for item in stale:
+        dup, keeper, shape = item["entry"], item["keeper"], item["shape"]
+        if shape == "suffix-keeper":
+            base = keeper_final.get(id(keeper))
+            if base is None:
+                continue                         # 上面已判「基键被占」，记过 skipped
+            pl = {"shape": shape, "target": keeper, "old": keeper["citekey"], "new": base,
+                  "month": keeper["month"], "note_file": keeper.get("note_file")}
+        else:
+            new_key = keeper_final.get(id(keeper), keeper["citekey"])
+            if new_key == dup["citekey"]:
+                continue                         # keeper 改回基键后它就一致了，无需改 dup
+            pl = {"shape": shape, "target": dup, "old": dup["citekey"], "new": new_key,
+                  "month": dup["month"], "note_file": dup.get("note_file")}
+        # 同一 keeper 被多个 dup 指向时会生成重复的 suffix-keeper 计划：按目标行去重，
+        # 否则 apply 第二条必然 REFUSED（键已改走）并打假「未能修复」（第 1 轮审计 A5 / 压测 S4）
+        sig = (pl["target"].get("note_file"), pl["target"].get("note_line"), pl["old"], pl["new"])
+        if sig in seen_plan:
+            continue
+        seen_plan.add(sig)
+        planned.append(pl)
+    result: Dict[str, Any] = {"planned": planned, "applied": 0, "refused": [], "partial": [],
+                              "skipped": skipped}
+    if not apply or not planned:
+        return result
+
+    touched: List[Dict[str, Any]] = []
+    rekey_pairs: List[Tuple[str, str]] = []
+    for pl in planned:
+        res = _rename_citekey_in_note(notes_dir, pl["target"], pl["old"], pl["new"])
+        desc = "{} → {}（{} / {} / {}）".format(pl["old"], pl["new"], pl["shape"],
+                                              pl["month"], pl["note_file"])
+        if res == RENAME_OK:
+            result["applied"] += 1
+            logger.info("  🔧 行内键 {} ".format(desc))
+        elif res == RENAME_PARTIAL:
+            result["partial"].append(desc)
+        else:
+            result["refused"].append(desc)
+            continue
+        if pl["shape"] == "suffix-keeper":
+            # keeper 改键 = 派生物（向量库 chunk id / 概念页引用 / 书目）失效，须告知并同步；
+            # dup 侧改键不进这些派生物，不必。
+            touched.append(pl["target"])
+            rekey_pairs.append((pl["old"], pl["new"]))
+    if result["partial"]:
+        logger.error("  ⛔ {} 条改键**已半改且回滚失败**，务必优先人工核对 md/references/sidecar："
+                     .format(len(result["partial"])))
+        for s in result["partial"]:
+            logger.error("      {}".format(s))
+    if result["refused"]:
+        logger.warning("  ⚠️ {} 条行内键未能修复（预检不过，磁盘未改动）：".format(len(result["refused"])))
+        for s in result["refused"]:
+            logger.warning("      {}".format(s))
+    if touched:
+        side = announce_rekey_side_effects(notes_dir, touched, rekey_map=rekey_pairs) or {}
+        if side_out is not None:
+            side_out.update(side)
+    if result["applied"] or result["partial"]:
+        idx = update_index(notes_dir)
+        write_outputs(idx, notes_dir)
+        result["remaining"] = len(find_stale_inline_citekeys(idx))
+    return result
+
+
 # ---------------- backfill 去重集 ----------------
 
 def existing_citekeys(index_path: Path,
@@ -1629,6 +1867,55 @@ def existing_citekeys(index_path: Path,
     excl = exclude_note_files or set()
     return {e.get("citekey") for e in data.get("papers", [])
             if e.get("citekey") and e.get("note_file") not in excl}
+
+
+def existing_citekey_owners(index_path: Path,
+                            exclude_note_files: Optional[Set[str]] = None) -> Dict[str, Tuple[str, str]]:
+    """citekey → (占有者 dedup_key, 占有者规范标题)，供 write_notes 做「同一论文继承基键」。
+
+    与 existing_citekeys 同一数据源、同一 exclude 语义。同一 citekey 被**不同** dedup_key 的
+    条目占着（撞键态）时映射为 ("", "")——继承判据自然不成立，宁可加后缀也不在撞键上再叠一层。
+    文件不存在/损坏返回空 dict（不影响正确性，只是本次不继承）。
+
+    **为什么要连标题一起给**：继承的前提是「索引最终会把这两条判成同一篇」。dedup_key 家族相等
+    （arXiv 剥不剥 vN、DataCite DOI 与 arxiv 档）**不等于**索引会合并——那正是
+    config/dedup_overrides.json 里要写死人工裁决的原因。索引真正的二级合并键是**规范标题**
+    （_entry_keys），所以标题相同才敢继承；否则两条都 live、共用一个 citekey，
+    build_all_references 会把该键整键剔除，**两篇一起**从全局书目消失（第 2 轮压测 CONFIRMED）。
+    """
+    p = Path(index_path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    excl = exclude_note_files or set()
+    out: Dict[str, Tuple[str, str]] = {}
+    seen_keeper: Set[str] = set()
+    for e in data.get("papers", []):
+        if not isinstance(e, dict):
+            continue
+        ck, dk = e.get("citekey"), e.get("dedup_key")
+        if not ck or not dk or e.get("note_file") in excl:
+            continue
+        val = (dk, _norm_title(e.get("title")))
+        is_keeper = not e.get("duplicate_of")
+        # **keeper 优先，且只有两个 keeper 才算撞键**。继承成功之后，同一个 citekey 会同时挂在
+        # keeper 与它的 duplicate 上，而两者的 dedup_key 可以是同一篇论文的不同形态
+        # （arxiv 剥不剥 vN、DataCite DOI 与 arxiv 档）——按「同键不同 dedup_key 即撞键」判，
+        # 下一轮就不敢继承了，keeper 又退回 `<基键>b`，键在两轮之间来回抖
+        # （2026-09-04 第 3 轮审计 CONFIRMED）。duplicate 不是 live 条目，不参与唯一性。
+        if is_keeper:
+            if ck in seen_keeper and out.get(ck, ("", ""))[0] != dk:
+                out[ck] = ("", "")          # 两个 keeper 共键：真撞键，不许继承
+                seen_keeper.add(ck)
+                continue
+            seen_keeper.add(ck)
+            out[ck] = val                   # keeper 覆盖 duplicate 先前写入的值
+        else:
+            out.setdefault(ck, val)
+    return out
 
 
 def load_seen_keys(index_path: Path,

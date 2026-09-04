@@ -514,7 +514,7 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     citekeys = resolve_citekeys(segs, proc.zotero_base_url)
 
     from .notes import write_notes
-    from .notes_index import INDEX_JSON, existing_citekeys
+    from .notes_index import INDEX_JSON, existing_citekeys, existing_citekey_owners
     notes_out_dir = Path(proc.notes_dir)
     note_filename = "科研札记_{}_全文精读".format(label)
     # 排除本次要重写的周札记自己的旧条目——否则本批重算出同样的兜底键会被判「库内
@@ -524,6 +524,10 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
     # 本批覆盖既有全集时仍会走到这里，防御一下不额外增加成本。
     idx_path = Path(proc.notes_dir) / INDEX_JSON
     existing_ckeys = existing_citekeys(
+        idx_path, exclude_note_files={"{}.md".format(note_filename)})
+    # 键的占有者（citekey → dedup_key）：同一论文的既有条目占着基键时继承它而非加后缀
+    # （notes.write_notes 的 existing_key_owners 说明；keeper/duplicate 同键才不会让基键从书目消失）
+    existing_owners = existing_citekey_owners(
         idx_path, exclude_note_files={"{}.md".format(note_filename)})
     try:
         existing_dk = _existing_note_dedup_keys(notes_out_dir, note_filename)
@@ -567,7 +571,9 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
                 model=(settings.llm.closeread_model or settings.llm.model),
                 scratch_dir=Path("output/scholar_pdfs"),
                 deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-                max_chunks=proc.closeread_max_chunks)
+                max_chunks=proc.closeread_max_chunks,
+                extra_routes=getattr(proc, "fulltext_extra_routes", False),
+                route_delay=getattr(proc, "fulltext_route_delay", 0.0))
         finally:
             llm_client.close()
         if top_n > 0 and pending and done == 0:
@@ -585,13 +591,16 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
         digest_title="科研札记 · {}{}".format(label, title_suffix),
         filename=note_filename,
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True, existing_citekeys=existing_ckeys)
+        fallback_citekeys=True, existing_citekeys=existing_ckeys,
+        existing_key_owners=existing_owners)
 
     hit_ck = sum(1 for v in citekeys.values() if v)
     logger.info("  ✅ {} → {} 篇 | citekey {}/{} | 全文精读 {} | 增强 CR{}/AX{}/TS{}".format(
         label, len(segs), hit_ck, len(segs), full_text, cr, ax, ts))
     return {"label": label, "status": "ok", "count": len(segs), "citekey": hit_ck,
-            "full_text": full_text, "md": res["note_path"], "docx": res.get("docx_path")}
+            "full_text": full_text, "md": res["note_path"], "docx": res.get("docx_path"),
+            # 显式两态（notes.write_notes 2026-09-04）：False = 要求写却失败，量尺永久丢失
+            "sidecar_ok": res.get("sidecar_ok", True)}
 
 
 def describe(segs: Sequence[PaperSegment]) -> List[str]:

@@ -76,6 +76,10 @@ def _fmt(r: T.TopicResult) -> str:
 
 
 def main() -> int:
+    # 父死联动：被 `topics._run_refresh_child` 拉起时，父进程一没就自杀。
+    # 子进程自成会话（为了能整组终止）之后就逃出了 launchd 的进程组清扫网，
+    # 父被 -9 时信号转发也拦不住——这条轮询是那一格唯一的兜底。手动直接跑本脚本时不启用。
+    T.install_parent_death_watchdog()
     ap = argparse.ArgumentParser(description="从札记库句级证据合成概念页（topic pages）")
     ap.add_argument("--config", default="config/scholar.env")
     ap.add_argument("--topics-config", default=T.DEFAULT_CONFIG, help="概念页定义（yaml）")

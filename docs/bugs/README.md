@@ -4,43 +4,63 @@
 先写清「在哪、什么现象、怎么复现」，修法只作为备选记录。本目录是待处理台账，不是决策记录（决策进 `docs/decisions/`）。
 
 > ⚠️ `.gitignore` 里 `docs/*` 是全忽略、靠 `!` 白名单逐个放行的（`.gitignore:111` 起）。
-> 本目录已加 `!docs/bugs/`；**新建其它 docs 子目录时记得补放行**，否则文件 git 根本看不见。
+> **新建其它 docs 子目录时记得补放行**，否则文件 git 根本看不见。
 
-> 下表按目录实际内容生成，是**快照**。多个会话会并发往这里加条目（本次生成时就有另一会话在写），
-> 增删后请重新核对，不要只信这张表。
+> 下表按目录实际内容生成，是**快照**（2026-09-04 台账批清理后）。多个会话会并发往这里加条目，
+> 增删后请重新核对，不要只信这张表。已修条目的「修复」细节都在各自文末的「修复（2026-09-04 台账批）」节。
 
 ---
 
-## 待处理（20 条）
+## 已修复 / 已防复发（20 条，2026-09-04 台账批）
+
+| 缺陷 | 改在哪 | 状态 |
+|---|---|---|
+| [finalize 整月重建的并发缺口：盘上有 bundle 的论文会被静默抹出札记](2026-09-03-finalize-concurrency.md) | `scripts/read_pdf.py` 锁 + 提交前重查 | **已修复**（c3eb40a） |
+| [finalize「僵死」的候选根因：卡的不是向量同步，是它之后的 topics 子进程](2026-09-03-finalize-topics-mistaken-for-hang.md) | `topics.trigger_topic_refresh` / `_run_refresh_child` | **已修复**：pid/耗时/日志路径三行可见；子进程随父死；stdout 落 `logs/topics_refresh/`；SKILL 改写 |
+| [父进程被杀后 build_topics 子进程变孤儿](2026-09-04-topics-subprocess-orphaned-on-parent-kill.md) | 同上 | **已修复**（同一处改动） |
+| [finalize 收尾在向量库同步处僵死不退出](2026-09-04-finalize-vector-sync-hang.md) | 同上 | **归因已明、已修复**：卡的是向量同步之后的 topics 子进程 |
+| [元数据退化到 pdf-llm、DOI 全空，但 ingest 回执不报](2026-09-03-metadata-degradation-not-flagged.md) | `pdf_ingest.resolve_metadata(diag)` / `read_pdf._is_thin_metadata` | **已修复**：判据改为书目可用性，回执带退化原因 |
+| [ingest 的 `degraded` 状态：全部块都成功也会触发，原因不落盘](2026-09-04-ingest-degraded-silent.md) | `pdf_ingest.ingest_pdf` 五态 / SKILL | **已修复**：新增 `synth_failed`，失败原因进 `draft_note`，回退协议扩到三态 |
+| [分块通读草稿的四类系统性错误](2026-09-03-ingest-draft-systematic-errors.md) | `pdf_ingest.extract_availability_statements` / `--context` / prompt | **部分修复**：②③④ 已修；① 分数抽成整数未修 |
+| [`digest --month` 静默整篇覆盖历史月度札记](2026-09-04-digest-month-overwrite.md) | `cli.run_digest` 预检 + `workflow._step_sync_zotero` 守卫 + `--overwrite-notes` | **已修复**：拒绝 + 逃生门 + 覆盖前备份四件套 |
+| [Crossref 的 article-number 被丢弃](2026-09-04-crossref-article-number-lost.md) | `crossref.parse_crossref_work` | **代码已修**；存量 36 条回填待跑（命令见文末） |
+| [索引没有 keeper 视图](2026-09-04-index-keeper-view-missing.md) | `notes_index.iter_keepers` / `keepers_by_citekey` | **已修复**：embed_store 与 backfill_deepread 已委托 |
+| [auto 月度札记缺 sidecar：写入失败被静默吞掉](2026-09-04-auto-sidecar-missing.md) | `notes.write_notes` | **路线 A 已修**：error 级 + `sidecar_ok`；存量 43 月认赔 |
+| [摘要降级通路对存量脚本实质失效](2026-09-04-abstract-fallback-dead.md) | `backfill_deepread.abstract_from_note_md` + `--accept-abstract` | **已修复（产出）**：abstracts.json 查不到时回读 md `### 摘要`。**收货默认关**——不加 `--accept-abstract` 时连摘要都不供给（省掉必被拒收的那次 LLM）|
+| [duplicate 条目的行内 citekey 只告警不修](2026-09-04-inline-citekey-mismatch-warn-only.md) | `notes_index.fix_inline_citekeys` / `scripts/notes_index.py --fix-inline-citekeys` | **已修复**：三处原子齐改工具（默认 dry-run）+ 告警升 **error 级**、清单挂进索引 `stale_inline_citekeys`。**刻意不 notify**（持久状态每周每月弹同一条会把告警面训练成噪音）|
+| [手动精读升级已入库论文时 keeper 拿到后缀键、基键从全局书目消失](2026-09-04-manual-upgrade-citekey-suffix.md) | `notes.write_notes(existing_key_owners)` / `notes_index.existing_citekey_owners` | **A+B 均已修**：同一论文继承基键；存量 `lin2025Addressing` 用工具处置（未在生产库执行） |
+| [精读节标题是机读锚点：加后缀会静默丢 reading_source](2026-09-04-closeread-heading-contract.md) | 测试 | **已防复发**：另两对渲染↔解析契约补了往返测试 |
+| [Zotero connector 的 saveItems 吞掉 target](2026-09-04-zotero-saveitems-target-ignored.md) | `zotero_sync.save_items(target)` + `updateSession` | **已修**（随本批提交）；BBT 非 ASCII 键加告警 |
+| [额度耗尽被记成 `no_output`：35 篇「全文已到手但没读成」混进待下载清单](2026-09-04-quota-failure-looks-like-no-fulltext.md) | `closereading.is_llm_unavailable` + `diag` 出参 / `backfill_deepread.classify_failure` | **已修复**：账本分 `llm_unavailable`、计入熔断、重跑不再跳过 |
+| [`replace_closeread` 吞掉精读节之后到下一篇之间的全部内容](2026-09-04-replace-closeread-eats-trailing-content.md) | `backfill_deepread.replace_closeread` | **已修复**（审计中发现）；存量 169 篇的篇末 `---` 已丢，补不补见该文末 |
+| [一次 run 内第二篇的备份会覆盖第一篇的原件](2026-09-04-backup-stamp-overwrites-original.md) | `backfill_deepread.backup_files` | **已修复**（审计中发现，判 BLOCKER）：同名已存在就不覆盖 |
+| [`find_local_pdf` 单向词面匹配会认下别篇论文的 PDF](2026-09-04-find-local-pdf-one-way-match.md) | `backfill_deepread.find_local_pdf` | **已修复**（审计中发现）：加反向覆盖 + 实词下限，与 fulltext 同一套判据 |
+
+## 已实现但**默认关闭**——月度链路的行为与修复前一致，要不要打开由你决定（1 条）
+
+| 缺陷 | 改在哪 | 状态 |
+|---|---|---|
+| [取全文只走两条路（自评高严重度：每月都在少读，漏判率约 13.5%）](2026-09-04-fulltext-routes-too-narrow.md) | `fulltext.resolve_oa_pdf(extra_routes)` + `settings.fulltext_extra_routes` | **代码已下沉、开关默认 False**。打开：`config/scholar.env` 加 `PROCESSING__FULLTEXT_EXTRA_ROUTES=true`。默认关的理由：每篇候选多打 2~3 个 API，真网络下的限流表现没验证过；月度择优阶段会放大成几十次请求 |
+
+## 待处理（4 条）
 
 | 缺陷 | 具体位置 | 状态 |
 |---|---|---|
-| [finalize「僵死」的候选根因：卡的不是向量同步，是它之后的 topics 子进程](2026-09-03-finalize-topics-mistaken-for-hang.md) | `scripts/read_pdf.py:757-777`（`_rebuild_month` 尾部，锁外… | **候选根因，待抓栈证实**——本条是 |
-| [分块通读草稿的四类系统性错误（一批四篇全中）](2026-09-03-ingest-draft-systematic-errors.md) | `src/scholar/pdf_ingest.py:445 _read_one`（逐块通读）与 `:5… | **未修** |
-| [元数据退化到 pdf-llm、DOI 全空，但 ingest 回执的「⚠️ 需要注意」块不报](2026-09-03-metadata-degradation-not-flagged.md) | `scripts/read_pdf.py:186-188` `_print_attention` 的 `… | **未修** |
-| [摘要降级通路对存量脚本实质失效：abstracts.json 只有 3 篇，而摘要明明存在 md 里](2026-09-04-abstract-fallback-dead.md) | `src/scholar/closereading.py:226` | **未修复** |
-| [auto 月度札记缺 sidecar：阅读深度量尺永久不可恢复，且写入失败被静默吞掉](2026-09-04-auto-sidecar-missing.md) | — | **未修复**（已定位根因与影响面，修法有两条路待选） |
-| [精读节标题是机读锚点：往里加后缀会静默丢掉 reading_source（已踩过一次）](2026-09-04-closeread-heading-contract.md) | — | **未发生于主干**（我引入后当轮撤回），已留回归测试防复发 |
-| [长论文仍被截尾：137,400 字符上限对 80 页以上的论文不够](2026-09-04-closeread-still-truncates.md) | `src/scholar/settings.py:218` | **未修复**（上限已从 120k 抬到 137,400，仍不够；且不能单独再抬） |
-| [Crossref 的 article-number 被丢弃：e-locator 期刊的书目条目没有定位号](2026-09-04-crossref-article-number-lost.md) | `src/scholar/crossref.py:89` | **未修** |
-| [`digest --month` 会静默整篇覆盖历史月度札记，无存在性检查、无备份、无提示](2026-09-04-digest-month-overwrite.md) | `src/scholar/notes.py:344` | **未修复** |
-| [finalize 收尾在向量库同步处僵死不退出（无报错、0% CPU）](2026-09-04-finalize-vector-sync-hang.md) | finalize 收尾的向量库同步：`src/scholar/embed_store.py:818 sy… | **症状已确证，阻塞点未定位**——四条最可能的嫌疑已逐一排除，需下次复现时抓栈 |
-| [取全文只走两条路：月度流水线系统性漏掉本来拿得到的全文](2026-09-04-fulltext-routes-too-narrow.md) | `src/scholar/fulltext.py:85` | **未修复**（补抓脚本里已有可用实现，尚未下沉进主链路） |
-| [索引没有 keeper 视图：按 citekey 建字典必被 duplicate 覆盖，验收已两次误判](2026-09-04-index-keeper-view-missing.md) | — | **未修复** |
-| [ingest 的 `degraded` 状态：全部块都成功也会触发，原因不落盘，且 skill 协议里没有这个状态](2026-09-04-ingest-degraded-silent.md) | `src/scholar/pdf_ingest.py:917` | **未修复** |
-| [duplicate 条目的行内 citekey 只告警不修：每轮重建都复读同一批，改一条要手工动三处派生物](2026-09-04-inline-citekey-mismatch-warn-only.md) | `src/scholar/notes_index.py:835` | **未修**（本次手工修了 3 条，机制照旧） |
-| [手动精读升级已入库论文时，keeper 拿到后缀键、干净基键被 duplicate 占住并从全局书目里消失](2026-09-04-manual-upgrade-citekey-suffix.md) | `notes_index.py:836` | **未修**。本轮已人工处置 1 例（`shi2025Federated`），存量还剩 … |
-| [存量条目缺 DOI 从未回补：36 篇连身份标识都没有，取全文与去重同时失效](2026-09-04-missing-identifier-backfill.md) | `src/scholar/crossref.py:111` | **未修复** |
-| [P4 的五处门/证据缺口（三轮对抗审期间实测发现）](2026-09-04-p4-gate-gaps.md) | `tests/test_mnn_line.py:198` | **未修复**（全部为实测确认，非推断） |
-| [父进程被杀后 build_topics 子进程变孤儿：概念页在无人知情的情况下继续重写](2026-09-04-topics-subprocess-orphaned-on-parent-kill.md) | `src/scholar/topics.py:1455` | **未修** |
-| [`fulltext_truncated` 混用两种成因，覆盖率百分比是误导性指标](2026-09-04-truncated-flag-conflates-two-causes.md) | `src/scholar/closereading.py:34` | **未修复**（轻，且已确认不影响证据质量——见「这条为什么不紧急」） |
-| [Zotero connector 的 saveItems 吞掉 target：条目静默落进「未归档条目」](2026-09-04-zotero-saveitems-target-ignored.md) | — | **已修**（改动未提交，见文末） |
+| [长论文仍被截尾：137,400 字符上限对 80 页以上不够](2026-09-04-closeread-still-truncates.md) | `src/scholar/settings.py` `closeread_max_chars` | **推后**：需「正文/附录两轮」设计，不能单独抬上限 |
+| [`fulltext_truncated` 混用两种成因](2026-09-04-truncated-flag-conflates-two-causes.md) | `src/scholar/closereading.py:34` | **推后**：低严重度，要新增索引字段五处联动 |
+| [存量条目缺 DOI 从未回补](2026-09-04-missing-identifier-backfill.md) | `src/scholar/crossref.py` `crossref_lookup` | **推后**：第一步是联网只读盘点，属数据操作 |
+| [P4 的五处门/证据缺口](2026-09-04-p4-gate-gaps.md) | `~/Desktop/Lab/P4` | **不属本仓库**，应整体搬去该仓库 |
 
-## 已修复 / 待归档（1 条）
+## 已修但有存量数据待处置（跑之前先 dry-run）
 
-| 缺陷 | 具体位置 | 状态 |
-|---|---|---|
-| [finalize 整月重建的并发缺口：盘上有 bundle 的论文会被静默抹出札记](2026-09-03-finalize-concurrency.md) | `scripts/read_pdf.py:408` —— `if (broken or skipped)… | **已修复**（2026-09-04，见文末「修复」一节）。诊断部分原样保留——它论证了… |
+| 事项 | 命令 |
+|---|---|
+| 陈旧行内键 / 后缀 keeper（`lin2025Addressing` 等） | `PYTHONPATH=. python3.12 scripts/notes_index.py --fix-inline-citekeys`（看计划）→ 加 `--apply` |
+| 36 条 e-locator 书目补定位号 | 逐月 `scripts/repair_references.py --month <月> --force --email <邮箱> --dry-run` → 去掉 `--dry-run` → `scripts/notes_index.py` |
+| Zotero 里三条未归档条目 | 人在 Zotero 里拖进 ScholarDigest |
+| 169 篇被吞掉的篇末 `---` | 见 `2026-09-04-replace-closeread-eats-trailing-content.md` 文末的 dry-run 脚本（纯版面，不影响解析，补不补由你定）|
+| 35 篇被记成 `no_output` 的额度失败 | 额度恢复后按 `2026-09-04-quota-failure-looks-like-no-fulltext.md` 文末命令 `--citekey` 点名重跑 |
+
 ---
 
 ## 已排除（记录以免重复排查）

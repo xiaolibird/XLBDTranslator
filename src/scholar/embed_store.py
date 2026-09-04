@@ -27,7 +27,7 @@ except ImportError:
     fcntl = None  # Windows fallback
 
 from ..utils.logger import get_logger
-from .notes_index import INDEX_JSON, is_retracted
+from .notes_index import INDEX_JSON, is_retracted, iter_keepers
 
 logger = get_logger(__name__)
 
@@ -215,16 +215,12 @@ def chunks_from_index(index: dict, abstracts: Optional[Dict[str, str]] = None) -
     同篇同文本不同 role（如一句同时标 citable/refutable）碰撞覆盖丢数据。
     """
     out: List[Chunk] = []
-    for e in index.get("papers") or []:
-        if not isinstance(e, dict):
-            continue
-        citekey = e.get("citekey")
-        if e.get("duplicate_of") or not citekey:
-            continue
-        if citekey.startswith("MISSING-KEY-") or e.get("citekey_source") == "missing":
-            # MISSING-KEY 占位键不对应真实文献（notes_index.is_missing_citekey 契约），
-            # 嵌进向量库会让 notes_search --cite 输出死引用，与 all_references 剔除口径一致。
-            continue
+    # keeper 过滤（duplicate / 无 citekey / MISSING-KEY 占位键）收敛到 notes_index.iter_keepers：
+    # 占位键不对应真实文献，嵌进向量库会让 notes_search --cite 输出死引用，与 all_references
+    # 剔除口径一致。此前这里手写一遍、backfill_deepread._keepers 又手写一遍，两份口径迟早漂移
+    # （见 docs/bugs/2026-09-04-index-keeper-view-missing.md）。撤稿留在下面单独判：要打日志。
+    for e in iter_keepers(index, include_retracted=True):
+        citekey = e["citekey"]
         if is_retracted(e):
             # 已撤稿：**札记保留**（读过它、判断过它的记录不该消失），但整篇踢出向量库。
             # 这一行就是"从 RAG 里删掉"的全部实现——`sync_store` 的期望集不含它，

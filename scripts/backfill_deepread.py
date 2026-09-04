@@ -46,6 +46,7 @@ git**，所以每次写盘前把 md + sidecar 原件复制到
 """
 import argparse
 import json
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -65,37 +66,46 @@ from src.utils.logger import get_logger                          # noqa: E402
 logger = get_logger("backfill_deepread")
 
 LEDGER_NAME = "backfill_deepread_progress.json"
+EXPAND_LEDGER_NAME = "backfill_expand_progress.json"   # --expand 批独立记账，见 _ledger_path
 BACKUP_DIR = ".backfill_deepread_backup"
 TARGET_DEPTH = "unknown-legacy"
 _FAIL_STREAK_STOP = 3   # 连续失败几篇就判通路级故障并中止（见 cmd_run 的熔断）
+_EXPAND_FAIL_STREAK_STOP = 8   # expand 批抓不到全文是常态，阈值放宽（同上）
 
 
 # ---------------- 目标集 ----------------
 
 def _keepers(index: dict) -> List[dict]:
-    """与 embed_store.chunks_from_index 同一口径的 keeper 过滤。"""
-    out = []
-    for e in index.get("papers") or []:
-        if not isinstance(e, dict):
-            continue
-        ck = e.get("citekey")
-        if e.get("duplicate_of") or not ck:
-            continue
-        if ck.startswith("MISSING-KEY-") or e.get("citekey_source") == "missing":
-            continue
-        out.append(e)
-    return out
+    """keeper 过滤，委托给 notes_index.iter_keepers（与 embed_store.chunks_from_index 同源）。
+
+    此前这里与 embed_store 各手写一份同样的过滤；索引里同一 citekey 可多条（跨月重复），
+    按 citekey 建字典会被 duplicate 覆盖、验收已两次读出反的结论——统一口径后别再第三次各写各的。
+    撤稿条目仍在目标集内（本脚本不做撤稿处置；那是 lint/embed 的事）。
+    """
+    from src.scholar.notes_index import iter_keepers
+    return list(iter_keepers(index, include_retracted=True))
 
 
-def select_targets(index: dict, decision: str = "", tier: str = "") -> List[dict]:
-    """选 reading_depth=unknown-legacy 的存量精读，可按 decision / priority_tier 收窄。
+def select_targets(index: dict, decision: str = "", tier: str = "",
+                   expand: bool = False) -> List[dict]:
+    """选目标篇目，可按 decision / priority_tier 收窄。两种口径由 `expand` 切换：
 
-    只挑 has_full_text_reading 为真的：没做过全文精读的（纯题录 / 只读摘要）不是本课题
-    的缺口——那是筛选阶段的决定，不是缺陷，重读它们属于「扩大精读面」的另一件事。
+    - 默认（补深度）：reading_depth=unknown-legacy **且**做过全文精读的存量精读。
+    - `expand=True`（扩大精读面）：**没**做过全文精读的（索引层：只有题录+摘要）。
+      这批不是「读得浅」，而是月度 digest 只给当月 top-N 做全文精读、其余留在索引层的
+      设计结果（见 closereading.close_read_segments 的 top_n）。把它们升格成全文精读
+      是另一件事，所以走独立账本（EXPAND_LEDGER_NAME），免得两批的完成度互相污染
+      —— `scan` 的分母靠账本兜底，混账本会让两边的数字都失真。
+
+    两种口径**互斥**：expand 批目标篇 has_full_text_reading 恒为假，跑完变真，
+    自然退出 expand 目标集；此后若还嫌读得浅，归默认口径管。
     """
     out = []
     for e in _keepers(index):
-        if e.get("reading_depth") != TARGET_DEPTH or not e.get("has_full_text_reading"):
+        if expand:
+            if e.get("has_full_text_reading"):
+                continue
+        elif e.get("reading_depth") != TARGET_DEPTH or not e.get("has_full_text_reading"):
             continue
         if decision and e.get("decision") != decision:
             continue
@@ -107,12 +117,62 @@ def select_targets(index: dict, decision: str = "", tier: str = "") -> List[dict
 
 # ---------------- 账本 ----------------
 
-def _ledger_path(notes_dir: Path) -> Path:
-    return notes_dir / LEDGER_NAME
+LLM_UNAVAILABLE_REASON = "llm_unavailable"
 
 
-def load_ledger(notes_dir: Path) -> dict:
-    p = _ledger_path(notes_dir)
+def classify_failure(cr_diag: dict, err) -> tuple:
+    """把一次「没产出」归类成账本 reason，并回答「要不要计入熔断连败」。返回 (reason, llm_dead)。
+
+    三类必须可分（见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md）：
+      - `llm_unavailable:<原因>` 全文/摘要**已经到手**，是模型侧挂了（额度耗尽 / 429 限流 / 鉴权）。
+        **暂时性**：额度一恢复原样重跑就成，绝不该沉淀进「待下载清单」等一个根本不需要的 PDF。
+        必须计入连败——熔断存在的全部理由就是拦这个（2026-09-04 实测：额度耗尽后一路跑到底，
+        把 65 篇烧成失败，其中 35 篇全文明明已经在手）。
+      - `error:<异常类型>` 抛异常的其它故障，计入连败。
+      - `no_output` 真没正文可读（无 DOI / 闭源 / 四条通道全断），**确定性**失败；
+        expand 批里它是常态，不计连败（否则熔断天天误跳）。
+    """
+    from src.scholar.closereading import is_llm_unavailable
+    llm_dead = bool((cr_diag or {}).get("llm_unavailable")) or (err is not None and is_llm_unavailable(err))
+    if llm_dead:
+        detail = ((cr_diag or {}).get("llm_error") or (err and str(err)) or "")[:120]
+        return "{}:{}".format(LLM_UNAVAILABLE_REASON, detail), True
+    if err is not None:
+        return "error:{}".format(type(err).__name__), True
+    return "no_output", False
+
+
+def counts_toward_streak(llm_dead: bool, expand: bool, err) -> bool:
+    """这次失败要不要计入熔断连败。
+
+    - 模型侧挂了（`llm_dead`）**一律计入**——熔断存在的全部理由就是拦它。2026-09-04 实测：
+      额度耗尽后一路跑到底把 65 篇烧成失败，其中 35 篇全文明明已经在手，
+      正是因为额度耗尽走的是 catch 分支、`err` 恒为 None，被下面那条 expand 豁免吃掉了。
+    - expand 批里「干净的 no_output」（真抓不到全文，`err is None`）**不计**：那是结构性缺口、
+      是常态，计进去会让熔断在正常情况下不停误跳（实测头 29 篇挂 24 篇）。
+    - 其余（抛异常的故障、补深度批的任何失败）都计。
+    """
+    return bool(llm_dead) or not (expand and err is None)
+
+
+def deterministic_failures(led: dict) -> set:
+    """账本里**确定性**失败的 citekey 集合——expand 批重跑时跳过它们。
+
+    `llm_unavailable` 不在其中：那是暂时性的，跳过等于让全文已到手的篇目永远留在待下载清单里。
+    """
+    out = set()
+    for k, v in (led.get("failed") or {}).items():
+        if not str((v or {}).get("reason") or "").startswith(LLM_UNAVAILABLE_REASON):
+            out.add(k)
+    return out
+
+
+def _ledger_path(notes_dir: Path, expand: bool = False) -> Path:
+    return notes_dir / (EXPAND_LEDGER_NAME if expand else LEDGER_NAME)
+
+
+def load_ledger(notes_dir: Path, expand: bool = False) -> dict:
+    p = _ledger_path(notes_dir, expand)
     if not p.exists():
         return {"done": {}, "failed": {}}
     try:
@@ -125,24 +185,103 @@ def load_ledger(notes_dir: Path) -> dict:
                            "重复改写札记。请先修复或删除它。".format(p, e))
 
 
-def save_ledger(notes_dir: Path, led: dict) -> None:
-    tmp = _ledger_path(notes_dir).with_suffix(".tmp")
+def save_ledger(notes_dir: Path, led: dict, expand: bool = False) -> None:
+    tmp = _ledger_path(notes_dir, expand).with_suffix(".tmp")
     tmp.write_text(json.dumps(led, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(_ledger_path(notes_dir))
+    tmp.replace(_ledger_path(notes_dir, expand))
 
 
 # ---------------- 段落重建 ----------------
 
-def segment_from_entry(entry: dict, sid: int, abstracts: Optional[Dict[str, str]] = None
-                       ) -> PaperSegment:
+_ABSTRACT_HEADING_RE = re.compile(r"^#{2,4} 摘要\s*$")
+_ABSTRACT_PLACEHOLDER = "*摘要暂无*"
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _looks_cjk(text: str, ratio: float = 0.15) -> bool:
+    """文本里 CJK 字符占非空白字符的比例超过 ratio 即视为中文译文（英文摘要偶含一两个汉字不算）。"""
+    body = "".join(ch for ch in (text or "") if not ch.isspace())
+    if not body:
+        return False
+    return len(_CJK_RE.findall(body)) / len(body) >= ratio
+
+
+def abstract_from_note_md(notes_dir: Path, entry: dict) -> str:
+    """从该篇所在月度 md 的 `### 摘要` 节回读摘要文本；找不到/占位/定位失败一律返回空串。
+
+    为什么需要：`abstracts.json` 是入库时另存的旁路文件，全库只有 3 条；此前本脚本把它当
+    唯一摘要源，全文一断就打「无全文也无摘要」零产出——而摘要明明就在每篇的 md 节下
+    （2026-09-03 那批 148 个失败篇没有一篇走成摘要降级；见
+    docs/bugs/2026-09-04-abstract-fallback-dead.md）。定位复用 _find_paper_span（note_line
+    锚 + citekey 兜底），不新写解析。
+    """
+    nf = entry.get("note_file")
+    ck = entry.get("citekey")
+    if not nf or not ck or notes_dir is None:
+        return ""
+    md = Path(notes_dir) / nf
+    try:
+        lines = md.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    try:
+        start, end = _find_paper_span(lines, ck, entry.get("note_line"))
+    except (RuntimeError, TypeError, ValueError):     # 定位失败 / 坏索引里 note_line 不是 int
+        return ""
+    buf: List[str] = []
+    grabbing = False
+    for ln in lines[start + 1:end]:
+        if _ABSTRACT_HEADING_RE.match(ln):
+            grabbing = True
+            continue
+        if grabbing:
+            # 摘要节到下一个标题 / 精读分节 / 篇末分隔线（`---`）为止
+            if ln.startswith(("#", "**【", "---")) or _CLOSEREAD_RE.match(ln):
+                break
+            buf.append(ln)
+    text = "\n".join(buf).strip()
+    if not text or text == _ABSTRACT_PLACEHOLDER:
+        return ""
+    return text
+
+
+def abstract_source_dir(notes_dir, accept_abstract: bool):
+    """摘要级降级的**来源目录**：只有收货方会接受摘要级产出时才供给。
+
+    关着时返回 None，`segment_from_entry` 就不回读 md 的「### 摘要」节，`close_read`
+    立刻 return None、零 LLM。若照传 notes_dir，模型会读完整份摘要再被下面那道闸
+    原样丢弃——比不供给还贵。守卫：test_abstract_source_dir_is_gated_by_accept_abstract。
+    """
+    return notes_dir if (accept_abstract and notes_dir) else None
+
+
+def segment_from_entry(entry: dict, sid: int, abstracts: Optional[Dict[str, str]] = None,
+                       notes_dir: Optional[Path] = None) -> PaperSegment:
     """索引条目 → PaperSegment（**只为重读用**，不参与元数据增强）。
 
     刻意不调 enrich_segments / resolve_citekeys：本脚本沿用索引里已有的 citekey 与
     元数据，绝不让重读这件事把身份键搅动了（见模块 docstring）。
+
+    摘要来源两级：abstracts.json（旁路文件，仅 3 条）→ 该篇 md 的 `### 摘要` 节
+    （notes_dir 非空时）。全文抓不到时 close_read 靠它降级成摘要级精读，而不是零产出。
+    ⚠️ **notes_dir 由 cmd_run 经 abstract_source_dir 决定，默认是 None**：两条批次默认
+    都不收摘要级，供给了也只会被 cmd_run 那道闸丢弃、白烧一次 LLM。加 --accept-abstract
+    才既供给又收货（且只对本来就没有全文精读的篇目）。
     """
     # 摘要挂在 PaperSegment.original_abstract 上，**不在 PaperMetadata**（它没有
     # abstract 字段；pydantic 会静默吞掉这个未知入参，直到读取时才 AttributeError）。
-    abstract = (abstracts or {}).get(entry.get("citekey") or "", "") or ""
+    abstract = ((abstracts or {}).get(entry.get("citekey") or "", "") or "").strip()
+    translated = ""
+    if not abstract and notes_dir is not None:
+        md_abs = abstract_from_note_md(notes_dir, entry)
+        # md 里落的是 `translated_abstract or original_abstract`：有译文的月份读到的是中文译文。
+        # 译文**不能**冒充 original_abstract——close_read 用 original_abstract 做数字回查对照，
+        # 拿一段未校验的 LLM 译文给另一段背书正是 closereading 明文禁止的（第 1 轮审计 A7/压测 S3）。
+        # 含 CJK 的当译文挂 translated_abstract，original_abstract 留空 → 对照退回喂读正文本身（设计内兜底）。
+        if _looks_cjk(md_abs):
+            translated = md_abs
+        else:
+            abstract = md_abs
     meta = PaperMetadata(
         paper_id=str(sid),
         title=entry.get("title") or "",
@@ -153,12 +292,13 @@ def segment_from_entry(entry: dict, sid: int, abstracts: Optional[Dict[str, str]
         journal=entry.get("journal") or "",
     )
     seg = PaperSegment(segment_id=sid, paper_id=str(sid), metadata=meta,
-                       original_abstract=abstract)
+                       original_abstract=abstract, translated_abstract=translated)
     seg.priority_score = entry.get("priority_score") or 1.0
     return seg
 
 
-def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str):
+def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str,
+                        diag: Optional[dict] = None):
     """用**本地** PDF 走深读，绕开 OA 解析与下载。返回 CloseReading 或 None。
 
     为什么需要这条通道：`close_read_one` 的全文来源只有两个——`resolve_oa_pdf` 给的
@@ -179,9 +319,12 @@ def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str):
     if not text.strip():
         logger.warning("  本地 PDF 抽不出文字层（可能是扫描件）：{}".format(pdf.name))
         return None
+    if diag is not None:
+        diag["from_full_text"] = True
+        diag["source"] = "local-pdf"
     cr = deep_close_read(seg, text, proc.research_interests, llm, model=model,
                          source="local-pdf", from_full_text=True,
-                         max_chunks=proc.closeread_max_chunks)
+                         max_chunks=proc.closeread_max_chunks, diag=diag)
     if cr is None:
         return None
     cr.body_chars = len(text)
@@ -192,6 +335,10 @@ def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str):
 
 
 _TITLE_MATCH_MIN = 0.6      # 首页标题词重合到几成才认（实测正确配对普遍 100%）
+# 反向覆盖与实词下限：与 fulltext.route_arxiv_title 同一套判据（那份第 1 轮已修，这是第三份副本）。
+# 单向覆盖对短标题恒为 1.0——一篇包含了本标题全部实词的长综述会被当成本篇的 PDF 认下来。
+_TITLE_MATCH_BACK_MIN = 0.25   # PDF 首页实词被本标题覆盖的比例下限（首页含作者/机构/摘要，故比 fulltext 宽）
+_TITLE_MIN_TOKENS = 4          # 实词少于这个数就不做词面匹配
 _PDF_HEAD_CACHE: Dict[str, set] = {}
 
 
@@ -230,7 +377,7 @@ def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
             return p
 
     want = _title_tokens(entry.get("title") or "")
-    if len(want) < 3:                      # 标题太短，词面匹配不可靠，宁可不认
+    if len(want) < _TITLE_MIN_TOKENS:      # 标题太短，词面匹配不可靠，宁可不认
         return None
     from src.scholar.closereading import _pdf_text_with_stats
     best, best_score = None, 0.0
@@ -242,8 +389,16 @@ def find_local_pdf(pdf_dir: Optional[Path], entry: dict) -> Optional[Path]:
             except Exception:              # noqa: BLE001  坏 PDF 不该拖垮整批
                 head = ""
             _PDF_HEAD_CACHE[key] = _title_tokens(head[:900])
-        score = len(want & _PDF_HEAD_CACHE[key]) / len(want)
-        if score > best_score:
+        head_tokens = _PDF_HEAD_CACHE[key]
+        if not head_tokens:
+            continue
+        hit = len(want & head_tokens)
+        # **双向**覆盖：只算 hit/len(want) 的话，一篇把本标题所有实词都包含进去的长综述会拿到
+        # 1.0，于是把**别篇论文的 PDF** 当成这篇的全文精读进库（fulltext 那份副本第 1 轮已修，
+        # 这是第三份副本，2026-09-04 第 3 轮压测 CONFIRMED）。反向覆盖挡的正是「被包含」。
+        score = hit / len(want)
+        back = hit / len(head_tokens)
+        if score > best_score and back >= _TITLE_MATCH_BACK_MIN:
             best, best_score = p, score
     if best is not None and best_score >= _TITLE_MATCH_MIN:
         logger.info("  按首页标题认出 {} → {}（重合 {:.0%}）".format(
@@ -306,8 +461,11 @@ def replace_closeread(md_text: str, citekey: str, note_line: Optional[int],
     """把某篇的精读节整段换成 new_lines。返回 (新全文, 旧节行数, 新节行数)。
 
     只动这一节：篇内的标题/裁决/摘要、以及**其余所有论文**的字节一律不碰。
-    找不到既有精读节时插在该篇末尾（正常路径不会走到——目标集限定
-    has_full_text_reading=True，必有精读节）。
+    找不到既有精读节时插在该篇末尾。**`--expand` 批走的就是这条**（它的目标集恰恰是
+    「没做过全文精读」的索引层篇目，篇内本来就没有精读节），所以这条分支不是罕见兜底而是
+    主路径之一——插入点必须退到 `build_digest_note` 每篇后追加的那条 `---` **之前**，
+    否则精读节会落在本篇分隔线之后，与 `notes._paper_section` 的规范排布（精读节在前、
+    `---` 在后）相反，并原样带进 vault 单篇页（2026-09-04 第 5 轮终审 CONFIRMED）。
     """
     lines = md_text.splitlines()
     start, end = _find_paper_span(lines, citekey, note_line)
@@ -319,17 +477,28 @@ def replace_closeread(md_text: str, citekey: str, note_line: Optional[int],
             break
     if cr_start is None:
         insert_at = end
-        while insert_at > start + 1 and not lines[insert_at - 1].strip():
+        while insert_at > start + 1 and (not lines[insert_at - 1].strip()
+                                         or lines[insert_at - 1].rstrip() == "---"):
             insert_at -= 1
         merged = lines[:insert_at] + [""] + new_lines + lines[insert_at:]
         return "\n".join(merged) + "\n", 0, len(new_lines)
 
-    cr_end = end
+    # 精读节的**终点**：先取硬边界（下一个标题，或篇末分隔线 `---`——build_digest_note 每篇后都
+    # 追加一条），再在硬边界内退到**最后一行机器生成的精读内容**为止。
+    # 只认标题、且一路吃到边界的话，精读节与下一篇之间的一切都会被整段替换掉——那条 `---`、
+    # 以及人手写在篇末的批注（2026-09-04 第 3 轮压测 CONFIRMED，与本函数 docstring
+    # 「只动这一节」相悖）。精读内容只有两种形态：`**【小节名】**` 与 `- ` 开头的句级标记行
+    # （notes._paper_section / _render_closeread 的唯一输出形态），其余一律视为外来内容、原样留下。
+    hard_end = end
     for k in range(cr_start + 1, end):
         ln = lines[k]
-        if ln.startswith("### ") or ln.startswith("## ") or ln.startswith("# "):
-            cr_end = k
+        if ln.startswith(("### ", "## ", "# ")) or ln.rstrip() == "---":
+            hard_end = k
             break
+    cr_end = cr_start + 1
+    for k in range(cr_start + 1, hard_end):
+        if lines[k].startswith("**【") or lines[k].startswith("- "):
+            cr_end = k + 1
     old_n = cr_end - cr_start
     merged = lines[:cr_start] + new_lines + lines[cr_end:]
     return "\n".join(merged) + "\n", old_n, len(new_lines)
@@ -397,10 +566,17 @@ def update_sidecar(path: Path, citekey: str, cr) -> str:
 # ---------------- 备份 ----------------
 
 def backup_files(notes_dir: Path, stamp: str, paths: List[Path]) -> Path:
+    """把 paths 复制进 `.backfill_deepread_backup/<stamp>/`；**已存在的同名文件绝不覆盖**。
+
+    为什么不覆盖：一次 run 里同一份月度 md 会被改很多次（一篇一改），而 `stamp` 在循环外只算
+    一次。若照抄覆盖，第 2 篇写盘前的「备份」存的就已经是**第 1 篇改完之后**的 md，原件当场丢失；
+    `restore` 恢复出来的是一个混合态（第 1 篇的新精读 + 其余篇的旧内容），还会报告成功。
+    第一份进来的才是这次 run 的原件，后来的一律跳过（2026-09-04 第 3 轮压测判 BLOCKER）。
+    """
     dst = notes_dir / BACKUP_DIR / stamp
     dst.mkdir(parents=True, exist_ok=True)
     for p in paths:
-        if p.exists():
+        if p.exists() and not (dst / p.name).exists():
             shutil.copy2(p, dst / p.name)
     return dst
 
@@ -424,32 +600,46 @@ def cmd_restore(notes_dir: Path, src: str) -> int:
 
 # ---------------- 子命令 ----------------
 
-def cmd_scan(notes_dir: Path, index: dict) -> int:
+def cmd_scan(notes_dir: Path, index: dict, expand: bool = False) -> int:
     import collections
-    led = load_ledger(notes_dir)
+    led = load_ledger(notes_dir, expand)
     # 一律扣掉账本已完成的：无 sidecar 的札记里 reading_depth 写不回去（md 没有字段承载
     # 它，notes_index 会按老规则推回 unknown-legacy），只看索引的话已重跑过的会永远赖在
     # 目标集里，scan 的数字就永远失真（实测 99 篇跑完后仍有 65 篇顶着旧标签）。
     # **账本才是「跑没跑过」的真相源**，这个标签不是。
     done = led["done"]
-    all_t = [e for e in select_targets(index) if e.get("citekey") not in done]
-    print("reading_depth={} 且做过全文精读、账本未完成：{} 篇".format(
+    all_t = [e for e in select_targets(index, expand=expand) if e.get("citekey") not in done]
+    print(("索引层（无全文精读）、账本未完成：{1} 篇" if expand
+           else "reading_depth={0} 且做过全文精读、账本未完成：{1} 篇").format(
         TARGET_DEPTH, len(all_t)), flush=True)
     print("  已完成（账本）：{}   失败：{}".format(len(done), len(led["failed"])), flush=True)
     for label, kw in (("INCLUDE", {"decision": "INCLUDE"}),
                       ("tier=high", {"tier": "high"}),
                       ("INCLUDE+high", {"decision": "INCLUDE", "tier": "high"})):
-        sub = [e for e in select_targets(index, **kw) if e.get("citekey") not in done]
+        sub = [e for e in select_targets(index, expand=expand, **kw)
+               if e.get("citekey") not in done]
         print("  {:<14} 待跑 {} 篇".format(label, len(sub)), flush=True)
     hl = [len(e.get("highlights") or []) for e in all_t]
     print("  现有可取证句：合计 {}，平均 {:.1f}".format(sum(hl), sum(hl) / len(hl) if hl else 0), flush=True)
     print("  涉及札记文件：{} 个".format(len(collections.Counter(e.get("note_file") for e in all_t))), flush=True)
-    print("  来源分布：{}".format(collections.Counter(e.get("reading_source") for e in all_t).most_common()), flush=True)
+    if expand:
+        # expand 批 reading_source 恒空，看来源分布没意义；真正决定成败的是有没有可解析的
+        # 标识——两者皆无时 resolve_oa_pdf 无从下手，几乎必然 no_output（那才是待下载的）。
+        n_doi = sum(1 for e in all_t if e.get("doi"))
+        n_ax = sum(1 for e in all_t if e.get("arxiv_id"))
+        n_none = sum(1 for e in all_t if not e.get("doi") and not e.get("arxiv_id"))
+        print("  可解析标识：有 DOI {} / 有 arXiv {} / 两者皆无 {}（后者多半抓不到全文）"
+              .format(n_doi, n_ax, n_none), flush=True)
+    else:
+        print("  来源分布：{}".format(
+            collections.Counter(e.get("reading_source") for e in all_t).most_common()), flush=True)
     return 0
 
 
 def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
-    targets = select_targets(index, args.decision, args.tier)
+    expand = bool(getattr(args, "expand", False))
+    accept_abstract = bool(getattr(args, "accept_abstract", False))
+    targets = select_targets(index, args.decision, args.tier, expand=expand)
     if args.citekey:
         want = set(args.citekey)
         targets = [e for e in targets if e.get("citekey") in want]
@@ -459,7 +649,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                 sorted(missing)), file=sys.stderr)
             if not targets:
                 return 2
-    led = load_ledger(notes_dir)
+    led = load_ledger(notes_dir, expand)
     if getattr(args, "only_failed", False):
         # 失败过的多半是全文抓不到（本库 abstracts.json 只有 3 篇，全文一断就零产出），
         # 补了 PDF 再来一轮才有意义；已成功的不动。
@@ -468,7 +658,17 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             print("账本里没有失败条目。", file=sys.stderr)
             return 1
     elif not args.redo:
-        targets = [e for e in targets if e.get("citekey") not in led["done"]]
+        skip = set(led["done"])
+        if expand:
+            # expand 批的失败几乎全是「这篇根本没 OA 全文」——确定性的，重跑必然再挂。
+            # 不跳过的话，熔断一停、重跑就从同一批必挂篇重新开始，8 连败立刻再停，
+            # 整批永远推不过去。它们该沉淀成待下载清单（--only-failed 配 --pdf-dir 补），
+            # 而不是挡在队首。补深度那批不这么做：那批失败多是抓取抖动，值得原样重试。
+            # **但 llm_unavailable 不在此列**：那类是暂时性的（额度耗尽/限流），全文往往已经
+            # 到手，额度一恢复重跑就成——把它跳过等于让它永远留在待下载清单里等一个不需要的
+            # PDF（2026-09-04 实测 35 篇，见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md）。
+            skip |= deterministic_failures(led)
+        targets = [e for e in targets if e.get("citekey") not in skip]
     if args.limit:
         targets = targets[: args.limit]
     if not targets:
@@ -502,15 +702,26 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
     for n, entry in enumerate(targets, start=1):
         ck = entry["citekey"]
         print("\n[{}/{}] {} …".format(n, len(targets), ck), flush=True)
-        seg = segment_from_entry(entry, n, abstracts)
+        # 只有**收货方会接受**摘要级产出时才供给摘要。不然 close_read 会照常花一次 LLM 读完摘要，
+        # 再被下面那道闸原样丢弃——比不供给还贵（不供给时 close_read 立刻 return None，零成本）。
+        # 2026-09-04 第 4 轮审计 CONFIRMED：台账说「补深度批现在能降级成摘要级」是**假的**——
+        # 补深度批的目标集本就限定 has_full_text_reading=True，摘要级 100% 会被拒收。
+        seg = segment_from_entry(entry, n, abstracts,
+                                 notes_dir=abstract_source_dir(notes_dir, accept_abstract))
+        if (seg.original_abstract or seg.translated_abstract) and not ((abstracts or {}).get(ck) or "").strip():
+            print("   ℹ️ 摘要取自该篇 md 节（abstracts.json 无此条，{}），全文抓不到时降级成摘要级"
+                  .format("是中文译文、不用于数字回查" if seg.translated_abstract else "英文原摘要"), flush=True)
         llm = LLMClient(settings.llm)
         local = find_local_pdf(pdf_dir, entry)
+        err = None
+        cr_diag = {}
+        _batch_diag = {}
         try:
             if local is not None:
                 print("   📄 用本地 PDF：{}".format(local.name), flush=True)
                 seg.close_reading = deep_read_local_pdf(
                     seg, local, proc, llm,
-                    settings.llm.closeread_model or settings.llm.model)
+                    settings.llm.closeread_model or settings.llm.model, diag=cr_diag)
                 done = 1 if seg.close_reading else 0
             else:
                 done = close_read_segments(
@@ -519,9 +730,14 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                     model=(settings.llm.closeread_model or settings.llm.model),
                     scratch_dir=Path("output/scholar_pdfs"),
                     deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-                    max_chunks=proc.closeread_max_chunks)
+                    max_chunks=proc.closeread_max_chunks,
+                    extra_routes=getattr(proc, "fulltext_extra_routes", False),
+                    route_delay=getattr(proc, "fulltext_route_delay", 0.0),
+                    diag=_batch_diag)
+                cr_diag.update(_batch_diag.get(seg.paper_id) or {})
         except Exception as e:                        # noqa: BLE001
             logger.warning("  重读异常：{}".format(e))
+            err = e
             done = 0
         finally:
             llm.close()
@@ -537,9 +753,19 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         old_n = len(entry.get("highlights") or [])
         if not done or not cr or not cr.sections or new_n == 0:
             print("   ❌ 重读未产出，跳过（不写盘）", flush=True)
-            led["failed"][ck] = {"at": stamp, "reason": "no_output"}
+            reason, llm_dead = classify_failure(cr_diag, err)
+            led["failed"][ck] = {"at": stamp, "reason": reason,
+                                 "had_fulltext": bool(cr_diag.get("from_full_text"))}
+            if llm_dead:
+                print("   ⛔ 模型侧不可用（额度/限流/鉴权），**不是抓不到全文**：{}"
+                      .format((cr_diag.get("llm_error") or str(err))[:120]), flush=True)
             fail += 1
-            streak += 1
+            # expand 批里「干净的 no_output」= 全文压根抓不到（无 DOI/闭源），是结构性
+            # 缺口而非通路故障，实测头 29 篇就这么挂了 24 篇（13 篇有 DOI 但闭源、
+            # 11 篇无任何标识）——把它计进连败会让熔断在正常情况下不停误跳。抛异常的
+            # 那种才计：限流/欠费/服务不可用走的是异常路径。
+            if counts_toward_streak(llm_dead, expand, err):
+                streak += 1
             # 熔断：单篇失败是常事（抓不到全文/解析不出），但**连着**失败几乎只有一种
             # 成因——通路级故障（订阅限流、欠费、Ollama 挂）。这批要跑十来个小时且每篇
             # 都真花额度，不熔断就会在故障期间把剩下几十篇全烧成 failed，还得人工挑出来
@@ -547,12 +773,50 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             # --only-failed 跑的本来就是「上一轮抓不到全文」的篇目，连续失败是预期常态
             # 而非通路故障信号，此时熔断纯属误伤（实测一进去就连挂 3 篇直接中止，
             # 后面能捞回来的根本没轮到）。只在正常批跑时熔断。
-            if streak >= _FAIL_STREAK_STOP and not getattr(args, "only_failed", False):
-                save_ledger(notes_dir, led)
+            # expand 批（索引层升格）里「本来就没 OA 全文」占相当比例，连挂 3 篇是常态
+            # 而非通路故障；但**完全不熔断**又会在真限流/欠费时把整批烧成 failed，所以
+            # 只放宽阈值不取消（172 篇 INCLUDE+high 里 41 篇 DOI/arXiv 皆无，实测基线）。
+            stop_at = _EXPAND_FAIL_STREAK_STOP if expand else _FAIL_STREAK_STOP
+            if streak >= stop_at and not getattr(args, "only_failed", False):
+                save_ledger(notes_dir, led, expand)
                 print("\n⛔ 连续 {} 篇失败，判定通路级故障（限流/欠费/服务不可用），中止。\n"
                       "   已完成的都在账本里，修好后重跑本命令会自动续上。".format(streak),
                       file=sys.stderr)
                 return 1
+            continue
+        # expand 批的目标就是「升格成全文精读」：拿不到全文而退化成摘要级时，写进去会把
+        # 篇目钉成 done（下次不再重试），却仍是索引层（has_full_text_reading 恒假），
+        # 等于用一份摘要脑补的精读堵死了将来补 PDF 的机会：done 会让它下次被跳过，而
+        # has_full_text_reading 仍是假，两头不着。宁可判失败，进待下载清单等 PDF。
+        # 摘要级产出**永远不许覆盖一份已有的全文精读**：写进去会把 sidecar/索引的
+        # has_full_text_reading 从真翻成假（_apply_to_sidecar 按 cr.from_full_text 写），
+        # 而回执打 ✅、退出码 0——一份真全文精读就这样被一份摘要脑补的替掉，事后只能靠人翻库发现。
+        # 默认两批都不收摘要级：补深度批的目标本就都是全文精读篇目（覆盖=降级）；expand 批的目标
+        # 是「升格成全文精读」，收了会把篇目钉成 done 却仍是索引层，两头不着。
+        # `--accept-abstract` 是给「闭源、全文确实拿不到，退而求其次留一份摘要级」那批的逃生门
+        # （见 docs/bugs/2026-09-04-abstract-fallback-dead.md）：它只放开「本来就没有全文精读」的
+        # 篇目，**永远不放开覆盖既有全文精读**。
+        if cr and not cr.from_full_text and (entry.get("has_full_text_reading") or not accept_abstract):
+            why = ("既有的是**全文精读**，覆盖会把 has_full_text_reading 翻成假"
+                   if entry.get("has_full_text_reading")
+                   else "本批不收摘要级（要收请加 --accept-abstract）")
+            print("   ❌ 只拿到摘要级（非全文），{}".format(why), flush=True)
+            led["failed"][ck] = {"at": stamp, "reason": "abstract_only",
+                                 "had_fulltext": bool(cr_diag.get("from_full_text"))}
+            fail += 1
+            # 这条**也要过熔断**：拒收发生在 LLM 已经读完之后，每篇都真花了额度。
+            # 补深度批的目标集本就都是全文精读篇目，连着退化成摘要级 = 全文通路整体坏了，
+            # 该停批而不是把 200 篇的额度烧光（第 2 轮压测 CONFIRMED：此前这条 continue
+            # 完全绕过 streak）。expand 批沿用既有豁免——那批抓不到全文是结构性常态。
+            if counts_toward_streak(False, expand, None):
+                streak += 1
+                if streak >= (_EXPAND_FAIL_STREAK_STOP if expand else _FAIL_STREAK_STOP) \
+                        and not getattr(args, "only_failed", False):
+                    save_ledger(notes_dir, led, expand)
+                    print("\n⛔ 连续 {} 篇只拿到摘要级，判定全文通路整体故障，中止。\n"
+                          "   已完成的都在账本里，修好后重跑本命令会自动续上。".format(streak),
+                          file=sys.stderr)
+                    return 1
             continue
         # 净变差就不写：深读产出反而少于既有，多半是这次抓全文失败退化成摘要级，
         # 写进去等于用坏数据覆盖好数据。宁可留旧的，让它下次再来。
@@ -593,7 +857,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             print("   ❌ 写盘失败：{}\n      备份在 {}，可用 restore 还原".format(e, bdir), flush=True)
             led["failed"][ck] = {"at": stamp, "reason": "write:{}".format(e)}
             fail += 1
-            save_ledger(notes_dir, led)
+            save_ledger(notes_dir, led, expand)
             continue
         print("   💾 md 精读节 {} 行 → {} 行 | {} | 备份 {}".format(
             o_lines, n_lines, note, bdir.name))
@@ -602,9 +866,9 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                            "note_file": entry.get("note_file"), "backup": bdir.name}
         ok += 1
         streak = 0
-        save_ledger(notes_dir, led)
+        save_ledger(notes_dir, led, expand)
 
-    save_ledger(notes_dir, led)
+    save_ledger(notes_dir, led, expand)
     print("\n完成：成功 {} / 失败 {}{}".format(
         ok, fail, "" if args.apply else "（干跑，未写盘）"))
     if ok and args.apply:
@@ -616,7 +880,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="给 auto 存量单跳精读补深度重读")
     ap.add_argument("--config", default="")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("scan", help="看盘子")
+    sc = sub.add_parser("scan", help="看盘子")
+    sc.add_argument("--expand", action="store_true",
+                    help="看**索引层**（没做过全文精读）那批的盘子，而非补深度那批")
     r = sub.add_parser("run", help="重读（默认干跑，--apply 才写盘）")
     r.add_argument("--citekey", action="append", help="指定 citekey（可重复）")
     r.add_argument("--decision", default="", help="按裁决过滤，如 INCLUDE")
@@ -629,6 +895,12 @@ def main() -> int:
                         "PDF 深读，绕开被反爬挡死的出版商站点")
     r.add_argument("--only-failed", action="store_true",
                    help="只跑账本里失败过的（配 --pdf-dir 补全文后重试）")
+    r.add_argument("--expand", action="store_true",
+                   help="扩大精读面：跑**没做过全文精读**的索引层篇目（独立账本）")
+    r.add_argument("--accept-abstract", action="store_true",
+                   help="全文抓不到时**接受摘要级产出**（只对本来就没有全文精读的篇目放开；"
+                        "绝不覆盖既有全文精读）。默认关：关着时连摘要都不供给，close_read 立刻返回、"
+                        "不花 LLM——否则读完再丢弃，比不读还贵")
     s = sub.add_parser("restore", help="从备份还原")
     s.add_argument("backup", help="备份目录名或绝对路径")
     args = ap.parse_args()
@@ -641,7 +913,7 @@ def main() -> int:
         return cmd_restore(notes_dir, args.backup)
     index = json.loads((notes_dir / INDEX_NAME).read_text(encoding="utf-8"))
     if args.cmd == "scan":
-        return cmd_scan(notes_dir, index)
+        return cmd_scan(notes_dir, index, getattr(args, "expand", False))
     return cmd_run(args, settings, notes_dir, index)
 
 

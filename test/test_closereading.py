@@ -659,3 +659,30 @@ def test_prompts_require_experiment_method_section():
         assert "原文未报告" in p, name
     # 单跳版会被「只有摘要」的降级篇用到，硬要页码会诱导编造 —— 必须是软化措辞
     assert "仅在可得文本确有报告时" in _CLOSEREAD_PROMPT
+
+
+def test_thin_reading_warning_names_the_truncation_cause(monkeypatch, tmp_path, caplog):
+    """第 4 轮审计：`fulltext_truncated` 混用两种成因，按覆盖率排序挑「最该重跑的几篇」必然跑偏。
+    索引字段暂不新增（要五处联动），但日志里先把成因说清楚——这是 3 行的最小可用版本。"""
+    from loguru import logger as _lg
+    from src.scholar.schema import (PaperSegment, PaperMetadata, CloseReading,
+                                    CloseReadSection, CloseReadSentence)
+
+    def _mk(body_chars, raw):
+        c = CloseReading(from_full_text=True, source="unpaywall", sections=[
+            CloseReadSection(heading="h", sentences=[CloseReadSentence(text="s", tag=None)])])
+        c.body_chars, c.body_chars_raw, c.truncated = body_chars, raw, raw > body_chars
+        return c
+
+    segs = [PaperSegment(segment_id=1, paper_id="p1", priority_score=1.0,
+                         metadata=PaperMetadata(paper_id="p1", title="T"))]
+    for body, raw, want in ((137400, 260000, "总上限截尾"), (80138, 137025, "单页上限削页")):
+        monkeypatch.setattr(cr, "close_read_segment", lambda *a, _c=_mk(body, raw), **k: _c)
+        lines = []
+        hid = _lg.add(lambda m: lines.append(str(m)), level="WARNING")
+        try:
+            cr.close_read_segments(segs, "ri", llm=None, top_n=1, deep=True, max_chars=137400)
+        finally:
+            _lg.remove(hid)
+        joined = "\n".join(lines)
+        assert "精读偏薄" in joined and want in joined, (want, joined)

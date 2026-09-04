@@ -193,13 +193,25 @@ def _meta_from_crossref(hit: Dict[str, Any]) -> PaperMetadata:
 
 def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                      first_pages_text: str = "",
-                     title_override: str = "") -> Tuple[PaperMetadata, str]:
+                     title_override: str = "",
+                     diag: Optional[Dict[str, Any]] = None) -> Tuple[PaperMetadata, str]:
     """按 DOI→arXiv→标题 Crossref→LLM 首页抽取 的权威链解析元数据。
 
     返回 (PaperMetadata, metadata_source)。source ∈ crossref-doi/arxiv/crossref-title/pdf-llm/pdf-only。
+
+    diag：可选出参字典。权威链**每一级为什么没走通**（网络/SSL 中断、DOI 查不中、LLM 抽取
+    失败）都追加到 `diag["degraded"]`（人读字串列表）。此前这些原因只进 logger.warning，
+    批量 ingest 时淹没在几十块通读日志中段，而末尾回执按「来源+作者数」判元数据是否完整，
+    一条「作者齐全但 DOI/卷期页全空」的 pdf-llm 记录就这样静默过关（2026-09-03 实测，
+    见 docs/bugs/2026-09-03-metadata-degradation-not-flagged.md）。回执据此区分
+    「查询失败导致的空」与「本来就没有」。
     """
     from .crossref import crossref_by_doi, crossref_lookup
     from .fulltext import ipv4_client
+
+    def _degraded(msg: str) -> None:
+        if diag is not None:
+            diag.setdefault("degraded", []).append(msg)
 
     doi = ids.get("doi")
     arxiv_id = ids.get("arxiv_id")
@@ -215,6 +227,8 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                 if arxiv_id and not meta.arxiv_id:
                     meta.arxiv_id = arxiv_id
                 return meta, "crossref-doi"
+        _degraded("DOI 直查 Crossref 未命中（{}）——可能是网络不通或 PDF 里的 DOI 串抽错"
+                  .format(" / ".join(cands[:3])))
         if len(cands) > 1:
             # 检出粘连但无一被 Crossref 证实 → 该串不可信，别污染下游元数据。
             # 无粘连迹象时保留原值（此处查不中多半只是网络不通）。
@@ -226,6 +240,8 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
             from .academic_search import fetch_arxiv_by_id
             with ipv4_client(timeout=20) as xc:
                 it = fetch_arxiv_by_id(arxiv_id, xc)
+            if not it:
+                _degraded("arXiv 精确查无结果（{}）".format(arxiv_id))
             if it:
                 meta = PaperMetadata(
                     paper_id=_generate_paper_id(it.get("title", ""), it.get("authors")),
@@ -243,6 +259,7 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                 return meta, "arxiv"
         except Exception as e:
             logger.warning("  ⚠️ arXiv 精确查失败（{}）: {}".format(arxiv_id, e))
+            _degraded("arXiv 精确查失败（{}）: {}".format(arxiv_id, str(e)[:160]))
 
     # 3) 标题查 Crossref（内建 0.85 相似度门槛）
     if title:
@@ -252,6 +269,8 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
             if arxiv_id and not meta.arxiv_id:
                 meta.arxiv_id = arxiv_id
             return meta, "crossref-title"
+        # crossref_lookup 自己吞异常返回 None：网络中断与「库里没有」在此同形，只能一并记为退化
+        _degraded("标题查 Crossref 未命中（{}）——可能是网络不通或标题不规范".format(title[:60]))
 
     # 4) LLM 从首页抽（全 miss 降级）
     if llm is not None and first_pages_text.strip():
@@ -281,6 +300,7 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
                     if arxiv_id and not meta.arxiv_id:
                         meta.arxiv_id = arxiv_id
                     return meta, "crossref-title"
+                _degraded("LLM 抽出的标题查 Crossref 未命中（{}）".format(t[:60]))
             meta = PaperMetadata(
                 paper_id=_generate_paper_id(t, authors),
                 title=t, authors=authors,
@@ -292,6 +312,7 @@ def resolve_metadata(ids: Dict[str, Optional[str]], llm=None, email: str = "",
             return meta, "pdf-llm"
         except Exception as e:
             logger.warning("  ⚠️ LLM 元数据抽取失败: {}".format(e))
+            _degraded("LLM 首页元数据抽取失败: {}".format(str(e)[:160]))
 
     # 5) 兜底：只有 PDF 抓到的零散信息
     meta = PaperMetadata(
@@ -390,15 +411,114 @@ _CHUNK_PROMPT = """你在逐块通读一篇论文（这是第 {idx}/{total} 块�
 硬要求：**只记这一块原文里确有的内容，宁缺勿造**；用原文自己的措辞，
 不要把原文的表述换成更强或更专业的同义术语（例如原文写 "non-random" 就记 "non-random"，
 不要写成 "MNAR"；原文写"违反某假设"就照记，不要替它归类到某个理论框架）。
+**每条方法细节 / 参数 / 数字都要写明属于哪个算例、数据集或实验**（如「Lorenz 3D：λ1=10.0」、
+「12D GMM：D=20」）；同一块里出现多个算例时**绝不把 A 实验的设置挂到 B 实验上**，归属不明确的
+宁可写「归属未明」。这是汇总阶段最常见的串位来源：数字本身是对的、对象错了，逐个回查数字验不出来。
 {{
-  "method_details": ["方法/建模/统计细节，带原文关键词或数值依据"],
-  "key_numbers": ["关键数字/效应量/样本量/指标，含上下文（如 AUC=0.87, n=1200）"],
+  "method_details": ["方法/建模/统计细节，带原文关键词或数值依据，并注明所属算例/数据集"],
+  "key_numbers": ["关键数字/效应量/样本量/指标，含上下文与所属算例（如 MIMIC 队列：AUC=0.87, n=1200）"],
   "claims": ["作者的结论主张"],
   "limitations": ["局限/威胁/边界条件"]
 }}
 
 这一块文本：
 {chunk}"""
+
+
+# ---------------- 确定性抽取：代码 / 数据可得性声明 ----------------
+#
+# 「Code/Data availability」在版面上紧挨参考文献、离方法节很远，分块通读时它落在最后一块，
+# 汇总 LLM 反复把它漏报成「原文未报告」（SKILL 里点名警告过仍复发两次，见
+# docs/bugs/2026-09-03-ingest-draft-systematic-errors.md 第 3 类）。靠 prompt 提醒不够，
+# 改成确定性 grep：命中的原句直接喂给汇总步，并要求「实验方法」节以它为准。
+_AVAIL_KEY_RE = re.compile(
+    r"(?i)(?:\b(?:code|data|software|materials?|source\s+code)\b[^.\n]{0,40}?\bavailab(?:le|ility)\b"
+    r"|\bavailability\s+of\s+(?:code|data)\b"
+    r"|\bpublicly\s+available\b|\bavailable\s+(?:at|from|upon\s+request|on\s+request)\b"
+    r"|https?://(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org|zenodo\.org|osf\.io"
+    r"|figshare\.com|huggingface\.co|codeocean\.com|doi\.org/10\.5281)\S*"
+    r"|\b(?:github|gitlab|zenodo|figshare|osf)\.(?:com|org|io)/\S+)")
+_AVAIL_WINDOW = 260          # 命中点前后各取多少字符作为「原句」窗口
+_AVAIL_MAX_ITEMS = 6
+_AVAIL_MAX_LEN = 360
+# 强信号：正式的可得性声明（多为独立小节标题）与代码/数据仓库直链。
+# 弱信号（`publicly available benchmarks such as MIMIC-III`、`Prior work made their code
+# available at …`）在引言/相关工作里成片出现，按出现顺序取前 6 条会把**真正的声明挤出去**，
+# 而 prompt 又强制「必须以此为准」——等于拿别人的仓库当本文的（2026-09-04 第 4 轮审计 CONFIRMED）。
+_AVAIL_STRONG_STATEMENT_RE = re.compile(
+    r"(?i)\b(?:code|data|software|materials?)\s+(?:and\s+\w+\s+)?availability\b"
+    r"|\bavailability\s+of\s+(?:code|data)\b|\bdata\s+availability\s+statement\b")
+_AVAIL_REPO_RE = re.compile(
+    r"(?i)(?:github|gitlab|zenodo|osf|figshare|huggingface|codeocean)\.(?:com|org|io|co)"
+    r"|doi\.org/10\.5281")
+
+
+def extract_availability_statements(full_text: str, max_items: int = _AVAIL_MAX_ITEMS) -> List[str]:
+    """从全文里确定性抽取代码/数据可得性声明的原句片段（不调 LLM，纯正则）。
+
+    **先打分、再截断、最后按原文出现顺序输出**（不是「取最先出现的 N 条」）：
+    正式声明 +3（`_AVAIL_STRONG_STATEMENT_RE`）、代码/数据仓库直链 +2（`_AVAIL_REPO_RE`）、
+    落在文档后 40% +1。理由见 `_AVAIL_STRONG_STATEMENT_RE` 上方注释：引言/相关工作里的泛泛命中
+    （`publicly available benchmarks such as MIMIC-III`）成片出现在最前面，先到先得会把文末
+    真正的 Data availability 声明挤出上限，而 prompt 又强制「必须以此为准」。
+    ⚠️ 那三行打分不是冗余，删掉就退回上述缺陷。
+
+    片段取命中点前后一个窗口并尽量在句边界截断；同一句多次命中只出一次。
+    每条 ≤ `_AVAIL_MAX_LEN + 1` 字符（超长截断后补一个省略号）。
+    抽不到返回空列表——**空列表 ≠「原文未报告」**，只表示确定性通道没抓到，汇总步照旧。
+    """
+    text = full_text or ""
+    if not text.strip():
+        return []
+    out: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    for m in _AVAIL_KEY_RE.finditer(text):
+        # URL 分支的 \S* 会把句尾的「.」「)」一起吞掉，随后往后找句边界就跳到了下一句——
+        # 两句被并成一条、再与下一命中链式合并（实测 20 句坍成 1 条）。先把尾标点退回去。
+        m_end = m.end()
+        while m_end > m.start() and text[m_end - 1] in ".,;:)]":
+            m_end -= 1
+        s = max(0, m.start() - _AVAIL_WINDOW)
+        e = min(len(text), m_end + _AVAIL_WINDOW)
+        # 尽量退到句边界：往前找最近的句号/换行，往后找最近的句号
+        head = text[s:m.start()]
+        cut = max(head.rfind(". "), head.rfind("\n\n"), head.rfind("。"))
+        if cut >= 0:
+            s += cut + 1
+        tail = text[m_end:e]
+        cut2 = min([i for i in (tail.find(". "), tail.find("。"), tail.find("\n\n")) if i >= 0],
+                   default=-1)
+        if cut2 >= 0:
+            e = m_end + cut2 + 1
+        # 与上一片段**真正重叠**才合并（同一句里 “Data availability” + URL 多次命中），
+        # 恰好首尾相接的是相邻两句，各出一条；用 <= 会把整段可得性声明坍成一条再被截长。
+        if spans and s < spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+            continue
+        spans.append((s, e))
+    seen = set()
+    scored = []
+    n = max(1, len(text))
+    for order, (s, e) in enumerate(spans):
+        frag = re.sub(r"\s+", " ", text[s:e]).strip()
+        if len(frag) > _AVAIL_MAX_LEN:
+            frag = frag[:_AVAIL_MAX_LEN].rstrip() + "…"
+        key = frag.lower()
+        if not frag or key in seen:
+            continue
+        seen.add(key)
+        # 打分再截断，而不是按出现顺序截断：正式声明总在文末（紧挨参考文献），
+        # 而引言/相关工作里的泛泛命中在最前面，先到先得会把真正的声明挤出上限。
+        score = 0
+        if _AVAIL_STRONG_STATEMENT_RE.search(frag):
+            score += 3
+        if _AVAIL_REPO_RE.search(frag):
+            score += 2
+        if s / n >= 0.6:                      # 文档后 40%
+            score += 1
+        scored.append((-score, order, frag))
+    scored.sort()
+    return [f for _sc, _o, f in sorted(scored[:max_items], key=lambda x: x[1])]
 
 
 # 码集与短语表**复用 llm_client 的权威定义**，不再手抄第三遍：这里已经漂过两次
@@ -500,6 +620,14 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
 3. **不要把研究者的想法写成论文提出的东西**。「对我研究的联想」里的每一句都要能看出
    是"我由此想到"，而不是"该文提出"。
 4. 若这篇论文其实与研究主线关系不大，「对我研究的联想」写一两句实话即可，**不要硬凑关联**。
+   但若研究主线里写明了「本批阅读目的」，请按那个目的来写联想——它说明了研究者为什么要读这篇。
+
+代码 / 数据可得性声明（由程序从全文**确定性抽取**的原句片段；非空时「实验方法」节的
+代码/数据可得性**必须以此为准**，不得写「原文未报告」；为空时才按块笔记判断）：
+{availability}
+
+⚠️ 块笔记里的每条参数/数字都标了所属算例；汇总时**不得把 A 算例的设置挂到 B 算例上**，
+归属不明的参数句宁可略去。
 
 逐块笔记（JSON 数组）：
 {chunk_notes}
@@ -611,24 +739,39 @@ def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_B
 
 def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional[str],
                          research_interests: str,
-                         budget_info: Optional[Dict[str, Any]] = None
+                         budget_info: Optional[Dict[str, Any]] = None,
+                         availability: Optional[List[str]] = None
                          ) -> Tuple[Optional[CloseReading], str, bool]:
     """把块笔记汇总为扩展分节 CloseReading。返回 (CloseReading|None, one_line, api_error)。
 
     budget_info：可选的出参字典，超预算裁剪时写入 note/n_truncated/n_dropped，供调用方
     落进 bundle 的 draft_note——logger.warning 在自动权限模式的 agent 会话里看不见。
+    汇总**失败**时同样把原因写进 `budget_info["synth_error"]`（异常类型+消息前 200 字符，或
+    「返回不可解析」+ 响应长度/打包长度/预算）：此前失败原因在这里被整个丢弃，bundle 只留
+    一句硬编码的「汇总步失败但部分块可用」，事后既不可复现也不可修
+    （见 docs/bugs/2026-09-04-ingest-degraded-silent.md）。
+
+    availability：extract_availability_statements 抽出的代码/数据可得性原句，非空时进 prompt
+    并要求「实验方法」节以它为准（第 3 类系统性错误：漏报成「原文未报告」）。
     """
     usable = [n for n in chunk_notes if not n.get("_error")]
     if not usable:
         return None, "", False
+    packed = _pack_chunk_notes(usable, info=budget_info)
+    avail_txt = ("\n".join("- {}".format(a) for a in availability)
+                 if availability else "（程序未抓到明确的可得性声明）")
     prompt = _SYNTH_PROMPT.format(
         research_interests=research_interests or "（未提供）",
         contamination_examples="、".join(get_contamination_example_terms()),
-        chunk_notes=_pack_chunk_notes(usable, info=budget_info))
+        availability=avail_txt,
+        chunk_notes=packed)
     try:
         resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
         logger.warning("  ⚠️ 汇总精读 LLM 调用失败: {}".format(e))
+        if budget_info is not None:
+            budget_info["synth_error"] = "汇总 LLM 调用失败：{}: {}".format(
+                type(e).__name__, str(e)[:200])
         return None, "", is_credit_error(e)
     one_line = ""
     try:
@@ -636,6 +779,11 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
     except Exception:
         pass
     cr = parse_closeread(resp)  # 复用 closereading 的宽松解析（忽略 one_line 字段）
+    if cr is None and budget_info is not None:
+        budget_info["synth_error"] = (
+            "汇总返回不可解析为分节精读（响应 {} 字符；块笔记打包 {} 字符 / 预算 {}；"
+            "响应开头：{!r}）".format(len(resp or ""), len(packed), _SYNTH_NOTES_BUDGET,
+                                   (resp or "")[:120]))
     if cr is not None:
         cr.from_full_text = True
         cr.model = model
@@ -684,8 +832,17 @@ def write_bundle(bundle_file: Path, *, status: str, month: str, pdf_path: str,
                  n_pages: Optional[int] = None) -> Path:
     """落盘/更新 bundle JSON。
 
-    draft_status：脚本深读草稿状态——"ok"（有草稿）/ "api_error"（LLM 无额度/鉴权失败，
-    应回退到 subagent 对抗生成）/ "degraded"（部分块失败）/ "empty"（无可用块）。
+    draft_status：脚本深读草稿状态（五态，与 ingest_pdf 的判定一一对应；协议见
+    docs/skills/read-paper/SKILL.md）——
+      - "ok"           有草稿，全部块通读成功；
+      - "degraded"     **有草稿**，但部分块通读失败——草稿只基于其余块，失败块覆盖的页段
+                       须亲读补齐（draft_note 写明失败块号）；
+      - "synth_failed" 块通读有成功、**汇总步失败**，无草稿——draft_note 带失败原因
+                       （异常类型/消息 或 返回不可解析+长度），走回退协议；
+      - "api_error"    LLM 无额度/鉴权失败（401/402/403），无草稿，走回退协议；
+      - "empty"        全部块通读失败，无草稿，走回退协议。
+    此前 "degraded" 是 if/elif 链的 else 兜底：块全成功、汇总失败也落成它，与 docstring
+    「部分块失败」不符，且原因不落盘（2026-09-03 Hoogland 27/27 块成功却无草稿）。
 
     n_pages：PDF 总页数，给 agent 定亲读窗口用（见 pdf_page_count 的说明）。
     """
@@ -854,9 +1011,11 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     n_pages = pdf_page_count(pdf_path)
     first_pages = full_text[:12000]
     ids = extract_pdf_ids(pdf_path, first_pages)
+    meta_diag: Dict[str, Any] = {}
     meta, meta_source = resolve_metadata(
         ids, llm=llm, email=email, first_pages_text=first_pages,
-        title_override=title_override)
+        title_override=title_override, diag=meta_diag)
+    meta_degraded: List[str] = list(meta_diag.get("degraded") or [])
     logger.info("  元数据来源: {} | {} | DOI={}".format(meta_source, meta.title[:50], meta.doi))
 
     bundle = bundle_path(notes_dir, month, meta.paper_id)
@@ -877,6 +1036,8 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
                 "authors_n": len(meta.authors or []), "n_pages": old.get("n_pages") or n_pages,
                 "chunks": 0, "chunk_ok": 0, "has_close_reading": True,
                 "draft_status": old.get("draft_status") or "ok",
+                "draft_note": old.get("draft_note") or "",
+                "meta_degraded": [],
                 "pdf_path": str(pdf_path.resolve()),
                 "duplicate": find_duplicate(index_path, meta), "month": month,
                 "skipped": "final",
@@ -891,30 +1052,51 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     chunks = chunk_text(full_text)
     logger.info("  分块通读: {} 块（全文 {} 字符）".format(len(chunks), len(full_text)))
     chunk_notes = deep_read_chunks(chunks, llm, model, research_interests)
+    # 代码/数据可得性走确定性抽取，不指望分块 LLM 在最后一块里注意到（第 3 类系统性错误）
+    availability = extract_availability_statements(full_text)
+    if availability:
+        logger.info("  可得性声明：确定性抽到 {} 条，喂进汇总".format(len(availability)))
     budget_info: Dict[str, Any] = {}
     cr, one_line, synth_api_err = synthesize_deep_read(
-        chunk_notes, llm, model, research_interests, budget_info=budget_info)
+        chunk_notes, llm, model, research_interests, budget_info=budget_info,
+        availability=availability)
 
-    # 草稿状态：区分「API 无额度（应回退 subagent 对抗生成）」与普通降级
+    # 草稿状态（五态，语义见 write_bundle docstring）：
+    #   有草稿 → ok / degraded（部分块失败）；无草稿 → api_error / empty / synth_failed。
+    # 「有多少块失败」与「汇总有没有成功」是两个独立维度，此前用一条 if/elif 链混判，
+    # else 兜底把「块全成功、汇总失败」也落成 degraded，且原因不落盘。
     n_ok = sum(1 for n in chunk_notes if not n.get("_error"))
     n_api = sum(1 for n in chunk_notes if n.get("_api_error"))
+    n_total = len(chunk_notes)
+    failed_idx = [n.get("_chunk") for n in chunk_notes if n.get("_error")]
+    fail_note = ""
+    if 0 < n_ok < n_total:
+        shown = ", ".join(str(i) for i in failed_idx[:8]) + ("…" if len(failed_idx) > 8 else "")
+        fail_note = ("{}/{} 块通读失败（块 {}），草稿只基于其余块——失败块覆盖的页段必须亲读补齐"
+                     .format(n_total - n_ok, n_total, shown))
+    # 截断也是草稿不完整的一种，且比块笔记裁剪更严重（整段正文根本没进过 LLM）。
+    # 五态**都**要带上它：无草稿时 agent 走回退协议亲读，同样得知道尾部有多少没进过通读。
+    trunc_note = ("全文被截断：{}/{} 字符，尾部 {:.0%} 未进入通读".format(
+        len(full_text), raw_chars, 1 - len(full_text) / raw_chars) if text_truncated else "")
     if cr is not None:
         # 草稿本身可用，但可能是**裁剪过的**块笔记汇总出来的。这条必须落进 bundle：
         # agent 拿草稿当亲读核验基线，只会核验草稿写了的条目，被裁掉的那部分不会被发现。
-        draft_status, draft_note = "ok", budget_info.get("note", "")
-        if text_truncated:
-            # 截断也是草稿不完整的一种，且比块笔记裁剪更严重（整段正文根本没进过 LLM）。
-            # 必须与 budget_info 的裁剪说明并列落进 draft_note，agent 才知道草稿覆盖不到哪。
-            trunc_note = "全文被截断：{}/{} 字符，尾部 {:.0%} 未进入通读".format(
-                len(full_text), raw_chars, 1 - len(full_text) / raw_chars)
-            draft_note = (draft_note + " | " + trunc_note) if draft_note else trunc_note
+        draft_status = "degraded" if fail_note else "ok"
+        draft_note = " | ".join(p for p in (budget_info.get("note", ""), fail_note, trunc_note) if p)
     elif synth_api_err or (n_api and n_ok == 0):
         draft_status = "api_error"
         draft_note = "LLM 无额度/鉴权失败（如 402），脚本草稿不可用——应回退 subagent 对抗生成"
+        if trunc_note:
+            draft_note += " | " + trunc_note
     elif n_ok == 0:
         draft_status, draft_note = "empty", "全文分块通读均失败，无脚本草稿"
+        if trunc_note:
+            draft_note += " | " + trunc_note
     else:
-        draft_status, draft_note = "degraded", "汇总步失败但部分块可用"
+        draft_status = "synth_failed"
+        draft_note = "块通读 {}/{} 成功，但汇总步失败、无脚本草稿：{}".format(
+            n_ok, n_total, budget_info.get("synth_error") or "原因未捕获")
+        draft_note = " | ".join(p for p in (draft_note, fail_note, trunc_note) if p)
 
     seg = build_segment(meta, abstract_en, abstract_zh, cr, one_line)
     dup = find_duplicate(index_path, meta)
@@ -925,9 +1107,11 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     return {
         "bundle": str(bundle), "paper_id": meta.paper_id, "title": meta.title,
         "meta_source": meta_source, "doi": meta.doi, "arxiv_id": meta.arxiv_id,
+        "meta_degraded": meta_degraded,
         "authors_n": len(meta.authors or []), "n_pages": n_pages,
         "chunks": len(chunks), "chunk_ok": n_ok,
         "has_close_reading": cr is not None, "draft_status": draft_status,
+        "draft_note": draft_note,
         "pdf_path": str(pdf_path.resolve()), "duplicate": dup, "month": month,
         "skipped": None,
     }

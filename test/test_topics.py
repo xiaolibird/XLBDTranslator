@@ -1804,16 +1804,17 @@ def test_sync_topics_best_effort_notifies_on_timeout(monkeypatch):
     """Y3：2026-08-17 运行时复审现场证伪"人盯着终端"假设——`ps aux` 实际看到真正在
     跑这条路径的是自动权限模式的 Claude Code 会话，不是人盯着终端，warning 级日志
     完全可能被会话自己的输出吞掉。子进程超时也要 notify，不能只 logger.warning。"""
-    import subprocess
     M = _load_read_pdf_cli()
     calls = []
     monkeypatch.setattr("src.utils.notify.notify",
                         lambda title, text: calls.append((title, text)))
     monkeypatch.setattr("src.scholar.topics.notes_dir_is_production", lambda _d: True)
 
-    def _boom(*a, **k):
-        raise subprocess.TimeoutExpired(cmd="build_topics.py", timeout=2400)
-    monkeypatch.setattr("subprocess.run", _boom)
+    # 进程接缝已从 subprocess.run 换成 topics._run_refresh_child（子进程随父死 + 日志落盘），
+    # 超时不再抛 TimeoutExpired，而是返回 timed_out=True 的 ChildRun
+    monkeypatch.setattr("src.scholar.topics._run_refresh_child",
+                        lambda cmd, **k: T.ChildRun(returncode=None, stdout="", stderr="",
+                                                    timed_out=True, pid=4242))
 
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")
 
@@ -1829,9 +1830,9 @@ def test_sync_topics_best_effort_notifies_on_subprocess_exception(monkeypatch):
                         lambda title, text: calls.append((title, text)))
     monkeypatch.setattr("src.scholar.topics.notes_dir_is_production", lambda _d: True)
 
-    def _boom(*a, **k):
+    def _boom(cmd, **k):
         raise OSError("boom")
-    monkeypatch.setattr("subprocess.run", _boom)
+    monkeypatch.setattr("src.scholar.topics._run_refresh_child", _boom)
 
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")
 
@@ -1843,16 +1844,14 @@ def test_sync_topics_best_effort_notifies_on_subprocess_exception(monkeypatch):
 def test_sync_topics_best_effort_notifies_when_outcome_not_ok(monkeypatch):
     """子进程本身正常退出，但概念页有页面失败/冲突（summarize_build_topics_run
     判定 ok=False）——同样要 notify，不是只有子进程崩溃才算数。"""
-    import subprocess
     M = _load_read_pdf_cli()
     calls = []
     monkeypatch.setattr("src.utils.notify.notify",
                         lambda title, text: calls.append((title, text)))
     monkeypatch.setattr("src.scholar.topics.notes_dir_is_production", lambda _d: True)
 
-    completed = subprocess.CompletedProcess(
-        args=[], returncode=1, stdout="▶ mnar-diagnosis\n  ❌ mnar-diagnosis", stderr="")
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: completed)
+    completed = T.ChildRun(returncode=1, stdout="▶ mnar-diagnosis\n  ❌ mnar-diagnosis", stderr="")
+    monkeypatch.setattr("src.scholar.topics._run_refresh_child", lambda cmd, **k: completed)
 
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")
 
@@ -1864,16 +1863,14 @@ def test_sync_topics_best_effort_notifies_when_outcome_not_ok(monkeypatch):
 def test_sync_topics_best_effort_does_not_notify_on_success(monkeypatch):
     """不多打扰人：概念页全部成功时不该弹窗——Y3 修法原文强调"警告不会多到扰民，
     只在概念页合成真失败时才弹"。"""
-    import subprocess
     M = _load_read_pdf_cli()
     calls = []
     monkeypatch.setattr("src.utils.notify.notify",
                         lambda title, text: calls.append((title, text)))
     monkeypatch.setattr("src.scholar.topics.notes_dir_is_production", lambda _d: True)
 
-    completed = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout="▶ mnar-diagnosis\n  ✅ merged", stderr="")
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: completed)
+    completed = T.ChildRun(returncode=0, stdout="▶ mnar-diagnosis\n  ✅ merged", stderr="")
+    monkeypatch.setattr("src.scholar.topics._run_refresh_child", lambda cmd, **k: completed)
 
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")
 
@@ -1888,9 +1885,9 @@ def test_sync_topics_best_effort_skips_notify_when_notes_dir_not_production(monk
     monkeypatch.setattr("src.utils.notify.notify",
                         lambda title, text: calls.append((title, text)))
 
-    def _boom(*a, **k):
+    def _boom(cmd, **k):
         raise AssertionError("不该发起子进程")
-    monkeypatch.setattr("subprocess.run", _boom)
+    monkeypatch.setattr("src.scholar.topics._run_refresh_child", _boom)
 
     M._sync_topics_best_effort(Path("/fake/notes"), "note.md")   # 真实判定：非生产目录
 
@@ -2016,10 +2013,11 @@ def test_trigger_requires_exactly_one_of_note_md_citekeys(tmp_path):
 def test_trigger_skips_non_production_dir_without_spawning(monkeypatch, tmp_path):
     import subprocess
 
-    def _bomb(*a, **kw):
+    def _bomb(cmd, **kw):
         raise AssertionError("非生产 notes_dir 不得发子进程")
 
-    monkeypatch.setattr(subprocess, "run", _bomb)
+    monkeypatch.setattr(T, "_run_refresh_child", _bomb)
+    monkeypatch.setattr(subprocess, "run", _bomb)   # 双保险：连旧接缝也不许走
     calls = _no_notify(monkeypatch)
     out = T.trigger_topic_refresh(tmp_path, note_md="x.md", notify_title="t", subject="s")
     assert out.ok and "skipped" in out.detail
@@ -2042,10 +2040,15 @@ def test_trigger_command_shapes(monkeypatch, tmp_path):
         # XLBDTranslator、本机叫 XLBDTranslator-dev，写死名字在干净环境必红）。
         from src.scholar.paths import REPO_ROOT
         assert Path(kw["cwd"]).resolve() == REPO_ROOT.resolve()
-        assert kw["capture_output"] is True and kw["text"] is True
-        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+        # 子进程 stdout 落盘位置：logs/topics_refresh/ 下、带时间戳与父 pid（父死也留痕）
+        lp = Path(kw["log_path"])
+        assert lp.parent == REPO_ROOT / T.TOPICS_REFRESH_LOG_DIR
+        assert lp.name.startswith("build_topics_") and lp.name.endswith(".log")
+        return T.ChildRun(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(T, "_run_refresh_child", _fake_run)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该走 subprocess.run")))
 
     out = T.trigger_topic_refresh(tmp_path, note_md="科研札记_2026-08_手动精读.md",
                                   notify_title="t", subject="s")
@@ -2067,9 +2070,9 @@ def test_trigger_timeout_and_failure_notify(monkeypatch, tmp_path):
     calls = _no_notify(monkeypatch)
 
     def _timeout(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd="x", timeout=1)
+        return T.ChildRun(returncode=None, stdout="", stderr="", timed_out=True, pid=1)
 
-    monkeypatch.setattr(subprocess, "run", _timeout)
+    monkeypatch.setattr(T, "_run_refresh_child", _timeout)
     out = T.trigger_topic_refresh(tmp_path, note_md="x.md",
                                   notify_title="Scholar 周入库", subject="札记已正常入库")
     assert not out.ok
@@ -2077,10 +2080,488 @@ def test_trigger_timeout_and_failure_notify(monkeypatch, tmp_path):
 
     # 子进程非零退出：outcome 透传 summarize_build_topics_run 的解读并 notify
     def _fail(cmd, **kw):
-        return types.SimpleNamespace(stdout="❌ topic-a 合成失败\n", stderr="", returncode=1)
+        return T.ChildRun(returncode=1, stdout="❌ topic-a 合成失败\n", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", _fail)
+    monkeypatch.setattr(T, "_run_refresh_child", _fail)
     out = T.trigger_topic_refresh(tmp_path, note_md="x.md",
                                   notify_title="Scholar 周入库", subject="札记已正常入库")
     assert not out.ok and "topic-a" in out.detail
     assert "topic-a" in calls[-1][1]
+
+
+# ---------------- _run_refresh_child：子进程可观测 + 随父死（2026-09-04 台账批） ----------------
+# 见 docs/bugs/2026-09-04-topics-subprocess-orphaned-on-parent-kill.md 与
+# 2026-09-03-finalize-topics-mistaken-for-hang.md。这里用真子进程（sys.executable -c），不打桩。
+
+import os as _os
+import signal as _signal
+import sys as _sys
+import threading as _threading
+import time as _time
+
+
+def _alive(pid: int) -> bool:
+    try:
+        _os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        _time.sleep(0.05)
+    return not _alive(pid)
+
+
+def test_child_stdout_lands_in_log_file_and_is_returned(tmp_path):
+    """stdout 直接落文件而不是管道：父进程先死也留痕；正常结束后整份回灌。"""
+    log = tmp_path / "logs" / "build_topics_x.log"
+    run = T._run_refresh_child(
+        [_sys.executable, "-c", "print('▶ mnar-diagnosis'); print('  ✅ merged'); "
+                                "import sys; print('warn', file=sys.stderr)"],
+        timeout=30, cwd=str(tmp_path), log_path=log)
+    assert run.returncode == 0 and not run.timed_out and run.pid
+    assert "▶ mnar-diagnosis" in run.stdout and "✅ merged" in run.stdout
+    assert log.read_text(encoding="utf-8") == run.stdout
+    assert "warn" in run.stderr
+    assert run.elapsed >= 0 and run.log_path == log
+
+
+# 孙进程：忽略 SIGTERM 且先把标志写进文件再睡——模拟装了优雅退出 handler / 卡在网络请求的 LLM CLI。
+# 第 1 轮审计三条路径（超时 / 信号转发 / KeyboardInterrupt）都复现「组长一死就 return，孙进程永不被 SIGKILL」。
+_STUBBORN_GRANDCHILD = ("import signal, time, os, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+
+
+def _child_with_stubborn_grandchild(flag_path, child_sleep=60, child_exit_first=False):
+    return ("import subprocess, sys, time, os\n"
+            "p = subprocess.Popen([sys.executable, '-c', {gc!r}, {flag!r}])\n"
+            "print(os.getpid(), p.pid, flush=True)\n"
+            + ("" if child_exit_first else "time.sleep({sleep})\n")
+            ).format(gc=_STUBBORN_GRANDCHILD, flag=str(flag_path), sleep=child_sleep)
+
+
+def _wait_file(p, timeout=5.0):
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if p.exists() and p.read_text().strip():
+            return p.read_text().strip()
+        _time.sleep(0.05)
+    raise AssertionError("孙进程没写标志文件 {}".format(p))
+
+
+def test_child_timeout_kills_whole_process_group_including_stubborn_grandchild(tmp_path):
+    """超时必须 killpg 整组：build_topics 往下还会派生 LLM CLI，run() 的 kill 只杀直接子进程。
+    孙进程忽略 SIGTERM 时，grace 到点必须对**整组** SIGKILL——判据是进程组为空，不是组长退出。"""
+    log = tmp_path / "b.log"
+    flag = tmp_path / "gc.pid"
+    t0 = _time.monotonic()
+    run = T._run_refresh_child([_sys.executable, "-c", _child_with_stubborn_grandchild(flag)],
+                               timeout=1.5, cwd=str(tmp_path), log_path=log)
+    elapsed = _time.monotonic() - t0
+    assert run.timed_out is True
+    # 上界要卡在「一个 grace」这个量级上：宽到 +5 会让「不 killpg、靠 finally 兜底多等一个 grace」
+    # 的变异存活（实测 R02/R03）。CI 慢机器的余量靠 +3.5 兜——正确实现下实测约 6.6s。
+    assert elapsed < 1.5 + T._CHILD_TERM_GRACE_SEC + 3.5, elapsed
+    pids = [int(x) for x in run.stdout.split()]
+    assert len(pids) == 2, run.stdout
+    assert int(_wait_file(flag)) == pids[1]
+    for pid in pids:
+        assert _wait_dead(pid, timeout=2.0), "pid {} 仍活着（孙进程漏杀 = 孤儿）".format(pid)
+
+
+def test_child_exits_but_stubborn_grandchild_holds_pipe_is_not_a_timeout(tmp_path):
+    """组长秒退（exit 0）、孙进程占着 stderr 管道让 communicate 等到超时：不是概念页超时，
+    不得报 timed_out（那会触发「超时」notify 假失败）；残留组要被清掉。"""
+    log = tmp_path / "c.log"
+    flag = tmp_path / "gc.pid"
+    t0 = _time.monotonic()
+    run = T._run_refresh_child(
+        [_sys.executable, "-c", _child_with_stubborn_grandchild(flag, child_exit_first=True)],
+        timeout=1.5, cwd=str(tmp_path), log_path=log)
+    elapsed = _time.monotonic() - t0
+    assert run.timed_out is False and run.returncode == 0, run
+    assert elapsed < 1.5 + T._CHILD_TERM_GRACE_SEC + 3.5, elapsed
+    gc_pid = int(_wait_file(flag))
+    assert _wait_dead(gc_pid, timeout=2.0), "孙进程仍活着"
+
+
+def test_parent_sigint_terminates_child_then_raises_keyboardinterrupt(tmp_path):
+    """父进程收到 SIGINT：先带走子进程组，再按原语义抛 KeyboardInterrupt（不吞信号）。
+    SIGTERM 同一条路（handler 恢复 SIG_DFL 后对自己重发），但那会杀掉 pytest，只能用 SIGINT 验。"""
+    log = tmp_path / "c.log"
+    flag = tmp_path / "gc.pid"
+    _threading.Timer(1.0, lambda: _os.kill(_os.getpid(), _signal.SIGINT)).start()
+    prev = _signal.getsignal(_signal.SIGINT)
+    with pytest.raises(KeyboardInterrupt):
+        T._run_refresh_child([_sys.executable, "-c", _child_with_stubborn_grandchild(flag)], timeout=30,
+                             cwd=str(tmp_path), log_path=log)
+    # handler 必须恢复原状，否则后续测试/调用方的 Ctrl+C 语义被改掉
+    assert _signal.getsignal(_signal.SIGINT) is prev
+    for _ in range(50):
+        txt = log.read_text(encoding="utf-8").strip()
+        if txt:
+            break
+        _time.sleep(0.05)
+    pids = [int(x) for x in txt.split()]
+    assert len(pids) == 2
+    for pid in pids:
+        assert _wait_dead(pid, timeout=8.0), "父进程被中断后 pid {} 仍活着（这正是台账里的孤儿）".format(pid)
+
+
+def test_signal_handlers_restored_after_normal_run(tmp_path):
+    prev = {name: _signal.getsignal(getattr(_signal, name)) for name in T._FORWARDED_SIGNALS}
+    T._run_refresh_child([_sys.executable, "-c", "print(1)"], timeout=30,
+                         cwd=str(tmp_path), log_path=tmp_path / "d.log")
+    for name in T._FORWARDED_SIGNALS:
+        assert _signal.getsignal(getattr(_signal, name)) is prev[name]
+
+
+def test_child_from_non_main_thread_degrades_without_error(tmp_path):
+    """signal.signal 只能在主线程装；非主线程调用要能跑通（不转发，只记日志），不能抛 ValueError。"""
+    box = {}
+
+    def _go():
+        try:
+            box["run"] = T._run_refresh_child([_sys.executable, "-c", "print('t')"], timeout=30,
+                                              cwd=str(tmp_path), log_path=tmp_path / "e.log")
+        except BaseException as e:  # noqa: BLE001
+            box["err"] = e
+    th = _threading.Thread(target=_go)
+    th.start()
+    th.join(30)
+    assert "err" not in box, box.get("err")
+    assert box["run"].returncode == 0 and "t" in box["run"].stdout
+
+
+def test_trigger_logs_pid_and_duration_lines(monkeypatch, tmp_path, caplog):
+    """发起前后各一行：这是「还在跑」与「真卡死」在日志上的唯一分界。"""
+    monkeypatch.setattr(T, "notes_dir_is_production", lambda nd: True)
+    _no_notify(monkeypatch)
+    monkeypatch.setattr(T, "_run_refresh_child",
+                        lambda cmd, **k: T.ChildRun(returncode=0, stdout="▶ a\n  ✅ merged",
+                                                    stderr="", pid=777, elapsed=12.3,
+                                                    log_path=k["log_path"]))
+    from loguru import logger as _lg
+    sink = []
+    hid = _lg.add(lambda m: sink.append(str(m)), level="INFO")
+    try:
+        out = T.trigger_topic_refresh(tmp_path, note_md="x.md", notify_title="t", subject="精读已正常归档")
+    finally:
+        _lg.remove(hid)
+    assert out.ok
+    joined = "\n".join(sink)
+    assert "开始概念页刷新（精读已正常归档）" in joined and "最长 2400s" in joined
+    assert "不是卡死" in joined and T.TOPICS_REFRESH_LOG_DIR in joined
+    assert "pid=777 结束：退出码 0，耗时 12s" in joined
+    assert "✅ merged" in joined                      # W3：stdout 全量回灌
+
+
+def test_trigger_timeout_reports_log_path_and_killed(monkeypatch, tmp_path):
+    monkeypatch.setattr(T, "notes_dir_is_production", lambda nd: True)
+    calls = _no_notify(monkeypatch)
+    monkeypatch.setattr(T, "_run_refresh_child",
+                        lambda cmd, **k: T.ChildRun(returncode=None, stdout="", stderr="",
+                                                    timed_out=True, pid=5, log_path=k["log_path"]))
+    from loguru import logger as _lg
+    sink = []
+    hid = _lg.add(lambda m: sink.append(str(m)), level="WARNING")
+    try:
+        out = T.trigger_topic_refresh(tmp_path, citekeys=["k"], timeout=7, notify_title="t", subject="s")
+    finally:
+        _lg.remove(hid)
+    assert not out.ok and "超时（7s）" in out.detail
+    assert any("子进程组已终止" in m and "build_topics_" in m for m in sink)
+    assert calls and "超时" in calls[-1][1]
+
+
+def test_prune_topics_refresh_logs_by_age(tmp_path):
+    old = tmp_path / "build_topics_20260101T000000_1.log"
+    new = tmp_path / "build_topics_20260904T000000_2.log"
+    other = tmp_path / "keep.txt"
+    for p in (old, new, other):
+        p.write_text("x", encoding="utf-8")
+    now = _time.time()
+    _os.utime(old, (now - 20 * 86400, now - 20 * 86400))
+    _os.utime(other, (now - 20 * 86400, now - 20 * 86400))
+    assert T.prune_topics_refresh_logs(tmp_path, keep_days=14, now=now) == 1
+    assert not old.exists() and new.exists() and other.exists()
+    assert T.prune_topics_refresh_logs(tmp_path / "nope", keep_days=14) == 0
+
+
+def test_topics_refresh_log_path_shape():
+    from datetime import datetime as _dt
+    from src.scholar.paths import REPO_ROOT
+    p = T.topics_refresh_log_path(_dt(2026, 9, 4, 13, 5, 7, 123456))
+    assert p.parent == REPO_ROOT / "logs" / "topics_refresh"
+    # 微秒精度：同进程 1 秒内两次触发不得同名互相覆盖
+    assert p.name == "build_topics_20260904T130507123456_{}.log".format(_os.getpid())
+    assert T.topics_refresh_log_path() != T.topics_refresh_log_path()
+    assert T._TOPICS_LOG_KEEP_DAYS == 14
+
+
+def test_run_child_prunes_old_logs_in_its_dir(tmp_path):
+    """真跑一次时顺手清 14 天前的旧日志；昨天的保留。"""
+    old = tmp_path / "build_topics_20250101T000000000000_1.log"
+    recent = tmp_path / "build_topics_20260903T000000000000_2.log"
+    for p in (old, recent):
+        p.write_text("x", encoding="utf-8")
+    now = _time.time()
+    _os.utime(old, (now - 20 * 86400, now - 20 * 86400))
+    _os.utime(recent, (now - 86400, now - 86400))
+    T._run_refresh_child([_sys.executable, "-c", "print(1)"], timeout=30,
+                         cwd=str(tmp_path), log_path=tmp_path / "new.log")
+    assert not old.exists() and recent.exists()
+
+
+def test_sighup_ignored_by_parent_leaves_child_alone(tmp_path):
+    """父进程原本忽略 SIGHUP（nohup 语义）：不装转发，终端挂断不得连带杀掉概念页子进程。"""
+    prev = _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+    try:
+        _threading.Timer(0.4, lambda: _os.kill(_os.getpid(), _signal.SIGHUP)).start()
+        run = T._run_refresh_child(
+            [_sys.executable, "-c", "import time; time.sleep(1.2); print('survived')"],
+            timeout=30, cwd=str(tmp_path), log_path=tmp_path / "h.log")
+        assert run.returncode == 0 and "survived" in run.stdout and not run.timed_out
+        assert _signal.getsignal(_signal.SIGHUP) is _signal.SIG_IGN
+    finally:
+        _signal.signal(_signal.SIGHUP, prev)
+
+
+def test_parent_sigterm_kills_child_group_and_parent_exits_with_original_semantics(tmp_path):
+    """SIGTERM 路径（launchd / 会话超时的真实信号）只能在**子解释器**里验：handler 恢复 SIG_DFL 后
+    对自己重发，父进程按原语义退出（rc=-15），且不会因为没恢复 prev 而把重发的 SIGTERM 又吃回 handler
+    （那会让父进程永远退不出——第 1 轮变异 M03a 指出的无守卫缺口）。"""
+    import subprocess as _sp
+    from src.scholar.paths import REPO_ROOT
+    flag = tmp_path / "gc.pid"
+    inner = (
+        "import sys; sys.path.insert(0, {root!r})\n"
+        "from src.scholar import topics as T\n"
+        "child = {child!r}\n"
+        "T._run_refresh_child([sys.executable, '-c', child], timeout=60, cwd={cwd!r}, log_path={log!r})\n"
+    ).format(root=str(REPO_ROOT), child=_child_with_stubborn_grandchild(flag), cwd=str(tmp_path),
+             log=str(tmp_path / "t.log"))
+    parent = _sp.Popen([_sys.executable, "-c", inner], cwd=str(REPO_ROOT),
+                       stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+    try:
+        gc_pid = int(_wait_file(flag, timeout=15.0))
+        _time.sleep(0.3)
+        parent.send_signal(_signal.SIGTERM)
+        rc = parent.wait(timeout=15)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+    assert rc == -_signal.SIGTERM, (rc, parent.stderr.read()[-800:])
+    assert _wait_dead(gc_pid, timeout=8.0), "父进程被 SIGTERM 后顽固孙进程仍活着"
+    log_pids = [int(x) for x in (tmp_path / "t.log").read_text().split()]
+    for pid in log_pids:
+        assert _wait_dead(pid, timeout=8.0)
+
+
+def test_terminating_well_behaved_child_group_returns_promptly(tmp_path):
+    """终止一个**乖巧的**进程组必须立刻返回，不能每次都烧满 grace。
+
+    机制：`_killpg_then_kill` 的等待循环里 `proc.poll()` 负责给组长收尸——不收尸的话组长会以僵尸
+    身份留在进程组里，`killpg(pgid, 0)` 恒为真，循环必然走满 5s grace，再 SIGKILL（对僵尸无效），
+    再走满 1s 收尸等待，finally 里还会因为「组还在」再来一遍。后果不是错误结果而是**每次
+    Ctrl+C / 超时都白等 6 秒以上**。第 2 轮变异 R02/R02b/R03 全部存活，就是因为没有任何测试盯耗时上界
+    （既有那条超时测试用的是**顽固**孙进程，本来就该烧满 grace，盯不住这个）。
+    这里用「子孙都对 SIGTERM 默认退出」的乖巧组：正常实现应在毫秒级收尾。
+    """
+    log = tmp_path / "fast.log"
+    flag = tmp_path / "gc.pid"
+    gc_code = "import time, os, sys; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)"
+    child = ("import subprocess, sys, time, os\n"
+             "p = subprocess.Popen([sys.executable, '-c', {gc!r}, {flag!r}])\n"
+             "print(os.getpid(), p.pid, flush=True)\n"
+             "time.sleep(60)\n").format(gc=gc_code, flag=str(flag))
+    t0 = _time.monotonic()
+    run = T._run_refresh_child([_sys.executable, "-c", child], timeout=1.0,
+                               cwd=str(tmp_path), log_path=log)
+    elapsed = _time.monotonic() - t0
+    assert run.timed_out is True
+    # 超时 1.0s + 组内两个进程对 SIGTERM 立即退出 → 收尾应远快于一个 grace
+    assert elapsed < 1.0 + T._CHILD_TERM_GRACE_SEC - 1.5, (
+        "终止乖巧进程组耗时 {:.1f}s，说明没给组长收尸、白烧了 grace".format(elapsed))
+    pids = [int(x) for x in run.stdout.split()]
+    for pid in pids:
+        assert _wait_dead(pid, timeout=2.0)
+
+
+def test_signal_restore_falls_back_to_sig_dfl_when_install_returned_none(tmp_path, monkeypatch):
+    """`signal.signal()` 对 **C 层安装**的 handler 返回 None，而 None 不能再装回去（TypeError）。
+
+    不按 SIG_DFL 兜底的话：finally 恢复时抛 TypeError（覆盖掉真正的异常），`_forward` 残留在进程上，
+    父进程此后收到 SIGTERM 会走进一个已失效的 handler。这条分支在真实环境里要嵌入式解释器才撞得上，
+    第 1 轮审计用 ctypes 都没造出来——所以改成「让 signal.signal 在安装时返回 None」直接钉住恢复行为
+    （第 2 轮变异 R05/R05b 存活）。
+    """
+    import signal as S
+    real = S.signal
+    restored = []
+
+    def fake(signum, handler):
+        if callable(handler):                 # 安装 _forward：真装上，但谎报「原 handler 是 C 层的」
+            real(signum, handler)
+            return None
+        restored.append((signum, handler))    # 恢复：记录我们到底装回了什么
+        return real(signum, handler)
+
+    monkeypatch.setattr(S, "signal", fake)
+    run = T._run_refresh_child([_sys.executable, "-c", "print('ok')"], timeout=30,
+                               cwd=str(tmp_path), log_path=tmp_path / "n.log")
+    assert run.returncode == 0 and "ok" in run.stdout      # 没有被 TypeError 打断
+    assert restored, "finally 必须恢复信号 handler"
+    assert all(h is S.SIG_DFL for _sig, h in restored), restored
+
+
+def test_killpg_contract_group_is_gone_when_it_returns(tmp_path):
+    """`_killpg_then_kill` 的契约是「返回时进程组已经空了」，调用方（finally 与超时分支）据此决定
+    要不要再来一轮。SIGKILL 之后**必须**再等一小会儿收尸：SIGKILL 是异步的，被杀者要先变僵尸、
+    再由 init 收走，返回太早会让调用方看到「组还在」而重复走一遍终止流程（第 2 轮变异 R03 存活）。
+    这里直接对着一个顽固进程组（忽略 SIGTERM，只有 SIGKILL 能杀）验契约。
+    """
+    import os as _o
+    import subprocess as _sp
+    flag = tmp_path / "gc.pid"
+    gc = ("import signal, time, os, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+          "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+    p = _sp.Popen([_sys.executable, "-c", gc, str(flag)], start_new_session=True)
+    try:
+        _wait_file(flag, timeout=10.0)
+        assert T._pgroup_alive(p.pid) is True
+        T._killpg_then_kill(p.pid, grace=1.0, proc=p)
+        # 返回的那一刻组就该是空的——不能把「等它真的死掉」留给调用方
+        assert T._pgroup_alive(p.pid) is False, "_killpg_then_kill 返回时进程组仍非空"
+    finally:
+        if p.poll() is None:
+            try:
+                _o.killpg(p.pid, _signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait(timeout=5)
+
+
+def test_forward_honors_original_signal_semantics_when_previous_handler_is_none(tmp_path):
+    """变异 R05：`_forward` 里不把 None 兜成 SIG_DFL 会怎样（实测，非推断）。
+
+    `signal.signal(sig, None)` 在 CPython 里先过 `_enum_to_int(None)`，恢复失败 → handler 仍是
+    `_forward` → 紧接着的 `os.kill(self, sig)` **就地重入** handler → 层层嵌套直到
+    `RecursionError`：父进程带着一整页栈以退出码 1 崩掉，而不是按该信号的原语义退出。
+    正确实现下父进程被 SIGINT 按 SIG_DFL 带走（退出码 -2），且 stderr 里没有 traceback。
+    只能在子解释器里验——本进程里跑会把 pytest 自己打死。
+    """
+    import subprocess as _sp
+    from src.scholar.paths import REPO_ROOT
+    inner = (
+        "import sys\n"
+        "sys.path.insert(0, {root!r})\n"
+        "import signal as S\n"
+        "real = S.signal\n"
+        "def fake(signum, handler):\n"
+        "    if callable(handler):\n"
+        "        real(signum, handler)\n"
+        "        return None          # 谎报「原 handler 是 C 层装的」\n"
+        "    return real(signum, handler)\n"
+        "S.signal = fake\n"
+        "from src.scholar import topics as T\n"
+        "print('ready', flush=True)\n"
+        "T._run_refresh_child([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+        "                     timeout=30, cwd={cwd!r}, log_path={log!r})\n"
+    ).format(root=str(REPO_ROOT), cwd=str(tmp_path), log=str(tmp_path / "loop.log"))
+    proc = _sp.Popen([_sys.executable, "-c", inner], cwd=str(REPO_ROOT),
+                     stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+    try:
+        deadline = _time.monotonic() + 20
+        while _time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if "ready" in line or not line:
+                break
+        else:
+            raise AssertionError("子解释器没起来")
+        _time.sleep(0.4)
+        proc.send_signal(_signal.SIGINT)
+        rc = proc.wait(timeout=15)
+        err = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert rc == -_signal.SIGINT, (
+        "父进程应按 SIGINT 的原语义（SIG_DFL）被带走、退出码 -2，实得 {}".format(rc))
+    assert "RecursionError" not in err and "Traceback" not in err, err[-600:]
+
+
+# ---------------------------------------------------------------------------
+# 父死联动（2026-09-04 第 5 轮终审 R5-1.1）
+# ---------------------------------------------------------------------------
+
+def test_parent_is_gone_predicate(monkeypatch):
+    """纯判据：父进程还在吗。三种「已经不在」的形态都要认出来。"""
+    monkeypatch.setattr(_os, "getppid", lambda: 12345)
+    assert T.parent_is_gone(1) is True             # init 不可能是我们的父
+    assert T.parent_is_gone(0) is True
+
+    def _kill(pid, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(_os, "kill", _kill)
+    assert T.parent_is_gone(999999) is True        # 父已消失
+
+    monkeypatch.setattr(_os, "kill", lambda pid, sig: None)
+    assert T.parent_is_gone(999999) is False       # 父还在
+
+    monkeypatch.setattr(_os, "getppid", lambda: 1)
+    assert T.parent_is_gone(999999) is True        # 已被 init/launchd 收养
+
+
+def test_parent_death_watchdog_only_arms_when_the_parent_asked_for_it(monkeypatch):
+    """手动直接跑 build_topics.py 不该被它影响（nohup 后关终端，getppid 变 1 是正常的）。"""
+    monkeypatch.delenv(T.TOPICS_PARENT_PID_ENV, raising=False)
+    assert T.install_parent_death_watchdog(poll_sec=0.01) is False
+    monkeypatch.setenv(T.TOPICS_PARENT_PID_ENV, "not-a-pid")
+    assert T.install_parent_death_watchdog(poll_sec=0.01) is False
+
+
+def test_parent_death_watchdog_exits_the_child_when_the_parent_disappears(monkeypatch):
+    """父被 -9 时信号转发拦不住，且 start_new_session 让子进程逃出 launchd 的进程组清扫网
+    （第 5 轮终审用真 launchd job 实测：同组子进程被收尸、新会话子进程存活）。这条轮询补那一格。"""
+    monkeypatch.setenv(T.TOPICS_PARENT_PID_ENV, "4242")
+    monkeypatch.setattr(T, "parent_is_gone", lambda pid: pid == 4242)
+    fired = _threading.Event()
+    assert T.install_parent_death_watchdog(poll_sec=0.01, _on_death=fired.set) is True
+    assert fired.wait(3.0), "父进程消失后守护线程必须让子进程退出"
+
+
+def test_refresh_child_passes_its_pid_to_the_child(monkeypatch, tmp_path):
+    """接线：父进程必须把自己的 pid 放进子进程环境，否则子进程侧那条联动永远不武装。"""
+    seen = {}
+
+    class _P:
+        pid = 4321
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def poll(self):
+            return 0
+        returncode = 0
+
+    def _popen(cmd, **kw):
+        seen.update(kw)
+        return _P()
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "Popen", _popen)   # topics 在函数内 import subprocess，打 stdlib 即可
+    monkeypatch.setattr(T, "_killpg_then_kill", lambda *a, **k: None)
+    T._run_refresh_child(["true"], timeout=5, cwd=str(tmp_path), log_path=tmp_path / "l.log")
+    assert seen.get("start_new_session") is True
+    env = seen.get("env") or {}
+    assert env.get(T.TOPICS_PARENT_PID_ENV) == str(_os.getpid()), \
+        "子进程环境里必须带父进程 pid，父死联动才装得上"

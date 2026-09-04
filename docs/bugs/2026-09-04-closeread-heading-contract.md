@@ -1,7 +1,7 @@
 # 精读节标题是机读锚点：往里加后缀会静默丢掉 reading_source（已踩过一次）
 
 日期：2026-09-04
-状态：**未发生于主干**（我引入后当轮撤回），已留回归测试防复发
+状态：**未发生于主干，已防复发（2026-09-04 补齐其余契约对的往返测试）**
 严重度：中——静默丢字段，无报错、无日志，md 肉眼看不出异常
 发现者：xiaolibird / Claude（2026-09-03 会话；由对抗审 subagent 实测复现）
 
@@ -80,3 +80,11 @@ for l in ["### 全文精读 · 来源 `unpaywall`",
 
 **注释不会失败，测试会。** 建议给每对契约都补一条往返测试（渲染 → 解析 → 字段逐一相等），
 成本很低。目前只有精读节标题这一对有。
+
+---
+
+## 修复（2026-09-04 台账批）
+
+按本条「一般性教训」给另两对渲染↔解析契约补了往返测试（渲染 → 解析 → 字段逐一相等）：
+`render_tag_line ↔ TAG_LINE_RE`（全部 tag × 有/无页码锚，含含〔〕的句子）、`notes._book_line ↔ notes_index._parse_book_line`（chapter 与 book 两种条目）。
+见 `test/test_bugs_batch_2026_09.py` W11 节。`backfill_deepread._render_closeread ↔ 解析` 那一对由既有 `test_backfill_deepread.py` 覆盖。

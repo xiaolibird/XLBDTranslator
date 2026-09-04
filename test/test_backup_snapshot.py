@@ -138,9 +138,17 @@ def test_snapshot_restore_roundtrip_sha256(tmp_path, monkeypatch):
     assert not any(".pytest_cache" in r for r in restored)
     # bundle 可 verify + clone
     bundle = next(backup.glob("*" + bn.BUNDLE_SUFFIX))
-    v = subprocess.run(["git", "bundle", "verify", str(bundle)],
+    # verify 必须挂在一个真仓库上：`git bundle verify` 需要 cwd 是 git 仓库，不传 cwd 就
+    # 继承 pytest 的工作目录——在真仓库里恰好通过，在任何非 git 目录（沙箱快照、tarball
+    # 解包、审计副本）里报 "need a repository to verify a bundle"，而失败信息指不到真因。
+    # 这里按恢复手册的三步来：先 clone 出仓库，再在它里面 verify。
+    clone = tmp_path / "vault_clone"
+    c = subprocess.run(["git", "clone", "-q", str(bundle), str(clone)],
                        capture_output=True, text=True)
-    assert v.returncode == 0
+    assert c.returncode == 0, c.stderr
+    v = subprocess.run(["git", "-C", str(clone), "bundle", "verify", str(bundle)],
+                       capture_output=True, text=True)
+    assert v.returncode == 0, v.stderr
     # manifest 数字自洽
     manifest = json.loads(next(backup.glob("*" + bn.MANIFEST_SUFFIX)).read_text())
     assert manifest["files"] > 0 and manifest["sha256_tar"]

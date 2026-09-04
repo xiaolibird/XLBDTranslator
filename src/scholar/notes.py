@@ -19,7 +19,7 @@ from typing import List, Dict, Any, Optional
 from .schema import PaperSegment, PaperMetadata
 from ._citekey_utils import (_fallback_citekey, _priority_tier, _suffix_seq,
                              entry_from_segment, date_parts, build_csl_common,
-                             render_tag_line, TAG_MARK)
+                             render_tag_line, TAG_MARK, dedup_key_fields, _norm_title)
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -66,6 +66,77 @@ def _slug(text: str, maxlen: int = 60) -> str:
     while "--" in s:
         s = s.replace("--", "-")
     return (s or "untitled")[:maxlen]
+
+
+# 覆盖既有札记前的备份目录（与 backfill_deepread 的 .backfill_deepread_backup 同一思路：
+# output/ 全部在 .gitignore 内，回滚不能靠 git）。
+NOTE_OVERWRITE_BACKUP_DIR = ".digest_overwrite_backup"
+
+
+def note_file_paths(out_dir, filename: str) -> Dict[str, Path]:
+    """write_notes(filename=…) 会落的四件套路径（md / references / sidecar / docx），与
+    write_notes 内部的 slug 规则**同源**——调用方要判「目标已存在」必须经此取路径，别自己拼。"""
+    out_dir = Path(out_dir)
+    slug = _slug(filename, 80) or "scholar_digest"
+    return {
+        "md": out_dir / "{}.md".format(slug),
+        "references": out_dir / "{}.references.json".format(slug),
+        "sidecar": out_dir / "{}.index.json".format(slug),
+        "docx": out_dir / "{}.docx".format(slug),
+    }
+
+
+def backup_note_files(out_dir, filename: str, stamp: Optional[str] = None) -> Optional[Path]:
+    """把既有四件套（凡存在者）复制到 out_dir/.digest_overwrite_backup/<时间戳>/，返回备份目录。
+    一件都不存在返回 None（无需备份）。复制失败向外抛——备份不成功就不该继续覆盖。"""
+    import shutil
+    from datetime import datetime
+    out_dir = Path(out_dir)
+    existing = [p for p in note_file_paths(out_dir, filename).values() if p.exists()]
+    if not existing:
+        return None
+    bdir = out_dir / NOTE_OVERWRITE_BACKUP_DIR / (stamp or datetime.now().strftime("%Y%m%dT%H%M%S%f"))
+    bdir.mkdir(parents=True, exist_ok=True)
+    for p in existing:
+        shutil.copy2(p, bdir / p.name)
+    return bdir
+
+
+def _segment_dedup_key(meta) -> str:
+    """与 notes_index.recompute_entry_key 同一套键梯（doi → arxiv → isbn/章 → 场地 id → 标题）。
+    不 import ingest：ingest 在函数内 import 本模块，模块级反向 import 会成环。
+    书/章条目要带 isbn/chapter_number，否则章的键退化成标题键、永远对不上索引侧的 `isbn:…:chNN`。"""
+    return dedup_key_fields(meta.doi, meta.arxiv_id, meta.title, fallback=meta.paper_id,
+                            url=getattr(meta, "url", None),
+                            isbn=getattr(meta, "isbn", None),
+                            chapter_number=getattr(meta, "chapter_number", None))
+
+
+def _may_inherit(owner, meta) -> bool:
+    """占着基键的那条，能不能判定为「与本篇是同一篇、且**索引最终会把两条合并**」？
+
+    判据直接照抄索引自己的合并判据（`notes_index._entry_keys`）：条目的身份键集合 =
+    `dedup_key` **加上规范标题二级键**（二级键无条件生成）。所以两条只要满足其一，
+    就必然被并查集 union 进同一簇、其中一条成为 duplicate：
+      1. `dedup_key` 逐字相等；
+      2. **规范标题相等**。
+
+    为什么不按「dedup_key 家族相等」（arXiv 剥不剥 vN、DataCite DOI 与 arxiv 档）判：
+    家族相等**不等于**索引会合并——那正是 `config/dedup_overrides.json` 要写死人工裁决的原因。
+    一旦没合并，两条 live 条目共用一个 citekey → `build_all_references` 把该键整键剔除 →
+    **两篇一起**从全局书目消失，比原来那个「基键消失」的缺陷更糟（第 2 轮压测 CONFIRMED）。
+    改用标题判据后：那三种 arXiv 形态照样继承（同一篇论文标题相同），「家族相同但标题已漂」
+    这个真正危险的组合被挡住，还顺带覆盖了一种此前漏掉的情形——auto 侧是 arXiv DOI、
+    manual 侧被 Crossref 补成正刊 DOI（一级键完全不同、标题相同，索引照样合并）。
+    """
+    if not owner:
+        return False
+    owner_dk, owner_title = owner if isinstance(owner, tuple) else (owner, None)
+    if not owner_dk:
+        return False                       # ("", "") = 两个 keeper 撞键，不许继承
+    if owner_dk == _segment_dedup_key(meta):
+        return True                        # 一级键逐字相等
+    return bool(owner_title) and owner_title == _norm_title(meta.title)
 
 
 def _yaml_list(items: List[str]) -> str:
@@ -257,6 +328,7 @@ def write_notes(
     index_series: str = "auto",
     existing_citekeys: Optional[set] = None,
     explicit_citekey_source: str = "zotero",
+    existing_key_owners: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
@@ -271,6 +343,18 @@ def write_notes(
             但手动精读的 regen 会把**上一轮自己生成的兜底键**显式传回来沿用（见
             read_pdf._rebuild_month），那些键并非权威，必须传 "fallback"，
             否则 sidecar 会把兜底键冒充成 Zotero 键，下游按 citekey_source 判权威时会误判。
+        existing_key_owners: 库内已占用键 → (占有者 dedup_key, 占有者规范标题)
+            （notes_index.existing_citekey_owners；也接受老形态的裸 dedup_key 字符串）。
+            给了它，兜底键才能做「同一篇论文继承基键」：一篇论文先被月度流水线浅读入库
+            （auto，0 条取证句），后来被手动全文精读——去重层会把手动深读判为 keeper、auto
+            判为 duplicate，但 citekey 是在去重**之前**分配的，只看 `used` 集合只能盲目加
+            后缀，于是 keeper 拿到 `<基键>b`、干净基键留在那条 0 条取证句的 duplicate 上，
+            而 all_references 只收 keeper → **基键从全局书目里消失**，此前所有 `[@基键]`
+            引用悬空（已波及 P4 主稿 8 处，见 docs/bugs/2026-09-04-manual-upgrade-citekey-suffix.md）。
+            规则：基键被占，但占有者与本篇 dedup_key 相同、且**本批**尚未有人用它 → 直接
+            继承基键（keeper 与 duplicate 同键，_global_pass 的陈旧键守卫不再触发）。
+            本批内两篇同 dedup_key 仍各得不同键（与 read_pdf._reuse_citekeys 的口径一致）；
+            不同论文同基键照旧加后缀。不传（None）= 旧行为。
     Returns: 摘要 dict（聚合札记路径、references 路径、缺 key 数）
     """
     out_dir = Path(out_dir)
@@ -285,20 +369,31 @@ def write_notes(
         citekeys = dict(citekeys)
         # used 初始化为"本批已用键 + 索引已有 citekey 全集"：确保新生成的 fallback 键
         # 不与库内任何条目重名，杜绝"同一论文 auto/manual 各收一次生成同名 citekey"
-        used = {v for v in citekeys.values() if v} | (existing_citekeys or set())
+        batch_used = {v for v in citekeys.values() if v}
+        used = set(batch_used) | (existing_citekeys or set())
+        owners = existing_key_owners or {}
+        inherited = 0
         for seg in segments:
             if citekeys.get(seg.paper_id):
                 continue
             base = _fallback_citekey(seg.metadata)
             key = base
             if key in used:
-                for suf in _suffix_seq():
-                    cand = "{}{}".format(base, suf)
-                    if cand not in used:
-                        key = cand
-                        break
+                if owners and base not in batch_used and _may_inherit(owners.get(base), seg.metadata):
+                    # 占着基键的是**同一篇论文**的既有条目（跨月重复 / auto→manual 升级）：
+                    # 继承基键，让 keeper 与 duplicate 同键（见 existing_key_owners 的说明）
+                    inherited += 1
+                else:
+                    for suf in _suffix_seq():
+                        cand = "{}{}".format(base, suf)
+                        if cand not in used:
+                            key = cand
+                            break
             used.add(key)
+            batch_used.add(key)
             citekeys[seg.paper_id] = key
+        if inherited:
+            logger.info("  citekey：{} 篇继承了库内同一论文既有条目的基键（不加后缀）".format(inherited))
 
     csl_items = [build_csl_item(seg.metadata, citekeys[seg.paper_id])
                  for seg in segments if citekeys.get(seg.paper_id)]
@@ -321,6 +416,7 @@ def write_notes(
     # 索引 sidecar：从内存对象无损导出结构化条目（含 arxiv_id/priority_score/三色计数），
     # 供 notes_index 聚合——新札记不再依赖 md 反向解析。排序与 build_digest_note 一致。
     sidecar_path = None
+    sidecar_error = None
     if emit_index_sidecar:
         try:
             ordered = sorted(segments, key=lambda s: s.priority_score, reverse=True)
@@ -338,7 +434,14 @@ def write_notes(
                 {"schema_version": 1, "papers": entries}, ensure_ascii=False, indent=2))
         except Exception as e:
             sidecar_path = None
-            logger.warning("  ⚠️ 写索引 sidecar 失败（不影响札记）: {}".format(e))
+            sidecar_error = "{}: {}".format(type(e).__name__, e)
+            # 不是「不影响札记」：md 不存阅读深度量尺（fulltext_chars/_raw/truncated、
+            # reading_source 只能从标题两态半猜），sidecar 一旦没写出来这些字段**永久
+            # 不可恢复**——全库 76 个 auto 月里 43 个没有 sidecar 正是这样悄悄积出来的
+            # （见 docs/bugs/2026-09-04-auto-sidecar-missing.md）。所以走 error 级，
+            # 并在返回值里带 sidecar_ok=False 让调用方能判定/告警，而不是把它当成功。
+            logger.error("  ❌ 写索引 sidecar 失败——本月条目的阅读深度量尺将无法从 md 回读，"
+                         "索引只能按老规则推断（reading_depth=unknown-legacy）: {}".format(sidecar_error))
 
     # md 最后落盘（见上）：此行成功 = 本次 write_notes 事务提交
     _atomic_write(note_path, md_content)
@@ -357,6 +460,12 @@ def write_notes(
     }
     if sidecar_path:
         result["index_sidecar"] = str(sidecar_path)
+    if emit_index_sidecar:
+        # 显式两态：调用方（backfill/ingest/read_pdf）据此判定「本月量尺有没有落盘」。
+        # 只看 index_sidecar 键在不在会把"没要求写"与"要求了但失败"混成一态。
+        result["sidecar_ok"] = sidecar_path is not None
+        if sidecar_error:
+            result["sidecar_error"] = sidecar_error
 
     # 样式化 docx（单元格着色/句级三色/字体区分）；延迟导入避免与 docx_builder 循环依赖
     if emit_docx:

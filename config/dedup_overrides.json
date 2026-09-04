@@ -12,6 +12,14 @@
     [
       "title:federatedlearningusedforpredictingoutcomesinsarscov2patients",
       "title:federatedlearningforpredictingclinicaloutcomesinpatientswithcovid19"
+    ],
+    [
+      "arxiv:2602.15159",
+      "arxiv:2602.15159v1"
+    ],
+    [
+      "doi:10.48550/arxiv.2305.02504",
+      "arxiv:2305.02504v1"
     ]
   ],
   "_notes": {
@@ -22,7 +30,9 @@
     "键迁移 2026-08-15": "新增 pmlr:/openreview: 键层后，5 条裁决的键由 title: 迁到场地原生 id。原文件备份在 dedup_overrides.json.bak。",
     "键大小写修正 2026-08-15": "OpenReview 的 forum id 区分大小写（base62），原先 venue_native_id 一律 .lower() 会把仅大小写不同的两个 id 折成同一个键（静默吞篇）。改为 PMLR 小写归一、OpenReview 原样保留后，本文件里 3 个 openreview: 键同步改回原始大小写（x4UK4GadLd / F3G2udCF3Q / 6r2acwubHf，取自各篇 url）。",
     "li-baohong 影子变量三篇": "非同文：Baohong Li 组 2024 年三篇不同论文，同主题词导致标题相似度 0.45–0.58。li2024Learning=影子变量『表示学习』(collider bias)；li2024Generative=『生成式+OOD 视角』(collider bias)；li2024Twostage=『两阶段 IV』且问题设定是 latent confounding 而非 collider bias。三篇各有 59–65 条独立证据，2026-08-25 人工确认。",
-    "covid 跨语言假阳性": "非同文：dayan2021（英文，联邦学习预测 COVID-19 临床结局，Roth/Zhong/Harouni）与 куксенко2024（乌克兰语，天气与社会活动对 COVID-19 传播的影响，有 DOI）。作者/年份/语言/主题全不同，唯一共同点是 COVID-19，属共享高频词噪声（cos=0.4509，卡在报告阈值下沿）。2026-08-25 人工确认。"
+    "covid 跨语言假阳性": "非同文：dayan2021（英文，联邦学习预测 COVID-19 临床结局，Roth/Zhong/Harouni）与 куксенко2024（乌克兰语，天气与社会活动对 COVID-19 传播的影响，有 DOI）。作者/年份/语言/主题全不同，唯一共同点是 COVID-19，属共享高频词噪声（cos=0.4509，卡在报告阈值下沿）。2026-08-25 人工确认。",
+    "xiang dual-masked autoencoding (arXiv 版本形态)": "同一篇：arXiv 2602.15159 的无版本形态与 v1 形态。手动精读路径的 _ARXIV_RE 保留 vN、自动链路剥掉，同一篇经两条路进库拿到两个一级键。现在靠 _entry_keys 的规范标题二级键合并——标题是派生量（库内已有 32 条解析截断的残条），标题一漂合并就静默失效，故写死人工裁决。",
+    "lee unified multi-modal EHR (arXiv DOI vs arxiv 档)": "同一篇：arXiv 2305.02504 的 DataCite DOI 形态（doi: 档）与 arxiv:…v1 形态。键梯 DOI 优先于 arXiv，两条路各停一档。同上，现靠标题二级键合并，写死人工裁决防标题漂移。"
   },
   "distinct": [
     [

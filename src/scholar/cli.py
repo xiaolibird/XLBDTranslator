@@ -73,6 +73,9 @@ def add_digest_arguments(parser):
     parser.add_argument('--zotero', action='store_true', help='digest 后写入 Zotero 并生成 pandoc 札记（需 Zotero 在线）')
     parser.add_argument('--no-zotero', action='store_true', help='禁用 Zotero 联动')
     parser.add_argument('--close-read', action='store_true', help='对高优先级 top-N 做全文精读（句级三色联想）')
+    parser.add_argument('--overwrite-notes', action='store_true',
+                        help='目标月度札记已存在时允许整篇覆盖（默认拒绝，防止 --month 重跑静默抹掉历史札记；'
+                             '覆盖前自动把旧 md/references/sidecar/docx 备份到 .digest_overwrite_backup/）')
 
     # 输出参数
     parser.add_argument('--output-dir', type=str, default=None, help='输出目录路径')
@@ -82,6 +85,27 @@ def add_digest_arguments(parser):
     parser.add_argument('--debug', action='store_true', help='启用调试模式')
     parser.add_argument('--dry-run', action='store_true', help='仅获取和解析邮件')
     return parser
+
+
+def preflight_existing_note(workflow, month_range):
+    """开跑前预检：本次 run 会不会整篇覆盖一份已存在的月度札记？会则返回那份路径，否则 None。
+
+    条件：会写札记（zotero_enabled）∧ 显式 `--month/--since/--until` 区间 ∧ 未加 `--overwrite-notes`
+    ∧ 目标四件套任一已存在。写盘时的护栏（workflow._step_sync_zotero）照样会拒绝，但那时
+    Gmail/PubMed 抓取、LLM 过滤与翻译已经跑完，白烧一轮额度——预检省的是这一轮。
+    只在显式区间时预检：常规 `--days` 跑写的是日期戳文件名，同日重跑到了写盘护栏同样会被拒绝
+    （加 --overwrite-notes 才覆盖），但 digest 主产出（json/md/_stats）那时已完整落盘，
+    不该为此把整个 run 在开跑前中止。
+    """
+    if not (workflow.settings.processing.zotero_enabled and month_range
+            and not workflow.allow_note_overwrite):
+        return None
+    from .notes import note_file_paths
+    from pathlib import Path as _P
+    paths = note_file_paths(_P(workflow.settings.processing.notes_dir), workflow.planned_note_stem())
+    if any(p.exists() for p in paths.values()):
+        return paths["md"]
+    return None
 
 
 def run_digest(args, settings):
@@ -194,6 +218,14 @@ def run_digest(args, settings):
     # 创建并执行工作流
     workflow = ScholarWorkflow(settings)
     workflow.date_range = month_range
+    workflow.allow_note_overwrite = bool(getattr(args, 'overwrite_notes', False))
+    blocked = preflight_existing_note(workflow, month_range)
+    if blocked is not None:
+        logger.error("⛔ 目标月度札记已存在：{}".format(blocked))
+        logger.error("   `digest --month` 会用本次抓到的论文集合**整篇重造**它，原有精读句/人工修订会永久丢失"
+                     "（output/ 不在 git 内）。确要重造请加 --overwrite-notes（覆盖前自动备份旧四件套）；"
+                     "只想补漏抓的论文请改用 scripts/ingest_notes.py。本次未执行任何抓取。")
+        sys.exit(1)
     output = workflow.execute()
 
     # 额外导出 CSV
@@ -336,6 +368,8 @@ def run_zotero_sync(args, settings):
             model=(settings.llm.closeread_model or settings.llm.model),
             deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
             max_chunks=proc.closeread_max_chunks,
+            extra_routes=getattr(proc, "fulltext_extra_routes", False),
+            route_delay=getattr(proc, "fulltext_route_delay", 0.0),
         )
 
     # 聚合札记：一个时间窗一篇，文件名取 digest 输入名
@@ -349,11 +383,16 @@ def run_zotero_sync(args, settings):
     )
 
     saved = sum(1 for r in results.values() if r.saved)
+    unfiled = sum(1 for r in results.values() if r.saved and not r.filed)
     resolved = sum(1 for r in results.values() if r.citekey)
     oa_hit = sum(1 for r in results.values() if r.pdf_url)
     logger.info("=" * 60)
-    logger.info("Zotero 联动完成: 写库 {} 篇 / citekey {} 篇 / OA 命中 {} 篇".format(
-        saved, resolved, oa_hit))
+    # 「写库」按**条目在不在库里**算，归类失败单独说——否则会出现「写库 0 篇 / citekey 1 篇」
+    # 这种自相矛盾的行（citekey 解析得出来恰恰证明条目在库里），而看见「写库 0 篇」的人
+    # 最自然的下一步是重跑，重跑会写出重复条目（2026-09-04 第 5 轮终审 CONFIRMED）。
+    logger.info("Zotero 联动完成: 写库 {} 篇{} / citekey {} 篇 / OA 命中 {} 篇".format(
+        saved, "（其中 {} 篇未归类，需在 Zotero 里手动拖）".format(unfiled) if unfiled else "",
+        resolved, oa_hit))
     logger.info("聚合札记: {}".format(summary.get("note_path")))
     logger.info("references.json: {}".format(summary.get("references_json")))
     logger.info("=" * 60)

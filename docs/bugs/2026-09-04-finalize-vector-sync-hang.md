@@ -1,7 +1,7 @@
 # finalize 收尾在向量库同步处僵死不退出（无报错、0% CPU）
 
 日期：2026-09-04（观测于 2026-08-31 21:53–22:07 的一次手动精读归档）
-状态：**症状已确证，阻塞点未定位**——四条最可能的嫌疑已逐一排除，需下次复现时抓栈。
+状态：**归因已明、已修复（2026-09-04）**——卡的是向量同步**之后**的 topics 子进程（本条「已排除的嫌疑」全在向量同步内部，与结论一致）；修法见 `2026-09-03-finalize-topics-mistaken-for-hang.md` 文末。原状态：症状已确证，阻塞点未定位。
 ⚠️ 2026-09-04 补：[`2026-09-03-finalize-topics-mistaken-for-hang.md`](2026-09-03-finalize-topics-mistaken-for-hang.md)
 提出了一条**候选根因**——卡的不是向量同步本身，而是它之后的 `topics` 子进程
 （`_sync_topics_best_effort`，默认 timeout 2400s）。该线索与本条的全部观测自洽
@@ -82,3 +82,13 @@ sample $PID 5 -f /tmp/finalize_hang.txt   # macOS 自带，无需装包
 - kill 后补跑增量同步：`PYTHONPATH=. python3.12 scripts/notes_embed.py`
 - 用 dense 模式验证新篇可检索（hybrid 会给假阴性）：
   `PYTHONPATH=. python3.12 scripts/notes_search.py "<核心论断>" --mode dense --min-score 0.62 --limit 5`
+
+---
+
+## 修复（2026-09-04 台账批）
+
+本条本身没有独立改动；处置口径更新如下：
+
+- 以后 finalize 若长时间不退，先看日志有没有 `🧵 开始概念页刷新` 那一行：**有**＝归档已完成、在等 topics 子进程（现在 Ctrl+C / kill 父进程会连带终止子进程组，
+  代价只是本轮概念页不刷新，补跑 `build_topics.py --affected-by-note <md>` 即可）；**没有**＝才是真的卡在向量同步，按本条「取证步骤」抓栈再 kill。
+- SKILL.md 的归因（「本机 Ollama 没起来时」）已改写，见 `docs/skills/read-paper/SKILL.md` finalize 节。

@@ -74,8 +74,19 @@ KEEP_MONTHLY_MONTHS = 24
 QUOTA_MIN_BYTES = 5 * 1024**3          # brctl 剩余低于 5G 报警（~100 份的余量）
 CONSISTENCY_RETRIES = 3
 
+# 两个 `.*_backup/` 目录都排除，理由不同、结论相同（2026-09-04 权衡过，别再来回改）：
+#   .backfill_deepread_backup —— 每篇重读前存一份 md+sidecar，实测已 19M（payload 本体才 ~31M
+#     gzip），进快照等于体量翻倍；且它护的是「重读写坏了」，当前态本身在快照里。
+#   .digest_overwrite_backup —— `digest --month … --overwrite-notes` 覆盖前存的四件套。体量很小，
+#     但**它护的主场景已经被上一份周快照覆盖**：要覆盖的通常是历史月札记，那份内容早在之前的
+#     快照里。漏掉的窗口是「本周新建、本周又被覆盖」——`digest --month <当月> --overwrite-notes`
+#     确实走得到这条路（`planned_note_stem` 只看 date_range 给没给，给了 --month 就用月份命名），
+#     那一格只能靠这个目录本身兜。取舍：收进快照的话，8 份周档 + 24 份月档会各带一份
+#     **永不收缩**的历史覆盖备份，成本随时间单调增长；而覆盖是人手动加 --overwrite-notes 才发生的、
+#     且覆盖前刚在本机存过一份。故仍排除，但这个窗口是**已知代价**，不是「不存在」。
 EXCLUDE_PATTERNS = ("embeddings.sqlite3*", "_archive", "_archive/*",
                     ".backfill_deepread_backup", ".backfill_deepread_backup/*",
+                    ".digest_overwrite_backup", ".digest_overwrite_backup/*",
                     ".pytest_cache", ".pytest_cache/*")
 
 

@@ -180,7 +180,7 @@ def test_connector_ping_and_save_and_resolve():
 
     c = _connector_client(handler)
     assert c.ping() is True
-    assert c.save_items([{"itemType": "journalArticle", "title": "t"}]) is True
+    assert c.save_items([{"itemType": "journalArticle", "title": "t"}]) == "ok"
     assert state["saved"]["items"][0]["title"] == "t"
     ck = c.resolve_citekey(doi="10.1/abc", title="A Study of MNAR in EHR", retries=1, delay=0)
     assert ck == "public2025mnar"
@@ -224,21 +224,29 @@ def test_connector_ping_false_when_unreachable():
 # ---------------- 编排：sync_segments_to_zotero（注入 fake client） ----------------
 
 class _FakeClient:
-    def __init__(self, up=True, citekey="public2025mnar", coll_name="兴趣"):
+    def __init__(self, up=True, citekey="public2025mnar", coll_name="兴趣", targets=None):
         self.up = up
         self.citekey = citekey
         self.coll_name = coll_name
         self.saved_items = None
+        self.saved_target = None
+        self.targets = targets
 
     def ping(self):
         return self.up
 
     def get_selected_collection(self):
-        return {"libraryName": "我的文库", "name": self.coll_name}
+        coll = {"libraryName": "我的文库", "name": self.coll_name}
+        if self.targets is not None:
+            coll["targets"] = self.targets
+        return coll
 
-    def save_items(self, items, uri=""):
+    save_outcome = "ok"     # 三态替身：ok / unfiled / failed（2026-09-04 第 5 轮终审）
+
+    def save_items(self, items, uri="", target=""):
         self.saved_items = items
-        return True
+        self.saved_target = target
+        return self.save_outcome
 
     def resolve_citekey(self, doi=None, title=None, retries=6, delay=0.8):
         return self.citekey
@@ -272,6 +280,22 @@ def test_sync_require_collection_match_writes(monkeypatch):
     results = zotero_sync.sync_segments_to_zotero([seg], client=fake, email="x@y.com",
                                                   enrich_crossref=False, require_collection="P4")
     assert fake.saved_items is not None  # 分类匹配 → 写入
+    assert results["pidZ"].saved is True
+
+
+def test_sync_require_collection_resolves_target_without_manual_select(monkeypatch):
+    """指定分类能在 targets 里解析出 id 时，不必手动选中：直接带 target 写入并自动归类。"""
+    seg = PaperSegment(segment_id=1, paper_id="pidZ",
+                       metadata=_meta(doi=None, arxiv_id="2401.99999", source_type="arxiv"),
+                       status=DigestStatus.PENDING)
+    fake = _FakeClient(coll_name="P4",
+                       targets=[{"id": "L1", "name": "我的文库"},
+                                {"id": "C19", "name": "ScholarDigest"}])
+    results = zotero_sync.sync_segments_to_zotero([seg], client=fake, email="x@y.com",
+                                                 enrich_crossref=False,
+                                                 require_collection="ScholarDigest")
+    assert fake.saved_items is not None          # 选中的是 P4 也照写
+    assert fake.saved_target == "C19"            # 但带上 ScholarDigest 的 target
     assert results["pidZ"].saved is True
 
 
@@ -452,3 +476,35 @@ def test_sync_segments_ts_offline_alerts_once_and_falls_back(monkeypatch):
     assert results["pidA"].saved is True and len(fake.saved_items) == 1   # 停机不挡写库
     assert "creators" not in fake.saved_items[0] or fake.saved_items[0]["creators"][0].get("lastName") != "Reddy"
     assert len(sent) == 1 and "不在线" in sent[0]
+
+
+def test_half_success_is_saved_but_unfiled_not_a_write_failure():
+    """第 5 轮终审 R5-3.5：updateSession 挪不动分类时，条目**其实已经写进 Zotero 了**。
+
+    第 4 轮把它从 saved=True 改成 saved=False 是为了不让 require_collection 这道防呆
+    被静默放宽——但矫枉过正：收尾汇总会打出「写库 0 篇 / citekey 1 篇」这种自相矛盾的行
+    （citekey 解析得出来恰恰证明条目在库里），而看见「写库 0 篇」的人最自然的下一步是重跑，
+    重跑会写出重复条目。所以拆成两个字段：saved = 在不在库里，filed = 归没归对类。
+    """
+    def _one(outcome):
+        seg = PaperSegment(
+            segment_id=1, paper_id="pidZ",
+            metadata=_meta(doi=None, arxiv_id="2401.99999", journal="arXiv",
+                           source_type="arxiv"),
+            original_abstract="abs", status=DigestStatus.PENDING,
+        )
+        fake = _FakeClient(up=True, citekey="abc2024Foo", coll_name="ScholarDigest")
+        fake.save_outcome = outcome
+        return zotero_sync.sync_segments_to_zotero(
+            [seg], client=fake, email="x@y.com", enrich_crossref=False,
+            require_collection="ScholarDigest")["pidZ"]
+
+    r = _one("unfiled")
+    assert r.saved is True, "条目已在库里，不能报成没写——否则人会重跑并写出重复条目"
+    assert r.filed is False, "但必须让人看见它没归进目标分类"
+
+    r2 = _one("failed")
+    assert r2.saved is False and r2.filed is False, "真失败两个都是假"
+
+    r3 = _one("ok")
+    assert r3.saved is True and r3.filed is True

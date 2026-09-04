@@ -304,7 +304,7 @@ def test_force_excludes_own_month_citekeys_from_existing_ckeys(tmp_path, monkeyp
 
     captured = {}
 
-    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args, existing_owners=None):
         captured["existing_ckeys"] = set(existing_ckeys)
         return {"month": "{:04d}-{:02d}".format(y, m), "status": "ok"}
 
@@ -346,7 +346,7 @@ def test_no_force_keeps_own_month_citekeys_in_existing_ckeys(tmp_path, monkeypat
 
     captured = {}
 
-    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args, existing_owners=None):
         captured["existing_ckeys"] = set(existing_ckeys)
         return {"month": "{:04d}-{:02d}".format(y, m), "status": "ok"}
 
@@ -392,7 +392,7 @@ def test_sidecar_citekeys_merged_into_existing_ckeys_across_months(tmp_path, mon
 
     captured = []
 
-    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args, existing_owners=None):
         label = "{:04d}-{:02d}".format(y, m)
         captured.append((label, set(existing_ckeys)))
         if label == "2026-06":
@@ -430,7 +430,7 @@ def test_refresh_topics_called_once_with_merged_citekeys_across_months(tmp_path,
     md_june = notes_dir / "科研札记_2026-06_全文精读.md"
     md_july = notes_dir / "科研札记_2026-07_全文精读.md"
 
-    def fake_run_month(y, m, settings, seen, existing_ckeys, args):
+    def fake_run_month(y, m, settings, seen, existing_ckeys, args, existing_owners=None):
         label = "{:04d}-{:02d}".format(y, m)
         md = {"2026-06": md_june, "2026-07": md_july}[label]
         return {"month": label, "status": "ok", "md": str(md)}
@@ -703,3 +703,61 @@ def test_lint_trigger_refuses_to_touch_a_non_production_notes_dir(tmp_path, monk
     monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: runs.append(cmd))
     assert bn._run_knowledge_lint(tmp_path / "notes") is True
     assert runs == []
+
+
+def test_run_month_report_carries_sidecar_ok(tmp_path, monkeypatch):
+    """变异 R31b：run_month 回执不透传 `sidecar_ok` → main() 里那条 error+notify 永远不触发，
+    sidecar 写失败（阅读深度量尺永久丢失）在过夜回填里重新变回静默。"""
+    import argparse
+    import scripts.backfill_notes as bn
+    from src.scholar.schema import DigestOutput, PaperSegment, PaperMetadata, FilterDecision
+    from src.scholar.settings import ScholarSettings
+    settings = ScholarSettings.from_env_file(_env_file(tmp_path))
+    settings.processing.notes_dir = tmp_path / "notes"
+    settings.processing.output_dir = tmp_path / "out"
+
+    def _paper(sid, title):
+        return PaperSegment(
+            segment_id=sid, paper_id="paper_{}".format(sid), priority_score=0.9,
+            filter_decision=FilterDecision(paper_id="paper_{}".format(sid), title=title,
+                                           verdict="included", decision="INCLUDE",
+                                           stage="llm_judge", reason="r", confidence=0.9),
+            metadata=PaperMetadata(paper_id="paper_{}".format(sid), title=title))
+
+    digest = DigestOutput(digest_id="d", segments=[_paper(1, "EHR missingness study")],
+                          undecided_segments=[])
+
+    class FakeWF:
+        def __init__(self, s):
+            self.date_range = None
+
+        def execute(self):
+            return digest
+
+    monkeypatch.setattr(bn, "ScholarWorkflow", FakeWF)
+    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(bn, "resolve_citekeys", lambda segs, base: {s.paper_id: None for s in segs})
+    import src.scholar.closereading as closereading
+    monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: 1)
+    import src.scholar.llm_client as llm_client
+    monkeypatch.setattr(llm_client, "LLMClient",
+                        lambda cfg: type('M', (), {'close': lambda self: None,
+                                                   'call': lambda self, *a, **k: ''})())
+    import src.scholar.notes as notes
+    args = argparse.Namespace(force=False, no_close_read=False, top_n=1, summary=False, batch_size=15)
+
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n.md"), "docx_path": None, "sidecar_ok": False,
+        "sidecar_error": "ValueError: boom"})
+    r = bn.run_month(2026, 6, settings, set(), set(), args)
+    assert r["status"] == "ok" and r["sidecar_ok"] is False
+
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n2.md"), "docx_path": None, "sidecar_ok": True,
+        "index_sidecar": str(tmp_path / "n2.index.json")})
+    r = bn.run_month(2026, 7, settings, set(), set(), args)
+    assert r["sidecar_ok"] is True
+    # 老形态回执（无该键）默认视为成功，不误报
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n3.md"), "docx_path": None})
+    assert bn.run_month(2026, 8, settings, set(), set(), args)["sidecar_ok"] is True

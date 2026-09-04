@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.settings import load_scholar_settings   # noqa: E402
 from src.scholar.embed_store import INDEX_NAME           # noqa: E402
-from src.scholar.notes_index import _SECTION_RE          # noqa: E402
+from src.scholar.notes_index import _SECTION_RE, keepers_by_citekey   # noqa: E402
 from scripts.backfill_deepread import BACKUP_DIR, LEDGER_NAME, TARGET_DEPTH  # noqa: E402
 
 
@@ -55,8 +55,9 @@ def main() -> int:
     # 只认 keeper：同一篇跨月重复时索引里有多条，duplicate 那条的 highlights 是另一份
     # 札记的旧内容。不排除的话字典会被后出现的 duplicate 覆盖，把「已改厚的 keeper」
     # 误报成变薄（bauer2025Sepsis 实测 29 条被读成 6 条）。
-    by_ck = {e["citekey"]: e for e in idx["papers"]
-             if e.get("citekey") and not e.get("duplicate_of")}
+    # 走公共 helper 而不是自己写过滤——本脚本是验收入口，台账那条定的规则就是
+    # 「写统计/验收代码一律经 keepers_by_citekey」；自持一份还会漏掉 MISSING-KEY 占位键。
+    by_ck = keepers_by_citekey(idx)
     problems = []
 
     # 前置闸：索引比最后一次写盘还旧时，第 3、4 项读到的全是改动前的旧值，会把

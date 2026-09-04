@@ -43,8 +43,10 @@ def test_read_plan_unknown_pages_says_so_loudly():
 # ---------------- 末尾汇总块 ----------------
 
 def _row(**kw):
+    # 形状对齐 ingest_pdf 的真实回执：权威源（crossref-*）必带 DOI；draft_status 默认 ok
     base = {"title": "Some Paper Title", "duplicate": None, "meta_source": "crossref-doi",
-            "authors_n": 3, "skipped": None}
+            "authors_n": 3, "skipped": None, "doi": "10.1000/x", "arxiv_id": None,
+            "meta_degraded": [], "draft_status": "ok", "draft_note": ""}
     base.update(kw)
     return base
 
@@ -68,14 +70,104 @@ def test_attention_block_flags_thin_metadata():
 
 
 @pytest.mark.parametrize("row,expect", [
-    (_row(meta_source="pdf-only", authors_n=0), True),
-    (_row(meta_source="pdf-llm", authors_n=0), True),      # 有来源但没作者，一样是 anon*
+    (_row(meta_source="pdf-only", authors_n=0, doi=None), True),
+    (_row(meta_source="pdf-llm", authors_n=0, doi=None), True),      # 有来源但没作者，一样是 anon*
     (_row(meta_source="crossref-doi", authors_n=5), False),
-    (_row(meta_source="pdf-only", authors_n=0, skipped="final"), False),  # 跳过的不重复提醒
+    (_row(meta_source="pdf-only", authors_n=0, doi=None, skipped="final"), False),  # 跳过的不重复提醒
+    # 2026-09-03 漏报的那一类：LLM 把四位作者全抽对了，但 DOI/卷期页全空——书目照样是残的
+    (_row(meta_source="pdf-llm", authors_n=4, doi=None, arxiv_id="2102.09204v2"), True),
+    # 权威源没 DOI 但有 arXiv id（arxiv 直查命中）：身份键不退化，不报
+    (_row(meta_source="arxiv", authors_n=4, doi=None, arxiv_id="2102.09204v2"), False),
+    (_row(meta_source="crossref-title", authors_n=2), False),
+    # 来源看着权威却两个标识都空（不该发生，防御性）：身份键会退化，报
+    (_row(meta_source="crossref-title", authors_n=2, doi=None, arxiv_id=None), True),
 ])
 def test_thin_metadata_predicate(row, expect, capsys):
     M._print_attention([row], [])
     assert ("元数据不全" in capsys.readouterr().out) is expect
+
+
+def test_thin_metadata_prints_degradation_reason_and_identifiers(capsys):
+    """回执要能区分「查询失败导致的空」与「本来就没有」：有原因行的是前者。
+    2026-09-03 那篇 arXiv 精确查遇 SSL 中断退化成 pdf-llm，原因只在日志中段，末尾回执全绿。"""
+    row = _row(title="Towards a Mathematical Theory of Trajectory Inference",
+               meta_source="pdf-llm", authors_n=4, doi=None, arxiv_id="2102.09204v2",
+               meta_degraded=["arXiv 精确查失败（2102.09204v2）: [SSL: UNEXPECTED_EOF_WHILE_READING]"])
+    M._print_attention([row], [])
+    out = capsys.readouterr().out
+    assert "元数据不全" in out and "pdf-llm" in out
+    assert "DOI 无" in out and "arXiv 2102.09204v2" in out
+    assert "原因：arXiv 精确查失败" in out and "UNEXPECTED_EOF" in out
+    assert "网络恢复后" in out
+
+
+def test_attention_block_reports_non_ok_draft_status(capsys):
+    """draft_status≠ok 必须进末尾块：Hoogland 那次 27/27 块成功却无草稿，只在中间打了一行
+    `draft_status=degraded`，agent 差点当成「草稿只是没写好」（实为根本没生成）。"""
+    rows = [_row(title="Fine Paper"),
+            _row(title="Synth Broke", draft_status="synth_failed",
+                 draft_note="块通读 27/27 成功，但汇总步失败、无脚本草稿：汇总返回不可解析为分节精读（响应 12 字符…）"),
+            _row(title="Partial", draft_status="degraded",
+                 draft_note="2/11 块通读失败（块 3, 7），草稿只基于其余块"),
+            _row(title="Skipped Final", skipped="final", draft_status="synth_failed")]
+    M._print_attention(rows, [])
+    out = capsys.readouterr().out
+    assert "需要注意（3 项）" in out          # 2 条草稿状态 + 1 条已 final 跳过
+    assert "脚本草稿 synth_failed：Synth Broke" in out and "汇总返回不可解析" in out
+    assert "脚本草稿 degraded：Partial" in out and "块 3, 7" in out
+    assert "走回退协议" in out
+    assert "Fine Paper" not in out
+
+
+@pytest.mark.parametrize("base,ctx,expect", [
+    ("EHR 缺失机制", "", "EHR 缺失机制"),
+    ("EHR 缺失机制", "   ", "EHR 缺失机制"),
+    ("EHR 缺失机制", "景观-流形-缺失：本批为 A 层地基文献",
+     "EHR 缺失机制\n\n【本批阅读目的】景观-流形-缺失：本批为 A 层地基文献"),
+    ("", "本批目的", "\n\n【本批阅读目的】本批目的"),
+])
+def test_research_interests_with_context(base, ctx, expect):
+    assert M._research_interests_with_context(base, ctx) == expect
+
+
+def test_cmd_ingest_prints_fallback_protocol_when_synth_failed(tmp_path, monkeypatch, capsys):
+    """无草稿的三态（api_error / synth_failed / empty）都要打回退协议，不只 api_error。"""
+    from types import SimpleNamespace
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+        zotero_email = ""
+        external_email = ""
+        research_interests = "画像"
+    class _S:
+        processing = _Proc()
+        class llm:
+            closeread_model = "m"
+            model = "m"
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _S())
+    monkeypatch.setattr(M, "LLMClient", lambda cfg: None)
+    import src.scholar.pdf_ingest as pi
+    seen = {}
+
+    def _fake_ingest(pdf_path, notes_dir, month, llm, **kw):
+        seen["ri"] = kw.get("research_interests")
+        return {"title": "T", "bundle": "b", "pdf_path": "p", "meta_source": "crossref-doi",
+                "doi": "10.1/x", "arxiv_id": None, "meta_degraded": [], "n_pages": 17,
+                "chunk_ok": 27, "chunks": 27, "has_close_reading": False,
+                "draft_status": "synth_failed",
+                "draft_note": "块通读 27/27 成功，但汇总步失败、无脚本草稿：汇总 LLM 调用失败：TimeoutError: x",
+                "authors_n": 3, "duplicate": None, "skipped": None}
+    monkeypatch.setattr(pi, "ingest_pdf", _fake_ingest)
+    (tmp_path / "a.pdf").write_bytes(b"%PDF")
+    args = SimpleNamespace(config="u", month="2026-09", pdf=[str(tmp_path / "a.pdf")],
+                           recursive=False, title=None, force=False,
+                           context="插补扭曲第二批：方法学地基")
+    assert M.cmd_ingest(args) == 0
+    out = capsys.readouterr().out
+    assert "脚本草稿这一轨缺失（synth_failed）" in out and "TimeoutError" in out
+    assert "回退协议" in out and "两个 subagent 对抗生成" in out
+    assert "脚本草稿 synth_failed" in out          # 末尾「需要注意」块也要有
+    assert seen["ri"].endswith("【本批阅读目的】插补扭曲第二批：方法学地基")
+    assert seen["ri"].startswith("画像")
 
 
 def test_attention_block_silent_when_nothing_to_report(capsys):
@@ -1638,3 +1730,8 @@ def test_receipt_truncates_huge_broken_list(tmp_path, capsys):
     out = capsys.readouterr().out
     assert max(len(ln) for ln in out.splitlines()) < 500, "回执单行不得爆炸"
     assert "等共 1000 份" in out
+
+
+# ---------------- 台账批（2026-09-04）：元数据退化回执 / 草稿五态 ----------------
+# 上面 test_thin_metadata_predicate 等已覆盖 _print_attention；本节补 ingest_pdf 侧的状态判定，
+# 放在本文件是因为 _stub_ingest_env 在 test_pdf_ingest 里，这里用独立的最小打桩。

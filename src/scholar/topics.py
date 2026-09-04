@@ -1405,6 +1405,302 @@ def summarize_build_topics_run(stdout: str, stderr: str, returncode: int
     return SubprocessRefreshOutcome(ok=False, detail=detail)
 
 
+# ---------------------------------------------------------------------------
+# 概念页子进程：可观测 + 随父进程死（见 docs/bugs/2026-09-04-topics-subprocess-orphaned-on-parent-kill.md
+# 与 2026-09-03-finalize-topics-mistaken-for-hang.md）
+# ---------------------------------------------------------------------------
+#
+# 此前是一句 `subprocess.run(cmd, capture_output=True, timeout=2400)`，两个性质叠加出了
+# 「finalize 僵死」的误诊：
+#   1. 父进程打印「向量库已同步」之后静默、0% CPU、S 态——其实是在等这个子进程（最长 40 分钟，
+#      实测跑过 2 小时 18 分），日志上与真卡死**完全同形**，人于是 kill 了它；
+#   2. kill 掉父进程，子进程**不会死**（没建进程组、没装信号转发，被 init 收养继续写
+#      topics/*.md 近两小时），而 capture_output 让它的 stdout 积在管道里随父进程一起蒸发——
+#      哪几页重建了、哪几页失败，事后零痕迹；人按「回执没出来 = 失败」重跑 finalize，
+#      新的 build_topics 与孤儿**并发写同一批概念页**，双份烧订阅额度。
+# 现在：
+#   - 发起前后各打一行（pid / 上限 / 日志路径 / 耗时 / 退出码），「还在跑」与「真卡死」在日志上可分；
+#   - 子进程放进自己的会话（进程组 = 子 pid），父进程收到 SIGTERM/SIGINT/SIGHUP 时先 killpg 再
+#     按原语义退出；超时同样 killpg（此前 TimeoutExpired 后 run() 只 kill 直接子进程，
+#     build_topics 再往下派生的 LLM CLI 会漏掉）；
+#   - **父被 SIGKILL 时信号转发拦不住**，且自成会话还有一个代价：在 launchd 下，子进程原本与
+#     job 同进程组，job 死后由 launchd 按进程组一并清扫；自成会话之后 launchd 不再认它
+#     （2026-09-04 第 5 轮终审用真 launchd job 实测：同组子进程被收尸，新会话子进程存活且
+#     bootout 后仍在）。所以另装一条**不依赖信号**的父死联动：父进程把自己的 pid 经
+#     `TOPICS_PARENT_PID_ENV` 传给子进程，`build_topics.py` 起一个守护线程轮询，父进程一没
+#     就自杀（见 `install_parent_death_watchdog`）。两条路合起来覆盖 TERM 与 KILL；
+#   - stdout 直接落文件（不是管道），父进程先死也留痕；正常结束后再整份回灌 logger
+#     （W3 契约：全量入日志不截尾）。
+# best-effort 语义不变：子进程失败不影响调用方退出码，只 notify。
+TOPICS_REFRESH_LOG_DIR = "logs/topics_refresh"
+TOPICS_PARENT_PID_ENV = "XLBD_TOPICS_PARENT_PID"   # 父进程 pid，供子进程做父死联动
+_PARENT_WATCH_POLL_SEC = 5.0
+_TOPICS_LOG_KEEP_DAYS = 14
+_CHILD_TERM_GRACE_SEC = 5.0          # killpg SIGTERM 后等这么久再 SIGKILL
+_FORWARDED_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+
+
+@dataclass
+class ChildRun:
+    """_run_refresh_child 的结果：与 subprocess.CompletedProcess 同形，多 timed_out/pid/elapsed。"""
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    pid: Optional[int] = None
+    elapsed: float = 0.0
+    log_path: Optional[Path] = None
+
+
+def topics_refresh_log_path(now: Optional[datetime] = None) -> Path:
+    """本次子进程 stdout 落盘位置：logs/topics_refresh/build_topics_<时间戳>_<父pid>.log。
+
+    放 logs/（gitignore）而不是 notes_dir/topics/：后者被 vault 的 WatchPaths 盯着，
+    往里新建文件会触发一次 vault 重建。
+    """
+    import os
+    from .paths import repo_path
+    # 微秒精度：同一进程 1 秒内两次触发（W7 并集调用之外的边角）不会用 "w" 覆盖前一份
+    stamp = (now or datetime.now()).strftime("%Y%m%dT%H%M%S%f")
+    return repo_path(TOPICS_REFRESH_LOG_DIR) / "build_topics_{}_{}.log".format(stamp, os.getpid())
+
+
+def prune_topics_refresh_logs(log_dir: Path, keep_days: int = _TOPICS_LOG_KEEP_DAYS,
+                              now: Optional[float] = None) -> int:
+    """删掉 keep_days 之前的 build_topics_*.log（按 mtime）。best-effort，返回删除数。"""
+    import os
+    import time as _time
+    cutoff = (now if now is not None else _time.time()) - keep_days * 86400
+    n = 0
+    try:
+        for p in Path(log_dir).glob("build_topics_*.log"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    n += 1
+            except OSError:
+                continue
+    except OSError:
+        return n
+    return n
+
+
+def _pgroup_alive(pgid: int) -> bool:
+    """进程组里还有没有任何成员（含孙进程）。killpg(…, 0) 只探测不发信号。"""
+    import os
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _killpg_then_kill(pgid: int, grace: float = _CHILD_TERM_GRACE_SEC, proc=None) -> None:
+    """对整个进程组先 SIGTERM，等 grace 秒**整组**还没空就 SIGKILL。进程组已不存在则静默。
+
+    终止判据是「进程组为空」，不是「直接子进程退出」：build_topics 自己对 SIGTERM 默认退出，
+    但它派生的 LLM CLI 若装了优雅退出 handler 或正卡在网络请求上，会在组长死后继续活——
+    只盯 `proc.poll()` 会在这里提前 return、跳过 SIGKILL，孤儿照旧（第 1 轮审计/压测三条路径复现）。
+    `proc` 参数保留只为顺手 reap 组长（避免僵尸让 pgid 看似还在）。
+    """
+    import os
+    import signal
+    import time as _time
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        pass
+    deadline = _time.monotonic() + grace
+    while _time.monotonic() < deadline:
+        if proc is not None:
+            proc.poll()                      # reap 组长：僵尸也算组成员，不 reap 探测永远为真
+        if not _pgroup_alive(pgid):
+            return
+        _time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    # SIGKILL 后再给一点时间让内核收尸，避免调用方紧接着的 killpg(…,0) 仍看到僵尸组
+    deadline = _time.monotonic() + 1.0
+    while _time.monotonic() < deadline:
+        if proc is not None:
+            proc.poll()
+        if not _pgroup_alive(pgid):
+            return
+        _time.sleep(0.02)
+
+
+def parent_is_gone(parent_pid: int) -> bool:
+    """父进程是否已经不在了（纯判据，好测；不区分「退出」与「被 -9」——对我们后果相同）。"""
+    import os
+    if parent_pid <= 1:
+        return True
+    if os.getppid() == 1:                    # 已被 init/launchd 收养 = 原父必已死
+        return True
+    try:
+        os.kill(parent_pid, 0)               # 只探活，不发信号
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False                         # 进程在、只是不属于我们
+    return False
+
+
+def install_parent_death_watchdog(poll_sec: float = _PARENT_WATCH_POLL_SEC,
+                                  _on_death=None) -> bool:
+    """子进程侧：父进程一没就自杀。返回是否真的装上了。
+
+    为什么需要它：`_run_refresh_child` 用 `start_new_session=True` 把子进程放进自己的会话，
+    这样才能整组终止（超时 / 转发信号时连 build_topics 派生的 LLM CLI 一起收），但代价是
+    **它同时逃出了 launchd 的进程组清扫网**——launchd 下 job 被 SIGKILL 时，原本同进程组的
+    子进程会被 launchd 一并收尸，自成会话之后不会（2026-09-04 第 5 轮终审用真 launchd job 实测）。
+    信号转发只能覆盖 TERM/INT/HUP，覆盖不了 -9，这条轮询补上那一格。
+
+    只在父进程显式传了 `TOPICS_PARENT_PID_ENV` 时启用——手动直接跑 `build_topics.py`
+    不该被它影响（例如 nohup 后关掉终端，getppid 变 1 是正常的）。
+    """
+    import os
+    import threading
+    import time as _time
+
+    raw = os.environ.get(TOPICS_PARENT_PID_ENV) or ""
+    if not raw.strip().isdigit():
+        return False
+    ppid = int(raw.strip())
+    die = _on_death or (lambda: os._exit(143))       # 143 = 128 + SIGTERM，与被转发终止同码
+
+    def _watch():
+        while True:
+            _time.sleep(poll_sec)
+            if parent_is_gone(ppid):
+                try:
+                    logger.warning("⚠️ 父进程 {} 已消失，概念页子进程自行退出（避免成为孤儿"
+                                   "继续写 topics/*.md 并烧订阅额度）".format(ppid))
+                except Exception:
+                    pass
+                die()
+                return
+
+    threading.Thread(target=_watch, name="parent-death-watchdog", daemon=True).start()
+    return True
+
+
+def _run_refresh_child(cmd: Sequence[str], *, timeout: float, cwd: str,
+                       log_path: Path) -> ChildRun:
+    """发起 build_topics 子进程并等它结束。**这是 trigger_topic_refresh 唯一的进程接缝**，
+    测试请 monkeypatch 本函数（别再 patch subprocess.run——已经不走它了）。
+
+    - 子进程 `start_new_session=True`：自成进程组，pgid == pid，便于整组终止。代价是它同时
+      逃出了 launchd 的进程组清扫网，故另经 `TOPICS_PARENT_PID_ENV` 装一条父死联动（见模块头注释）；
+    - stdout 落 log_path（父进程先死也留痕），stderr 走管道（体量小、只用于诊断摘要）；
+    - 父进程在等待期间装 SIGTERM/SIGINT/SIGHUP 转发：先 killpg 子进程组，再恢复原 handler
+      并按原语义处理该信号（SIG_DFL → 对自己重发，进程照旧退出；可调用 handler → 直接调，
+      如 SIGINT 默认抛 KeyboardInterrupt）。只有主线程能装信号 handler，非主线程调用时
+      降级为不转发、打一行 debug；
+    - 超时：killpg（不是 run() 那样只 kill 直接子进程），返回 timed_out=True；
+    - 任何异常向外传播前，finally 保证子进程组已被终止（不留孤儿）。
+    """
+    import os
+    import signal
+    import subprocess
+    import threading
+    import time as _time
+
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    prune_topics_refresh_logs(log_path.parent)
+    t0 = _time.monotonic()
+    installed: Dict[int, Any] = {}
+    proc = None
+
+    def _forward(signum, frame):
+        # 先杀子进程组，再把信号按原语义交还——本 handler 只是「顺路带走孩子」，不改变父进程命运
+        if proc is not None and _pgroup_alive(proc.pid):
+            logger.warning("父进程收到信号 {}，终止概念页子进程组 pgid={}".format(signum, proc.pid))
+            _killpg_then_kill(proc.pid, proc=proc)
+        # signal.signal() 对 C 层安装的 handler 返回 None——None 不能再装回去（TypeError），按 SIG_DFL 处理
+        prev = installed.get(signum)
+        if prev is None:
+            prev = signal.SIG_DFL
+        try:
+            signal.signal(signum, prev)
+        except (ValueError, OSError, TypeError):
+            prev = signal.SIG_DFL
+        if callable(prev):
+            prev(signum, frame)
+        elif prev == signal.SIG_DFL:
+            os.kill(os.getpid(), signum)
+
+    forwarding = threading.current_thread() is threading.main_thread()
+    if forwarding:
+        for name in _FORWARDED_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                # 父进程原本**忽略**该信号（典型：`nohup … finalize &` 下 SIGHUP=SIG_IGN）就不装转发——
+                # 装了会在终端挂断时先把子进程组杀掉、再「什么都不做」：父进程活着、孩子无辜死了。
+                if signal.getsignal(signum) is signal.SIG_IGN:
+                    continue
+                installed[int(signum)] = signal.signal(signum, _forward)
+            except (ValueError, OSError, TypeError):
+                # 极少数环境（嵌入式解释器/非主线程假阳性）装不上：降级为不转发
+                installed.pop(int(signum), None)
+    else:
+        logger.debug("概念页子进程在非主线程发起，不装信号转发（父进程被杀时子进程可能成孤儿）")
+
+    timed_out = False
+    stderr_txt = ""
+    try:
+        with open(log_path, "w", encoding="utf-8") as fh:
+            child_env = dict(os.environ)
+            child_env[TOPICS_PARENT_PID_ENV] = str(os.getpid())
+            proc = subprocess.Popen(list(cmd), stdout=fh, stderr=subprocess.PIPE, text=True,
+                                    cwd=cwd, start_new_session=True, env=child_env)
+            logger.info("🧵 已发起概念页子进程 pid={}（进程组 {}，最长 {:.0f}s，stdout 实时落 {}）"
+                        .format(proc.pid, proc.pid, timeout, log_path))
+            try:
+                _, stderr_txt = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if proc.poll() is not None:
+                    # 组长早已退出，是它派生的孙进程还占着 stderr 管道让 communicate 等到超时——
+                    # 这不是概念页刷新超时（退出码已经有了），别报「超时」假失败；清掉残留即可。
+                    logger.warning("概念页子进程 pid={} 已退出（退出码 {}），但进程组里仍有成员占着管道，"
+                                   "清理残留进程组".format(proc.pid, proc.returncode))
+                else:
+                    timed_out = True
+                    logger.warning("概念页子进程 pid={} 超时（{:.0f}s），终止整个进程组".format(proc.pid, timeout))
+                _killpg_then_kill(proc.pid, proc=proc)
+                try:
+                    _, stderr_txt = proc.communicate(timeout=_CHILD_TERM_GRACE_SEC)
+                except Exception:
+                    stderr_txt = stderr_txt or ""
+    finally:
+        # 异常（含 KeyboardInterrupt）向外传播前不留孤儿——看**整组**而不是组长
+        if proc is not None and _pgroup_alive(proc.pid):
+            _killpg_then_kill(proc.pid, proc=proc)
+        if forwarding:
+            for signum, prev in installed.items():
+                try:
+                    signal.signal(signum, signal.SIG_DFL if prev is None else prev)
+                except (ValueError, OSError, TypeError):
+                    pass
+    try:
+        stdout_txt = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        stdout_txt = ""
+    elapsed = _time.monotonic() - t0
+    return ChildRun(returncode=proc.returncode if proc is not None else None,
+                    stdout=stdout_txt, stderr=stderr_txt or "", timed_out=timed_out,
+                    pid=proc.pid if proc is not None else None, elapsed=elapsed,
+                    log_path=log_path)
+
+
 def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
                           timeout: int = 2400, notify_title: str, subject: str
                           ) -> SubprocessRefreshOutcome:
@@ -1432,8 +1728,11 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
 
     note_md（--affected-by-note，单份札记路由）与 citekeys（--affected-by 并集路由）
     二选一，都给或都不给直接 ValueError（编程错误，不走 best-effort）。
+
+    **可观测性与孤儿**（2026-09-04，见 _run_refresh_child 上方的说明）：发起前打一行
+    「即将发起 / 最长 N 秒 / 日志路径」，结束打一行「pid / 退出码 / 耗时」；子进程随父进程
+    的 SIGTERM/SIGINT/SIGHUP 一起终止、超时整组终止；stdout 落 logs/topics_refresh/。
     """
-    import subprocess
     import sys
     from .paths import repo_path
     from ..utils.notify import notify
@@ -1452,22 +1751,30 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
     else:
         for k in citekeys:
             cmd += ["--affected-by", k]
+    log_path = topics_refresh_log_path()
+    # 这一行是「还在跑」与「真卡死」在日志上的分界：此前打印完向量同步就再无输出，
+    # 父进程 0% CPU 干等子进程被当成僵死 kill 掉（两次现场，一次 28 分钟）。
+    logger.info("🧵 开始概念页刷新（{}）：子进程最长 {}s（约 {:.0f} 分钟），期间本进程 0% CPU 是在等它，"
+                "不是卡死；子进程 stdout 实时落 {}。中断本进程会连带终止子进程。"
+                .format(subject, timeout, timeout / 60.0, log_path))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              cwd=str(repo_path(".")))
-    except subprocess.TimeoutExpired:
-        logger.warning("概念页更新超时（{}s），本轮跳过（{}）".format(timeout, subject))
-        notify(notify_title, "概念页更新超时，{}".format(subject))
-        return SubprocessRefreshOutcome(ok=False, detail="超时（{}s）".format(timeout))
+        run = _run_refresh_child(cmd, timeout=timeout, cwd=str(repo_path(".")), log_path=log_path)
     except Exception as e:
         logger.warning("概念页更新跳过（{}）：{}".format(subject, e))
         notify(notify_title, "概念页更新异常（{}）：{}".format(subject, str(e)[:120]))
         return SubprocessRefreshOutcome(ok=False, detail=str(e)[:300])
+    if run.timed_out:
+        logger.warning("概念页更新超时（{}s），子进程组已终止，本轮跳过（{}）；已完成部分见 {}"
+                       .format(timeout, subject, run.log_path))
+        notify(notify_title, "概念页更新超时，{}".format(subject))
+        return SubprocessRefreshOutcome(ok=False, detail="超时（{}s）".format(timeout))
+    logger.info("🧵 概念页子进程 pid={} 结束：退出码 {}，耗时 {:.0f}s（{}）"
+                .format(run.pid, run.returncode, run.elapsed, subject))
 
     # 全量入日志，不截尾（W3：失败页身份曾恰好落在被截掉的窗口外）
-    for line in (proc.stdout or "").strip().splitlines():
+    for line in (run.stdout or "").strip().splitlines():
         logger.info("  {}".format(line))
-    outcome = summarize_build_topics_run(proc.stdout, proc.stderr, proc.returncode)
+    outcome = summarize_build_topics_run(run.stdout, run.stderr, run.returncode)
     if not outcome.ok:
         logger.warning("概念页更新未全部成功（{}）：{}".format(subject, outcome.detail))
         notify(notify_title, "概念页有页面未更新成功（{}）：{}".format(subject, outcome.detail[:300]))

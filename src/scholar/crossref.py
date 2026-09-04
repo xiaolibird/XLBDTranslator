@@ -86,7 +86,13 @@ def parse_crossref_work(item: Dict[str, Any]) -> Dict[str, Any]:
         "doi": doi,
         "volume": (item.get("volume") or "").strip() or None,
         "issue": (item.get("issue") or "").strip() or None,
-        "pages": (item.get("page") or "").strip() or None,
+        # e-locator 期刊（Sci Rep / Nat Commun / npj / BMC / Frontiers / Wiley 的 eNNNNN…）
+        # 不发页码，只给 article-number；只读 page 会让书目条目没有任何定位号
+        # （全库实测 36 条被丢，见 docs/bugs/2026-09-04-crossref-article-number-lost.md）。
+        # 塞进 pages/CSL page 是 CSL 1.0.2 的常见做法，多数样式直接输出。值不一定是
+        # 纯数字（gkag386 / e10308），别做 int 校验。
+        "pages": (str(item.get("page") or "").strip()
+                  or str(item.get("article-number") or "").strip() or None),
         "publication_date": pub_date,
         "date_precision": date_precision,
         "url": item.get("URL") or (f"https://doi.org/{doi}" if doi else None),

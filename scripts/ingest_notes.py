@@ -105,6 +105,33 @@ def parse_pick(spec: str, n: int) -> list:
     return uniq
 
 
+def finish_report(rep: dict, topics_ok: bool) -> int:
+    """打印收尾回执并给出退出码。抽成函数是为了能被测试盯住——这里是**唯一全自动写库**的
+    launchd job（周一 09:30 com.xlbd.scholar-weekly-ingest），没有人看终端，接线断掉时
+    没有别的信号会响（2026-09-04 第 3 轮审计 CONFIRMED：sidecar 写失败此前既不 notify
+    也不改退出码，而量尺永久不可恢复——md 不存那三个字段）。
+
+    退出码语义：
+      1 = 本次入库本身出了问题（sidecar 写失败、量尺永久丢失属此类）；
+      3 = 入库成功但**派生产物**没跟上（概念页未全部更新），与 backfill_notes 同义；
+      0 = 都好。两者并存时报更严重的那个。
+    """
+    print("\n{}".format("=" * 66))
+    print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))
+    print("   全文精读 {} 篇 · citekey 命中 {}/{}".format(
+        rep["full_text"], rep["citekey"], rep["count"]))
+    sidecar_lost = rep.get("sidecar_ok") is False
+    if sidecar_lost:
+        print("   ⛔ 本周札记的索引 sidecar 写失败：阅读深度量尺无法从 md 回读、**永久丢失**（见上方错误）")
+        notify("Scholar 周入库", "本周札记 sidecar 写失败，阅读深度量尺永久丢失，请查日志并重跑")
+    if not topics_ok:
+        print("   ⚠️ 概念页未全部更新成功，详见上方日志（不影响本次入库结果）")
+    print("=" * 66)
+    if sidecar_lost:
+        return 1
+    return 0 if topics_ok else 3
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="把 digest 判过的论文入库成周札记")
     src = ap.add_argument_group("来源（三选一，默认读本周 digest）")
@@ -259,14 +286,7 @@ def main() -> int:
                 settings.processing.notes_dir, note_md=rep["md"],
                 notify_title="Scholar 周入库", subject="札记已正常入库").ok
 
-    print("\n{}".format("=" * 66))
-    print("✅ {} 篇 → {}".format(rep["count"], rep["md"]))
-    print("   全文精读 {} 篇 · citekey 命中 {}/{}".format(
-        rep["full_text"], rep["citekey"], rep["count"]))
-    if not topics_ok:
-        print("   ⚠️ 概念页未全部更新成功，详见上方日志（不影响本次入库结果）")
-    print("=" * 66)
-    return 0 if topics_ok else 3
+    return finish_report(rep, topics_ok)
 
 
 if __name__ == "__main__":

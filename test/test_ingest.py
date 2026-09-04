@@ -757,3 +757,41 @@ def test_enrich_segments_ts_offline_notify_failure_is_swallowed(monkeypatch):
     monkeypatch.setattr(NT, "notify", _broken)
     # 告警面挂了不能把入库弄挂
     assert ING.enrich_segments([_plain_seg(0, "10.1/a")], "e@x", "http://ts.local:1969") == (0, 0, 0)
+
+
+def test_run_ingest_report_carries_sidecar_ok(tmp_path, monkeypatch):
+    """变异 R32：周入库回执不透传 `sidecar_ok` —— sidecar 写失败（阅读深度量尺永久丢失）
+    在 ingest_notes.py 的回执里就完全看不见了。两态都要透传。"""
+    settings = _settings(tmp_path)
+    _mock_pipeline(monkeypatch, done=1)
+    import src.scholar.notes as notes
+    segs = [_seg(1, "A", doi="10.1/a")]
+
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n.md"), "docx_path": None, "sidecar_ok": False,
+        "sidecar_error": "ValueError: boom"})
+    rep = ING.run_ingest(segs, settings, "2026-07-27", top_n=5, close_read=True, seen=set())
+    assert rep["sidecar_ok"] is False
+
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n.md"), "docx_path": None, "sidecar_ok": True})
+    rep = ING.run_ingest(segs, settings, "2026-08-03", top_n=5, close_read=True, seen=set())
+    assert rep["sidecar_ok"] is True
+    # 老形态回执（无该键）默认视为成功，不误报
+    monkeypatch.setattr(notes, "write_notes", lambda *a, **k: {
+        "note_path": str(tmp_path / "n.md"), "docx_path": None})
+    rep = ING.run_ingest(segs, settings, "2026-08-10", top_n=5, close_read=True, seen=set())
+    assert rep["sidecar_ok"] is True
+
+
+def test_ingest_receipt_key_matches_what_ingest_notes_reads():
+    """跨文件键名契约：回执的**生产方**（ingest.run_ingest）与**消费方**
+    （scripts/ingest_notes.py 的收尾报告）必须用同一个键名。
+
+    上面那条 test_run_ingest_report_carries_sidecar_ok 只盯生产方；两边各改一个名字时
+    它照样绿，而「阅读深度量尺永久丢失、需 --force 重跑该月」这句告警会静默消失。
+    """
+    consumer = (Path(__file__).resolve().parent.parent / "scripts" / "ingest_notes.py").read_text(
+        encoding="utf-8")
+    assert 'rep.get("sidecar_ok") is False' in consumer, \
+        "ingest_notes 的量尺丢失判据与 ingest 回执的键名不一致"

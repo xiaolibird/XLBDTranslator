@@ -1,7 +1,7 @@
 # auto 月度札记缺 sidecar：阅读深度量尺永久不可恢复，且写入失败被静默吞掉
 
 日期：2026-09-04
-状态：**未修复**（已定位根因与影响面，修法有两条路待选）
+状态：**路线 A 已修（2026-09-04）+ 存量认赔**，见文末。原状态：未修复（修法有两条路待选）
 严重度：中——不丢句子，丢的是「这篇读了多少正文」这把尺子，且**无法事后补**（md 不存该信息）
 发现者：xiaolibird / Claude（2026-09-03 精读入库会话，查 legacy tag 真相源时顺带撞见）
 
@@ -110,3 +110,13 @@ miss = [os.path.basename(f) for f in md
 print(f"全文精读 md {len(md)} 份，缺 sidecar {len(miss)} 份")
 PY
 ```
+
+---
+
+## 修复（2026-09-04 台账批）
+
+选了本条推荐的 **A + 存量认赔**：`notes.write_notes` 写 sidecar 失败时 `logger.error`（不再是 warning，文案写明「量尺将无法从 md 回读」），
+返回值新增两态 `sidecar_ok: bool`（仅 `emit_index_sidecar=True` 时出现）与 `sidecar_error`；md 仍照常提交。调用方可据此判定，此前只能看 `index_sidecar` 键在不在，
+把「没要求写」与「要求了但失败」混成一态。路线 B（量尺渲进 md）不做——`2026-09-04-closeread-heading-contract.md` 刚证明那是全库最脆的契约。
+存量 43 个月的量尺不可恢复，维持 `reading_depth=unknown-legacy` 标记。
+测试：`test/test_bugs_batch_2026_09.py::test_write_notes_reports_sidecar_failure_loudly` / `test_write_notes_sidecar_ok_flag_two_states`。

@@ -26,6 +26,11 @@ python-docx>=1.1.0
 
 # 全文精读抽取（PDF → 文本）
 PyMuPDF>=1.23.0
+# pypdf：补抓/额外通道拿到的 PDF 要过「可解析页数」这道闸（fulltext.validate_pdf_bytes）。
+# 缺它不会报错，只会**静默降级成两道闸**（magic + 体积）——反爬页与残片就可能被当成合法 PDF
+# 存下来，再在 _pdf_text_with_stats 炸成空文本、被误诊成「精读质量差」。
+# 本机一直是手工装的，CI 与任何按 requirements 重建的环境都没有（2026-09-04 第 3 轮审计发现）。
+pypdf>=4.0.0
 
 # 其他工具
 python-dateutil>=2.8.2

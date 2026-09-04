@@ -112,13 +112,21 @@ def cmd_ingest(args):
     if len(pdfs) > len(args.pdf):
         logger.info("展开目录后共 {} 篇 PDF".format(len(pdfs)))
 
+    # 研究画像按批动态补一段「本批阅读目的」：分块 LLM 手里只有一条静态画像（如「EHR 缺失
+    # 机制」），凡不匹配的都判「与我研究无关、不必强行建立关联」——而那四篇恰是本批的全部
+    # 目的（2026-09-03 景观地基文献 4 篇中 3 篇如此，且是 memory 记过一次修复后的复发；见
+    # docs/bugs/2026-09-03-ingest-draft-systematic-errors.md 第 4 类）。ingest 是唯一知道
+    # 「为什么读这批」的位置，故在这里注入，不改配置文件里的长期画像。
+    research_interests = _research_interests_with_context(
+        proc.research_interests, getattr(args, "context", "") or "")
+
     outs, failed = [], []
     for pdf_path in pdfs:
         try:
             r = ingest_pdf(
                 pdf_path, notes_dir, month, llm,
                 model=model, email=email,
-                research_interests=proc.research_interests,
+                research_interests=research_interests,
                 title_override=(args.title or "") if len(pdfs) == 1 else "",
                 index_path=notes_dir / INDEX_JSON,
                 force=args.force)
@@ -131,6 +139,7 @@ def cmd_ingest(args):
     print("\n" + "=" * 66)
     print("已 ingest {} 篇 → draft bundle（待 agent 亲读交叉核验）".format(len(fresh)))
     any_api_err = False
+    any_no_draft = False
     for r in outs:
         print("\n📄 {}".format(r["title"]))
         print("   bundle       : {}".format(r["bundle"]))
@@ -144,11 +153,20 @@ def cmd_ingest(args):
         print("   分块通读      : {}/{} 块成功 | 脚本草稿 {} | draft_status={}".format(
             r["chunk_ok"], r["chunks"],
             "有" if r["has_close_reading"] else "无", r["draft_status"]))
-        if r["draft_status"] == "api_error":
+        st = r["draft_status"]
+        if st == "api_error":
             any_api_err = True
             print("   ⚠️ LLM API 无额度/鉴权失败：脚本草稿这一轨不可用。")
-    if any_api_err:
-        print("\n🔁 回退协议（API 没钱）：不依赖脚本草稿，改用**两个 subagent 对抗生成**——")
+        elif st in _NO_DRAFT_STATUSES:
+            any_no_draft = True
+            print("   ⚠️ 脚本草稿这一轨缺失（{}）：{}".format(st, (r.get("draft_note") or "")[:300]))
+        elif st == "degraded":
+            print("   ⚠️ 草稿不完整（degraded）：{}".format((r.get("draft_note") or "")[:300]))
+        elif r.get("draft_note"):
+            print("   ℹ️ draft_note    : {}".format(r["draft_note"][:300]))
+    if any_api_err or any_no_draft:
+        why = ("API 没钱" if any_api_err else "汇总步失败/无可用块，脚本轨缺失")
+        print("\n🔁 回退协议（{}）：不依赖脚本草稿，改用**两个 subagent 对抗生成**——".format(why))
         print("   Opus 亲读整本 PDF 出深读初稿 → Sonnet 亲读同一 PDF 逐条对抗核验+纠错 →")
         print("   主 agent 合并为 close_reading_final + cross_check_report（记录分歧裁决）→ finalize。")
         print("   详见 skill: read-paper 的「回退」节。")
@@ -176,6 +194,39 @@ def _read_plan(n_pages, size: int = 20) -> str:
         n_pages, len(wins), size, ", ".join("{}-{}".format(a, b) for a, b in wins))
 
 
+# 「无脚本草稿」的三态：走回退协议（两个 subagent 对抗生成）。api_error 单列是因为文案不同。
+_NO_DRAFT_STATUSES = ("synth_failed", "empty")
+# 元数据「未经权威源确认」的两个来源：pdf-llm 是 LLM 从首页抽的，pdf-only 是零散兜底。
+_UNCONFIRMED_META_SOURCES = ("pdf-only", "pdf-llm")
+
+
+def _research_interests_with_context(base: str, context: str) -> str:
+    """把 --context（本批阅读目的）拼到研究画像后面；context 为空原样返回。"""
+    context = (context or "").strip()
+    if not context:
+        return base or ""
+    return "{}\n\n【本批阅读目的】{}".format((base or "").rstrip(), context)
+
+
+def _is_thin_metadata(r) -> bool:
+    """回执行是否该报「元数据不全」。
+
+    判据是**书目可用性**，不是抽取通道：作者齐全但 DOI/arXiv 皆空的 pdf-llm 记录，书目
+    缺 DOI 与卷期页、dedup_key 退化成非 DOI 键，与「零作者」一样是残条——旧判据只看
+    `pdf-only or 无作者`，这类记录静默过关（2026-09-03 arXiv 查询遇 SSL 中断后实测漏报）。
+    """
+    if r.get("skipped"):
+        return False
+    if r.get("meta_source") in _UNCONFIRMED_META_SOURCES:
+        return True
+    if not r.get("authors_n"):
+        return True
+    # 权威源（crossref-*/arxiv）必然带 DOI 或 arXiv id；两者皆空说明身份键会退化
+    if not (r.get("doi") or r.get("arxiv_id")):
+        return True
+    return False
+
+
 def _print_attention(outs, failed, title_ignored: str = ""):
     """把「必须有人看一眼」的事项汇总到输出最末。
 
@@ -184,10 +235,12 @@ def _print_attention(outs, failed, title_ignored: str = ""):
     循环前 warning 一次，会落在同一个被淹掉的位置。
     """
     dups = [r for r in outs if r.get("duplicate")]
-    thin = [r for r in outs if not r.get("skipped")
-            and (r.get("meta_source") == "pdf-only" or not r.get("authors_n"))]
+    thin = [r for r in outs if _is_thin_metadata(r)]
+    bad_draft = [r for r in outs if not r.get("skipped")
+                 and r.get("draft_status") not in (None, "ok")]
     skipped = [r for r in outs if r.get("skipped") == "final"]
-    n = len(dups) + len(thin) + len(skipped) + len(failed) + (1 if title_ignored else 0)
+    n = (len(dups) + len(thin) + len(bad_draft) + len(skipped) + len(failed)
+         + (1 if title_ignored else 0))
     if not n:
         return
     print("\n" + "-" * 66)
@@ -199,11 +252,22 @@ def _print_attention(outs, failed, title_ignored: str = ""):
     if dups:
         print("    → 先确认是否值得重读；继续 finalize 则手动深读成为 keeper（旧条目标 duplicate）")
     for r in thin:
-        print("  · 元数据不全（来源 {}、作者 {} 位）：{}".format(
-            r.get("meta_source"), r.get("authors_n", 0), r["title"][:48]))
+        print("  · 元数据不全（来源 {}、作者 {} 位、DOI {}、arXiv {}）：{}".format(
+            r.get("meta_source"), r.get("authors_n", 0),
+            r.get("doi") or "无", r.get("arxiv_id") or "无", r["title"][:48]))
+        for why in (r.get("meta_degraded") or [])[:4]:
+            # 区分「查询失败导致的空」与「本来就没有」：有原因行的是前者，网络恢复后重跑即可补齐
+            print("      原因：{}".format(str(why)[:160]))
     if thin:
-        print("    → citekey 会退化成 anon*、bibliography 缺卷期页；"
-              "可**单独对那一篇**重跑 ingest --title \"精确标题\"（--title 批量时不生效）")
+        print("    → citekey 会退化成 anon*、bibliography 缺 DOI/卷期页、dedup_key 退化成非 DOI 键；"
+              "有「原因」行的多为网络瞬断，网络恢复后**单独对那一篇**重跑 ingest（draft 不需 --force）"
+              "或加 --title \"精确标题\"（--title 批量时不生效）；否则手工回查 Crossref 补正")
+    for r in bad_draft:
+        print("  · 脚本草稿 {}：{} —— {}".format(
+            r.get("draft_status"), r["title"][:48], (r.get("draft_note") or "")[:200]))
+    if bad_draft:
+        print("    → degraded=有草稿但部分块失败（失败块页段亲读补齐）；"
+              "synth_failed/empty/api_error=无草稿，走回退协议（两个 subagent 对抗生成）")
     if title_ignored:
         print("  · --title \"{}\" 本次被忽略：批量时不生效".format(title_ignored[:40]))
         print("    → 需要覆盖标题请单独对那一篇重跑 ingest --title")
@@ -580,7 +644,8 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
     """
     from src.scholar.pdf_ingest import BUNDLE_SUFFIX
     from src.scholar.notes import write_notes
-    from src.scholar.notes_index import update_index, write_outputs, existing_citekeys
+    from src.scholar.notes_index import (update_index, write_outputs, existing_citekeys,
+                                         existing_citekey_owners)
 
     # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名。
     # 但要排除本月这份手动精读 md 自己的旧条目——否则每次 finalize/regen 整篇重写
@@ -601,6 +666,9 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
         # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
         # 放在锁内取：锁外取到的可能是另一轮重建正在改写的中间态。
         existing_ckeys = existing_citekeys(idx_path, exclude_note_files={own_note_file})
+        # 键的占有者（citekey → dedup_key）：手动精读升级一篇已被 auto 浅读的论文时，让 keeper
+        # **继承**干净基键而不是拿 `<基键>b`（见 notes.write_notes 的 existing_key_owners）。
+        existing_owners = existing_citekey_owners(idx_path, exclude_note_files={own_note_file})
 
         res = None
         written_papers = 0          # **真正写进盘的那一轮**的篇数（≠ 循环结束时的 segments）
@@ -643,6 +711,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
                 if res is not None:
                     out["md"] = res["note_path"]
                     out["docx"] = res.get("docx_path")
+                    out["sidecar_ok"] = res.get("sidecar_ok", True)
                 if unstable:
                     # 前面某一轮写过盘/检出过并发，这一轮却一份 final 都没看见——多半读到的
                     # 又是陈旧列表。不能打绿回执 + exit 0（agent 收到绿的就不会重跑）。
@@ -692,6 +761,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
                 emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
                 fallback_citekeys=True, index_series="manual",
                 existing_citekeys=existing_ckeys,
+                existing_key_owners=existing_owners,
                 # 沿用的是上一轮的兜底键，不是 Zotero 权威键，别在 sidecar 里冒充
                 explicit_citekey_source="fallback")
             written_papers = len(segments)
@@ -734,6 +804,8 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
         out = {"month": month, "papers": written_papers, "skipped_drafts": vs,
                "broken_bundles": vb,
                "md": res["note_path"], "docx": res.get("docx_path"), "index": idx,
+               # 手动精读的 sidecar 是 _reuse_citekeys 的锚：写失败 = 下一轮 regen 键全被重算顶回
+               "sidecar_ok": res.get("sidecar_ok", True),
                # 全局索引的指纹：锁外做 best-effort 同步前要重读比对，见 _rebuild_month 尾部
                "_index_fp": _stat_fp(idx_path)}
         if unstable:
@@ -917,7 +989,9 @@ def cmd_finalize(args):
     # 在 _rebuild_month 里「拒收」等价于「从已归档的 md 里删掉」：整月 md 被重写、索引重建、
     # 向量库同步，一篇已核验论文当场蒸发。绿回执 + exit 0 会让自动权限模式的 agent 直接
     # 往下走（同 audit_citekeys_vs_pmlr 的论证），所以这里必须非 0。
-    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")) else 0
+    # sidecar 写失败也退非 0：手动精读的 sidecar 是 _reuse_citekeys 的锚，丢了下一轮 regen 会把键全顶回
+    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")
+                 or r.get("sidecar_ok") is False) else 0
 
 
 def cmd_regen(args):
@@ -927,7 +1001,9 @@ def cmd_regen(args):
     r = _rebuild_month(notes_dir, month, settings,
                        allow_removals=getattr(args, "allow_removals", False))
     _report_final(r, notes_dir)
-    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")) else 0
+    # sidecar 写失败也退非 0：手动精读的 sidecar 是 _reuse_citekeys 的锚，丢了下一轮 regen 会把键全顶回
+    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")
+                 or r.get("sidecar_ok") is False) else 0
 
 
 def _report_final(r, notes_dir):
@@ -961,6 +1037,10 @@ def _report_final(r, notes_dir):
         # 混在一起会让人去修根本没坏的 JSON。
         print("⚠️ 手动精读归档 · {}：{} 篇（**写盘期间有并发归档，可能缺最新一篇**）".format(
             r["month"], r["papers"]))
+    elif r.get("sidecar_ok") is False:
+        # 首行不能打 ✅：退出码已是 1，回执首行还说成功会让人（和 agent）直接往下走。
+        print("⚠️ 手动精读归档 · {}：{} 篇（**sidecar 写失败，见下**）".format(
+            r["month"], r["papers"]))
     else:
         print("✅ 手动精读归档 · {}：{} 篇".format(r["month"], r["papers"]))
     if r.get("unverified_broken"):
@@ -977,6 +1057,9 @@ def _report_final(r, notes_dir):
     if r.get("concurrent") and not r.get("refused"):
         # 与 broken 并存时首行让位给 broken，但这条提示本身不能丢
         print("   ⚠️ 写盘期间有并发归档，可能缺最新一篇 → 等对方结束后重跑 regen 收敛")
+    if r.get("sidecar_ok") is False:
+        print("   ⛔ 本月 sidecar（.index.json）**写失败**：阅读深度量尺无法回读，且下一轮 regen 会因"
+              "找不到 sidecar 而不沿用 citekey（键被重算顶回）。修好后立刻重跑 regen。")
     if r.get("md"):
         print("   札记: {}".format(r["md"]))
     if r.get("docx"):
@@ -993,6 +1076,14 @@ def _report_final(r, notes_dir):
         print("   ⛔ {} 篇 bundle 读不出/结构非法，**未入库**（修好 JSON 后重跑 finalize）: {}{}"
               .format(len(_bb), ", ".join(_bb[:10]),
                       " …等共 {} 份".format(len(_bb)) if len(_bb) > 10 else ""))
+    stale_inline = idx.get("stale_inline_citekeys") or []
+    if stale_inline:
+        # 挂在索引上、由这里报：update_index 每次都会算出它（持久状态），当场 notify 会让
+        # 4 个 launchd job 每周每月刷同一条；而 finalize 是**有 agent 在看回执**的入口。
+        print("   ⚠️ {} 条 duplicate 的行内 citekey 与其 keeper 不一致（抄引用会引错论文）：{}{}".format(
+            len(stale_inline), "；".join(stale_inline[:3]),
+            " …等共 {} 条".format(len(stale_inline)) if len(stale_inline) > 3 else ""))
+        print("      → 修复：PYTHONPATH=. python scripts/notes_index.py --fix-inline-citekeys（默认 dry-run）")
     manual = [e for e in idx["papers"] if e.get("series") == "manual" and not e.get("duplicate_of")]
     print("   索引: 手动深读 {} 篇 · 撞键 {} 组".format(len(manual), len(collisions)))
     if collisions:
@@ -1013,6 +1104,9 @@ def main():
     p_ing.add_argument("--month", default=None, type=_month_arg,
                        help="归档月份桶 YYYY-MM[-DD][-批次名]（默认当月）")
     p_ing.add_argument("--title", default=None, help="手动覆盖标题（单篇时；元数据解析用）")
+    p_ing.add_argument("--context", default="",
+                       help="本批阅读目的（拼进研究画像，只影响「对我研究的联想」一节；"
+                            "如 \"景观-流形-缺失：本批为 A 层地基文献\"）")
     p_ing.add_argument("--force", action="store_true",
                        help="覆盖已 final 的 bundle（默认跳过——覆盖会丢弃 agent 已写的核验成果）")
     p_ing.set_defaults(func=cmd_ingest)

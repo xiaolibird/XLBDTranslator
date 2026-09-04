@@ -774,3 +774,283 @@ def test_shrink_note_drops_round_robin_across_fields():
     assert did
     for k in ("method_details", "key_numbers", "claims", "limitations"):
         assert len(out[k]) >= 1, "{} 整类消失了".format(k)
+
+
+# ---------------- 台账批（2026-09-04）：元数据退化诊断 / 草稿五态 / 可得性确定性抽取 ----------------
+
+def test_resolve_metadata_records_arxiv_failure_in_diag(monkeypatch):
+    """arXiv 精确查抛异常（SSL 中断）→ diag['degraded'] 必须带原因；此前只进日志中段。"""
+    import src.scholar.crossref as cr
+    import src.scholar.academic_search as acs
+    monkeypatch.setattr(cr, "crossref_by_doi", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "crossref_lookup", lambda *a, **k: None)
+
+    def _boom(aid, client):
+        raise OSError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+    monkeypatch.setattr(acs, "fetch_arxiv_by_id", _boom)
+    llm = _FakeLLM([json.dumps({"title": "Towards a Mathematical Theory",
+                                "authors": ["Hugo Lavenant", "Stephen Zhang"], "year": 2021})])
+    diag = {}
+    meta, src = pi.resolve_metadata({"doi": None, "arxiv_id": "2102.09204v2",
+                                     "title": "Towards a Mathematical Theory"},
+                                    llm=llm, first_pages_text="x" * 50, diag=diag)
+    assert src == "pdf-llm" and meta.doi is None and len(meta.authors) == 2
+    assert any("arXiv 精确查失败（2102.09204v2）" in d and "UNEXPECTED_EOF" in d
+               for d in diag["degraded"])
+
+
+def test_resolve_metadata_diag_is_optional_and_records_doi_miss(monkeypatch):
+    import src.scholar.crossref as cr
+    monkeypatch.setattr(cr, "crossref_by_doi", lambda *a, **k: None)
+    monkeypatch.setattr(cr, "crossref_lookup", lambda *a, **k: None)
+    # 不传 diag：签名向后兼容，不抛
+    meta, src = pi.resolve_metadata({"doi": "10.1/miss", "arxiv_id": None, "title": ""})
+    assert src == "pdf-only"
+    diag = {}
+    pi.resolve_metadata({"doi": "10.1/miss", "arxiv_id": None, "title": ""}, diag=diag)
+    assert any("DOI 直查 Crossref 未命中" in d and "10.1/miss" in d for d in diag["degraded"])
+
+
+def test_synthesize_records_failure_reason_for_unparseable_response():
+    """汇总返回不可解析 → budget_info['synth_error'] 带响应长度/打包长度/预算/开头。"""
+    info = {}
+    llm = _FakeLLM(["not json at all"])
+    cr, one, api = pi.synthesize_deep_read([{"claims": ["c"]}], llm, "m", "ri", budget_info=info)
+    assert cr is None and api is False
+    assert "不可解析" in info["synth_error"] and "响应 15 字符" in info["synth_error"]
+    assert "预算 {}".format(pi._SYNTH_NOTES_BUDGET) in info["synth_error"]
+    assert "not json" in info["synth_error"]
+
+
+def test_synthesize_records_failure_reason_for_exception():
+    class _Boom:
+        def call(self, *a, **k):
+            raise TimeoutError("read timed out after 300s")
+    info = {}
+    cr, one, api = pi.synthesize_deep_read([{"claims": ["c"]}], _Boom(), "m", "ri", budget_info=info)
+    assert cr is None and api is False
+    assert info["synth_error"].startswith("汇总 LLM 调用失败：TimeoutError: read timed out")
+
+
+def test_synthesize_feeds_availability_statements_into_prompt():
+    llm = _FakeLLM([json.dumps({"one_line": "x", "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "a", "tag": None}]}]})])
+    avail = ["The code used to perform the analyses are publicly available at "
+             "GitHub, github.com/ChrisWLynn/Broken_detailed_balance (54)."]
+    pi.synthesize_deep_read([{"claims": ["c"]}], llm, "m", "ri", availability=avail)
+    prompt = llm.calls[0]
+    assert "github.com/ChrisWLynn/Broken_detailed_balance" in prompt
+    assert "必须以此为准" in prompt
+    # 为空时的占位文案也要在（模板槽位不能留空字串让模型自由发挥）
+    llm2 = _FakeLLM([json.dumps({"one_line": "x", "sections": []})])
+    pi.synthesize_deep_read([{"claims": ["c"]}], llm2, "m", "ri")
+    assert "程序未抓到明确的可得性声明" in llm2.calls[0]
+
+
+@pytest.mark.parametrize("text,expect_sub", [
+    ("Methods. We fit a model.\n\nData Availability. The data analyzed in this paper and the code "
+     "used to perform the analyses are publicly available at GitHub, "
+     "github.com/ChrisWLynn/Broken_detailed_balance (54). References\n1. Foo",
+     "github.com/ChrisWLynn/Broken_detailed_balance"),
+    ("Our implementation is available at https://github.com/zhao/EPR-Net under MIT license. "
+     "Next sentence.", "https://github.com/zhao/EPR-Net"),
+    ("Code and data availability: all scripts are deposited on Zenodo (doi.org/10.5281/zenodo.123).",
+     "zenodo"),
+    ("The datasets are available upon request from the corresponding author.", "upon request"),
+])
+def test_extract_availability_statements_hits(text, expect_sub):
+    got = pi.extract_availability_statements(text)
+    assert got, "该有命中"
+    assert any(expect_sub.lower() in g.lower() for g in got)
+
+
+def test_extract_availability_statements_misses_and_caps():
+    assert pi.extract_availability_statements("") == []
+    assert pi.extract_availability_statements("We propose a novel estimator. Results follow.") == []
+    # 同一句多次命中只出一次；上限 max_items；单条长度有上限
+    text = " ".join("Data availability statement number {} is publicly available at "
+                    "https://github.com/org/repo{}.".format(i, i) for i in range(20))
+    got = pi.extract_availability_statements(text, max_items=3)
+    assert len(got) == 3
+    assert all(len(g) <= pi._AVAIL_MAX_LEN + 1 for g in got)
+    assert len(set(g.lower() for g in got)) == len(got)
+
+
+def _stub_ingest_status_env(monkeypatch, tmp_path, chunk_notes, synth):
+    """最小打桩：只留「块结果 + 汇总结果 → draft_status/draft_note」这条判定线。"""
+    _txt = "full text " * 500
+    monkeypatch.setattr(pi, "extract_pdf_text_with_stats", lambda p, **k: (_txt, len(_txt)))
+    monkeypatch.setattr(pi, "pdf_page_count", lambda p: 17)
+    monkeypatch.setattr(pi, "extract_pdf_ids",
+                        lambda p, t="": {"doi": "10.5/m", "arxiv_id": None, "title": "T"})
+    meta = PaperMetadata(paper_id="pm", title="T", authors=["Jane Doe"], doi="10.5/m")
+    monkeypatch.setattr(pi, "resolve_metadata", lambda ids, **k: (meta, "crossref-doi"))
+    monkeypatch.setattr(pi, "extract_abstract", lambda t, llm: ("en", "zh"))
+    monkeypatch.setattr(pi, "chunk_text", lambda t: ["c"] * len(chunk_notes))
+    monkeypatch.setattr(pi, "deep_read_chunks", lambda *a, **k: chunk_notes)
+    monkeypatch.setattr(pi, "find_duplicate", lambda *a, **k: None)
+    monkeypatch.setattr(pi, "synthesize_deep_read", synth)
+
+
+def _ok_cr():
+    return CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        CloseReadSection(heading="研究问题", sentences=[CloseReadSentence(text="s", tag=None)])])
+
+
+def test_ingest_status_synth_failed_when_all_chunks_ok_but_synth_fails(tmp_path, monkeypatch):
+    """Hoogland 2020 现场：27/27 块成功、无草稿——此前落成 degraded（文档说「部分块失败」），
+    且原因是硬编码字串。现在必须是 synth_failed 且 note 带汇总步的真实原因。"""
+    notes = [{"_chunk": i, "claims": ["c"]} for i in range(1, 28)]
+
+    def _synth(chunk_notes, llm, model, ri, budget_info=None, availability=None):
+        budget_info["synth_error"] = "汇总返回不可解析为分节精读（响应 12 字符；块笔记打包 9000 字符 / 预算 66000；响应开头：'{}')"
+        return None, "", False
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, _synth)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "synth_failed" and r["has_close_reading"] is False
+    assert r["chunk_ok"] == 27
+    assert "27/27 成功" in r["draft_note"] and "不可解析" in r["draft_note"]
+    data = pi.load_bundle(Path(r["bundle"]))
+    assert data["draft_status"] == "synth_failed" and "不可解析" in data["draft_note"]
+
+
+def test_ingest_status_degraded_only_when_chunks_partially_failed_but_draft_exists(tmp_path, monkeypatch):
+    notes = [{"_chunk": 1, "claims": ["c"]}, {"_chunk": 2, "_error": True},
+             {"_chunk": 3, "claims": ["c"]}, {"_chunk": 4, "_error": True}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes,
+                            lambda *a, **k: (_ok_cr(), "one", False))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "degraded" and r["has_close_reading"] is True
+    assert "2/4 块通读失败（块 2, 4）" in r["draft_note"] and "亲读补齐" in r["draft_note"]
+
+
+def test_ingest_status_ok_when_all_chunks_ok_and_draft_exists(tmp_path, monkeypatch):
+    notes = [{"_chunk": 1, "claims": ["c"]}, {"_chunk": 2, "claims": ["c"]}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes,
+                            lambda *a, **k: (_ok_cr(), "one", False))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "ok" and r["draft_note"] == ""
+    assert r["meta_degraded"] == []
+
+
+def test_ingest_status_partial_chunks_and_synth_failed_names_both(tmp_path, monkeypatch):
+    notes = [{"_chunk": 1, "claims": ["c"]}, {"_chunk": 2, "_error": True}]
+
+    def _synth(chunk_notes, llm, model, ri, budget_info=None, availability=None):
+        budget_info["synth_error"] = "汇总 LLM 调用失败：TimeoutError: t"
+        return None, "", False
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, _synth)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "synth_failed"
+    assert "1/2 成功" in r["draft_note"] and "TimeoutError" in r["draft_note"]
+    assert "1/2 块通读失败" in r["draft_note"]
+
+
+def test_ingest_status_empty_and_api_error_unchanged(tmp_path, monkeypatch):
+    notes = [{"_chunk": 1, "_error": True}, {"_chunk": 2, "_error": True}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, lambda *a, **k: (None, "", False))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "empty"
+    notes = [{"_chunk": 1, "_error": True, "_api_error": True}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, lambda *a, **k: (None, "", True))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None, force=True)
+    assert r["draft_status"] == "api_error"
+
+
+def test_ingest_passes_meta_degraded_through(tmp_path, monkeypatch):
+    notes = [{"_chunk": 1, "claims": ["c"]}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes,
+                            lambda *a, **k: (_ok_cr(), "one", False))
+    meta = PaperMetadata(paper_id="pm", title="T", authors=["A", "B", "C", "D"], arxiv_id="2102.1")
+
+    def _resolve(ids, **k):
+        k["diag"].setdefault("degraded", []).append("arXiv 精确查失败（2102.1）: SSL")
+        return meta, "pdf-llm"
+    monkeypatch.setattr(pi, "resolve_metadata", _resolve)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["meta_source"] == "pdf-llm" and r["meta_degraded"] == ["arXiv 精确查失败（2102.1）: SSL"]
+
+
+def test_resolve_metadata_records_title_lookup_miss_in_diag(monkeypatch):
+    """标题查 Crossref 未命中也是一级退化（crossref_lookup 吞异常，网络断与库里没有同形）——第 1 轮审计 A6。"""
+    import src.scholar.crossref as cr
+    monkeypatch.setattr(cr, "crossref_lookup", lambda *a, **k: None)
+    llm = _FakeLLM([json.dumps({"title": "Some Other Title", "authors": ["A B"], "year": 2020})])
+    diag = {}
+    meta, src = pi.resolve_metadata({"doi": None, "arxiv_id": None, "title": "Original Title Here"},
+                                    llm=llm, first_pages_text="x" * 50, diag=diag)
+    assert src == "pdf-llm"
+    joined = " | ".join(diag["degraded"])
+    assert "标题查 Crossref 未命中（Original Title Here）" in joined
+    assert "LLM 抽出的标题查 Crossref 未命中（Some Other Title）" in joined
+
+
+def test_ingest_no_draft_states_still_carry_truncation_note(tmp_path, monkeypatch):
+    """无草稿三态也要带「全文被截断」：走回退协议亲读的 agent 同样得知道尾部多少没进过通读（压测 S14）。"""
+    notes = [{"_chunk": 1, "claims": ["c"]}]
+
+    def _synth(chunk_notes, llm, model, ri, budget_info=None, availability=None):
+        budget_info["synth_error"] = "汇总 LLM 调用失败：TimeoutError: t"
+        return None, "", False
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, _synth)
+    _txt = "full text " * 500
+    monkeypatch.setattr(pi, "extract_pdf_text_with_stats", lambda p, **k: (_txt, len(_txt) * 10))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "synth_failed"
+    assert "全文被截断" in r["draft_note"] and "90%" in r["draft_note"]
+    _stub_ingest_status_env(monkeypatch, tmp_path, [{"_chunk": 1, "_error": True}],
+                            lambda *a, **k: (None, "", False))
+    monkeypatch.setattr(pi, "extract_pdf_text_with_stats", lambda p, **k: (_txt, len(_txt) * 10))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None, force=True)
+    assert r["draft_status"] == "empty" and "全文被截断" in r["draft_note"]
+
+
+def test_api_error_state_also_carries_truncation_note(tmp_path, monkeypatch):
+    """变异 R16a：api_error 态不带「全文被截断」。走回退协议亲读的 agent 同样得知道尾部有多少
+    根本没进过通读——五态都要带（此前只测了 synth_failed 与 empty）。"""
+    notes = [{"_chunk": 1, "_error": True, "_api_error": True}]
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, lambda *a, **k: (None, "", True))
+    _txt = "full text " * 500
+    monkeypatch.setattr(pi, "extract_pdf_text_with_stats", lambda p, **k: (_txt, len(_txt) * 10))
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "api_error"
+    assert "无额度" in r["draft_note"] and "全文被截断" in r["draft_note"] and "90%" in r["draft_note"]
+
+
+def test_availability_extraction_ranks_the_real_statement_over_generic_hits():
+    """第 4 轮审计 CONFIRMED：引言/相关工作里的泛泛命中（`publicly available benchmarks such as
+    MIMIC-III`、`Prior work made their code available at github.com/other/repoA`）成片出现在
+    文档最前面，按出现顺序取前 6 条会把**文末真正的 Data Availability 声明挤出去**——而 prompt
+    强制「必须以此为准」，等于拿别人的仓库当本文的。改成打分后截断。"""
+    noise = " ".join(
+        "We use publicly available benchmarks such as MIMIC-{}. Prior work made their code "
+        "available at github.com/other/repo{}.".format(i, i) for i in range(1, 7))
+    real = ("Data Availability. The data analyzed in this paper and the code used to perform the "
+            "analyses are publicly available at GitHub, github.com/ChrisWLynn/Broken_detailed_balance (54).")
+    text = noise + (" Results follow. " * 60) + real + " References 1. Foo"
+    got = pi.extract_availability_statements(text, max_items=6)
+    assert any("ChrisWLynn/Broken_detailed_balance" in g for g in got), got
+    # 顺序仍按原文出现次序（喂给模型时读起来自然）
+    assert got == sorted(got, key=lambda g: text.find(g[:40]))
+
+
+def test_availability_extraction_keeps_first_come_order_within_the_kept_set():
+    text = ("Data availability: code at github.com/a/b. " + "filler. " * 40 +
+            "Materials availability: data at zenodo.org/record/1.")
+    got = pi.extract_availability_statements(text, max_items=6)
+    assert len(got) == 2 and "github.com/a/b" in got[0] and "zenodo.org/record/1" in got[1]
+
+
+def test_availability_ranking_needs_the_strong_statement_signal():
+    """变异 R68 存活暴露的缺口：上一条排序测试里，真声明同时占了「仓库直链」与「在文末」
+    两个弱信号，所以把「正式声明」那 +3 分去掉它照样入选——测不出强信号在起作用。
+
+    这里让噪声也全部占满两个弱信号且都排在前面，真声明只多出「正式声明」这一个信号。
+    去掉 +3 就会平票、按出现顺序被 6 条噪声挤出去。"""
+    noise = " ".join(
+        "Prior work released code at github.com/other/repo{}.".format(i) for i in range(1, 8))
+    real = ("Data availability statement: the corpus supporting this study is deposited at "
+            "github.com/thisPaper/corpus.")
+    text = ("Intro. " * 200) + noise + " " + real + " References"
+    got = pi.extract_availability_statements(text, max_items=6)
+    assert any("thisPaper/corpus" in g for g in got), got

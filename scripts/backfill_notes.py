@@ -35,6 +35,7 @@ import json
 import os
 import sys
 import time
+from typing import Optional
 import traceback
 from datetime import date
 from pathlib import Path
@@ -78,7 +79,22 @@ from src.scholar.ingest import (dedup_key, enrich_segments,  # noqa: E402,F401
                                 resolve_citekeys)
 
 
-def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
+def report_sidecar_failure(label: str, r: dict) -> bool:
+    """本月 sidecar 写失败就 error + notify；返回是否报了。
+
+    43 个 auto 月的阅读深度量尺就是这样在过夜回填里悄悄丢掉的（sidecar 写失败只有一行 warning）。
+    抽成函数是为了能被测试盯住——接线断掉时没有任何别的信号会响。
+    """
+    if r.get("status") != "ok" or r.get("sidecar_ok") is not False:
+        return False
+    logger.error("❌ {} 的索引 sidecar 写失败：该月条目的阅读深度量尺无法从 md 回读、永久丢失；"
+                 "请查看上方 write_notes 的错误并用 --force 重跑该月".format(label))
+    notify("Scholar 月度回填", "{} 的 sidecar 写失败，阅读深度量尺丢失，需 --force 重跑该月".format(label))
+    return True
+
+
+def run_month(y, m, settings, seen: set, existing_ckeys: set, args,
+              existing_owners: Optional[dict] = None) -> dict:
     proc = settings.processing
     label = "{:04d}-{:02d}".format(y, m)
     note_md = Path(proc.notes_dir) / "科研札记_{}_全文精读.md".format(label)
@@ -197,7 +213,9 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
                 # 与周度 ingest 同一个开关：漏传会让 CLOSEREAD_DEEP 打开后周度深读、
                 # 月度回填仍单跳，两代札记在同一索引里无声混存
                 deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
-                max_chunks=proc.closeread_max_chunks)
+                max_chunks=proc.closeread_max_chunks,
+                extra_routes=getattr(proc, "fulltext_extra_routes", False),
+                route_delay=getattr(proc, "fulltext_route_delay", 0.0))
         finally:
             llm_client.close()
         if args.top_n > 0 and fresh and done == 0:
@@ -216,7 +234,9 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
         digest_title="科研札记 · {}（全文精读）".format(label),
         filename="科研札记_{}_全文精读".format(label),
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True, existing_citekeys=existing_ckeys)  # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
+        fallback_citekeys=True, existing_citekeys=existing_ckeys,   # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
+        # 同一论文（同 dedup_key）的既有条目占着基键时继承它，不加后缀（notes.write_notes 说明）
+        existing_key_owners=existing_owners)
     seen |= month_keys           # 落盘成功，本月键此刻才算真正「已收录」
 
     hit_ck = sum(1 for v in citekeys.values() if v)
@@ -227,7 +247,9 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args) -> dict:
             "md": res["note_path"], "docx": res.get("docx_path"),
             # index_sidecar：本月 write_notes 顺手写出的 {slug}.index.json，供 main()
             # 把本月新生成的兜底 citekey 并回 existing_ckeys（碰撞窗口修复，见 main()）。
-            "index_sidecar": res.get("index_sidecar")}
+            "index_sidecar": res.get("index_sidecar"),
+            # 显式两态（notes.write_notes 2026-09-04）：False = 要求写却失败，量尺永久丢失
+            "sidecar_ok": res.get("sidecar_ok", True)}
 
 
 def prev_month_label(today=None):
@@ -401,7 +423,8 @@ def main():
             results = []
     # 全局去重集：从文献索引恢复（跨运行持久化——跑新月份不与历史月重复）。
     # --force 重跑历史月时剔除待跑月份自己的键，否则本月论文全在 seen 里会被 dedup 成空札记。
-    from src.scholar.notes_index import INDEX_JSON, load_seen_keys, existing_citekeys
+    from src.scholar.notes_index import (INDEX_JSON, load_seen_keys, existing_citekeys,
+                                         existing_citekey_owners)
     run_months = {"{:04d}-{:02d}".format(y, m) for y, m in months}
     seen: set = load_seen_keys(
         Path(settings.processing.notes_dir) / INDEX_JSON,
@@ -415,6 +438,9 @@ def main():
                       if args.force else set())
     idx_path = Path(settings.processing.notes_dir) / INDEX_JSON
     existing_ckeys: set = existing_citekeys(idx_path, exclude_note_files=own_note_files)
+    # 键的占有者快照（citekey → dedup_key），供 write_notes 做「同一论文继承基键」。
+    # 与 existing_ckeys 同一时刻取；本轮新生成的键不回填进来（只影响能否继承，不影响防撞）。
+    existing_owners: dict = existing_citekey_owners(idx_path, exclude_note_files=own_note_files)
 
     for i, (y, m) in enumerate(months, 1):
         label = "{:04d}-{:02d}".format(y, m)
@@ -423,13 +449,15 @@ def main():
         logger.info("#" * 60)
         t0 = time.time()
         try:
-            r = run_month(y, m, settings, seen, existing_ckeys, args)
+            r = run_month(y, m, settings, seen, existing_ckeys, args,
+                          existing_owners=existing_owners)
         except SystemExit:
             raise
         except Exception as e:
             logger.error("❌ {} 失败：{}".format(label, e))
             logger.error(traceback.format_exc())
             r = {"month": label, "status": "error", "error": str(e)}
+        report_sidecar_failure(label, r)
         if r.get("status") == "ok" and r.get("index_sidecar"):
             # 碰撞窗口修复：existing_ckeys 只在循环开始前从 literature_index.json 算过
             # 一次快照，主索引要等本轮全部月份跑完才由 update_index 刷新——本月刚生成

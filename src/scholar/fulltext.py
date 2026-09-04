@@ -15,8 +15,9 @@ J Clin Med/Eur Heart J 全挂），但同一批论文的 OA 全文在 Europe PMC
 只返回 URL 与 OA 状态，实际下载交给 Zotero（连接器 attachments 让 Zotero 自己抓），
 或上层显式下载。HTTP 与解析分离，便于 mock 测试。
 """
+import re
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 
@@ -45,12 +46,17 @@ def ipv4_client(timeout: float = 15.0, headers: Optional[Dict[str, str]] = None)
 
 @dataclass
 class OAResult:
-    """OA 解析结果。pdf_url 为 None 表示未找到合法免费 PDF。"""
+    """OA 解析结果。pdf_url 为 None 表示未找到合法免费 PDF。
+
+    candidates：额外通道（extra_routes）给出的**备选** PDF 直链列表（含 pdf_url 自己，按命中
+    顺序），下载方逐个试到一个通过校验为止。主链路（arXiv/Unpaywall）不填它——保持旧行为。
+    """
     oa_status: str = "unknown"          # arxiv / gold / green / hybrid / bronze / closed / unknown
     pdf_url: Optional[str] = None        # 直接可下载的 PDF 链接
     landing_url: Optional[str] = None    # OA 落地页（非 PDF 直链时）
-    source: Optional[str] = None         # arxiv / unpaywall
+    source: Optional[str] = None         # arxiv / unpaywall / arxiv-title / epmc-render / openalex / s2
     extra: Dict[str, Any] = field(default_factory=dict)
+    candidates: List[str] = field(default_factory=list)
 
     @property
     def is_oa(self) -> bool:
@@ -87,34 +93,257 @@ def resolve_oa_pdf(
     email: str = "",
     client: Optional[httpx.Client] = None,
     timeout: float = 15.0,
+    *,
+    extra_routes: bool = False,
+    route_delay: float = 0.0,
 ) -> OAResult:
-    """按 arXiv → Unpaywall 顺序解析 OA PDF。任何异常都降级为 closed，绝不抛出中断上层。
+    """按 arXiv → Unpaywall（→ 额外四路）顺序解析 OA PDF。任何异常都降级为 closed，绝不抛出中断上层。
 
     email 是 Unpaywall 的强制礼貌参数（联系句柄，非密钥）；缺失则跳过 Unpaywall。
+
+    extra_routes=False（默认）时行为与历史版本**逐字节一致**。为 True 时，前两路都没给出
+    pdf_url 才继续试 `extra_route_candidates` 的四路（arXiv 标题检索 → EPMC 渲染版 PDF →
+    OpenAlex → Semantic Scholar），命中则 pdf_url 取第一个、全部候选进 `candidates`，由下载方
+    逐个试并做 PDF 三闸校验（反爬页也回 200，见 download_pdf 的 validate）。route_delay 是
+    每次额外 API 调用之间的礼貌间隔。设计与边界见 docs/bugs/2026-09-04-fulltext-routes-too-narrow.md。
     """
     # 1) arXiv 直链
     if meta.arxiv_id:
         return OAResult(oa_status="arxiv", pdf_url=arxiv_pdf_url(meta.arxiv_id), source="arxiv")
 
-    # 2) Unpaywall（需 DOI + email）
-    if meta.doi and email:
-        own_client = client is None
-        c = client or ipv4_client(timeout=timeout)
-        try:
-            resp = c.get(f"{UNPAYWALL_API}/{meta.doi}", params={"email": email})
-            resp.raise_for_status()
-            return parse_unpaywall(resp.json())
-        except Exception as e:
-            logger.warning("  ⚠️ Unpaywall 解析失败（{}）: {}".format(meta.doi, e))
-            return OAResult(oa_status="unknown", source="unpaywall")
-        finally:
-            if own_client:
-                try:
-                    c.close()
-                except Exception:
-                    pass
+    own_client = client is None
+    c = client if client is not None else (ipv4_client(timeout=timeout)
+                                           if (meta.doi and email) or extra_routes else None)
+    try:
+        primary: Optional[OAResult] = None
+        # 2) Unpaywall（需 DOI + email）
+        if meta.doi and email:
+            try:
+                resp = c.get(f"{UNPAYWALL_API}/{meta.doi}", params={"email": email})
+                resp.raise_for_status()
+                primary = parse_unpaywall(resp.json())
+            except Exception as e:
+                logger.warning("  ⚠️ Unpaywall 解析失败（{}）: {}".format(meta.doi, e))
+                primary = OAResult(oa_status="unknown", source="unpaywall")
+            if primary.pdf_url or not extra_routes:
+                return primary
+
+        # 3) 额外四路（默认关）
+        if extra_routes and c is not None:
+            cands = extra_route_candidates(meta, c, email=email, delay=route_delay)
+            if cands:
+                src, url = cands[0]
+                return OAResult(oa_status=(primary.oa_status if primary and primary.oa_status
+                                           not in ("closed", "unknown") else "green"),
+                                pdf_url=url,
+                                landing_url=primary.landing_url if primary else None,
+                                source=src,
+                                extra={"routes": [s for s, _ in cands]},
+                                candidates=[u for _, u in cands])
+        if primary is not None:
+            return primary
+    finally:
+        if own_client and c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
     return OAResult(oa_status="closed" if meta.doi else "unknown")
+
+
+# ---------------- 额外四路（默认关；从 scripts/fetch_missing_pdfs.py 下沉） ----------------
+#
+# 只走公开 API 与开放副本；**不做任何绕过出版商反爬的改写**（换 UA / 加 Referer / 走机构 IP
+# 都实测无效，那是 Cloudflare 认"你不像浏览器"，不是订阅问题——那类篇目应进人工清单）。
+# 唯一的宿主改写是 NCBI PMC → Europe PMC：两家镜像同一份 PMC 全文，NCBI 对脚本 403、EPMC 不挡。
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+PDF_ACCEPT_HEADERS = {"Accept": "application/pdf,*/*;q=0.8"}
+_ARXIV_TITLE_MIN_OVERLAP = 0.75      # 查询标题实词被命中标题覆盖的比例
+_ARXIV_TITLE_MIN_BACK_OVERLAP = 0.6  # 反向：命中标题实词被查询覆盖的比例（防短标题被长综述包含）
+_ARXIV_TITLE_MIN_WORDS = 4           # 实词太少的标题不检索：「Missing Data Imputation」对谁都 1.0
+_PMC_URL_RE = re.compile(
+    r"(?:pmc\.ncbi\.nlm\.nih\.gov|www\.ncbi\.nlm\.nih\.gov)/(?:pmc/)?articles/(PMC\d+)")
+_POLITE_RETRIES = 3
+_POLITE_FIRST_DELAY = 5.0
+_POLITE_BACKOFF = 2.5
+# PDF 三闸：magic / 体积 / 可解析页数。反爬页与登录页也回 200，不卡死会流到 _pdf_text_with_stats
+# 炸成空文本，然后被误诊成「精读质量差」。
+# 体积闸原取 20KB（补抓脚本经验值），会误杀 2 页纯文本的合法短文（实测 1.2KB）；反爬/登录页
+# 由 magic + 页数两闸兜，这里只挡明显的占位空壳。
+PDF_MIN_BYTES = 1_000
+PDF_MIN_PAGES = 2
+# PDF 规范允许 %PDF- 头出现在文件前 1024 字节内（前面可有 BOM / \r\n / 垃圾字节）
+_PDF_MAGIC_WINDOW = 1024
+
+
+def polite_get(client, url: str, *, retries: int = _POLITE_RETRIES,
+               first_delay: float = _POLITE_FIRST_DELAY, backoff: float = _POLITE_BACKOFF,
+               sleep=None, **kw):
+    """403/429 指数退避重试：公开 API 上这两个码多半是「打太快」不是「没有」，直接判死会把
+    本来拿得到的篇目误写进人工清单（补抓脚本实测 24 篇假阴性）。sleep 可注入（测试免等）。"""
+    import time as _time
+    _sleep = sleep or _time.sleep
+    delay = first_delay
+    r = None
+    n = max(1, retries)
+    for i in range(n):
+        r = client.get(url, **kw)
+        if r.status_code not in (403, 429):
+            return r
+        if i < n - 1:                 # 最后一轮失败后不再白等（死候选曾多等 31s）
+            _sleep(delay)
+            delay *= backoff
+    return r
+
+
+def rewrite_pmc_url(url: str) -> str:
+    """NCBI PMC 的 articles/PMC… → Europe PMC 渲染版 PDF（同一份文件、不挡脚本的宿主）。其余原样。"""
+    m = _PMC_URL_RE.search(url or "")
+    if m:
+        return "https://europepmc.org/articles/{}?pdf=render".format(m.group(1))
+    return url
+
+
+def _title_words(t: str) -> set:
+    return set(re.findall(r"[a-z]{4,}", (t or "").lower()))
+
+
+def route_arxiv_title(meta: PaperMetadata, client) -> List[Tuple[str, str]]:
+    """无 arxiv_id 时按标题在 arXiv 检索副本；只认词面重合 ≥ 0.75 的命中。"""
+    title = (meta.title or "").strip()
+    if len(title) < 12 or len(_title_words(title)) < _ARXIV_TITLE_MIN_WORDS:
+        return []
+    try:
+        r = client.get("http://export.arxiv.org/api/query",
+                       params={"search_query": 'ti:"{}"'.format(title[:180]), "max_results": 1},
+                       timeout=30.0)
+        if r.status_code != 200:
+            return []
+        body = r.text
+        entry = body[body.find("<entry>"):] if "<entry>" in body else ""
+        got = re.search(r"<title>(.*?)</title>", entry, re.S)
+        pid = re.search(r"<id>https?://arxiv\.org/abs/([^<]+)</id>", entry)
+        if not (got and pid):
+            return []
+        a, b = _title_words(title), _title_words(got.group(1))
+        # 双向：|a∩b|/|a| 只防「命中标题缺词」，防不了「命中标题是包含本标题的长综述」（压测 S2）
+        if (not a or not b or len(a & b) / len(a) < _ARXIV_TITLE_MIN_OVERLAP
+                or len(a & b) / len(b) < _ARXIV_TITLE_MIN_BACK_OVERLAP):
+            return []
+        return [("arxiv-title", "https://arxiv.org/pdf/{}".format(pid.group(1).strip()))]
+    except Exception:                             # noqa: BLE001
+        return []
+
+
+def route_epmc_render(meta: PaperMetadata, client) -> List[Tuple[str, str]]:
+    """EPMC 渲染版 PDF——与 JATS 全文接口是两套：XML 404 不代表没 PDF（geva2021 实测）。"""
+    pmcid = None
+    for _ in range(2):        # EPMC 偶发 502，重试一次再判死
+        try:
+            pmcid = europepmc_pmcid(doi=meta.doi or None, pmid=getattr(meta, "pmid", None) or None,
+                                    client=client)
+        except Exception:                         # noqa: BLE001
+            pmcid = None
+        if pmcid:
+            break
+    if not pmcid:
+        return []
+    return [("epmc-render", "https://europepmc.org/articles/{}?pdf=render".format(pmcid))]
+
+
+def route_openalex(meta: PaperMetadata, client, email: str = "") -> List[Tuple[str, str]]:
+    """OpenAlex best_oa_location + locations 的 pdf_url（最多 3 条），NCBI PMC 链接换成 EPMC。"""
+    doi = (meta.doi or "").strip()
+    if not doi:
+        return []
+    try:
+        r = polite_get(client, "https://api.openalex.org/works/doi:{}".format(doi),
+                       params={"mailto": email} if email else None,
+                       headers={"User-Agent": "{} mailto:{}".format(_BROWSER_UA, email)} if email else None,
+                       timeout=30.0)
+        if r.status_code != 200:
+            return []
+        d = r.json() or {}
+    except Exception:                             # noqa: BLE001
+        return []
+    out, seen = [], set()
+    for loc in [d.get("best_oa_location")] + list(d.get("locations") or []):
+        u = rewrite_pmc_url(((loc or {}).get("pdf_url") or "").strip())
+        if u and u not in seen:
+            seen.add(u)
+            out.append(("openalex", u))
+    return out[:3]
+
+
+def route_s2(meta: PaperMetadata, client) -> List[Tuple[str, str]]:
+    """Semantic Scholar openAccessPdf；把 doi.org 本身填进来的等于没给，过滤掉。"""
+    doi = (meta.doi or "").strip()
+    if not doi:
+        return []
+    try:
+        r = polite_get(client, "https://api.semanticscholar.org/graph/v1/paper/DOI:{}".format(doi),
+                       params={"fields": "openAccessPdf"}, timeout=30.0)
+        if r.status_code != 200:
+            return []
+        u = ((r.json() or {}).get("openAccessPdf") or {}).get("url") or ""
+    except Exception:                             # noqa: BLE001
+        return []
+    u = u.strip()
+    if not u or "doi.org/" in u:
+        return []
+    return [("s2", rewrite_pmc_url(u))]
+
+
+EXTRA_ROUTES = (route_arxiv_title, route_epmc_render, route_openalex, route_s2)
+
+
+def extra_route_candidates(meta: PaperMetadata, client, *, email: str = "",
+                           delay: float = 0.0, sleep=None) -> List[Tuple[str, str]]:
+    """按实测命中率顺序跑四路，返回去重后的 (source, url) 列表；任何一路异常都跳过。
+    delay 是路与路之间的礼貌间隔（首路之前不等）。"""
+    import time as _time
+    _sleep = sleep or _time.sleep
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for i, route in enumerate(EXTRA_ROUTES):
+        if i and delay > 0:
+            _sleep(delay)
+        try:
+            hits = route(meta, client, email=email) if route is route_openalex else route(meta, client)
+        except Exception:                         # noqa: BLE001
+            hits = []
+        for src, url in hits:
+            if url and url not in seen:
+                seen.add(url)
+                out.append((src, url))
+    if out:
+        logger.info("  额外通道命中 {} 条候选（{}）".format(
+            len(out), " / ".join(sorted({s for s, _ in out}))))
+    return out
+
+
+def validate_pdf_bytes(blob: bytes, *, min_bytes: int = PDF_MIN_BYTES,
+                       min_pages: int = PDF_MIN_PAGES) -> Tuple[bool, str]:
+    """三道闸：%PDF magic、体积、可解析页数。返回 (是否通过, 人读原因)。
+    pypdf 缺失时跳过页数闸（前两闸仍卡）。"""
+    if b"%PDF-" not in blob[:_PDF_MAGIC_WINDOW]:
+        return False, "不是 PDF（多半是反爬页/登录页）"
+    if len(blob) < min_bytes:
+        return False, "体积仅 {} 字节，疑似占位页".format(len(blob))
+    try:
+        import io as _io
+        from pypdf import PdfReader
+    except Exception:                             # noqa: BLE001
+        return True, "{:.1f} KB（未装 pypdf，跳过页数闸）".format(len(blob) / 1024)
+    try:
+        n = len(PdfReader(_io.BytesIO(blob)).pages)
+    except Exception as e:                        # noqa: BLE001
+        return False, "PDF 解析失败：{}".format(e)
+    if n < min_pages:
+        return False, "只有 {} 页".format(n)
+    return True, "{} 页 / {:.1f} KB".format(n, len(blob) / 1024)
 
 
 # ---------------- Europe PMC 全文（不经 PDF） ----------------

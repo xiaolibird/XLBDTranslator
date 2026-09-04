@@ -117,3 +117,45 @@ def test_parse_crossref_work_records_true_date_precision():
 
     d = parse_crossref_work(work([2026, 5, 5]))
     assert d["date_precision"] == "day"
+
+
+# ---------------- e-locator 期刊：article-number 回退（docs/bugs/2026-09-04-crossref-article-number-lost.md） ----------------
+
+def _work(**kw):
+    base = {"title": ["Testing Covariates Effects on Bivariate Reference Regions"],
+            "DOI": "10.1002/sim.10308", "container-title": ["Statistics in Medicine"],
+            "volume": "44", "issue": "3-4", "issued": {"date-parts": [[2025, 1, 24]]}}
+    base.update(kw)
+    return base
+
+
+def test_parse_crossref_work_falls_back_to_article_number():
+    from src.scholar.crossref import parse_crossref_work
+    assert parse_crossref_work(_work(page=None, **{"article-number": "e10308"}))["pages"] == "e10308"
+    # 不一定是纯数字（NAR 的 gkag386），别做 int 校验
+    assert parse_crossref_work(_work(**{"article-number": "gkag386"}))["pages"] == "gkag386"
+
+
+def test_parse_crossref_work_page_wins_over_article_number_and_both_empty_is_none():
+    from src.scholar.crossref import parse_crossref_work
+    assert parse_crossref_work(_work(page="123-130", **{"article-number": "e1"}))["pages"] == "123-130"
+    assert parse_crossref_work(_work(page="", **{"article-number": ""}))["pages"] is None
+    assert parse_crossref_work(_work())["pages"] is None
+
+
+def test_parse_crossref_work_tolerates_non_string_page():
+    from src.scholar.crossref import parse_crossref_work
+    assert parse_crossref_work(_work(page=7))["pages"] == "7"
+    assert parse_crossref_work(_work(**{"article-number": 294}))["pages"] == "294"
+
+
+def test_repair_references_csl_carries_article_number_as_page():
+    import importlib.util
+    from src.scholar.paths import REPO_ROOT
+    from src.scholar.crossref import parse_crossref_work
+    spec = importlib.util.spec_from_file_location("repair_refs_t", REPO_ROOT / "scripts" / "repair_references.py")
+    rr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rr)
+    item = parse_crossref_work(_work(**{"article-number": "e10308"}))
+    csl = rr._csl_from_crossref(item, {"citekey": "ladobaleato2025Testing"})
+    assert csl["page"] == "e10308" and csl["id"] == "ladobaleato2025Testing"
