@@ -794,3 +794,847 @@ def test_cmd_ingest_forwards_title_ignored(tmp_path, monkeypatch):
     args.pdf = [str(tmp_path / "a.pdf")]
     M.cmd_ingest(args)
     assert seen.get("t") == "", "单篇时 --title 生效，不该报忽略"
+
+
+# ---------------- R4：整月重建的并发缺口（见 docs/bugs/2026-09-03-finalize-concurrency.md） ----------------
+
+def test_rebuild_month_must_not_drop_bundle_still_on_disk(tmp_path):
+    """并发场景：A 会话 glob 完 bundle 列表后，B 会话新写了一份 final bundle。
+    A 用陈旧列表重建 → 那篇会被静默抹出 md/索引，而它的 bundle **仍在盘上**。
+
+    与 test_rebuild_month_does_not_refuse_on_clean_removal 的区别正在于此：
+    人主动删 bundle 时文件已不在盘上（该放行）；并发时文件在盘上（该拦）。
+    两者在 segments 列表上完全同形，故守卫无法靠「条目变少」分辨。
+
+    这里用「永久说谎的 glob」模拟最坏情况的陈旧——**列表本身不可信**。提交前重查
+    因此必须用一条**独立的**目录读取路径（os.scandir），复用同一次 glob 的结果就
+    对这类陈旧完全隐形。修复后本例走「3 轮都不稳定 → 整月一字未动」，md 里的 B 保住。
+    """
+    from src.scholar import pdf_ingest as pi
+    import pathlib
+    month = "2026-08"
+    a = _manual_seg("pa9", "Paper A Archived", "Zhang", "10.1/a9")
+    b = _manual_seg("pb9", "Paper B NewlyAdded", "Wang", "10.1/b9")
+    _write_final_bundle(tmp_path, month, a, "/a9.pdf")
+    _write_final_bundle(tmp_path, month, b, "/b9.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    b_path = pi.bundle_path(tmp_path, month, "pb9")
+
+    orig_glob = pathlib.Path.glob
+
+    def _stale_glob(self, pat):                      # A 没看见 B 新写的那份
+        out = list(orig_glob(self, pat))
+        if self.name == month:
+            out = [p for p in out if p != b_path]
+        return iter(out)
+
+    pathlib.Path.glob = _stale_glob
+    try:
+        M._rebuild_month(tmp_path, month, _FakeSettings())
+    finally:
+        pathlib.Path.glob = orig_glob
+
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert b_path.exists(), "前提：B 的 bundle 仍在盘上"
+    assert "Paper B NewlyAdded" in md, "盘上仍有 bundle 的论文不得被整月重建抹掉"
+
+
+def test_rebuild_month_rewrites_global_index_across_all_months(tmp_path):
+    """爆炸半径：_rebuild_month 收尾的 update_index 扫的是**全部月份**，
+    故两个会话即使精读不同月份，全局索引仍会对撞——按月加锁不够，得锁到索引层。
+    """
+    a = _manual_seg("pm1", "July Paper", "Zhang", "10.1/m1")
+    b = _manual_seg("pm2", "August Paper", "Wang", "10.1/m2")
+    _write_final_bundle(tmp_path, "2026-07", a, "/m1.pdf")
+    _write_final_bundle(tmp_path, "2026-08", b, "/m2.pdf")
+    M._rebuild_month(tmp_path, "2026-07", _FakeSettings())
+    # 只重建 8 月，7 月的条目也会被重新写进全局索引
+    M._rebuild_month(tmp_path, "2026-08", _FakeSettings())
+    idx = json.loads((tmp_path / "literature_index.json").read_text(encoding="utf-8"))
+    titles = {p.get("title") for p in idx["papers"]}
+    assert {"July Paper", "August Paper"} <= titles, \
+        "重建 8 月却重写了含 7 月条目的全局索引 → 跨月并发同样对撞"
+
+
+def test_adding_a_paper_renumbers_existing_headings(tmp_path):
+    """为什么不能「按论文 id 单篇 append/覆盖」：小节标题里嵌了**全月排名与优先级档位**
+    （`## 🔴 高 3. Title [@key]`，档位由 _priority_tier(rank, total) 算），
+    新增一篇会改变 total 与其后所有篇的序号，故单篇 upsert 无法就地完成。
+    """
+    month = "2026-08"
+    segs = [_manual_seg("pr%d" % i, "Paper %d" % i, "Author%d" % i, "10.1/r%d" % i)
+            for i in range(1, 4)]
+    for i, s in enumerate(segs):
+        s.priority_score = 1.0 - i * 0.1          # 拉开排名，避免并列
+        _write_final_bundle(tmp_path, month, s, "/r%d.pdf" % i)
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    md_before = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    heads_before = [l for l in md_before.splitlines() if l.startswith("## ") and "[@" in l]
+
+    extra = _manual_seg("pr9", "Paper Inserted", "AuthorZ", "10.1/r9")
+    extra.priority_score = 0.95                   # 插进已有序列中间
+    _write_final_bundle(tmp_path, month, extra, "/r9.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    md_after = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    heads_after = [l for l in md_after.splitlines() if l.startswith("## ") and "[@" in l]
+
+    assert len(heads_after) == len(heads_before) + 1
+    moved = [h for h in heads_before if h not in heads_after]
+    assert moved, "新增一篇后，既有论文的小节标题（序号/档位）必然改变 → 单篇 append 不成立"
+
+
+# ---------------- R5：并发修复（锁 + 提交前重查）----------------
+
+def test_rebuild_month_reruns_and_includes_bundle_written_during_collection(tmp_path,
+                                                                            monkeypatch):
+    """忠实复现生产竞态（时间差、非"永久说谎的 glob"）：A 已 glob 完列表、正在逐份读
+    bundle 时，B 会话新写了一份 final bundle。
+
+    期望**自愈而非拒绝**：提交前重查发现磁盘多了一份 → 用新列表重来一轮 → 两篇都进 md。
+    这比"拒绝改动"更好——拒绝的话 A 自己那篇也归不了档。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pa10", "Paper A First", "Zhang", "10.1/a10")
+    b = _manual_seg("pb10", "Paper B Concurrent", "Wang", "10.1/b10")
+    _write_final_bundle(tmp_path, month, a, "/a10.pdf")
+
+    orig_load = pi.load_bundle
+    fired = {"n": 0}
+
+    def _load_and_race(bf):
+        # 第一次读 bundle 的瞬间，另一个会话写入了 B（A 的 glob 早已取完，看不到它）
+        if fired["n"] == 0:
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, b, "/b10.pdf")
+        return orig_load(bf)
+
+    monkeypatch.setattr(pi, "load_bundle", _load_and_race)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert not r.get("refused"), "并发新增应当自愈重来，而不是拒绝整月"
+    assert r["papers"] == 2, "重来那一轮必须看到 B"
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Paper A First" in md and "Paper B Concurrent" in md
+
+
+def test_bundle_inventory_detects_draft_flipped_to_final_without_path_change(tmp_path):
+    """指纹必须带 mtime/size：本工作流的常态是 ingest 先落 draft、agent 后把**同一个
+    文件**改写成 final——路径集合根本没变，只比路径集会漏掉（缺陷文档实测过）。
+    """
+    from src.scholar.pdf_ingest import BUNDLE_SUFFIX
+    month = "2026-08"
+    seg = _manual_seg("pf1", "Flip Me", "Zhao", "10.1/f1")
+    _write_final_bundle(tmp_path, month, seg, "/f1.pdf")
+    mdir = tmp_path / "manual" / month
+    before = M._bundle_inventory(mdir, BUNDLE_SUFFIX)
+
+    import time as _t
+    _t.sleep(0.01)
+    _write_final_bundle(tmp_path, month, seg, "/f1.pdf",          # 同一路径改写
+                        cross_check_report={"verified_count": 9, "corrected": [], "added": []})
+    after = M._bundle_inventory(mdir, BUNDLE_SUFFIX)
+
+    assert set(before) == set(after), "前提：路径集合没变"
+    assert before != after, "只比路径集会漏掉 draft→final 翻转，指纹必须带 mtime/size"
+
+
+def test_bundle_inventory_reads_disk_independently_of_glob(tmp_path):
+    """提交前重查必须走**独立**的目录读取路径：若它复用采集那次 glob，
+    "我手上这份列表已经过时"这件事对守卫就完全隐形（这正是守卫要发现的东西）。
+    """
+    import pathlib
+    from src.scholar.pdf_ingest import BUNDLE_SUFFIX
+    month = "2026-08"
+    seg = _manual_seg("pi1", "Hidden From Glob", "Sun", "10.1/i1")
+    _write_final_bundle(tmp_path, month, seg, "/i1.pdf")
+    mdir = tmp_path / "manual" / month
+
+    orig_glob = pathlib.Path.glob
+    pathlib.Path.glob = lambda self, pat: iter([])      # glob 全盘说谎
+    try:
+        assert M._bundle_inventory(mdir, BUNDLE_SUFFIX), \
+            "_bundle_inventory 不得依赖 glob（否则陈旧列表对守卫隐形）"
+    finally:
+        pathlib.Path.glob = orig_glob
+
+
+def test_rebuild_month_flags_concurrent_change_during_write(tmp_path, monkeypatch):
+    """写盘期间（write_notes 那一段）磁盘又变了：内容已经落盘且本身是对的，只是可能
+    缺最新那篇。不回滚，但必须**标红 + 非 0 退出**，否则 agent 收到绿回执就不会重跑。
+    """
+    from types import SimpleNamespace
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    a = _manual_seg("pw1", "Written Paper", "Zhang", "10.1/w1")
+    b = _manual_seg("pw2", "Arrived Late", "Wang", "10.1/w2")
+    _write_final_bundle(tmp_path, month, a, "/w1.pdf")
+
+    orig_write = notes_mod.write_notes
+    fired = {"n": 0}
+
+    def _write_and_race(*args, **kw):
+        out = orig_write(*args, **kw)
+        if fired["n"] == 0:          # 只在第一轮制造并发，之后让它收敛
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, b, "/w2.pdf")
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _write_and_race)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    # 第二轮会看到 B 并收敛；这里只断言机制被触发过（重来了一轮）
+    assert fired["n"] == 1
+    assert r["papers"] == 2, "写盘期间到达的那篇应在下一轮被收进来"
+
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    # concurrent 标记必须让 regen 退非 0（与 refused/broken 同档）
+    monkeypatch.setattr(M, "_rebuild_month",
+                        lambda *a, **k: {"month": month, "papers": 1, "concurrent": True,
+                                         "skipped_drafts": [], "broken_bundles": [],
+                                         "index": {"papers": [], "citekey_collisions": []}})
+    rc = M.cmd_regen(SimpleNamespace(config="unused", month=month, allow_removals=False))
+    assert rc == 1, "并发未收敛必须非 0 退出，否则 agent 不会重跑"
+
+
+def test_report_final_concurrent_wording_is_not_a_deletion_warning(tmp_path, capsys):
+    """并发导致的拒绝**没有**净删除清单：报成「会净删除 0 篇已归档论文」会把人引向
+    「数据出问题了」的错误方向，而真相是「什么都没动，稍后重跑即可」。
+    """
+    M._report_final({"month": "2026-08", "papers": 0, "refused": True, "reason": "concurrent",
+                     "skipped_drafts": [], "broken_bundles": [],
+                     "index": {"papers": [], "citekey_collisions": []}}, tmp_path)
+    out = capsys.readouterr().out
+    assert "整月未改动" in out and "数据没丢" in out
+    assert "净删除" not in out, "并发拒绝不该说成净删除（会误导排查方向）"
+
+
+def test_rebuild_lock_serialises_two_rebuilds(tmp_path, monkeypatch):
+    """锁：另一轮重建持锁时，本轮等待到上限后拒绝（整月一字未动），而不是并行写盘。
+
+    flock 按 open file description 生效——同进程内另开一个 fd 同样会被挡住，
+    故可在进程内构造竞争。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pl1", "Locked Out", "Qian", "10.1/l1")
+    _write_final_bundle(tmp_path, month, seg, "/l1.pdf")
+
+    holder = M._RebuildLock(tmp_path)
+    assert holder.acquire(), "前提：先手拿到锁"
+    try:
+        monkeypatch.setattr(M, "_REBUILD_LOCK_TIMEOUT", 0.3)
+        r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    finally:
+        holder.release()
+
+    assert r.get("refused") is True and r.get("reason") == "locked"
+    assert not (tmp_path / "科研札记_{}_手动精读.md".format(month)).exists(), \
+        "等锁失败时不得写盘"
+    # 锁释放后照常重建
+    r2 = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r2["papers"] == 1 and not r2.get("refused")
+
+
+def test_rebuild_lock_is_released_and_reentrant_across_calls(tmp_path):
+    """锁必须在 finally 里释放：漏释放会让同一进程内的下一次重建（regen 批量按月循环、
+    或同一会话连着 finalize 两篇）直接等锁超时。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pl2", "Twice", "Zhou", "10.1/l2")
+    _write_final_bundle(tmp_path, month, seg, "/l2.pdf")
+    for _ in range(3):
+        r = M._rebuild_month(tmp_path, month, _FakeSettings())
+        assert r["papers"] == 1 and not r.get("refused")
+
+
+# ---------------- R6：第 1 轮对抗审计/压测的回归（变异存活 + 实测缺陷）----------------
+
+def test_inplace_draft_to_final_rewrite_is_caught_end_to_end(tmp_path, monkeypatch):
+    """变异 M1 存活补测：把重查削弱成「只比路径集」时，本例必红。
+
+    另一会话把**同一个文件**从 draft 改写成 final（本工作流常态：ingest 落 draft、
+    agent 后写 final），路径集合完全没变——只有 mtime/size 变。端到端必须发现并重来，
+    否则那篇被静默丢掉。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pm1", "Anchor Paper", "Zhang", "10.1/m1")
+    b = _manual_seg("pm2", "Flipped To Final", "Wang", "10.1/m2")
+    _write_final_bundle(tmp_path, month, a, "/m1.pdf")
+    # B 先以 draft 落盘（不会被纳入重建）
+    b_path = pi.bundle_path(tmp_path, month, "pm2")
+    pi.write_bundle(b_path, status="draft", month=month, pdf_path="/m2.pdf",
+                    metadata_source="crossref-doi", segment=b,
+                    close_reading_script=b.close_reading)
+
+    orig_load = pi.load_bundle
+    fired = {"n": 0}
+
+    def _flip_during_collection(bf):
+        if fired["n"] == 0:                     # 读 A 的瞬间，对方把 B 原地翻成 final
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, b, "/m2.pdf")
+        return orig_load(bf)
+
+    monkeypatch.setattr(pi, "load_bundle", _flip_during_collection)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert set(_bundle_names(tmp_path, month)) == {"pm1.paper.json", "pm2.paper.json"}, \
+        "前提：路径集合自始至终没变，只有内容/mtime 变"
+    assert r["papers"] == 2, "同路径 draft→final 翻转必须被重查发现并在下一轮收进来"
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Flipped To Final" in md
+
+
+def _bundle_names(notes_dir, month):
+    import os as _os
+    return sorted(n for n in _os.listdir(notes_dir / "manual" / month)
+                  if n.endswith(".paper.json"))
+
+
+def test_concurrent_flag_and_finalize_exit_code_on_real_path(tmp_path, monkeypatch):
+    """变异 M6/M7 存活补测：`out["concurrent"]=True` 与 cmd_finalize 的退出码此前
+    只被「把 _rebuild_month 换成硬编码字典」的测试覆盖，真实路径上零覆盖。
+    这里让并发**持续**发生（每轮都插），逼真实代码走到标记那一行。
+    """
+    from types import SimpleNamespace
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    a = _manual_seg("pc1", "Base Paper", "Zhang", "10.1/c1")
+    bf_a = _write_final_bundle(tmp_path, month, a, "/c1.pdf")
+
+    orig_write = notes_mod.write_notes
+    n = {"i": 0}
+
+    def _always_race(*args, **kw):
+        out = orig_write(*args, **kw)
+        n["i"] += 1                              # 每轮写完都再塞一篇 → 永远收敛不了
+        extra = _manual_seg("px%d" % n["i"], "Racer %d" % n["i"], "Wang", "10.1/x%d" % n["i"])
+        _write_final_bundle(tmp_path, month, extra, "/x%d.pdf" % n["i"])
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _always_race)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r.get("concurrent") is True, "持续并发下必须标 concurrent（真实路径）"
+    assert not r.get("refused"), "已经写过盘就不能报成整月未改动"
+
+    # 真实标记 → cmd_finalize 必须退非 0（agent 收到绿回执就不会重跑）
+    class _Proc(_FakeProc):
+        notes_dir = tmp_path
+    class _Settings:
+        processing = _Proc()
+    monkeypatch.setattr(M, "_load_settings", lambda cfg: _Settings())
+    monkeypatch.setattr(notes_mod, "write_notes", orig_write)   # 停止捣乱
+    monkeypatch.setattr(M, "_rebuild_month", lambda *a, **k: dict(r))
+    rc = M.cmd_finalize(SimpleNamespace(config="unused", bundle=str(bf_a),
+                                        allow_removals=False))
+    assert rc == 1
+
+
+def test_lock_released_when_write_notes_raises(tmp_path, monkeypatch):
+    """变异 M12 存活补测：原测试靠「连跑三次都成功」钉锁释放，但 CPython 引用计数在
+    函数返回时关掉 fd、关 fd 即释放 flock，所以删掉 finally 也照样绿（恒真断言）。
+    真正需要 finally 的是**异常路径**——这里显式持有锁对象、不让 GC 帮忙。
+    """
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    seg = _manual_seg("pe1", "Boom", "Zhao", "10.1/e1")
+    _write_final_bundle(tmp_path, month, seg, "/e1.pdf")
+
+    def _boom(*a, **kw):
+        raise RuntimeError("写盘炸了")
+
+    # 必须**持有** _rebuild_month 内部造的那个锁对象：否则函数一返回，CPython 引用计数
+    # 就把 fd 关了，而关 fd 即释放 flock——删掉 finally 也照样绿，断言恒真（变异实证）。
+    real_lock_cls = M._RebuildLock
+    made = []
+
+    class _KeepAlive(real_lock_cls):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    monkeypatch.setattr(M, "_RebuildLock", _KeepAlive)
+    monkeypatch.setattr(notes_mod, "write_notes", _boom)
+    with pytest.raises(RuntimeError):
+        M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert made, "前提：本轮确实构造过锁"
+
+    monkeypatch.setattr(M, "_REBUILD_LOCK_TIMEOUT", 0.3)
+    probe = real_lock_cls(tmp_path)
+    try:
+        assert probe.acquire(), "异常路径必须在 finally 里释放锁，否则整库重建被永久挡住"
+    finally:
+        probe.release()
+
+
+def test_stat_before_load_detects_file_changed_while_being_read(tmp_path, monkeypatch):
+    """变异 M4b 存活补测：stat 必须取在 load **之前**。取在之后的话，「我读它的时候
+    它正被改写」会被记成「没变」——正是要发现的那件事被自己抹平。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    seg = _manual_seg("ps1", "Being Rewritten", "Sun", "10.1/s1")
+    _write_final_bundle(tmp_path, month, seg, "/s1.pdf")
+
+    orig_load = pi.load_bundle
+    fired = {"n": 0}
+
+    def _rewrite_while_reading(bf):
+        data = orig_load(bf)
+        if fired["n"] == 0:                      # 读完这一份的瞬间，对方把它改写了
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, seg, "/s1.pdf",
+                                cross_check_report={"verified_count": 7,
+                                                    "corrected": [], "added": []})
+        return data
+
+    monkeypatch.setattr(pi, "load_bundle", _rewrite_while_reading)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert fired["n"] == 1
+    assert r["papers"] == 1 and not r.get("refused"), "重来一轮后应正常收敛"
+
+
+def test_concurrent_partial_write_is_retried_not_reported_as_broken_json(tmp_path,
+                                                                        monkeypatch):
+    """审计 F1：净删除闸必须排在提交前重查**之后**。
+
+    另一会话正原地改写某份**已归档**论文的 bundle 时，本轮会读到半截 JSON → 记成
+    broken → 闸门开火 → 直接 return，一轮都不重试，回执还教用户「去修一份根本没坏的
+    JSON」。正确行为是先按并发重来；重来之后还坏才是真的坏。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pp1", "Stable Paper", "Zhang", "10.1/p1")
+    b = _manual_seg("pp2", "Being Rewritten Paper", "Wang", "10.1/p2")
+    _write_final_bundle(tmp_path, month, a, "/p1.pdf")
+    _write_final_bundle(tmp_path, month, b, "/p2.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())        # 两篇都已归档
+    b_path = pi.bundle_path(tmp_path, month, "pp2")
+    b_path.write_text('{"status": "final"', encoding="utf-8")  # 对方写到一半
+
+    orig_load = pi.load_bundle
+    done = {"v": False}
+
+    def _finish_write_after_read(bf):
+        try:
+            return orig_load(bf)
+        finally:
+            if bf.name == b_path.name and not done["v"]:
+                done["v"] = True                  # 对方把这一份写完了 → mtime 再变
+                _write_final_bundle(tmp_path, month, b, "/p2.pdf")
+
+    monkeypatch.setattr(pi, "load_bundle", _finish_write_after_read)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert not r.get("refused"), "并发半截 JSON 不该被当成「你的 JSON 坏了」直接拒绝"
+    assert r["papers"] == 2 and not r.get("broken_bundles")
+
+
+def test_gate_after_a_successful_write_does_not_claim_month_untouched(tmp_path,
+                                                                     monkeypatch):
+    """审计/压测发现的**回归**：闸门被搬进重试循环后，第 2 轮才触发的闸会否定第 1 轮
+    已经落的盘——回执谎称「整月一字未动」，而 refused 分支不刷 write_outputs，
+    于是月度 md/sidecar 有新论文、全局索引没有，**持久不一致**。
+
+    正确行为：已写盘那一轮是数据完整的，收下它走正常收尾，broken 照报、退出码照样非 0。
+    """
+    from src.scholar import pdf_ingest as pi
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    a = _manual_seg("pg1", "Archived A", "Zhang", "10.1/g1")
+    b = _manual_seg("pg2", "Archived B", "Wang", "10.1/g2")
+    c = _manual_seg("pg3", "Newly Added C", "Li", "10.1/g3")
+    _write_final_bundle(tmp_path, month, a, "/g1.pdf")
+    _write_final_bundle(tmp_path, month, b, "/g2.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())         # A、B 已归档
+    _write_final_bundle(tmp_path, month, c, "/g3.pdf")         # agent 新写 C
+
+    orig_write = notes_mod.write_notes
+    fired = {"n": 0}
+
+    def _break_b_during_write(*args, **kw):
+        out = orig_write(*args, **kw)                          # 第 1 轮写盘：A+B+C 都进去了
+        if fired["n"] == 0:
+            fired["n"] = 1
+            pi.bundle_path(tmp_path, month, "pg2").write_text(
+                '{"status": "final"', encoding="utf-8")        # 写盘期间 B 的 JSON 被改坏
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _break_b_during_write)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert not r.get("refused"), "第 1 轮已写盘，不能报成「整月一字未动」"
+    assert r["broken_bundles"], "B 的 JSON 确实坏了，必须报出来让人去修"
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    idx = json.loads((tmp_path / "literature_index.json").read_text(encoding="utf-8"))
+    titles = {p.get("title") for p in idx["papers"]}
+    assert "Newly Added C" in md, "第 1 轮写进 md 的内容是完整的，不该回滚"
+    assert "Newly Added C" in titles, "全局索引必须与月度 md 一致（refused 分支曾漏刷）"
+
+
+def test_directory_named_like_a_bundle_does_not_wedge_the_month(tmp_path):
+    """压测发现：`<x>.paper.json` 若是**目录**，采集侧 glob 收得到、重查侧 scandir
+    的 is_file() 收不到 → 指纹恒不相等 → 三轮全判并发 → 该月**永久**归档不进，
+    回执还教人「稍后重跑」（永远不会奏效）。两侧口径必须一致。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pd1", "Real Paper", "Qian", "10.1/d1")
+    _write_final_bundle(tmp_path, month, seg, "/d1.pdf")
+    (tmp_path / "manual" / month / "trap.paper.json").mkdir()   # 同名目录陷阱
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert not r.get("refused"), "同名目录不该把整月卡成永久 refused"
+    assert r["papers"] == 1
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Real Paper" in md
+
+
+def test_report_final_keeps_broken_headline_when_also_concurrent(tmp_path, capsys):
+    """审计 F7：两者并存时首行必须是 ⛔（有 bundle 没入库，要人去修），
+    不能被 ⚠️ 并发降级；但并发提示本身也不能丢。
+    """
+    M._report_final({"month": "2026-08", "papers": 2, "concurrent": True,
+                     "skipped_drafts": [], "broken_bundles": ["x.paper.json"],
+                     "index": {"papers": [], "citekey_collisions": []}}, tmp_path)
+    out = capsys.readouterr().out
+    headline = next(ln for ln in out.splitlines() if "手动精读归档" in ln)
+    assert headline.startswith("⛔"), "两者并存时首行必须是 ⛔（要人去修 JSON），不能被 ⚠️ 降级"
+    assert "有 bundle 未入库" in out and "并发归档" in out
+
+
+# ---------------- R7：第 2 轮对抗审计/压测的回归 ----------------
+
+def test_non_regular_bundle_file_cannot_silently_drop_an_archived_paper(tmp_path):
+    """第 2 轮审计抓到的**回归**：给采集侧加 `is_file()` 过滤后，非普通文件
+    （同名目录 / 悬空软链）会从 consumed、disk、broken 三处同时消失 → 净删除闸失明
+    → 那篇已归档论文在**绿回执 + exit 0** 下被整篇重写抹掉。必须记进 broken。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pn1", "Keeps Living", "Zhang", "10.1/n1")
+    b = _manual_seg("pn2", "Must Not Vanish", "Wang", "10.1/n2")
+    _write_final_bundle(tmp_path, month, a, "/n1.pdf")
+    b_path = _write_final_bundle(tmp_path, month, b, "/n2.pdf")
+    M._rebuild_month(tmp_path, month, _FakeSettings())      # A、B 都已归档
+
+    b_path.unlink()
+    b_path.symlink_to(tmp_path / "does_not_exist.json")     # 悬空软链：既非普通文件也读不出
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r.get("refused") is True, "已归档论文的 bundle 变成非普通文件 → 闸必须开火"
+    assert any("pn2" in n for n in r["broken_bundles"]), "非普通文件必须报进 broken"
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Must Not Vanish" in md, "整月必须一字未动"
+
+
+def test_unverified_broken_is_not_named_as_something_to_fix(tmp_path, monkeypatch, capsys):
+    """第 2 轮审计：在重查（一）处夭折的那一轮，其 broken 多半是「对方写到一半」的半截
+    JSON。把它当「你的 JSON 坏了」点名，就是教人去修一份此刻已经好了的文件。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("pu1", "Anchor", "Zhang", "10.1/u1")
+    b = _manual_seg("pu2", "Half Written", "Wang", "10.1/u2")
+    _write_final_bundle(tmp_path, month, a, "/u1.pdf")
+    b_path = pi.bundle_path(tmp_path, month, "pu2")
+
+    orig_load = pi.load_bundle
+
+    def _always_half_then_finish(bf):
+        # 每一轮：读到 B 时它是半截的，读完立刻被写完 → 指纹变 → 重查夭折 → 下一轮同理
+        if bf.name == b_path.name:
+            try:
+                return orig_load(bf)
+            finally:
+                _write_final_bundle(tmp_path, month, b, "/u2.pdf")
+        out = orig_load(bf)
+        b_path.write_text('{"status": "final"', encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(pi, "load_bundle", _always_half_then_finish)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert not r.get("broken_bundles"), "未经重查证实的 broken 不许进正式清单"
+    if r.get("unverified_broken"):
+        M._report_final(r, tmp_path)
+        out = capsys.readouterr().out
+        assert "先别改" in out, "要明说这份清单不可信，别教人去修好文件"
+
+
+def test_stale_index_does_not_trigger_sync_that_would_delete_peer_vectors(tmp_path,
+                                                                          monkeypatch):
+    """第 2 轮压测抓到的新窗口：把 best-effort 同步移到锁外后，A 释放锁→同步之间，
+    B 可能已经重建并刷新了全局索引。A 手上的 idx 是**陈旧**的，拿它 sync_store 会把
+    B 刚嵌入的 chunk 当成"库里多出来的"删掉（向量库的 0.5 骤缩闸拦不住，只少一篇）。
+    指纹变了就必须跳过本轮同步。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pv1", "Vector Paper", "Zhao", "10.1/v1")
+    _write_final_bundle(tmp_path, month, seg, "/v1.pdf")
+
+    synced = []
+    monkeypatch.setattr(M, "_sync_embedding_best_effort",
+                        lambda nd, idx, st: synced.append(idx))
+
+    orig_write_outputs = M.__dict__.get("write_outputs")   # 模块内是函数内 import，改不到
+    real_update = None
+
+    # 在锁内写完索引之后、锁外同步之前，模拟"另一轮重建刷新了全局索引"
+    orig_stat_fp = M._stat_fp
+    calls = {"n": 0}
+
+    def _fp_changes_after_lock(path):
+        calls["n"] += 1
+        # 第 1 次（锁内记指纹）给真值，第 2 次（锁外比对）给一个不同的值 = 别人改过了
+        return orig_stat_fp(path) if calls["n"] == 1 else (12345, 999)
+
+    monkeypatch.setattr(M, "_stat_fp", _fp_changes_after_lock)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r.get("sync_skipped") is True, "索引已被别人刷新时必须跳过同步"
+    assert not synced, "拿陈旧 idx 同步会删掉并发方刚嵌入的向量"
+
+
+def test_best_effort_syncs_run_outside_the_rebuild_lock(tmp_path, monkeypatch):
+    """变异 M4 补测：两个 best-effort 同步必须在**锁外**跑。topics 合成是 timeout 2400s
+    的子进程，而等锁上限只有 180s——放锁内的话一次慢合成能让全库 finalize 撞
+    refused/locked 半小时（压测实证）。
+    """
+    month = "2026-08"
+    seg = _manual_seg("pk1", "Outside Lock", "Sun", "10.1/k1")
+    _write_final_bundle(tmp_path, month, seg, "/k1.pdf")
+
+    seen = {}
+
+    def _probe_lock(nd, idx, st):
+        probe = M._RebuildLock(tmp_path)
+        seen["free"] = probe.acquire()      # 同步进行时，锁必须已经放开
+        if seen["free"]:
+            probe.release()
+
+    monkeypatch.setattr(M, "_REBUILD_LOCK_TIMEOUT", 0.3)
+    monkeypatch.setattr(M, "_sync_embedding_best_effort", _probe_lock)
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert seen.get("free") is True, "同步跑在锁内 → 慢同步会把全库重建挡在门外"
+
+
+def test_successful_heal_reports_green_not_concurrent(tmp_path, monkeypatch):
+    """变异 M6 补测：并发被自愈收敛之后必须是**绿回执**（unstable 要复位），
+    否则"自愈而非拒绝"的收益在回执上看不出来，用户照样以为要重跑。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    a = _manual_seg("ph1", "First", "Zhang", "10.1/h1")
+    b = _manual_seg("ph2", "Arrived During Collection", "Wang", "10.1/h2")
+    _write_final_bundle(tmp_path, month, a, "/h1.pdf")
+
+    orig_load = pi.load_bundle
+    fired = {"n": 0}
+
+    def _race_once(bf):
+        if fired["n"] == 0:
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, b, "/h2.pdf")
+        return orig_load(bf)
+
+    monkeypatch.setattr(pi, "load_bundle", _race_once)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert r["papers"] == 2
+    assert not r.get("concurrent"), "收敛之后 unstable 必须复位，回执要是绿的"
+    assert not r.get("refused")
+
+
+def test_papers_count_matches_what_is_actually_in_the_md(tmp_path, monkeypatch):
+    """变异 M5 补测：papers 必须是**写盘那一轮**的篇数（描述 md 里实际有几篇），
+    不是循环结束时的 segments（那可能是后来某轮读到的、并没写进 md 的数字）。
+    """
+    from src.scholar import pdf_ingest as pi
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    a = _manual_seg("pq1", "A", "Zhang", "10.1/q1")
+    b = _manual_seg("pq2", "B", "Wang", "10.1/q2")
+    c = _manual_seg("pq3", "C", "Li", "10.1/q3")
+    for s, pth in ((a, "/q1.pdf"), (b, "/q2.pdf"), (c, "/q3.pdf")):
+        _write_final_bundle(tmp_path, month, s, pth)
+    M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    orig_write = notes_mod.write_notes
+    fired = {"n": 0}
+
+    def _break_one_during_write(*args, **kw):
+        out = orig_write(*args, **kw)          # 这一轮把 3 篇都写进了 md
+        if fired["n"] == 0:
+            fired["n"] = 1
+            pi.bundle_path(tmp_path, month, "pq2").write_text('{"x"', encoding="utf-8")
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _break_one_during_write)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    n_in_md = sum(1 for ln in md.splitlines() if ln.startswith("## ") and "[@" in ln)
+    assert r["papers"] == n_in_md == 3, "回执篇数必须等于 md 里实际的篇数"
+
+
+def test_receipt_after_a_write_never_names_an_unverified_broken_file(tmp_path, monkeypatch):
+    """正常收尾路径上的同一件事（变异实证此前无保护）：写过盘之后，末轮在重查（一）
+    处夭折，那轮的 broken 是「对方写到一半」的半截 JSON——回执必须用**上一次经重查
+    证实**的清单，而不是末轮那份。
+    """
+    from src.scholar import pdf_ingest as pi
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    a = _manual_seg("pz1", "Written OK", "Zhang", "10.1/z1")
+    b = _manual_seg("pz2", "Half Written Peer", "Wang", "10.1/z2")
+    _write_final_bundle(tmp_path, month, a, "/z1.pdf")
+    b_path = pi.bundle_path(tmp_path, month, "pz2")
+
+    orig_write = notes_mod.write_notes
+
+    def _spawn_half_b(*args, **kw):
+        out = orig_write(*args, **kw)          # 第 1 轮 A 正常写盘 → verified = 空清单
+        b_path.write_text('{"status": "final"', encoding="utf-8")   # 写盘期间冒出半截 B
+        return out
+
+    orig_load = pi.load_bundle
+
+    def _b_keeps_flapping(bf):
+        if bf.name == b_path.name:
+            try:
+                return orig_load(bf)           # 半截 → 进 broken
+            finally:
+                _write_final_bundle(tmp_path, month, b, "/z2.pdf")   # 读完即被写完 → 指纹变
+        out = orig_load(bf)
+        if b_path.exists():
+            b_path.write_text('{"status": "final"', encoding="utf-8")  # 下一轮又是半截
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _spawn_half_b)
+    monkeypatch.setattr(pi, "load_bundle", _b_keeps_flapping)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    assert r.get("concurrent") is True, "写过盘但始终没收敛 → 该标 concurrent"
+    assert not r.get("broken_bundles"), \
+        "末轮未通过重查，它的 broken 不可信，不许进正式清单（会教人去修好文件）"
+
+
+# ---------------- R8：第 3 轮对抗审计/压测的回归 ----------------
+
+def test_symlink_loop_bundle_does_not_wedge_the_month(tmp_path):
+    """第 3 轮压测抓到的实质缺陷：`DirEntry.is_file()` 撞符号链接环会**抛** ELOOP，
+    该判断若在 per-entry 的 try 之外，整份 scandir 会从那一条起静默截断 →
+    与采集侧口径分叉 → 指纹恒不等 → 该月**永久**卡死，回执还谎称"另有会话在归档"。
+    """
+    month = "2026-08"
+    seg = _manual_seg("psl", "Survives The Loop", "Zhang", "10.1/sl")
+    _write_final_bundle(tmp_path, month, seg, "/sl.pdf")
+    mdir = tmp_path / "manual" / month
+    a, b = mdir / "loop_a.paper.json", mdir / "loop_b.paper.json"
+    a.symlink_to(b)
+    b.symlink_to(a)                                   # 互指的符号链接环
+
+    inv = M._bundle_inventory(mdir, ".paper.json")
+    assert "psl.paper.json" in inv, "链接环不得让整份目录列表静默截断"
+
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert not r.get("refused"), "链接环不该把整月卡成永久 refused"
+    assert r["papers"] == 1
+    assert any("loop_" in n for n in r["broken_bundles"]), "环条目应按「读不出」报出来"
+
+
+def test_no_final_bundle_month_retries_instead_of_naming_a_half_written_file(tmp_path,
+                                                                             monkeypatch):
+    """变异 F1 补测（最值钱的一条）：早退若排在重查**之前**，「本月一份 final 都没有」
+    这个结论本身就可能来自陈旧列表——变异后实测是 `papers=0` + ⛔ 点名一份完好文件，
+    以及「前一轮已写盘后早退 → 绿回执 + exit 0 而 md 里有货」。
+    """
+    from src.scholar import pdf_ingest as pi
+    month = "2026-08"
+    seg = _manual_seg("pnf", "Becomes Final", "Wang", "10.1/nf")
+    b_path = pi.bundle_path(tmp_path, month, "pnf")
+    pi.write_bundle(b_path, status="draft", month=month, pdf_path="/nf.pdf",
+                    metadata_source="crossref-doi", segment=seg,
+                    close_reading_script=seg.close_reading)
+
+    orig_load = pi.load_bundle
+    fired = {"n": 0}
+
+    def _flip_to_final_during_collection(bf):
+        out = orig_load(bf)
+        if fired["n"] == 0:                 # 读它的瞬间，对方把 draft 写成了 final
+            fired["n"] = 1
+            _write_final_bundle(tmp_path, month, seg, "/nf.pdf")
+        return out
+
+    monkeypatch.setattr(pi, "load_bundle", _flip_to_final_during_collection)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    assert fired["n"] == 1
+    assert r["papers"] == 1, "重查必须先于早退：否则这篇会被判成「本月没有 final」"
+    assert not r.get("broken_bundles"), "不该点名一份完好文件"
+
+
+def test_early_exit_after_a_write_keeps_papers_and_md(tmp_path, monkeypatch):
+    """变异 F2 补测：早退分支必须沿用**写盘那一轮**的 papers 与 md。
+    报 0 篇而 md 里有货 = 回执与磁盘直接矛盾，且 out["md"] 缺失会让锁外 topics 同步被跳过。
+    """
+    from src.scholar import pdf_ingest as pi
+    from src.scholar import notes as notes_mod
+    month = "2026-08"
+    seg = _manual_seg("pea", "Solo Paper", "Li", "10.1/ea")
+    bf = _write_final_bundle(tmp_path, month, seg, "/ea.pdf")
+
+    orig_write = notes_mod.write_notes
+    fired = {"n": 0}
+
+    def _demote_to_draft_after_write(*args, **kw):
+        out = orig_write(*args, **kw)          # 第 1 轮：Solo 已写进 md
+        if fired["n"] == 0:
+            fired["n"] = 1                     # 写盘期间对方把它翻回 draft → 下一轮无 final
+            pi.write_bundle(bf, status="draft", month=month, pdf_path="/ea.pdf",
+                            metadata_source="crossref-doi", segment=seg,
+                            close_reading_script=seg.close_reading)
+        return out
+
+    monkeypatch.setattr(notes_mod, "write_notes", _demote_to_draft_after_write)
+    r = M._rebuild_month(tmp_path, month, _FakeSettings())
+    md = (tmp_path / "科研札记_{}_手动精读.md".format(month)).read_text(encoding="utf-8")
+    assert "Solo Paper" in md, "前提：第 1 轮确实写进了 md"
+    assert r["papers"] == 1, "早退不能报 0 篇——md 里有货"
+    assert r.get("md"), "早退必须带 md 键，否则锁外的 topics 同步被跳过"
+
+
+def test_fifo_lock_file_degrades_instead_of_hanging(tmp_path):
+    """变异 F3/F4 补测：锁文件是 FIFO 时 `open(..., "w")` 会**无限阻塞**，
+    而 timeout 只包 flock 等待循环、包不住 open 本身（压测抓到过挂死栈）。
+    必须 fail-open 并把降级如实标进结果。
+    """
+    import os as _os
+    import threading
+    month = "2026-08"
+    seg = _manual_seg("pfi", "Fifo Guarded", "Sun", "10.1/fi")
+    _write_final_bundle(tmp_path, month, seg, "/fi.pdf")
+    _os.mkfifo(str(tmp_path / ".rebuild.lock"))       # 无读端的 FIFO
+
+    box = {}
+
+    def _run():
+        box["r"] = M._rebuild_month(tmp_path, month, _FakeSettings())
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    th.join(timeout=20)
+    assert not th.is_alive(), "FIFO 锁文件不得让 finalize 永久挂死"
+    assert box["r"]["papers"] == 1
+    assert box["r"].get("unlocked") is True, "fail-open 必须如实标出来（回执要说本轮没加锁）"
+
+
+def test_receipt_truncates_huge_broken_list(tmp_path, capsys):
+    """1000 份坏 bundle 会把回执打成单行两万字符——agent 会话里是纯上下文污染。"""
+    M._report_final({"month": "2026-08", "papers": 0,
+                     "skipped_drafts": [], "index": {"papers": [], "citekey_collisions": []},
+                     "broken_bundles": ["b%03d.paper.json" % i for i in range(1000)]},
+                    tmp_path)
+    out = capsys.readouterr().out
+    assert max(len(ln) for ln in out.splitlines()) < 500, "回执单行不得爆炸"
+    assert "等共 1000 份" in out

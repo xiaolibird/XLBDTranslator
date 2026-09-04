@@ -19,9 +19,16 @@
 """
 import argparse
 import json
+import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
+
+try:                                    # Windows 无 fcntl：锁降级为不加锁（见 _RebuildLock）
+    import fcntl
+except ImportError:                     # pragma: no cover - 本仓库只在 macOS 跑
+    fcntl = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -315,35 +322,177 @@ def _archived_keys(notes_dir: Path, month: str):
     return {recompute_entry_key(r) for r in rows if isinstance(r, dict) and r.get("citekey")}
 
 
-def _rebuild_month(notes_dir: Path, month: str, settings,
-                   allow_removals: bool = False) -> dict:
-    """从当月全部 final bundle 重建手动精读四件套 + 刷索引。
+# ── 整月重建的并发防护（见 docs/bugs/2026-09-03-finalize-concurrency.md）────────
+# 两道机制防的**不是同一件事**，缺任何一个都有缺口：
+#   锁   —— 挡两个重建进程对撞（含跨月：收尾的 update_index 扫全部月份，按月加锁不够）；
+#   重查 —— 挡「写 bundle 的那一方根本不持锁」的情况：本工作流里 final bundle 是
+#           agent 用 Write 工具直接写的，它不走本脚本、不可能拿锁。
+_REBUILD_LOCK_NAME = ".rebuild.lock"
+_REBUILD_LOCK_TIMEOUT = 180.0        # 等锁上限（秒）：另一轮重建通常几秒到几十秒
+_CONCURRENCY_RETRIES = 3             # 清单不稳时最多重来几轮
+_RETRY_BACKOFF = 0.05                # 重来前的小退避（秒）×轮次：不退避的话三轮在
+                                     # 毫秒级烧完，只要写入方比一轮重建快就必然耗尽
 
-    allow_removals：跳过「净删除止损闸」。默认 False——整月重建是**整篇重写**，一份
-    bundle 被拒收（结构非法 / 读不出 / verified_count=0）就等于把那篇已归档论文从
-    md、references、sidecar、索引、书目、向量库里一起删掉。上一轮把回执改红、退出码
-    改成 1 只解决了「你会知道出事了」，没解决「已经出事了」。所以在**动库之前**先比对：
-    这一轮会不会净删掉上一轮已归档的条目？会就整月一字不动，让人先去修那份 JSON。
-    确要删（真的不想要那篇了）加 --allow-removals。
+
+class _RebuildLock:
+    """整月重建的排他文件锁（阻塞等待，有上限）。
+
+    跨月共用**同一把**锁：`_rebuild_month` 收尾会调 `update_index()`，而它扫的是全部
+    月份并重写 literature_index.json / INDEX.md / all_references.json——两个会话即使
+    精读的是不同月份，全局索引仍然对撞（已由
+    test_rebuild_month_rewrites_global_index_across_all_months 钉住）。
+
+    **作用域仅限本脚本的整月重建**（说清楚，别当成"锁到索引层"）：同样重写那份全局
+    索引的还有 ingest_notes / backfill_notes / notes_index / promote_identity_doi /
+    realign_metadata_ts / book_notes 六个入口，它们都不持这把锁。后果有限——那些产物
+    全是派生的、且走 `_atomic_write`，最坏是"陈旧但完整"的覆盖、下一轮自愈——但
+    「跨月也不安全」这条运维提示在本次修复后对**那些入口**依然成立。真要根治得把锁
+    上提到 notes_index.write_outputs 一侧，那是另一件事。
+
+    等待而非直接失败：另一轮重建通常几秒到几十秒，让本轮排队后拿到**新鲜**的 bundle
+    列表重建，比让 agent 收到一个失败回执再人工重跑要好。
+    flock 随进程退出自动释放，不存在需要手动清理的残留（同 embed_store 的既有注释）；
+    锁文件本身留着不删——删它反而会让两个进程各锁各的 inode，锁形同虚设。
     """
-    from src.scholar.pdf_ingest import load_bundle, segment_from_bundle, BUNDLE_SUFFIX
-    from src.scholar.notes import write_notes
-    from src.scholar.notes_index import update_index, write_outputs, existing_citekeys
 
-    # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名。
-    # 但要排除本月这份手动精读 md 自己的旧条目——否则每次 finalize/regen 整篇重写
-    # 本月 md 时，本月论文的上一轮 citekey 会被当成「库内已占用」，被迫加消歧后缀，
-    # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
-    own_note_file = "科研札记_{}_手动精读.md".format(month)
-    idx_path = notes_dir / INDEX_JSON
-    existing_ckeys = existing_citekeys(idx_path, exclude_note_files={own_note_file})
+    def __init__(self, notes_dir: Path, timeout: float = None):
+        self.path = Path(notes_dir) / _REBUILD_LOCK_NAME
+        self.degraded = False        # True = 这一轮没真加上锁（fail-open），回执要说出来
+        # 在**调用时**读模块常量，不写成默认参数——默认参数在函数定义时求值，之后
+        # 改 _REBUILD_LOCK_TIMEOUT（测试里调小、排障时调大）全都不生效。
+        self.timeout = _REBUILD_LOCK_TIMEOUT if timeout is None else timeout
+        self._fd = None
 
-    mdir = notes_dir / "manual" / month
-    bundles = sorted(mdir.glob("*{}".format(BUNDLE_SUFFIX))) if mdir.exists() else []
-    segments = []
-    skipped = []
-    broken = []
+    def acquire(self) -> bool:
+        if fcntl is None:                        # Windows：不加锁，只靠提交前重查
+            self.degraded = True
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # 锁文件若是 FIFO，`open(..., "w")` 会**无限阻塞**且 timeout 包不住它
+            # （压测抓到过挂死栈）。与 _collect_month_segments 对非普通文件的口径对齐：
+            # 不是普通文件就 fail-open，别把整个 finalize 僵在这里。
+            if self.path.exists() and not self.path.is_file():
+                logger.warning("  ⚠️ 重建锁 {} 不是普通文件（目录/管道？）：本轮不加锁，"
+                               "仅靠提交前重查兜底".format(self.path))
+                self.degraded = True
+                return True
+            self._fd = open(str(self.path), "w")
+        except OSError as e:
+            logger.warning("  ⚠️ 打不开重建锁 {}（{}）：本轮不加锁，仅靠提交前重查兜底"
+                           .format(self.path, e))
+            self._fd = None
+            self.degraded = True
+            return True
+        deadline = time.time() + self.timeout
+        waited = False
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if waited:
+                    logger.info("  ✅ 已拿到重建锁，继续（用的是等待后重新读的 bundle 列表）")
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    self._fd.close()
+                    self._fd = None
+                    return False
+                if not waited:
+                    logger.info("  ⏳ 另一轮整月重建正在进行，等待其完成（上限 {:.0f}s）……"
+                                .format(self.timeout))
+                    waited = True
+                time.sleep(0.5)
+
+    def release(self):
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self._fd.close()
+            self._fd = None
+
+
+def _stat_fp(path: Path):
+    """单个文件的指纹 `(mtime_ns, size)`；不存在/读不到返回 None。"""
+    try:
+        st = Path(path).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _bundle_inventory(mdir: Path, suffix: str) -> dict:
+    """当月 bundle 目录的现状指纹 `{文件名: (mtime_ns, size)}`。
+
+    **刻意用 os.scandir 而不是复用采集阶段那次 `glob`**：重查的全部意义就是「重新问一次
+    磁盘」，若两边共用同一条读取路径，那条路径本身的陈旧就对守卫完全隐形（守卫要能
+    发现的恰恰是「我手上那份列表不对」）。同 双录记账 的道理。
+
+    **只比路径集不够**，指纹必须带 mtime+size：本工作流的常态是 ingest 先落 draft、
+    agent 后把**同一个文件**改写成 final，路径集合根本没变（实测：只比路径集 → 差集为空
+    → 漏掉；带 mtime → 立刻发现）。
+    """
+    out = {}
+    try:
+        with os.scandir(str(mdir)) as it:
+            for ent in it:
+                if not ent.name.endswith(suffix):
+                    continue
+                # is_file()/stat() 都放进 per-entry 的 try：DirEntry.is_file() 只吞
+                # FileNotFoundError，撞上**符号链接环**会抛 OSError(ELOOP)。放在 try 外面
+                # 的话这个异常会落到最外层 except，整份 scandir 从那一条起**静默截断**
+                # （实测 6 个好文件收到 0 个）→ 与采集侧（Path.is_file() 对 ELOOP 返回
+                # False）口径分叉 → 指纹恒不相等 → 该月永久卡死，回执还谎称"另有会话在
+                # 归档"（第 3 轮压测实证）。单条出错只跳过这一条，别连累整个目录。
+                try:
+                    if not ent.is_file():
+                        continue
+                    st = ent.stat()
+                except OSError:              # 正被删/被换/链接环：跳过这一条即可
+                    continue
+                out[ent.name] = (st.st_mtime_ns, st.st_size)
+    except (OSError, ValueError):            # 目录不存在（本月还没 ingest 过）
+        pass
+    return out
+
+
+def _collect_month_segments(mdir: Path, suffix: str):
+    """扫当月 bundle → `(segments, skipped, broken, consumed)`。
+
+    `consumed` 是**本轮实际处理过的**那些文件的指纹，与 `_bundle_inventory()` 同形；
+    提交前拿它跟磁盘现状比，就能回答「我这份列表是不是已经过时了」。
+    每份文件在**读之前**取 stat：读完之后再取会把「我读的时候它正被改写」记成没变。
+    """
+    from src.scholar.pdf_ingest import load_bundle, segment_from_bundle
+
+    segments, skipped, broken = [], [], []
+    consumed = {}
+    bundles = sorted(mdir.glob("*{}".format(suffix))) if mdir.exists() else []
     for bf in bundles:
+        try:
+            # is_file() 必须与 _bundle_inventory 的 scandir+is_file() 口径一致：不一致时
+            # 一个名叫 <x>.paper.json 的**目录**会进 consumed 却进不了 disk，指纹恒不相等
+            # → 三轮全判"并发"→ 该月从此永久归档不进，回执还教人"稍后重跑"（压测实证）。
+            #
+            # 但**必须记进 broken**：净删除闸的触发条件是 `(broken or skipped)`，只 continue
+            # 的话非普通文件（同名目录、悬空符号链接）与 stat 失败的条目会从 consumed、disk、
+            # broken 三处同时消失 → 闸门失明 → 那篇已归档论文在**绿回执 + exit 0** 下被
+            # 整篇重写抹掉（第 2 轮审计实证，正是本文件最忌讳的失败模式）。
+            # 只进 broken、不进 consumed：这样与重查侧的 disk 仍然对齐，不复发上面那个死锁。
+            if not bf.is_file():
+                logger.warning("  ⚠️ {} 不是普通文件（同名目录/管道/悬空软链？），"
+                               "按「读不出」处理".format(bf.name))
+                broken.append(bf.name)
+                continue
+            st = bf.stat()
+            consumed[bf.name] = (st.st_mtime_ns, st.st_size)
+        except OSError as e:
+            logger.warning("  ⚠️ stat 失败 {}: {}（按「读不出」处理）".format(bf.name, e))
+            broken.append(bf.name)
+            continue
         try:
             data = load_bundle(bf)
         except Exception as e:
@@ -391,56 +540,248 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
             broken.append(bf.name)
             continue
         segments.append(seg)
+    return segments, skipped, broken, consumed
 
+
+def _stale_inventory_detail(consumed: dict, disk: dict) -> str:
+    """把「清单 vs 磁盘」的差异说成人话（新增 / 被改写 / 已消失），供日志点名。"""
+    added = sorted(set(disk) - set(consumed))
+    gone = sorted(set(consumed) - set(disk))
+    changed = sorted(n for n in set(consumed) & set(disk) if consumed[n] != disk[n])
+    bits = []
+    if added:
+        bits.append("新出现 {} 份（{}）".format(len(added), "、".join(added[:3])))
+    if changed:
+        bits.append("被改写 {} 份（{}）".format(len(changed), "、".join(changed[:3])))
+    if gone:
+        bits.append("已消失 {} 份（{}）".format(len(gone), "、".join(gone[:3])))
+    return "；".join(bits) or "指纹不一致"
+
+
+def _rebuild_month(notes_dir: Path, month: str, settings,
+                   allow_removals: bool = False) -> dict:
+    """从当月全部 final bundle 重建手动精读四件套 + 刷索引。
+
+    allow_removals：跳过「净删除止损闸」。默认 False——整月重建是**整篇重写**，一份
+    bundle 被拒收（结构非法 / 读不出 / verified_count=0）就等于把那篇已归档论文从
+    md、references、sidecar、索引、书目、向量库里一起删掉。上一轮把回执改红、退出码
+    改成 1 只解决了「你会知道出事了」，没解决「已经出事了」。所以在**动库之前**先比对：
+    这一轮会不会净删掉上一轮已归档的条目？会就整月一字不动，让人先去修那份 JSON。
+    确要删（真的不想要那篇了）加 --allow-removals。
+
+    **并发**（见 docs/bugs/2026-09-03-finalize-concurrency.md）：整月重建是「读一份
+    bundle 列表 → 整篇重写 md」，两步之间只要有人往当月新写/改写一份 final bundle，
+    那篇就会被这一轮用陈旧列表**静默抹出**派生视图（bundle 本身还在盘上，数据不丢）。
+    上面那道净删除闸拦不住它——并发新增的 bundle 在本轮眼里既不是 broken 也不是
+    skipped，闸门整个分支都不触发。这里用两道机制补上：
+      1) `_RebuildLock` 排他锁，让两个重建进程串行（含跨月的全局索引对撞）；
+      2) **提交前重查**：拿「本轮实际处理过的清单」比对「提交前独立重读的磁盘现状」，
+         不一致就用新列表重来（写 bundle 的 agent 不持锁，锁挡不住它）。
+    """
+    from src.scholar.pdf_ingest import BUNDLE_SUFFIX
+    from src.scholar.notes import write_notes
+    from src.scholar.notes_index import update_index, write_outputs, existing_citekeys
+
+    # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名。
+    # 但要排除本月这份手动精读 md 自己的旧条目——否则每次 finalize/regen 整篇重写
+    # 本月 md 时，本月论文的上一轮 citekey 会被当成「库内已占用」，被迫加消歧后缀，
+    # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
+    own_note_file = "科研札记_{}_手动精读.md".format(month)
+    idx_path = notes_dir / INDEX_JSON
+    mdir = notes_dir / "manual" / month
     proc = settings.processing
-    if not segments:
-        logger.info("  {} 无 final bundle，跳过重建（草稿 {} 篇）".format(month, len(skipped)))
-        # 仍刷一次索引（若该月手动 md 曾存在但现无 final，索引以磁盘为准）
+
+    def _locked_rebuild():
+        """锁内主体：采集 → 守卫 → 重查 → 写盘 → 刷索引。
+        两个 best-effort 同步**刻意留在锁外**（见下），这里只碰月度四件套与全局索引。
+        """
+        # 已有索引的 citekey 全集：fallback citekey 生成时避开，防止新论文与库内重名。
+        # 但要排除本月这份手动精读 md 自己的旧条目——否则每次 finalize/regen 整篇重写
+        # 本月 md 时，本月论文的上一轮 citekey 会被当成「库内已占用」，被迫加消歧后缀，
+        # 下一轮又因为后缀键才是「已占用」而改回原键，来回改名（citekey 抖动）。
+        # 放在锁内取：锁外取到的可能是另一轮重建正在改写的中间态。
+        existing_ckeys = existing_citekeys(idx_path, exclude_note_files={own_note_file})
+
+        res = None
+        written_papers = 0          # **真正写进盘的那一轮**的篇数（≠ 循环结束时的 segments）
+        segments, skipped, broken = [], [], []
+        # 只有**通过了重查（一）**的那一轮，其 broken/skipped 才可信：在重查处夭折的那轮，
+        # broken 里多半是"对方正写到一半"的半截 JSON，回执点名它 = 教人去修一份好文件
+        # （第 2 轮审计实证）。None = 本次调用还没有任何一轮的清单被证实过。
+        verified = None
+        unstable = False
+        for attempt in range(1, _CONCURRENCY_RETRIES + 1):
+            segments, skipped, broken, consumed = _collect_month_segments(mdir, BUNDLE_SUFFIX)
+
+            # ── 提交前重查（一）：采集期间磁盘变了吗？──────────────────────────────
+            # **必须排在净删除闸之前**：另一会话正用 Write 工具原地改写某份已归档论文的
+            # bundle 时，本轮会读到半截 JSON → 记成 broken → 闸门开火 → 直接 return，
+            # 一轮都不重试，回执还教用户「去修一份根本没坏的 JSON」（审计实测）。
+            # 先按并发重来，重来之后还 broken 才是真的坏了。
+            disk = _bundle_inventory(mdir, BUNDLE_SUFFIX)
+            if disk != consumed:
+                unstable = True
+                logger.warning("  ⏳ 采集期间当月 bundle 目录有变动（{}），第 {}/{} 轮，"
+                               "改用新列表重建".format(_stale_inventory_detail(consumed, disk),
+                                                     attempt, _CONCURRENCY_RETRIES))
+                time.sleep(_RETRY_BACKOFF * attempt)   # 小退避：不退避时三轮在毫秒级烧完
+                continue
+            verified = (list(skipped), list(broken))   # 这一轮的清单经重查证实，可以进回执
+            if not segments:
+                # 无 final bundle：**不写 md**（整月不动），只刷索引——没有删除风险。
+                logger.info("  {} 无 final bundle，跳过重建（草稿 {} 篇）".format(month, len(skipped)))
+                # 仍刷一次索引（若该月手动 md 曾存在但现无 final，索引以磁盘为准）
+                idx = update_index(notes_dir)
+                write_outputs(idx, notes_dir)
+                vs, vb = verified if verified else ([], [])
+                # papers/md 取**写盘那一轮**的：前面某轮可能已经写出过一份 md，早退时
+                # 报 0 篇、且不带 md 键，会与磁盘直接矛盾（回执报 0 而 md 里有货，
+                # 还会让锁外的 topics 同步被跳过）——第 2 轮审计实证。
+                out = {"month": month, "papers": written_papers,
+                       "skipped_drafts": vs, "broken_bundles": vb, "index": idx,
+                       "_index_fp": _stat_fp(idx_path)}
+                if res is not None:
+                    out["md"] = res["note_path"]
+                    out["docx"] = res.get("docx_path")
+                if unstable:
+                    # 前面某一轮写过盘/检出过并发，这一轮却一份 final 都没看见——多半读到的
+                    # 又是陈旧列表。不能打绿回执 + exit 0（agent 收到绿的就不会重跑）。
+                    logger.error("  ⚠️ 本轮一份 final bundle 都没看见，但此前检出过并发变动："
+                                 "多半读到的是陈旧列表。请重跑 regen 确认。")
+                    out["concurrent"] = True
+                return out
+
+
+            # ── 净删除止损闸（动库之前，见函数 docstring）──────────────────────────
+            # 只在**确实有 bundle 被拒收**时才查：没有拒收的正常重建即使条目变少，也是人主动
+            # 删了 bundle，不该拦。判据用 dedup_key 而非计数：一进一出时计数不变，但确实删了一篇。
+            if (broken or skipped) and not allow_removals:
+                from src.scholar.ingest import dedup_key as _seg_dedup_key
+                prev_keys = _archived_keys(notes_dir, month)
+                if prev_keys:
+                    now_keys = {_seg_dedup_key(s.metadata) for s in segments}
+                    missing = prev_keys - now_keys
+                    if missing and res is None:
+                        logger.error(
+                            "  ⛔ 本轮重建会从 {} 的札记里**净删除 {} 篇已归档论文**（有 {} 份 bundle 被拒收）。\n"
+                            "     整月一字未动。请先修好被拒收的 bundle JSON 再重跑；\n"
+                            "     确要删除那些论文请加 --allow-removals。".format(
+                                month, len(missing), len(broken) + len(skipped)))
+                        idx = update_index(notes_dir)
+                        vs, vb = verified if verified else ([], [])
+                        return {"month": month, "papers": len(segments), "refused": True,
+                                "removed_keys": sorted(missing),
+                                "skipped_drafts": vs, "broken_bundles": vb, "index": idx}
+                    if missing:
+                        # **本次调用的前一轮已经写过盘**，且那一轮是数据完整的（闸当时没响）。
+                        # 此刻某份 bundle 才坏掉——已写的 md 本身是对的，回滚它反而丢数据，
+                        # 更不能谎称「整月一字未动」（回执会与磁盘现状矛盾，且 refused 分支
+                        # 不刷 write_outputs，会让月度 md 与全局索引持久不一致——审计实测）。
+                        # 收下已写的结果走正常收尾，broken 照报、退出码照样非 0。
+                        logger.error("  ⛔ 已写盘之后又有 {} 份 bundle 变得读不出/非法：已写的内容"
+                                     "是完整的，不回滚。修好这些 JSON 后重跑 finalize。"
+                                     .format(len(broken) + len(skipped)))
+                        break
+
+            citekeys = _reuse_citekeys(notes_dir, month, segments)
+            res = write_notes(
+                segments, citekeys, out_dir=notes_dir,
+                instruction=proc.notes_instruction,
+                digest_title="科研札记 · {}（手动深度精读）".format(month),
+                filename="科研札记_{}_手动精读".format(month),
+                emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
+                fallback_citekeys=True, index_series="manual",
+                existing_citekeys=existing_ckeys,
+                # 沿用的是上一轮的兜底键，不是 Zotero 权威键，别在 sidecar 里冒充
+                explicit_citekey_source="fallback")
+            written_papers = len(segments)
+
+            # ── 提交前重查（二）：写盘期间磁盘变了吗？────────────────────────────
+            # 写 md/docx/references/sidecar 这段是本函数里最长的窗口之一，同样要盯。
+            # 变了就再来一轮：md 已经写了但可能缺最新那篇，重写一轮即收敛。
+            disk = _bundle_inventory(mdir, BUNDLE_SUFFIX)
+            if disk == consumed:
+                unstable = False
+                break
+            unstable = True
+            logger.warning("  ⏳ 写盘期间当月 bundle 目录有变动（{}），第 {}/{} 轮，重写一轮收敛"
+                           .format(_stale_inventory_detail(consumed, disk),
+                                   attempt, _CONCURRENCY_RETRIES))
+            time.sleep(_RETRY_BACKOFF * attempt)
+
+        if res is None:
+            # 采集始终没稳定过：一次都没写盘，整月一字未动（这是安全侧——照写就会抹掉
+            # 那些没进列表的论文）。bundle 都在盘上，稍后重跑即可。
+            logger.error("  ⛔ 当月 bundle 目录持续在变（{} 轮都没稳定），整月一字未动。"
+                         "等另一个会话的归档结束后重跑 regen（bundle 都在盘上，数据没丢）。"
+                         .format(_CONCURRENCY_RETRIES))
+            vs, vb = verified if verified else ([], [])
+            out = {"month": month, "papers": 0, "refused": True, "reason": "concurrent",
+                   "skipped_drafts": vs, "broken_bundles": vb}
+            if verified is None and broken:
+                # 一轮都没通过重查：这份 broken 里多半是对方写到一半的半截 JSON，
+                # 点名它等于教人去修一份好文件。单独一个键，回执里说清"不可信"。
+                out["unverified_broken"] = sorted(broken)
+            return out
+
+        # 这份索引直接带给 _report_final 复用：全量重建要扫全部札记 md，跑两遍纯属白等
         idx = update_index(notes_dir)
         write_outputs(idx, notes_dir)
-        _sync_embedding_best_effort(notes_dir, idx, settings)
-        return {"month": month, "papers": 0, "skipped_drafts": skipped,
-                "broken_bundles": broken, "index": idx}
+        # papers 取**写盘那一轮**的篇数（描述 md 里实际有几篇）；skipped/broken 取最后一轮
+        # 的（描述磁盘当前状态，是用户要去修的东西）——两者来自不同轮次时必然已标 concurrent
+        # 或有 broken，回执上不会被读成"一切正常"。
+        vs, vb = verified if verified else ([], [])
+        out = {"month": month, "papers": written_papers, "skipped_drafts": vs,
+               "broken_bundles": vb,
+               "md": res["note_path"], "docx": res.get("docx_path"), "index": idx,
+               # 全局索引的指纹：锁外做 best-effort 同步前要重读比对，见 _rebuild_month 尾部
+               "_index_fp": _stat_fp(idx_path)}
+        if unstable:
+            # 写完了，但最后一轮写盘期间磁盘又变了——md 可能缺最新那篇。不回滚（已写的
+            # 内容本身是对的），改为**回执标红 + 退出码非 0**，让调用方知道要再跑一次。
+            logger.error("  ⚠️ 归档已写盘，但期间当月 bundle 目录仍在变动：本轮 md 可能缺最新的"
+                         "那一篇。请在另一个会话结束后重跑 regen 收敛（bundle 都在盘上）。")
+            out["concurrent"] = True
+        return out
 
-    # ── 净删除止损闸（动库之前，见函数 docstring）──────────────────────────────
-    # 只在**确实有 bundle 被拒收**时才查：没有拒收的正常重建即使条目变少，也是人主动
-    # 删了 bundle，不该拦。判据用 dedup_key 而非计数：一进一出时计数不变，但确实删了一篇。
-    if (broken or skipped) and not allow_removals:
-        from src.scholar.ingest import dedup_key as _seg_dedup_key
-        prev_keys = _archived_keys(notes_dir, month)
-        if prev_keys:
-            now_keys = {_seg_dedup_key(s.metadata) for s in segments}
-            missing = prev_keys - now_keys
-            if missing:
-                logger.error(
-                    "  ⛔ 本轮重建会从 {} 的札记里**净删除 {} 篇已归档论文**（有 {} 份 bundle 被拒收）。\n"
-                    "     整月一字未动。请先修好被拒收的 bundle JSON 再重跑；\n"
-                    "     确要删除那些论文请加 --allow-removals。".format(
-                        month, len(missing), len(broken) + len(skipped)))
-                idx = update_index(notes_dir)
-                return {"month": month, "papers": len(segments), "refused": True,
-                        "removed_keys": sorted(missing),
-                        "skipped_drafts": skipped, "broken_bundles": broken, "index": idx}
+    lock = _RebuildLock(notes_dir)
+    if not lock.acquire():
+        logger.error("  ⛔ 等重建锁超时（{:.0f}s）：另一轮整月重建仍在进行。整月一字未动，"
+                     "稍后重跑 regen 即可（bundle 都在盘上，数据没丢）。"
+                     .format(_REBUILD_LOCK_TIMEOUT))
+        return {"month": month, "papers": 0, "refused": True, "reason": "locked",
+                "skipped_drafts": [], "broken_bundles": []}
+    try:
+        out = _locked_rebuild()
+    finally:
+        lock.release()
+    if lock.degraded:
+        # fail-open 了：重查只看**当月** bundle 目录，挡不住跨月的全局索引对撞——
+        # 锁唯一独有的那份保护本轮是缺席的，回执必须说出来，别让人以为串行保证还在。
+        out["unlocked"] = True
 
-    citekeys = _reuse_citekeys(notes_dir, month, segments)
-    res = write_notes(
-        segments, citekeys, out_dir=notes_dir,
-        instruction=proc.notes_instruction,
-        digest_title="科研札记 · {}（手动深度精读）".format(month),
-        filename="科研札记_{}_手动精读".format(month),
-        emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
-        fallback_citekeys=True, index_series="manual",
-        existing_citekeys=existing_ckeys,
-        # 沿用的是上一轮的兜底键，不是 Zotero 权威键，别在 sidecar 里冒充
-        explicit_citekey_source="fallback")
-    # 这份索引直接带给 _report_final 复用：全量重建要扫全部札记 md，跑两遍纯属白等
-    idx = update_index(notes_dir)
-    write_outputs(idx, notes_dir)
-    _sync_embedding_best_effort(notes_dir, idx, settings)
-    _sync_topics_best_effort(notes_dir, res["note_path"])   # W6：接入 P2，见函数文档
-    return {"month": month, "papers": len(segments), "skipped_drafts": skipped,
-            "broken_bundles": broken,
-            "md": res["note_path"], "docx": res.get("docx_path"), "index": idx}
+    # ── 两个 best-effort 同步在**锁外**做 ──────────────────────────────────────
+    # 它们本就声明「不影响归档结果」，却是本函数最长的两段：向量库嵌入是分钟级，
+    # topics 合成是子进程、默认 timeout 2400s（40 分钟），而等锁上限只有 180s——
+    # 放锁内的话，一次慢的概念页合成就能让此后半小时内**任何月份**的 finalize/regen
+    # 全部撞 refused/locked（压测实证）。归档本身（md/sidecar/索引）已在锁内完成。
+    idx = out.get("index")
+    idx_fp_then = out.pop("_index_fp", None)
+    if idx is not None and not out.get("refused"):
+        # 锁一放开，另一轮重建就可能已经完成并刷新了全局索引。此时**我们手上的 idx 是
+        # 陈旧的**：拿它去 sync_store 会把对方刚嵌入的 chunk 当成"库里多出来的"删掉
+        # （压测实证：`+0 嵌入 / -1 删除`，被删的正是并发方那篇）。向量库的 0.5 骤缩闸
+        # 拦不住——只少一篇远不到一半。指纹变了就跳过：对方那轮更新，它自己会同步。
+        if idx_fp_then is not None and _stat_fp(idx_path) != idx_fp_then:
+            logger.warning("  ⏭ 全局索引已被另一轮重建刷新，跳过本轮 best-effort 同步"
+                           "（对方那轮更新，向量库/概念页由它负责；拿陈旧索引同步会删掉"
+                           "对方刚嵌入的向量）")
+            out["sync_skipped"] = True
+        else:
+            _sync_embedding_best_effort(notes_dir, idx, settings)
+            if out.get("md"):
+                _sync_topics_best_effort(notes_dir, out["md"])   # W6：接入 P2，见函数文档
+    return out
 
 
 def _first_list(rep, *keys):
@@ -576,7 +917,7 @@ def cmd_finalize(args):
     # 在 _rebuild_month 里「拒收」等价于「从已归档的 md 里删掉」：整月 md 被重写、索引重建、
     # 向量库同步，一篇已核验论文当场蒸发。绿回执 + exit 0 会让自动权限模式的 agent 直接
     # 往下走（同 audit_citekeys_vs_pmlr 的论证），所以这里必须非 0。
-    return 1 if (r.get("broken_bundles") or r.get("refused")) else 0
+    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")) else 0
 
 
 def cmd_regen(args):
@@ -586,7 +927,7 @@ def cmd_regen(args):
     r = _rebuild_month(notes_dir, month, settings,
                        allow_removals=getattr(args, "allow_removals", False))
     _report_final(r, notes_dir)
-    return 1 if (r.get("broken_bundles") or r.get("refused")) else 0
+    return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")) else 0
 
 
 def _report_final(r, notes_dir):
@@ -596,29 +937,62 @@ def _report_final(r, notes_dir):
         idx = update_index(notes_dir)
     collisions = idx.get("citekey_collisions", [])
     print("\n" + "=" * 66)
-    if r.get("refused"):
+    if r.get("refused") and r.get("reason") in ("locked", "concurrent"):
+        # 并发导致的拒绝：**没有**净删除清单可报，报成「会净删除 0 篇」会让人以为是数据问题
+        why = ("等重建锁超时，另一轮整月重建仍在进行"
+               if r.get("reason") == "locked" else
+               "当月 bundle 目录持续在变（多半有另一个会话正在同月归档）")
+        print("⛔ 手动精读归档 · {}：**整月未改动**（{}）".format(r["month"], why))
+        print("   → 数据没丢：bundle 都在 manual/{}/ 下。等对方结束后重跑 regen 即可".format(
+            r["month"]))
+    elif r.get("refused"):
         print("⛔ 手动精读归档 · {}：**整月未改动**（本轮重建会净删除 {} 篇已归档论文）".format(
             r["month"], len(r.get("removed_keys") or [])))
         print("   净删除的条目（dedup_key）: {}".format(
             ", ".join((r.get("removed_keys") or [])[:5])))
         print("   → 先修好下面被拒收的 bundle JSON 再重跑；确要删除请加 --allow-removals")
     elif r.get("broken_bundles"):
+        # 排在 concurrent 之前：两者并存时「有 bundle 没入库」更严重（要人去修 JSON），
+        # 首行不能被降级成 ⚠️（审计实测过这个降级）。
         print("⛔ 手动精读归档 · {}：{} 篇（**有 bundle 未入库，见下**）".format(
+            r["month"], r["papers"]))
+    elif r.get("concurrent"):
+        # 写盘成功但期间磁盘还在变：内容是对的，只是可能缺最新一篇——与 broken 分开报，
+        # 混在一起会让人去修根本没坏的 JSON。
+        print("⚠️ 手动精读归档 · {}：{} 篇（**写盘期间有并发归档，可能缺最新一篇**）".format(
             r["month"], r["papers"]))
     else:
         print("✅ 手动精读归档 · {}：{} 篇".format(r["month"], r["papers"]))
+    if r.get("unverified_broken"):
+        # 与「确实读不出」分开报：这些是重查没通过那一轮记下的，多半是对方写到一半的
+        # 半截 JSON，此刻很可能已经好了。教人去修它就是把人引向一份好文件。
+        print("   ℹ️ 另有 {} 份 bundle 在未通过重查的那一轮里读不出（多半是对方正在写，"
+              "现在多半已经好了，**先别改**）：{}".format(
+                  len(r["unverified_broken"]), ", ".join(r["unverified_broken"][:5])))
+    if r.get("sync_skipped"):
+        print("   ⏭ 向量库/概念页同步本轮跳过：全局索引已被另一轮重建刷新，由它负责同步")
+    if r.get("unlocked"):
+        print("   ⚠️ 本轮**未加重建锁**（锁文件打不开/平台不支持）：只有提交前重查在兜底，"
+              "跨月的全局索引对撞挡不住。若同时在跑别的归档，建议串行重跑一次")
+    if r.get("concurrent") and not r.get("refused"):
+        # 与 broken 并存时首行让位给 broken，但这条提示本身不能丢
+        print("   ⚠️ 写盘期间有并发归档，可能缺最新一篇 → 等对方结束后重跑 regen 收敛")
     if r.get("md"):
         print("   札记: {}".format(r["md"]))
     if r.get("docx"):
         print("   docx: {}".format(r["docx"]))
     if r.get("skipped_drafts"):
-        print("   ⏭ 跳过 {} 篇 draft（未 agent 核验）: {}".format(
-            len(r["skipped_drafts"]), ", ".join(r["skipped_drafts"])))
+        _sd = r["skipped_drafts"]
+        print("   ⏭ 跳过 {} 篇 draft（未 agent 核验）: {}{}".format(
+            len(_sd), ", ".join(_sd[:10]),
+            " …等共 {} 份".format(len(_sd)) if len(_sd) > 10 else ""))
     if r.get("broken_bundles"):
         # 与 ⏭ 分开报：那是「还没核验」，这是「核验完了但 JSON 坏了、**没入库**」。
         # 混在一起会让 agent 去重做已经做过的核验。
-        print("   ⛔ {} 篇 bundle 读不出/结构非法，**未入库**（修好 JSON 后重跑 finalize）: {}"
-              .format(len(r["broken_bundles"]), ", ".join(r["broken_bundles"])))
+        _bb = r["broken_bundles"]
+        print("   ⛔ {} 篇 bundle 读不出/结构非法，**未入库**（修好 JSON 后重跑 finalize）: {}{}"
+              .format(len(_bb), ", ".join(_bb[:10]),
+                      " …等共 {} 份".format(len(_bb)) if len(_bb) > 10 else ""))
     manual = [e for e in idx["papers"] if e.get("series") == "manual" and not e.get("duplicate_of")]
     print("   索引: 手动深读 {} 篇 · 撞键 {} 组".format(len(manual), len(collisions)))
     if collisions:

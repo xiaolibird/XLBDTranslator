@@ -115,5 +115,6 @@ docs/*
 !docs/backup_restore.md
 !docs/skills/
 !docs/decisions/
+!docs/bugs/
 .ruff_cache/
 .claude/
