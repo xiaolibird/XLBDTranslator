@@ -371,6 +371,8 @@ def main() -> int:
     logger.info("主条目 {} 个，本次待抓 {} 个", len(main_entries), len(todo))
 
     got, failures = {}, {}
+    # 哪些源在本轮「没答上」（异常/限流）——与「源里确实没有」分开记，见收官分档
+    unreachable: dict = {}
     flushed = {"n": 0}
     # 抓取时冻结 citekey：_reconcile_drift 迁移 title: 孤儿键的唯一身份证据
     ck_by_key = {e["dedup_key"]: e.get("citekey") for e in main_entries}
@@ -418,6 +420,11 @@ def main() -> int:
             except Exception as e:
                 logger.warning("OpenAlex 批 {} 失败：{}", i // OPENALEX_BATCH, e)
                 found = {}
+                # 这一批的 key 全部记「源没答上」——与「源里确实没摘要」分开。
+                # 同一个函数里 title.search 那路已经有 class="network"，三个并列分支却没铺到，
+                # 这是「同义判据只写了一半」的教科书形态（2026-09-05 对抗审计 Lens C）。
+                unreachable.setdefault("openalex", set()).update(
+                    k for k, d in doi_entries if d in batch)
             for key, doi in list(remaining.items()):
                 if doi in found:
                     record(key, found[doi], "openalex")
@@ -433,6 +440,7 @@ def main() -> int:
                 abstract = crossref_doi(doi, mailto)
             except Exception:
                 abstract = ""
+                unreachable.setdefault("crossref", set()).add(key)
             if abstract:
                 record(key, abstract, "crossref")
                 del remaining[key]
@@ -443,13 +451,22 @@ def main() -> int:
                 abstract = pubmed_doi(doi)
             except Exception:
                 abstract = ""
+                unreachable.setdefault("pubmed", set()).add(key)
             if abstract:
                 record(key, abstract, "pubmed")
                 del remaining[key]
             time.sleep(NCBI_SLEEP)
         for key, doi in remaining.items():
-            failures[key] = {"reason": "doi 三源（openalex/crossref/pubmed）均无摘要",
-                             "class": "no_abstract_any_source", "attempted_at": _now()}
+            # 三源里只要有一源**没答上**，就不能说「三源均无摘要」——那是把暂时性失败
+            # 写成确定性结论。分档记，下轮重试时人能看出该不该信这个结论。
+            down = sorted(src for src, keys in unreachable.items() if key in keys)
+            if down:
+                failures[key] = {
+                    "reason": "doi 三源未全部问成（没答上：{}）".format("/".join(down)),
+                    "class": "network", "unreachable_sources": down, "attempted_at": _now()}
+            else:
+                failures[key] = {"reason": "doi 三源（openalex/crossref/pubmed）均无摘要",
+                                 "class": "no_abstract_any_source", "attempted_at": _now()}
 
     # -- arxiv: 批量 --------------------------------------------------------
     ax_entries = [(e["dedup_key"], re.sub(r"v\d+$", "", e["dedup_key"].split(":", 1)[1]))

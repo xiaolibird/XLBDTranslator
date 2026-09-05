@@ -253,9 +253,37 @@ lin2025Addressing → lin2025Addressingb | keeper manual 2026-09-02-插补扭曲
 这就是缺口。合理的修法是提醒直接按页名给命令（或走 `--affected-by-note`），
 而不是按新键路由。**工具侧未修，本条留作记录。**
 
-## 遗留
+## 概念页路由缺口 —— **已修（2026-09-05）**，但第一版修错了，记下来
 
-- 上面那条概念页路由缺口（未修）。
+**缺陷**：告警按「页面文本含旧键」扫，给的命令 `build_topics --affected-by <新键>` 却按
+**语义召回**路由（论文挤不挤得进这页当下的证据集）。语料涨大后被 `max_evidence` 挤出证据集的
+篇目，页面上仍写着旧键而路由看不见它；`topics/qa/` 更是根本没有重合成通路
+（specs 只来自 `config/topics.yaml`，qa 页由 `ask_notes.py` 人工触发写）。实测 3 页含旧键、只刷到 2 页。
+
+**第一版修法被对抗审核打回，两条 BLOCKER 都比原缺陷严重**，务必记住：
+
+1. **裸替换生成块内的文本而不重算 BEGIN 行的 `h=`**。那个哈希是「用户在生成块里手改过」的
+   探测器（`vault.generated_block_tampered`），对不上就判 conflict 并**拒绝覆盖**——
+   于是 `build_topics` 不再更新该页、`lint` 不再更新 `_lint.md`、`ask_notes` 也不再原地更新 qa 页，
+   页面**永久冻结**。最讽刺的是修法自己打印的「重合成」命令，对刚被它改过的页必然失败。
+2. **撞键路径方向相反，不能一起处理**。`fix_citekey_collisions` 的语义是「最早月的 keeper
+   **保留**基键，后来者加后缀」（`notes_index.py` 的 `for e in group[1:]`），故 pair 是
+   `(基键 → 后缀键)` 而 keeper 仍持基键。把页面上所有 `[@基键]` 一律改指 duplicate 就是猜，
+   猜错的那半会静默指向另一篇论文，无备份、不可逆。
+
+**第二版（现行）**：
+
+- `retired_rekey_pairs(rekey_map, live_citekeys)`：**只处理旧键确已注销**的 pair
+  （陈旧行内键那条路 `后缀键 → 基键`）；撞键路径的键仍在用，一律跳过并明示原因。
+- `_rehash_generated_block(text)`：改完重算 `h=`，页面不会被打成 conflict。
+- 逐页 try：一页写不进去只记 `errors` 并报出来，不掀翻调用方后面的重刷索引与向量库同步。
+- `announce_rekey_side_effects` 恢复成**只读**，但同时给两条命令并写清职责：
+  `scripts/notes_index.py --fix-topic-citekeys`（修文本，默认 dry-run）
+  与 `build_topics --affected-by`（更新内容，另一件事）。
+- 测试 `test/test_rekey_topics_rename_2026_09_05.py` 12 条，含两条 BLOCKER 回归与接线层断言；
+  手工变异验证过有牙（摘掉重算哈希 → 红；放开已注销守卫 → 红）。
+
+## 遗留
 - **`shi2025Federated` 基键永久悬空，且工具已经报不出它了**（2026-09-05 审计发现）。
   本文 `:215` 列的「8 处引用自动恢复」= 6 处 `@lin2025Addressing` + 2 处 `@shi2025Federated`。
   09-05 只执行了 lin 那 1 条改键；shi 这边实测：

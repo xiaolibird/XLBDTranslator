@@ -636,3 +636,54 @@ def test_routes_suppressed_is_a_transient_failure_like_llm_unavailable():
                       "c": {"reason": "llm_unavailable:429"},
                       "d": {"reason": bd.EMPTY_WITH_FULLTEXT_REASON}}}
     assert bd.deterministic_failures(led) == {"b"}, "只有真没正文可读的才进永久跳过集"
+
+
+# ---------------- 账本 schema 版本戳（2026-09-05 对抗审计 Lens C） ----------------
+
+def test_ledger_gets_a_schema_stamp_on_save(tmp_path):
+    """语义改了却没有版本戳，历史记录就会被拿新规则静默重新解释——2026-09-04 那批
+    改了 no_output 的含义，127 条旧记录至今无从判断口径。写盘必须打戳。"""
+    bd.save_ledger(tmp_path, {"done": {"a": 1}, "failed": {}}, expand=True)
+    import json
+    d = json.loads((tmp_path / bd.EXPAND_LEDGER_NAME).read_text(encoding="utf-8"))
+    assert d["schema_version"] == bd.LEDGER_SCHEMA_VERSION
+    assert d.get("generated_at") and d["done"] == {"a": 1}
+
+
+def test_legacy_skipped_flags_entries_with_unknown_provenance():
+    """永久跳过集里没记 had_fulltext 的，属「口径存疑」——无从判断当初是真没正文
+    还是全文在手没读成。必须能点出来，不能静默沉淀。"""
+    led = {"failed": {
+        "old1": {"reason": "no_output"},                          # 无 had_fulltext → 存疑
+        "new1": {"reason": "no_output", "had_fulltext": False},   # 新口径，确定性，不存疑
+        "new2": {"reason": "no_output", "had_fulltext": True},    # 新代码本不该这样写了
+        "t1": {"reason": "llm_unavailable:429"},                  # 暂时性，本就不进跳过集
+        "t2": {"reason": bd.EMPTY_WITH_FULLTEXT_REASON},          # 同上
+    }}
+    assert bd.legacy_skipped(led) == {"old1"}
+
+
+def test_load_ledger_warns_once_on_version_mismatch(tmp_path):
+    """旧账本（无戳）读进来要告警，并报出存疑条数；新账本不许打扰。"""
+    import json
+    from loguru import logger as _lg
+    p = tmp_path / bd.EXPAND_LEDGER_NAME
+    p.write_text(json.dumps({"done": {}, "failed": {"x": {"reason": "no_output"}}}),
+                 encoding="utf-8")
+    lines = []
+    hid = _lg.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        led = bd.load_ledger(tmp_path, expand=True)
+    finally:
+        _lg.remove(hid)
+    txt = "\n".join(lines)
+    assert "schema v" in txt and "口径存疑" in txt and led["failed"]
+    # 打过戳的账本：安静
+    bd.save_ledger(tmp_path, led, expand=True)
+    lines.clear()
+    hid = _lg.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        bd.load_ledger(tmp_path, expand=True)
+    finally:
+        _lg.remove(hid)
+    assert "schema v" not in "\n".join(lines), "版本对得上就别刷屏"

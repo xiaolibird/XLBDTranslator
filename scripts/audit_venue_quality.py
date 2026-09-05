@@ -29,8 +29,11 @@ Hindawi 2021 = **0.8**、LNCS 2021 = **0.2**。它**跨类型可比**，正好�
 - **Crossref**（`api.crossref.org/works/{doi}`）：免费无配额。`type` 字段直接给出
   `journal-article` / `proceedings-article` / `posted-content` / `book-chapter` 四分类，
   外加被引数、年份、ISSN。这是本脚本的主力。
-- **OpenAlex**：2026-08 起改预算制（$0.001/请求、每日 UTC 午夜重置），一次全量 652 源
-  就能打光当日免费额度。仅作可选的刊级 IF 补充，`RateLimited` 会在配额耗尽时中止。
+- **OpenAlex**：**当前未接线**（2026-09-05 核实）。`query_source()` 与 `oa_cache` 都没有任何
+  调用点，`config/venue_quality_cache.json` 那 91 条因此没有写入方、只会越来越旧。
+  背景：OpenAlex 2026-08 起改预算制（$0.001/请求、每日 UTC 午夜重置），一次全量 652 源
+  就能打光当日免费额度，接进来性价比很低。保留代码是为了将来需要刊级 IF 时不必重写，
+  但**别照 docstring 以为它在跑**——此前这里写的是「仅作可选的刊级 IF 补充」，是失实的。
 
 ## 用法
 
@@ -47,6 +50,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -64,7 +68,9 @@ MAILTO = "liming1390@gmail.com"                # polite pool，仅用于标识�
 UA = "scholar-venue-audit/1.0 (mailto:{})".format(MAILTO)
 NAME_MATCH_MIN = 0.6
 
-THIS_YEAR = 2026
+# 硬写年份会让跨年后所有论文的「年龄」整体偏移一年，CITED_MIN_AGE 与引/年判据跟着漂
+# （2026-09-05 对抗审计 Lens C）。改成运行时取。
+THIS_YEAR = datetime.now().year
 CITED_MIN_AGE = 3          # 满几年才用被引判据（更新的论文天然没引用）
 CITED_SUSPECT = 1.0        # 引/年 低于此值记可疑（实证 Hindawi 0.8、LNCS 0.2）
 CITED_LOW = 3.0            # 引/年 低于此值记偏低（IOS Press 2.0 落在这一档）
@@ -222,6 +228,8 @@ def crossref_lookup(client: httpx.Client, doi: str) -> dict:
 # ---------------- OpenAlex（刊级，可选补充） ----------------
 
 def query_source(client: httpx.Client, name: str) -> dict:
+    # ⚠️ 当前**没有任何调用点**（2026-09-05 核实）。见模块 docstring 的 OpenAlex 一节：
+    # 预算制下全量查 652 源不划算，故未接线。保留待用，勿据此以为 OpenAlex 数据是新的。
     """查一个发表源的刊级指标。返回 {} 表示查不到或名字对不上。
 
     **防模糊匹配误判**：`display_name.search` 是模糊搜索，查冷门刊很可能返回一个名字

@@ -63,6 +63,85 @@ def _csl_from_crossref(item, entry):
     return out
 
 
+
+def _crossref_or_unreachable(doi, email, client):
+    """(命中|None, 源是否答上)。**不能直接用 crossref_by_doi**：它把 404 / 非 200 / 超时 /
+    传输异常一律吞成 None（crossref.py:171），与「源里确实没这篇」同形，于是一次网络抖动
+    写下的索引兜底，事后再也分辨不出该不该补。这里自己看状态码。"""
+    from src.scholar.crossref import CROSSREF_API, parse_crossref_work
+    from src.scholar.fulltext import polite_get
+    try:
+        r = polite_get(client, "{}/{}".format(CROSSREF_API, doi),
+                       params={"mailto": email} if email else {})
+    except Exception:                                      # noqa: BLE001
+        return None, False
+    if r.status_code == 404:
+        return None, True                                  # 源答了：确实没有
+    if r.status_code != 200:
+        return None, False
+    try:
+        item = (r.json() or {}).get("message")
+    except Exception:                                      # noqa: BLE001
+        return None, False
+    return (parse_crossref_work(item) if item else None), True
+
+
+def _is_index_fallback(it):
+    """索引兜底形态：既没卷也没页。Crossref 命中的期刊条目至少会有其一。"""
+    return not (it.get("volume") or it.get("page"))
+
+
+def _repair_fallbacks(out_path, args):
+    """只对已存在文件里的索引兜底条目重查 Crossref，命中就地升级；**只升不降**。
+
+    解掉这个双向死锁：一次 Crossref 抖动 → 该月落成索引兜底书目 → 下次跑同一命令在**联网之前**
+    就撞上「已存在，拒绝覆盖」直接退 2 → 唯一逃生门 --force 又被台账明文禁止（那是整月重建、
+    索引兜底会覆盖既有更权威字段）。2026-09-05 对抗审计 Lens C。
+    """
+    import json as _json
+    from src.scholar.fulltext import ipv4_client
+    items = _json.loads(out_path.read_text(encoding="utf-8"))
+    targets = [i for i, it in enumerate(items)
+               if _is_index_fallback(it) and it.get("DOI")
+               and not str(it["DOI"]).lower().startswith("10.48550/arxiv")]
+    print("索引兜底条目 {} / {} 条可重查".format(len(targets), len(items)))
+    if not targets:
+        print("没有需要修复的条目。")
+        return 0
+    fixed = still_none = unreachable = 0
+    with ipv4_client(timeout=30) as cli:
+        for i in targets:
+            got, ok = _crossref_or_unreachable(str(items[i]["DOI"]), args.email, cli)
+            if not ok:
+                unreachable += 1
+                continue
+            if not got:
+                still_none += 1
+                continue
+            new = _csl_from_crossref(got, items[i])
+            # 只升不降：新值为空的字段一律保留旧值
+            merged = dict(items[i])
+            for k, v in new.items():
+                if v not in (None, "", [], {}):
+                    merged[k] = v
+            if merged != items[i]:
+                items[i] = merged
+                fixed += 1
+    print("升级 {} 条 · 源里确实没有 {} 条 · 源没答上 {} 条".format(fixed, still_none, unreachable))
+    if unreachable:
+        print("⚠️ {} 条这次没问成（不是源里没有），网络恢复后可再跑一次本命令。".format(unreachable))
+    if args.dry_run:
+        print("【dry-run】未写盘。")
+        return 0
+    if fixed:
+        bak = out_path.with_suffix(".json.bak")
+        bak.write_bytes(out_path.read_bytes())
+        out_path.write_text(_json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("已写 {}（原件备份 {}）\n   下一步：PYTHONPATH=. python scripts/notes_index.py"
+              .format(out_path, bak.name))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="重建月度札记缺失的 CSL-JSON 书目")
     ap.add_argument("--month", required=True, help="月份标签，如 2026-06 或 2026-07-27")
@@ -70,6 +149,11 @@ def main() -> int:
     ap.add_argument("--notes-dir", default="output/scholar_notes")
     ap.add_argument("--email", default="", help="Crossref 礼貌池邮箱（建议填）")
     ap.add_argument("--force", action="store_true", help="覆盖已存在的 CSL（默认拒绝）")
+    ap.add_argument("--repair-fallbacks", action="store_true",
+                    help="定向修复：只对已存在文件里**索引兜底形态**（缺卷且缺页）的条目重查 "
+                         "Crossref，命中就地升级、只升不降；其余条目一个字节不动。"
+                         "用来解掉「一次网络抖动写下兜底书目、之后被拒绝覆盖闸挡住再也修不回来」"
+                         "那个双向死锁——不必动 --force（那是整月重建，会覆盖既有更权威字段）。")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -95,9 +179,12 @@ def main() -> int:
     suffix = "全文精读" if args.series == "auto" else "手动精读"
     stem = "科研札记_{}_{}".format(args.month, suffix)
     out_path = nd / "{}.references.json".format(stem)
+    if out_path.exists() and args.repair_fallbacks:
+        return _repair_fallbacks(out_path, args)
     if out_path.exists() and not args.force:
-        print("已存在且更权威，拒绝覆盖：{}\n（确需重建请加 --force）".format(out_path),
-              file=sys.stderr)
+        print("已存在且更权威，拒绝覆盖：{}\n"
+              "（只想补回当初因网络抖动落成索引兜底的那几条：加 --repair-fallbacks，只升不降；"
+              "确需整月重建才加 --force）".format(out_path), file=sys.stderr)
         return 2
     if not (nd / "{}.md".format(stem)).exists():
         print("对应札记不存在：{}.md".format(stem), file=sys.stderr)
@@ -107,15 +194,18 @@ def main() -> int:
     from src.scholar.academic_search import fetch_arxiv_by_id
     from src.scholar.fulltext import ipv4_client
 
-    items, n_cr, n_ax, n_fb = [], 0, 0, 0
+    items, n_cr, n_ax, n_fb, n_unreachable = [], 0, 0, 0, 0
     with ipv4_client(timeout=30) as cli:
         for e in rows:
             got = None
             if e.get("doi") and not e["doi"].lower().startswith("10.48550/arxiv"):
-                try:
-                    got = crossref_by_doi(e["doi"], email=args.email, client=cli)
-                except Exception:
-                    got = None
+                # crossref_by_doi 把 404/非200/超时一律吞成 None，与「源里确实没这篇」同形。
+                # 这里必须分开：**没答上**而落成索引兜底的条目，是可以也应该改天补回的
+                #（2026-09-05 对抗审计 Lens C：一次抖动写下的兜底，之后被拒绝覆盖闸挡住，
+                # 而唯一的逃生门 --force 又被台账明文禁止——修复通道被双向堵死）。
+                got, ok = _crossref_or_unreachable(e["doi"], args.email, cli)
+                if not ok:
+                    n_unreachable += 1
             if got:
                 items.append(_csl_from_crossref(got, e))
                 n_cr += 1
@@ -141,8 +231,12 @@ def main() -> int:
             items.append(_fallback_csl(e))
             n_fb += 1
 
-    logger.info("  {} 条：Crossref {} · arXiv {} · 索引兜底 {}".format(
-        len(items), n_cr, n_ax, n_fb))
+    logger.info("  {} 条：Crossref {} · arXiv {} · 索引兜底 {}{}".format(
+        len(items), n_cr, n_ax, n_fb,
+        "（其中 {} 条是**源没答上**，不是源里没有）".format(n_unreachable) if n_unreachable else ""))
+    if n_unreachable:
+        logger.warning("  ⚠️ {} 条因 Crossref 没答上而落成索引兜底（缺卷/期/页）。"
+                       "网络恢复后用 `--repair-fallbacks` 定向补回，别用 --force。".format(n_unreachable))
     rich = sum(1 for it in items if it.get("volume") or it.get("page"))
     if args.dry_run:
         print("\n【dry-run】将写 {}（{} 条，其中 {} 条带卷/页）".format(

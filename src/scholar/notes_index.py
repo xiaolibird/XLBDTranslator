@@ -1485,6 +1485,116 @@ REKEY_SYNC_HINT = "PYTHONPATH=. python scripts/notes_embed.py"
 REKEY_RENDER_HINT = "scripts/render_notes.sh"
 
 
+def _page_cites_old_key(text: str, old: str, is_lint_page: bool) -> bool:
+    """页面文本里有没有引用旧键。**扫描与改名共用这一个判据**——两处同义判据只留一份。
+
+    `[@key]` 是正文引用形态；`_lint.md` 的 coverage 节孤儿 ID 是**裸 citekey**，故那一份
+    额外走词边界匹配（撞键消歧的 b/c 后缀让旧键天然是近亲键的前缀，裸子串会假阳性）。
+    qa 页「未纳入的近邻论文」的裸反引号键是 qa.py 刻意的非引用形态，不在此判据内。
+    """
+    if "[@{}]".format(old) in text:
+        return True
+    return bool(is_lint_page and re.search(
+        r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(old)), text))
+
+
+def _rehash_generated_block(text: str) -> str:
+    """生成块内容变了就重算 BEGIN 行的 `h=`。
+
+    **这是本函数存在的全部理由**：topics/qa/_lint 三条重建链都用这个哈希探测「用户在生成块里
+    手改过」，对不上就判 conflict 并**拒绝覆盖**。裸替换文本而不重算哈希，等于把每一页永久冻结
+    ——build_topics 不再更新它、lint 不再更新 _lint.md、ask_notes 也不再原地更新 qa 页。
+    那比「页面上留个旧键」严重一个量级（2026-09-05 对抗审核 BLOCKER 1，我第一版就是这么写错的）。
+    """
+    from .vault import GEN_BEGIN_RE, GEN_END, _gen_hash
+    lines = text.splitlines()
+    begin = end = None
+    for i, line in enumerate(lines):
+        if begin is None and GEN_BEGIN_RE.match(line.strip()):
+            begin = i
+        elif begin is not None and line.strip() == GEN_END:
+            end = i
+            break
+    if begin is None or end is None:
+        return text                                  # 没有哨兵：整页都是生成物或纯手写，不动
+    m = GEN_BEGIN_RE.match(lines[begin].strip())
+    if not m.group(2):
+        return text                                  # 老文件没记 h=，重建侧本就返回 False
+    fresh = _gen_hash("\n".join(lines[begin + 1:end]))
+    lines[begin] = re.sub(r"h=[0-9a-f]{8}", "h={}".format(fresh), lines[begin], count=1)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def retired_rekey_pairs(rekey_map, live_citekeys):
+    """只保留**旧键确已注销**的那些 pair。
+
+    改键有两条路，方向相反，混着处理必然改错一半（2026-09-05 对抗审核 BLOCKER 2）：
+      - 陈旧行内键（`fix_inline_citekeys`）：`(后缀键 → 基键)`，旧键**真的没了** → 可以改名。
+      - 撞键消歧（`fix_citekey_collisions`）：`(基键 → 后缀键)`，而**最早月的 keeper 仍持基键**
+        （notes_index.py:1761 `for e in group[1:]` 的语义）。页面上的 `[@基键]` 到底指 keeper
+        还是指那条 duplicate，代码没有任何信息能判断——无条件改指 duplicate 就是猜，
+        猜错的那半会静默指向另一篇论文。这一类只能继续走告警 + 重合成，不许自动改。
+    """
+    live = set(live_citekeys or ())
+    return [(o, n) for o, n in (rekey_map or [])
+            if o and n and o != n and o not in live]
+
+
+def rename_citekeys_in_topic_pages(notes_dir, rekey_map, live_citekeys=(), *, apply: bool = False):
+    """把 topics/（含 qa/）里**已注销**的旧 citekey 就地换成新键。确定性、不用 LLM。
+
+    为什么必须是改名而不是重合成：扫描判据是「页面文本含旧键」（文本问题），而
+    `build_topics --affected-by <新键>` 走的是**语义召回**路由（论文挤不挤得进这页当下的
+    证据集）。语料涨大后被 max_evidence 挤出证据集的篇目，页面上仍写着旧键而路由看不见它；
+    `topics/qa/` 更是根本没有重合成通路（specs 只来自 config/topics.yaml）。
+
+    三条硬约束（都是对抗审核换来的）：
+      1. 只改 `live_citekeys` 里已经不存在的旧键——见 `retired_rekey_pairs`。
+      2. 改完必须重算生成块哈希——见 `_rehash_generated_block`。
+      3. 逐页容错：一页写不进去不许掀翻整个收尾流程（调用方后面还要重刷索引、同步向量库）。
+
+    vault `02-主题/` 是 topics/ 的派生镜像，改完源头由既有 vault 同步带过去。
+    返回 {"pages": [...], "skipped_live": [...], "errors": [...], "applied": bool}。
+    """
+    out = {"pages": [], "skipped_live": [], "errors": [], "applied": False}
+    all_pairs = [(o, n) for o, n in (rekey_map or []) if o and n and o != n]
+    pairs = retired_rekey_pairs(all_pairs, live_citekeys)
+    out["skipped_live"] = sorted({o for o, _ in all_pairs} - {o for o, _ in pairs})
+    topics_dir = Path(notes_dir) / "topics"
+    if not pairs or not topics_dir.is_dir():
+        return out
+    for page in sorted(topics_dir.rglob("*.md")):
+        try:
+            text = page.read_text(encoding="utf-8")
+        except Exception:                                  # noqa: BLE001
+            continue
+        is_lint = page.name == "_lint.md"
+        new_text, n = text, 0
+        for old, new in pairs:
+            if not _page_cites_old_key(new_text, old, is_lint):
+                continue
+            before = new_text
+            new_text = new_text.replace("[@{}]".format(old), "[@{}]".format(new))
+            if is_lint:
+                new_text = re.sub(r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(old)),
+                                  new, new_text)
+            if new_text != before:
+                n += 1
+        if not n:
+            continue
+        rel = str(page.relative_to(topics_dir))
+        out["pages"].append({"page": rel, "n": n})
+        if apply:
+            try:
+                _atomic_write(page, _rehash_generated_block(new_text))
+            except Exception as e:                         # noqa: BLE001
+                out["errors"].append({"page": rel, "error": "{}: {}".format(type(e).__name__, e)})
+    out["applied"] = bool(apply and out["pages"] and not out["errors"])
+    return out
+
+
+
+
 def announce_rekey_side_effects(notes_dir: Path,
                                 renamed_entries: List[Dict[str, Any]],
                                 *, settings: Any = None,
@@ -1541,11 +1651,21 @@ def announce_rekey_side_effects(notes_dir: Path,
                                ", ".join(sorted({str(d["month"]) for d in out["stale_docx"]}))))
         for d in out["stale_docx"]:
             logger.warning("      {}".format(d["path"]))
-        logger.warning("      重渲染：{} <该月 .md>".format(REKEY_RENDER_HINT))
+        # render_notes.sh 写到 $NOTES_DIR/rendered/，而本函数扫的是 notes_dir 顶层那份
+        # （notes_emit_docx 让 write_notes 把 docx 落在 md 旁边）。只给前半条命令，
+        # 照着跑完告警看的那份一个字没变——2026-09-05 审计实证，故这里给端到端的两步。
+        logger.warning("      重渲染（注意脚本写到 rendered/，需搬回原位）：")
+        for d in out["stale_docx"]:
+            name = Path(d["path"]).name
+            logger.warning('        {} "{}" docx "{}" && mv "{}" "{}"'.format(
+                REKEY_RENDER_HINT, str(Path(d["path"]).with_suffix(".md")),
+                str(Path(d["path"]).with_suffix(".references.json")),
+                str(Path(d["path"]).parent / "rendered" / name), d["path"]))
 
     # ---- topics/qa 页与 _lint.md：按页聚合列清单，刷新命令用新键并集 ----
     out["topics_pages"] = []
     out["topics_refresh_hint"] = None
+    out["topics_fix_hint"] = None
     if rekey_map:
         # 去重：撞键组 ≥3 条时同一旧键出现多次（(key,keyb),(key,keyc)），不去重会让
         # 页面命中计数虚高（审计实证：引一次报 2 个旧键）
@@ -1560,13 +1680,10 @@ def announce_rekey_side_effects(notes_dir: Path,
                     text = page.read_text(encoding="utf-8")
                 except Exception:
                     continue
-                hits = [o for o in old_keys if "[@{}]".format(o) in text or
-                        # _lint.md 的孤儿 ID 是裸 citekey（coverage 节）。词边界匹配：
-                        # 撞键消歧的 b/c 后缀让旧键天然是近亲键（smith2024a）的前缀，
-                        # 裸子串会假阳性（审计实证）
-                        (page.name == "_lint.md" and re.search(
-                            r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(o)),
-                            text))]
+                # 判据与 rename_citekeys_in_topic_pages 共用同一个 helper——
+                # 告警面与修复面必须同源，这正是本条缺陷的教训（2026-09-05 审计）
+                hits = [o for o in old_keys
+                        if _page_cites_old_key(text, o, page.name == "_lint.md")]
                 if not hits:
                     continue
                 if page.name == "_lint.md":
@@ -1585,12 +1702,21 @@ def announce_rekey_side_effects(notes_dir: Path,
                 logger.warning("      {}（{} 个旧键）".format(p["page"], p["n_old_keys"]))
             if len(out["topics_pages"]) > 20:
                 logger.warning("      …等共 {} 页".format(len(out["topics_pages"])))
+            # 修复文本用文本工具（确定性、会重算生成块哈希、只碰已注销的旧键）；
+            # 重合成是另一件事，管的是**内容**新鲜度，按语义召回路由，盖不全本清单。
+            # 两条命令职责分开写清——此前只给重合成那条，照着跑完旧键还在（本条缺陷的核心）。
+            out["topics_fix_hint"] = "PYTHONPATH=. python scripts/notes_index.py --fix-topic-citekeys --apply"
+            logger.warning("      修文本（推荐，先不加 --apply 看计划）：{}"
+                           .format(out["topics_fix_hint"].replace(" --apply", "")))
             cmd_keys = sorted(affected_new) or new_keys
             out["topics_refresh_hint"] = (
                 "PYTHONPATH=. python scripts/build_topics.py "
                 + " ".join("--affected-by {}".format(k) for k in cmd_keys))
-            logger.warning("      手动刷新（新键并集，一次调用）：{}"
+            logger.warning("      （可选，另一件事）重合成以更新**内容**：{}"
                            .format(out["topics_refresh_hint"]))
+            logger.warning("      注意：重合成按语义召回路由，只动「证据集真的变了」的页，"
+                           "不负责把旧键文本改掉；撞键路径的旧键仍由 keeper 持有，"
+                           "归属要人判断，工具不会替你猜")
         if lint_affected:
             logger.warning("  ⚠️ topics/_lint.md 里出现旧 citekey：coverage 节的孤儿 ID "
                            "与对应 ack 将失效（下轮 lint 会按新键重报，旧 ack 需手动改）")

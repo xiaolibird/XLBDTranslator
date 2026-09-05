@@ -67,6 +67,16 @@ logger = get_logger("backfill_deepread")
 
 LEDGER_NAME = "backfill_deepread_progress.json"
 EXPAND_LEDGER_NAME = "backfill_expand_progress.json"   # --expand 批独立记账，见 _ledger_path
+
+# 账本 schema 版本。**改动 reason 词汇的语义时必须 +1**——2026-09-04 那批改了 `no_output`
+# 的含义却既没有版本戳也没有迁移，于是历史记录被拿新规则重新解释：全库 269 条 failed 里
+# 127 条写于那次改动之前、连 `had_fulltext` 键都没有，新口径无法回答「它们当时到底拿没拿到
+# 全文」，却全部躺在永久跳过集里（2026-09-05 对抗审计 Lens C）。当时那 35 篇是靠翻日志捞回来的，
+# 不是靠账本。有了版本戳，至少能把「口径不同的旧记录」当场说出来，而不是静默沉淀。
+#   1 = 2026-09-04 之前：只有 done/failed，reason 词汇未分暂时性/确定性
+#   2 = 2026-09-04 起：classify_failure 四类 + had_fulltext
+#   3 = 2026-09-05 起：新增 empty_with_fulltext（全文在手却零产出，暂时性）
+LEDGER_SCHEMA_VERSION = 3
 BACKUP_DIR = ".backfill_deepread_backup"
 TARGET_DEPTH = "unknown-legacy"
 _FAIL_STREAK_STOP = 3   # 连续失败几篇就判通路级故障并中止（见 cmd_run 的熔断）
@@ -204,21 +214,54 @@ def _ledger_path(notes_dir: Path, expand: bool = False) -> Path:
     return notes_dir / (EXPAND_LEDGER_NAME if expand else LEDGER_NAME)
 
 
+def legacy_skipped(led: dict) -> set:
+    """永久跳过集里**口径存疑**的那些：写于 schema v2 之前，连 `had_fulltext` 都没记，
+    于是无从判断当初是「真没正文」还是「全文在手但那趟没读成」。
+
+    不自动重试（那要烧 LLM 额度，得由人决定），但**必须说出来**——静默沉淀正是
+    2026-09-04 那批 quota-failure 的成因。
+    """
+    out = set()
+    for k, v in (led.get("failed") or {}).items():
+        v = v or {}
+        if str(v.get("reason") or "").startswith(TRANSIENT_REASON_PREFIXES):
+            continue
+        if "had_fulltext" not in v:
+            out.add(k)
+    return out
+
+
 def load_ledger(notes_dir: Path, expand: bool = False) -> dict:
     p = _ledger_path(notes_dir, expand)
     if not p.exists():
-        return {"done": {}, "failed": {}}
+        return {"done": {}, "failed": {}, "schema_version": LEDGER_SCHEMA_VERSION}
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
         d.setdefault("done", {})
         d.setdefault("failed", {})
-        return d
     except Exception as e:
         raise RuntimeError("账本 {} 读取失败（{}）：拒绝继续，否则会重复消耗 LLM 额度并"
                            "重复改写札记。请先修复或删除它。".format(p, e))
+    ver = d.get("schema_version")
+    if ver != LEDGER_SCHEMA_VERSION:
+        stale = legacy_skipped(d)
+        logger.warning(
+            "  ⚠️ 账本 {} 是 schema v{}（当前 v{}）：reason 的语义在版本之间变过，"
+            "旧记录正被拿新规则解释。".format(p.name, ver if ver is not None else "1(无戳)",
+                                        LEDGER_SCHEMA_VERSION))
+        if stale:
+            logger.warning(
+                "     其中 {} 条在永久跳过集里但**口径存疑**（没记 had_fulltext，无从判断当初"
+                "是真没正文还是全文在手没读成）。要救回：加 --redo 并 --citekey 点名，"
+                "或先删掉这些 failed 记录。".format(len(stale)))
+    return d
 
 
 def save_ledger(notes_dir: Path, led: dict, expand: bool = False) -> None:
+    # 写盘时打上版本戳与时间：下次语义再变时，读的人能当场知道口径对不对得上
+    led = dict(led)
+    led["schema_version"] = LEDGER_SCHEMA_VERSION
+    led["generated_at"] = datetime.now().strftime("%Y%m%dT%H%M%S")
     tmp = _ledger_path(notes_dir, expand).with_suffix(".tmp")
     tmp.write_text(json.dumps(led, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(_ledger_path(notes_dir, expand))
