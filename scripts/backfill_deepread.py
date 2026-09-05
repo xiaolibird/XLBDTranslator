@@ -46,6 +46,7 @@ git**，所以每次写盘前把 md + sidecar 原件复制到
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -245,13 +246,27 @@ def load_ledger(notes_dir: Path, expand: bool = False) -> dict:
         return {"done": {}, "failed": {}, "schema_version": LEDGER_SCHEMA_VERSION}
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
-        d.setdefault("done", {})
-        d.setdefault("failed", {})
+        if not isinstance(d, dict):
+            raise TypeError("顶层不是对象而是 {}".format(type(d).__name__))
+        for k in ("done", "failed"):
+            v = d.setdefault(k, {})
+            # `setdefault` 不覆盖已存在的键，所以 `{"done": null}` 会静默漏过，
+            # 之后 `set(led["done"])` 才在别处炸（压测 A2 MINOR）。这里当场判形状。
+            if v is None:
+                d[k] = {}
+            elif not isinstance(v, dict):
+                raise TypeError("{} 不是对象而是 {}".format(k, type(v).__name__))
+        for ck, v in d["failed"].items():
+            if v is not None and not isinstance(v, dict):
+                raise TypeError("failed[{!r}] 不是对象而是 {}".format(ck, type(v).__name__))
     except Exception as e:
         raise RuntimeError("账本 {} 读取失败（{}）：拒绝继续，否则会重复消耗 LLM 额度并"
                            "重复改写札记。请先修复或删除它。".format(p, e))
     ver = d.get("schema_version")
-    if ver != LEDGER_SCHEMA_VERSION:
+    # 用 int 比较而不是 `!=`：jq/pandas 过一遍会把 3 变成 3.0，而 Python 里 3.0 == 3，
+    # 版本闸会静默哑掉（压测 A3）。类型不对一律当「版本不明」。
+    ver_ok = isinstance(ver, int) and not isinstance(ver, bool) and ver == LEDGER_SCHEMA_VERSION
+    if not ver_ok:
         logger.warning(
             "  ⚠️ 账本 {} 是 schema v{}（当前 v{}）：reason 的语义在版本之间变过，"
             "旧记录正被拿新规则解释。".format(p.name, ver if ver is not None else "1(无戳)",
@@ -274,9 +289,15 @@ def save_ledger(notes_dir: Path, led: dict, expand: bool = False) -> None:
     led = dict(led)
     led["schema_version"] = LEDGER_SCHEMA_VERSION
     led["generated_at"] = datetime.now().strftime("%Y%m%dT%H%M%S")
-    tmp = _ledger_path(notes_dir, expand).with_suffix(".tmp")
-    tmp.write_text(json.dumps(led, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(_ledger_path(notes_dir, expand))
+    dst = _ledger_path(notes_dir, expand)
+    # tmp **必须带 pid**：固定名时两个进程共用同一路径，B 的 "w" 会截断 A 写到一半的内容、
+    # 再 replace 成正式账本，而 A 的 fd 仍指着那个 inode 继续在高偏移写 → 账本变成带 NUL 空洞的
+    # 垃圾、A 整批进度静默蒸发、下次 load 直接「拒绝继续」（压测 A6 实测 5.4MB 不可解析文件）。
+    tmp = dst.with_name("{}.tmp-{}".format(dst.name, os.getpid()))
+    # allow_nan=False：Infinity/NaN 原样写出的不是合法 JSON，账本会变成只有 Python 能读
+    tmp.write_text(json.dumps(led, ensure_ascii=False, indent=1, allow_nan=False),
+                   encoding="utf-8")
+    tmp.replace(dst)
 
 
 # ---------------- 段落重建 ----------------

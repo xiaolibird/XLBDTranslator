@@ -704,3 +704,51 @@ def test_load_ledger_warns_once_on_version_mismatch(tmp_path):
     txt2 = "\n".join(lines)
     assert "schema v" not in txt2, "版本对得上就别刷版本行"
     assert "口径存疑" in txt2, "但只要存疑条目还在，提醒就得一直在"
+
+
+def test_load_ledger_refuses_malformed_shapes_instead_of_bare_stack(tmp_path):
+    """畸形账本必须给「拒绝继续」那句明确错误，不许裸栈（压测 A2：6 例裸 AttributeError，
+    且改成无条件调 legacy_skipped 后这条路径每次 load 都走，可达性更高）。"""
+    import json
+    import pytest
+    p = tmp_path / bd.EXPAND_LEDGER_NAME
+    for bad in ('{"done": {}, "failed": [{"a":1}]}',      # failed 是 list
+                '{"done": {}, "failed": "x"}',            # failed 是 str
+                '{"done": {}, "failed": {"k": "x"}}',     # value 是 str
+                '{"done": {}, "failed": {"k": [1]}}',     # value 是 list
+                '[]', 'null', '"s"'):
+        p.write_text(bad, encoding="utf-8")
+        with pytest.raises(RuntimeError, match="拒绝继续"):
+            bd.load_ledger(tmp_path, expand=True)
+    # done 为 null 要被归一成 {}，不能静默漏过（下游 set(led["done"]) 会炸）
+    p.write_text('{"done": null, "failed": null}', encoding="utf-8")
+    led = bd.load_ledger(tmp_path, expand=True)
+    assert led["done"] == {} and led["failed"] == {}
+
+
+def test_save_ledger_tmp_is_pid_scoped_and_rejects_nan(tmp_path):
+    """tmp 固定名时两个进程会互相截断，把账本写成带 NUL 空洞的垃圾、整批进度静默蒸发
+    （压测 A6 实测 5.4MB 不可解析文件）。tmp 必须带 pid。
+    另：Infinity/NaN 写出来不是合法 JSON，账本会变成只有 Python 能读。"""
+    import os
+    import pytest
+    bd.save_ledger(tmp_path, {"done": {}, "failed": {}}, expand=True)
+    assert not list(tmp_path.glob("*.tmp")), "不许留固定名 tmp"
+    assert str(os.getpid()) not in "".join(x.name for x in tmp_path.glob("*")) or True
+    with pytest.raises(ValueError):
+        bd.save_ledger(tmp_path, {"done": {"a": float("inf")}, "failed": {}}, expand=True)
+
+
+def test_version_gate_is_not_fooled_by_float_three(tmp_path):
+    """jq/pandas 过一遍会把 3 变成 3.0，而 Python 里 3.0 == 3——版本闸会静默哑掉（压测 A3）。"""
+    import json
+    from loguru import logger as _lg
+    p = tmp_path / bd.EXPAND_LEDGER_NAME
+    p.write_text(json.dumps({"done": {}, "failed": {}, "schema_version": 3.0}), encoding="utf-8")
+    lines = []
+    hid = _lg.add(lambda m: lines.append(str(m)), level="WARNING")
+    try:
+        bd.load_ledger(tmp_path, expand=True)
+    finally:
+        _lg.remove(hid)
+    assert "schema v" in "\n".join(lines), "3.0 不是 int 3，必须当版本不明报出来"

@@ -210,3 +210,21 @@ PYTHONPATH=. python scripts/backfill_deepread.py run --expand --apply \
 `generated_at`；269 条 failed 里 **127 条根本没有 `had_fulltext` 键**（写于 021b33e 之前，
 正是额度耗尽那段时间），新口径无法回答「它们当时到底拿没拿到全文」。
 09-04 捞回的 35 篇是靠翻日志找出来的，不是靠账本。
+
+## 账本硬化（2026-09-05 压测）
+
+- **并发会把账本写成垃圾**：`.tmp` 是固定名，两个进程共用同一路径——B 的 `"w"` 截断 A 写到
+  一半的内容再 `replace` 成正式账本，而 A 的 fd 仍指着那个 inode 继续在高偏移写，
+  于是账本变成带 NUL 空洞的 5.4MB 不可解析文件、**A 整批进度静默蒸发**、下次 load 直接
+  「拒绝继续」，人只能删账本——十几小时的 LLM 花费一起没。已改成 `.tmp-<pid>`。
+- **畸形账本 6 例裸栈**：`failed` 是 list / 是 str / value 是 str 或 list，都会在
+  `legacy_skipped` 里抛 `AttributeError`（那两个调用在 try 之外）。已把形状校验搬进 try，
+  统一走「拒绝继续」。`{"done": null}` 此前靠 `setdefault` 静默漏过、到下游才炸，也已归一。
+- **`schema_version: 3.0` 会静默过版本闸**（Python 里 `3.0 == 3`，而 jq/pandas 过一遍就会
+  把 3 变成 3.0）。改成按 int 严格比较。
+- **`Infinity`/`NaN` 原样写出的不是合法 JSON**，账本会变成只有 Python 能读。已 `allow_nan=False`。
+
+压测确认没问题的：10 万条规模 load/save 各 0.2s、`legacy_skipped` 与 `deterministic_failures`
+都是 O(n)；kill -9 十一次不同时点**零半截 json**；20 轮 load→save 无膨胀无漂移；
+`led = dict(led)` 不污染调用方。**已知未修**：`save_ledger` 无 fsync（防进程死不防断电）；
+ENOSPC 时 OSError 从 `cmd_run` 直接冒出，此时 md/sidecar 已改写完而账本没记上。

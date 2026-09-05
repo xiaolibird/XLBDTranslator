@@ -96,7 +96,8 @@ def _crossref_or_unreachable(doi, email, client):
 _PREPRINT_DOI_PREFIXES = (
     "10.48550",   # arXiv
     "10.21203",   # Research Square
-    "10.1101",    # bioRxiv / medRxiv
+    "10.1101",    # bioRxiv / medRxiv（旧前缀）
+    "10.64898",   # medRxiv 新前缀（2025 起）——漏了它会白问 10 条（压测 B7 实测）
     "10.2139",    # SSRN
     "10.36227",   # TechRxiv
     "10.31234", "10.31235",   # PsyArXiv / SocArXiv
@@ -125,10 +126,26 @@ def _repair_fallbacks(out_path, args):
     解掉这个双向死锁：一次 Crossref 抖动 → 该月落成索引兜底书目 → 下次跑同一命令在**联网之前**
     就撞上「已存在，拒绝覆盖」直接退 2 → 唯一逃生门 --force 又被台账明文禁止（那是整月重建、
     索引兜底会覆盖既有更权威字段）。2026-09-05 对抗审计 Lens C。
+
+    ⚠️ **在当前真库上它的卷页回收率是 0**（2026-09-05 压测实测）：67 条目标全部打真 Crossref，
+    64 条答上、3 条 404，**没有一条能拿回卷或页**。原因是这批条目里 47% 结构上就不会有卷页
+    （book-chapter 15 / posted-content 12 / dissertation 6 / component 3），其余是
+    Nature/Springer 的 online-first，源侧同样没有。也就是说：**当前真库并没有「被网络抖动写坏
+    的书目」这种存量**，这道门是为将来真的发生抖动时准备的，不是拿来清理现状的。
+    别看到「67 条可重查」就以为有 67 条坏账——那只是形状匹配，不是坏账证据。
     """
     import json as _json
+    import os as _os
     from src.scholar.fulltext import ipv4_client
-    items = _json.loads(out_path.read_text(encoding="utf-8"))
+    try:
+        items = _json.loads(out_path.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            raise TypeError("顶层不是数组而是 {}".format(type(items).__name__))
+    except Exception as e:                                 # noqa: BLE001
+        # 同一个仓库里 load_ledger 给了「拒绝继续」、main 读索引给了「索引损坏」，
+        # 唯独这里裸栈，硬化口径不一致（压测 B11）。
+        print("书目文件损坏，拒绝继续（{}）：{}".format(e, out_path), file=sys.stderr)
+        return 2
     targets = [i for i, it in enumerate(items)
                if _is_index_fallback(it) and it.get("DOI")
                and not str(it["DOI"]).lower().startswith("10.48550/arxiv")]
@@ -159,6 +176,10 @@ def _repair_fallbacks(out_path, args):
             for k, v in new.items():
                 if v in (None, "", [], {}):
                     continue
+                if isinstance(v, str) and not v.strip():
+                    continue                                   # 纯空白算空，别当有效值写进去
+                if k in ("volume", "page") and str(v).strip() in ("0", "0-0"):
+                    continue     # Crossref 偶尔回 "0"：写进去会让本条永久退出将来的修复集
                 if merged.get(k) in (None, "", [], {}):        # 只补空缺
                     merged[k] = v
             if merged != items[i]:
@@ -173,10 +194,16 @@ def _repair_fallbacks(out_path, args):
     if fixed:
         # 备份名带时间戳：固定名会让「第一趟修一半、网络恢复后按提示再跑一趟」把原件盖掉——
         # 保险恰好在它唯一该起作用的场景（多趟修复要回滚）失效（对抗审核 MAJOR-2）。
-        bak = out_path.with_name("{}.{}.bak".format(out_path.name,
-                                                   datetime.now().strftime("%Y%m%dT%H%M%S")))
+        # 戳到微秒：秒级时同一秒内两次成功修复仍会同名覆盖，原件就找不回了（压测 B9）
+        bak = out_path.with_name("{}.{}.bak".format(
+            out_path.name, datetime.now().strftime("%Y%m%dT%H%M%S%f")))
         bak.write_bytes(out_path.read_bytes())
-        out_path.write_text(_json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        # **原子写**：裸 write_text 先截断再写，kill -9 落在写入前会把整月书目变成 0 字节，
+        # 落在中段会留下半截非法 JSON（压测 B12 实测三档全中）。同仓库 save_ledger 已是
+        # tmp+replace，两个写盘点口径不该一个原子一个不原子。
+        tmp = out_path.with_name("{}.tmp-{}".format(out_path.name, _os.getpid()))
+        tmp.write_text(_json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(out_path)
         print("已写 {}（原件备份 {}）\n   下一步：PYTHONPATH=. python scripts/notes_index.py"
               .format(out_path, bak.name))
     return 0

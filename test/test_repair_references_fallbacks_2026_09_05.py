@@ -130,3 +130,55 @@ def test_repair_fallbacks_dry_run_touches_nothing(tmp_path, monkeypatch):
         dry_run = True
     assert RR._repair_fallbacks(f, _D()) == 0
     assert f.read_bytes() == before, "dry-run 必须零写入"
+
+
+def test_corrupted_bibliography_is_refused_not_bare_stack(tmp_path, capsys):
+    """损坏的 references.json 必须给明确错误——同仓库 load_ledger 与 main 读索引都有，
+    唯独这里裸栈，硬化口径不一致（压测 B11：截断 JSON / 空文件 / 顶层是 dict / 非 UTF-8 四种全裸）。"""
+    for bad in (b'', b'[{"id":', b'{"a":1}', b'\xff\xfe\x00bad'):
+        f = tmp_path / "x.references.json"
+        f.write_bytes(bad)
+        assert RR._repair_fallbacks(f, _A()) == 2
+        assert "损坏" in capsys.readouterr().err
+
+
+def test_write_is_atomic_and_backup_stamp_has_microseconds(tmp_path, monkeypatch):
+    """裸 write_text 先截断再写：kill -9 落在写入前会把整月书目变成 0 字节（压测 B12 实测）。
+    备份戳到微秒，否则同一秒两次成功修复会同名覆盖、原件找不回（B9）。"""
+    f = tmp_path / "m.references.json"
+    f.write_text(json.dumps([{"id": "a", "DOI": "10.1/a", "title": "A"}]), encoding="utf-8")
+    monkeypatch.setattr(RR, "_crossref_or_unreachable",
+                        lambda *a: ({"doi": "10.1/a", "title": "A", "volume": "9"}, True))
+    import src.scholar.fulltext as FT
+    monkeypatch.setattr(FT, "ipv4_client",
+                        lambda **k: type("C", (), {"__enter__": lambda s: None,
+                                                   "__exit__": lambda *a: False})())
+    assert RR._repair_fallbacks(f, _A()) == 0
+    assert not list(tmp_path.glob("*.tmp*")), "tmp 必须已 replace 掉，不留残骸"
+    bak = list(tmp_path.glob("*.bak"))
+    assert len(bak) == 1 and len(bak[0].name.split(".")[-2]) == 21, "戳要到微秒（15+6 位）"
+    assert json.loads(f.read_text(encoding="utf-8"))[0]["volume"] == "9"
+
+
+def test_junk_volume_zero_is_not_written_in(tmp_path, monkeypatch):
+    """Crossref 偶尔回 volume="0"：写进去会让 _is_index_fallback 变假，
+    该条**永久退出**将来的修复目标集（压测 B8）。"""
+    f = tmp_path / "n.references.json"
+    f.write_text(json.dumps([{"id": "a", "DOI": "10.1/a", "title": "A"}]), encoding="utf-8")
+    monkeypatch.setattr(RR, "_crossref_or_unreachable",
+                        lambda *a: ({"doi": "10.1/a", "title": "A", "volume": "0",
+                                     "pages": "   "}, True))
+    import src.scholar.fulltext as FT
+    monkeypatch.setattr(FT, "ipv4_client",
+                        lambda **k: type("C", (), {"__enter__": lambda s: None,
+                                                   "__exit__": lambda *a: False})())
+    RR._repair_fallbacks(f, _A())
+    out = json.loads(f.read_text(encoding="utf-8"))[0]
+    assert "volume" not in out and "page" not in out, "垃圾值不许写入并锁死该条"
+
+
+def test_medrxiv_new_doi_prefix_is_excluded():
+    """medRxiv 2025 起换了新前缀 10.64898，漏掉它会白问 10 条（压测 B7 实测）。"""
+    assert RR._is_index_fallback({"DOI": "10.64898/2025.11.30.25341312"}) is False
+    assert RR._is_index_fallback({"DOI": "10.1101/2024.01.01.123456"}) is False
+    assert RR._is_index_fallback({"DOI": "10.1371/journal.pone.0266516"}) is True
