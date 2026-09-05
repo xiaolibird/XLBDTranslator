@@ -1,7 +1,7 @@
 # 额度耗尽被记成 `no_output`：35 篇「全文已到手但没读成」混进了待下载清单
 
 日期：2026-09-04
-状态：**已修复（2026-09-04 台账批，见文末「修复」）**；受影响的 35 篇中 32 已自愈，剩 3 篇见文末「后续」
+状态：**已修复（2026-09-04 台账批，见文末「修复」）；存量 35 篇已全部处置完毕**——32 篇随第 3 段 expand 自愈，剩 3 篇于 2026-09-05 用 `--redo` 重跑，成功 3 / 失败 0。⚠️ 全库**同型陈旧条目还剩 4 篇**（`liao2021Improving` / `li2023Prediction` / `jin2024Transferb` / `yoo2025Review`），要救回同法加 `--citekey`，见文末「后续」
 严重度：中——不丢数据，但让账本失去区分力：真抓不到全文与额度挂掉长得一模一样
 发现者：xiaolibird / Claude（2026-09-04 INCLUDE+mid 批次）
 
@@ -169,3 +169,22 @@ PYTHONPATH=. python scripts/backfill_deepread.py run --expand --apply \
 需要说明的是这属于**侥幸**：第 3 段本是为「补下了 PDF 的篇目」设计的，恰好把额度挂掉的
 一起捞了。换个跑法（比如不接第 3 段、或只跑补抓）它们就会一直躺在 failed 里——
 这正是本条缺陷的实际危害，也是「修复」一节里 `deterministic_failures()` 那条排除律的意义。
+
+## 收尾（2026-09-05 13:42–13:59）：最后 3 篇已重跑
+
+    scripts/backfill_deepread.py run --expand --apply --redo \
+        --citekey zhu2025Fedweight --citekey zhao2025Multimodal --citekey hong202624hour
+
+**成功 3 / 失败 0**，三篇都拿到真全文：`zhu2025Fedweight`（37 条带 tag）、
+`zhao2025Multimodal`（34 条，源 europepmc——出版商 PDF 403 后由四通道兜回）、
+`hong202624hour`（35 条，源 unpaywall，6 块）。备份 `.backfill_deepread_backup/20260905T134222/`。
+索引已重解析（三篇 `has_full_text_reading` 全部翻成 True），向量库经 WatchPaths job 自动同步
+（复核：store 内三篇各 37/34/35 条 highlight chunk，与精读产出条数一致）。
+
+**`--redo` 是必需的**：这 3 篇在 `backfill_expand_progress.json` 里是旧口径记的
+`reason: "no_output"` + `had_fulltext: true`，不加会被 `deterministic_failures()` 当确定性
+失败静默跳过——白跑且无任何提示。
+
+**⚠️ 全库同型陈旧条目还剩 4 篇未处理**：`liao2021Improving` / `li2023Prediction` /
+`jin2024Transferb` / `yoo2025Review`。它们同样是旧口径记的 `no_output` + `had_fulltext: true`，
+要救回同法加 `--citekey`（或迁移其 reason）。本批未做——用户点名的是那 3 篇。

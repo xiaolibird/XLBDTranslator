@@ -23,7 +23,7 @@
 | [ingest 的 `degraded` 状态：全部块都成功也会触发，原因不落盘](2026-09-04-ingest-degraded-silent.md) | `pdf_ingest.ingest_pdf` 五态 / SKILL | **已修复**：新增 `synth_failed`，失败原因进 `draft_note`，回退协议扩到三态 |
 | [分块通读草稿的四类系统性错误](2026-09-03-ingest-draft-systematic-errors.md) | `pdf_ingest.extract_availability_statements` / `--context` / prompt | **已修复（2026-09-05 四类全修）**：③ 可得性确定性抽取；④ `--context`；② 参数标算例；① 叠式分数按 drawing 层修（`stacked_fractions`）|
 | [`digest --month` 静默整篇覆盖历史月度札记](2026-09-04-digest-month-overwrite.md) | `cli.run_digest` 预检 + `workflow._step_sync_zotero` 守卫 + `--overwrite-notes` | **已修复**：拒绝 + 逃生门 + 覆盖前备份四件套 |
-| [Crossref 的 article-number 被丢弃](2026-09-04-crossref-article-number-lost.md) | `crossref.parse_crossref_work` + `scripts/backfill_article_numbers.py` | **代码已修**；存量 227 条候选（缺 page、非 arXiv DOI 的期刊条目）用定向脚本回填，见下表 |
+| [Crossref 的 article-number 被丢弃](2026-09-04-crossref-article-number-lost.md) | `crossref.parse_crossref_work` + `scripts/backfill_article_numbers.py` | **代码已修；存量已于 2026-09-05 回填**：候选 232、实补 45 条（其余 187 条源里本就没有）|
 | [索引没有 keeper 视图](2026-09-04-index-keeper-view-missing.md) | `notes_index.iter_keepers` / `keepers_by_citekey` | **已修复**：embed_store 与 backfill_deepread 已委托 |
 | [auto 月度札记缺 sidecar：写入失败被静默吞掉](2026-09-04-auto-sidecar-missing.md) | `notes.write_notes` | **路线 A 已修**：error 级 + `sidecar_ok`；存量 43 月认赔 |
 | [长论文仍被截尾](2026-09-04-closeread-still-truncates.md) | `closereading.read_tail_appendix` + `settings.closeread_tail_max_chars/chunks` | **已修复（2026-09-05）**：两轮读——尾段剔参考文献后按独立预算再读，分节以「附录·」并入 |
@@ -31,10 +31,10 @@
 | [取全文只走两条路](2026-09-04-fulltext-routes-too-narrow.md) | `fulltext.RouteBudget` / `HostBreaker` + `settings.fulltext_extra_routes=True` | **已修复，默认打开（2026-09-05）**：每批额度 80（= 候选 20 篇 × 4 路）/ 按宿主熔断 3 次、30 分钟后半开 / 路间 1.5s；被熔断或额度抑制的篇目记 `routes_suppressed`（暂时性，不进永久跳过）|
 | [摘要降级通路对存量脚本实质失效](2026-09-04-abstract-fallback-dead.md) | `backfill_deepread.abstract_from_note_md` + `--accept-abstract` | **已修复（产出）**：abstracts.json 查不到时回读 md `### 摘要`。**收货默认关**——不加 `--accept-abstract` 时连摘要都不供给（省掉必被拒收的那次 LLM）|
 | [duplicate 条目的行内 citekey 只告警不修](2026-09-04-inline-citekey-mismatch-warn-only.md) | `notes_index.fix_inline_citekeys` / `scripts/notes_index.py --fix-inline-citekeys` | **已修复**：三处原子齐改工具（默认 dry-run）+ 告警升 **error 级**、清单挂进索引 `stale_inline_citekeys`。**刻意不 notify**（持久状态每周每月弹同一条会把告警面训练成噪音）|
-| [手动精读升级已入库论文时 keeper 拿到后缀键、基键从全局书目消失](2026-09-04-manual-upgrade-citekey-suffix.md) | `notes.write_notes(existing_key_owners)` / `notes_index.existing_citekey_owners` | **A+B 均已修**：同一论文继承基键；存量 `lin2025Addressing` 用工具处置（未在生产库执行） |
+| [手动精读升级已入库论文时 keeper 拿到后缀键、基键从全局书目消失](2026-09-04-manual-upgrade-citekey-suffix.md) | `notes.write_notes(existing_key_owners)` / `notes_index.existing_citekey_owners` | **A+B 均已修**：同一论文继承基键；存量 `lin2025Addressing` **已于 2026-09-05 在生产库处置**（⚠️ 概念页路由缺口，见该条文末） |
 | [精读节标题是机读锚点：加后缀会静默丢 reading_source](2026-09-04-closeread-heading-contract.md) | 测试 | **已防复发**：另两对渲染↔解析契约补了往返测试 |
 | [Zotero connector 的 saveItems 吞掉 target](2026-09-04-zotero-saveitems-target-ignored.md) | `zotero_sync.save_items(target)` + `updateSession` | **已修**（随本批提交）；BBT 非 ASCII 键加告警 |
-| [额度耗尽被记成 `no_output`：35 篇「全文已到手但没读成」混进待下载清单](2026-09-04-quota-failure-looks-like-no-fulltext.md) | `closereading.is_llm_unavailable` + `diag` 出参 / `backfill_deepread.classify_failure` | **已修复**：账本分 `llm_unavailable`、计入熔断、重跑不再跳过 |
+| [额度耗尽被记成 `no_output`：35 篇「全文已到手但没读成」混进待下载清单](2026-09-04-quota-failure-looks-like-no-fulltext.md) | `closereading.is_llm_unavailable` + `diag` 出参 / `backfill_deepread.classify_failure` | **已修复；35 篇存量已清零**（32 自愈 + 3 篇 2026-09-05 `--redo` 重跑）。⚠️ 同型陈旧条目另有 4 篇未处理，见该条文末 |
 | [`replace_closeread` 吞掉精读节之后到下一篇之间的全部内容](2026-09-04-replace-closeread-eats-trailing-content.md) | `backfill_deepread.replace_closeread` | **已修复**（审计中发现）；存量 169 篇的篇末 `---` 已丢，补不补见该文末 |
 | [一次 run 内第二篇的备份会覆盖第一篇的原件](2026-09-04-backup-stamp-overwrites-original.md) | `backfill_deepread.backup_files` | **已修复**（审计中发现，判 BLOCKER）：同名已存在就不覆盖 |
 | [`find_local_pdf` 单向词面匹配会认下别篇论文的 PDF](2026-09-04-find-local-pdf-one-way-match.md) | `backfill_deepread.find_local_pdf` | **已修复**（审计中发现）：加反向覆盖 + 实词下限，与 fulltext 同一套判据 |
