@@ -359,9 +359,13 @@ def rebuild_book(notes_dir: Path, manifest: BookManifest, label: str,
         explicit_citekey_source="fallback")
     idx = update_index(notes_dir)
     write_outputs(idx, notes_dir)
+    # sidecar_ok 必须透传：书籍链路是 write_notes 的第 6 个调用方，此前唯独它把这个字段丢了
+    # （2026-09-05 对抗审计 Lens A）。丢它不只是少个告警——`_archived_keys` 读的正是这份
+    # sidecar，写失败被吞掉后它返回 None，下一轮 `if prev:` 整个不成立，**净删除止损闸静默解除**，
+    # 一章已过交叉核验、已归档的内容会被悄悄删掉而回执全绿。
     return {"slug": manifest.slug, "papers": len(segments), "skipped": skipped,
             "broken": broken, "md": res["note_path"], "docx": res.get("docx_path"),
-            "index": idx}
+            "index": idx, "sidecar_ok": res.get("sidecar_ok")}
 
 
 def _plan_citekeys(notes_dir: Path, manifest: BookManifest,

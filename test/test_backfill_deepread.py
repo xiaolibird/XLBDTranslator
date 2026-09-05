@@ -625,9 +625,14 @@ def test_routes_suppressed_is_a_transient_failure_like_llm_unavailable():
         "routes_suppressed 是暂时性但不是通路死了：不计连败"
     assert bd.counts_toward_streak(reason, expand=False, err=None) is False
     assert bd.counts_toward_streak(reason, expand=True, err=None) is False
-    # 全文其实到手了（只是别的原因没产出）→ 不算 routes_suppressed
+    # 全文其实到手了（只是别的原因没产出）→ 不算 routes_suppressed。
+    # 2026-09-05 订正：此前这里断言的是 no_output，等于把「全文在手却判确定性失败」钉成契约
+    #（对抗审计 Lens C：账本里 4 条 had_fulltext=True 的 no_output 就是新代码这样写出来的）。
+    # 现在归 empty_with_fulltext——仍然不是 routes_suppressed，但也不再进永久跳过集。
     reason2, dead2 = bd.classify_failure({"routes_suppressed": 2, "from_full_text": True}, None)
-    assert reason2 == "no_output" and dead2 is False
+    assert reason2 == bd.EMPTY_WITH_FULLTEXT_REASON and dead2 is False
+    assert not reason2.startswith(bd.ROUTES_SUPPRESSED_REASON), "本意不变：不算被抑制"
     led = {"failed": {"a": {"reason": "routes_suppressed:2"}, "b": {"reason": "no_output"},
-                      "c": {"reason": "llm_unavailable:429"}}}
-    assert bd.deterministic_failures(led) == {"b"}
+                      "c": {"reason": "llm_unavailable:429"},
+                      "d": {"reason": bd.EMPTY_WITH_FULLTEXT_REASON}}}
+    assert bd.deterministic_failures(led) == {"b"}, "只有真没正文可读的才进永久跳过集"

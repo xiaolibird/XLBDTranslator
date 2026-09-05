@@ -460,11 +460,20 @@ def cmd_finalize(args):
         print("\n⛔ 净删除止损闸触发，整本未动。被拒收 bundle：{}"
               .format(", ".join((res.get("skipped") or []) + (res.get("broken") or []))))
         return 2
-    print("\n✅ 归档 {} 条条目 → {}".format(res.get("papers"), res.get("md")))
+    sidecar_bad = res.get("sidecar_ok") is False
+    print("\n{} 归档 {} 条条目 → {}".format("⚠️" if sidecar_bad else "✅",
+                                          res.get("papers"), res.get("md")))
     if res.get("skipped"):
         print("   未纳入（草稿/未过门禁）：{}".format(", ".join(res["skipped"])))
     if res.get("broken"):
         print("   ⚠️ 结构非法：{}".format(", ".join(res["broken"])))
+    if sidecar_bad:
+        # 与 read_pdf.cmd_finalize/cmd_regen 同口径退非 0：这份 sidecar 是 `_archived_keys`
+        # 的唯一锚，丢了下一轮净删除止损闸就会静默失效、把已归档的一章删掉。
+        # 绿回执 + exit 0 会让自动权限模式的 agent 直接往下走，所以必须非 0。
+        print("   ⛔ sidecar（.index.json）写入失败：下一轮净删除止损闸会失效，"
+              "请修好磁盘/权限后重跑 finalize，勿在此状态下继续")
+        return 1
     return 0
 
 

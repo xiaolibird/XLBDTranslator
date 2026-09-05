@@ -103,3 +103,20 @@ PYTHONPATH=. python3.12 scripts/repair_references.py --month <YYYY-MM> --force -
 PYTHONPATH=. python3.12 scripts/notes_index.py                                                          # 重建全局书目
 ```
 验证 `ladobaleato2025Testing → e10308`、`duan2026Discovering → gkag386`。
+
+## 「187 条源里也没有」不可信，已修判据（2026-09-05 对抗审计 Lens C）
+
+`make_lookup` 很用心地把 `--limit` 额度耗尽单独记成 `UNCHECKED`（第 1 轮审计 R1-3.3 的产物），
+**却没把「问了没问成」从「问了确实没有」里分出来**——因为它调的 `crossref_by_doi` 自己
+就把 404 / 非 200 / 超时 / 传输异常**一律**吞成 `None`（`crossref.py:171`）。于是那个
+`warn` 告警钩子在生产里是**够不到的死代码**，HTTP 故障直接计进 `n_none`，
+终局打印成「源里也没有定位号 N 条」。
+
+台账与 decisions 文档里那句「其余 187 条 Crossref 源里本就没有 article-number」
+就是这么来的——**它没有资格当结论**。这与 decisions 文档同一天写下的教训自相矛盾：
+「凡是『查了外部源没查到』的结论，都必须能回答『你到底问成了没有』」。
+
+修法：新增哨兵 `UNREACHABLE`；`_fetch` 改成自己发请求自己看状态码
+（404 → 确实没有；429/5xx/异常 → 没答上；命中解析仍复用 `parse_crossref_work`，判据只留一份），
+且「没答上」**不写缓存**，本轮后面还能再问。回执与终局打印分三档：
+源里也没有 / 未回查（--limit）/ 源没答上。下次重跑这批时那 187 条会重新分档。

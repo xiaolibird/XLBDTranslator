@@ -188,3 +188,25 @@ PYTHONPATH=. python scripts/backfill_deepread.py run --expand --apply \
 **⚠️ 全库同型陈旧条目还剩 4 篇未处理**：`liao2021Improving` / `li2023Prediction` /
 `jin2024Transferb` / `yoo2025Review`。它们同样是旧口径记的 `no_output` + `had_fulltext: true`，
 要救回同法加 `--citekey`（或迁移其 reason）。本批未做——用户点名的是那 3 篇。
+
+## 归因订正（2026-09-05 对抗审计 Lens C）：那 4 条不是旧口径存量，是新代码还在写
+
+先前把「`no_output` + `had_fulltext: true` 的 4 条」判成了**旧口径遗留、补个迁移即可**。
+**错了，而且错在对己方有利的方向**：
+
+    021b33e（引入 classify_failure 与 had_fulltext）提交时间  2026-09-04 22:32:37
+    那 4 条的 at                                          2026-09-04 23:00:23
+
+`had_fulltext` 这个键**只有新代码会写**，所以它们是修完之后判出来的。根因是
+`classify_failure` 落盘了 `from_full_text` 却从不拿它当判据：只看 `llm_unavailable` /
+`err` / `routes_suppressed`，三者不中就一律 `no_output`——而 `no_output` 的 docstring
+写着「真没正文可读（无 DOI / 闭源 / 四条通道全断）」，`had_fulltext: true` 直接证伪它。
+
+**这是活缺陷，不是存量。** 修法：新增第五类 `empty_with_fulltext`（全文已到手却零产出：
+模型返回不可解析、抽取零命中），归入 `TRANSIENT_REASON_PREFIXES`——不进永久跳过集、
+重跑不跳过、不计连败。实证支持：同型 3 篇 2026-09-05 加 `--redo` 重跑，成功 3 / 失败 0。
+
+附带记账缺口（未修，已知）：`backfill_expand_progress.json` 无 `schema_version` 也无
+`generated_at`；269 条 failed 里 **127 条根本没有 `had_fulltext` 键**（写于 021b33e 之前，
+正是额度耗尽那段时间），新口径无法回答「它们当时到底拿没拿到全文」。
+09-04 捞回的 35 篇是靠翻日志找出来的，不是靠账本。

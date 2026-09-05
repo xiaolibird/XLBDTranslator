@@ -30,7 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.paths import repo_path                       # noqa: E402
-from src.scholar.crossref import crossref_by_doi               # noqa: E402
+from src.scholar.crossref import (CROSSREF_API, parse_crossref_work)  # noqa: E402
+from src.scholar.fulltext import polite_get                    # noqa: E402
 from src.scholar.fulltext import ipv4_client                   # noqa: E402
 from src.utils.logger import get_logger                        # noqa: E402
 
@@ -50,6 +51,13 @@ def is_candidate(item: Dict[str, Any]) -> bool:
 
 
 UNCHECKED = object()     # lookup 的哨兵：额度（--limit）用完、这条**没回查**——不是「源里也没有」
+UNREACHABLE = object()   # lookup 的哨兵：问了但**源没答上**（429/5xx/超时）——同样不是「源里也没有」
+#
+# 为什么要第二个哨兵：`crossref_by_doi` 把 404、非 200、超时、传输异常**一律**吞成 None
+# （crossref.py:171），与「Crossref 里确实没这篇」同形。于是 make_lookup 里那个 warn 钩子
+# 在生产中根本够不到，HTTP 故障会被计进 n_none 并打印成「源里也没有定位号 N 条」——
+# 这个数会被人抄进台账当成 Crossref 确认过的结论（2026-09-05 对抗审计 Lens C 实证：
+# 台账里「其余 187 条源里本就没有」就是这么来的，不可信）。故本脚本自己发请求自己看状态码。
 
 
 def make_lookup(fetch: Callable[[str], Any], budget: List[int],
@@ -75,7 +83,15 @@ def make_lookup(fetch: Callable[[str], Any], budget: List[int],
         except Exception as e:                            # noqa: BLE001
             if warn is not None:
                 warn(doi, type(e).__name__)
-            got = None
+            if delay > 0:
+                time.sleep(delay)
+            return UNREACHABLE                            # 不写缓存：本轮后面可以再问
+        if got is UNREACHABLE:                            # fetch 自己报「没答上」
+            if warn is not None:
+                warn(doi, "unreachable")
+            if delay > 0:
+                time.sleep(delay)
+            return UNREACHABLE
         page = (got or {}).get("pages") or None
         cache[doi] = page
         if delay > 0:
@@ -89,12 +105,12 @@ def plan_updates(items: List[Dict[str, Any]], lookup: Callable[[str], Any]
                  ) -> Tuple[List[Tuple[int, str]], int, int, int]:
     """纯函数：对候选逐条 lookup(doi) → 定位号。
 
-    返回 ([(下标, 新 page)], 候选数, 源里也没有的条数, 未回查条数)。
+    返回 ([(下标, 新 page)], 候选数, 源里也没有的条数, 未回查条数, 源没答上的条数)。
     lookup 返回 UNCHECKED 表示这条没回查（--limit 用完）——单独计数，不许混进「源里也没有」
     （第 1 轮审计 R1-3.3：先用 --limit 20 试跑的人会把「N 条源里也没有」当成 Crossref 确认过的结论）。
     """
     updates: List[Tuple[int, str]] = []
-    n_cand = n_none = n_unchecked = 0
+    n_cand = n_none = n_unchecked = n_unreachable = 0
     for i, it in enumerate(items):
         if not is_candidate(it):
             continue
@@ -102,11 +118,13 @@ def plan_updates(items: List[Dict[str, Any]], lookup: Callable[[str], Any]
         page = lookup(str(it["DOI"]).strip())
         if page is UNCHECKED:
             n_unchecked += 1
+        elif page is UNREACHABLE:
+            n_unreachable += 1
         elif page:
             updates.append((i, page))
         else:
             n_none += 1
-    return updates, n_cand, n_none, n_unchecked
+    return updates, n_cand, n_none, n_unchecked, n_unreachable
 
 
 def apply_updates(items: List[Dict[str, Any]], updates: List[Tuple[int, str]]) -> None:
@@ -154,11 +172,28 @@ def main() -> int:
     backup_dir = nd / BACKUP_DIRNAME / stamp
     cache: Dict[str, Optional[str]] = {}
     budget = [args.limit if args.limit > 0 else 10 ** 9]
-    tot_cand = tot_upd = tot_none = tot_files = tot_unchecked = 0
+    tot_cand = tot_upd = tot_none = tot_files = tot_unchecked = tot_unreach = 0
 
     with ipv4_client(timeout=30.0) as cli:
         def _fetch(doi):
-            return crossref_by_doi(doi, email=args.email, client=cli)
+            """自己发请求自己看状态码——**不能用 crossref_by_doi**：它把 404 / 非 200 / 超时 /
+            传输异常一律吞成 None（crossref.py:171），与「源里确实没这篇」同形，
+            于是 HTTP 故障会被计进「源里也没有」（2026-09-05 对抗审计 Lens C）。
+            命中解析仍复用 parse_crossref_work，判据只留一份。"""
+            try:
+                r = polite_get(cli, "{}/{}".format(CROSSREF_API, doi),
+                               params={"mailto": args.email} if args.email else {})
+            except Exception:                                  # noqa: BLE001
+                return UNREACHABLE
+            if r.status_code == 404:
+                return None                                    # 源答了：确实没这篇
+            if r.status_code != 200:
+                return UNREACHABLE                             # 429/5xx：没答上
+            try:
+                item = (r.json() or {}).get("message")
+            except Exception:                                  # noqa: BLE001
+                return UNREACHABLE
+            return parse_crossref_work(item) if item else None
 
         def _warn(doi, exc_name):
             logger.warning("  ⚠️ Crossref 回查失败（{}）: {}".format(doi, exc_name))
@@ -173,13 +208,15 @@ def main() -> int:
                 continue
             if not any(is_candidate(it) for it in items):
                 continue
-            updates, n_cand, n_none, n_unchecked = plan_updates(items, lookup)
+            updates, n_cand, n_none, n_unchecked, n_unreach = plan_updates(items, lookup)
             tot_cand += n_cand
             tot_none += n_none
             tot_unchecked += n_unchecked
-            print("{:<48} 候选 {:>3} → 可补 {:>3}（源里也没有 {}{}）".format(
+            tot_unreach += n_unreach
+            print("{:<48} 候选 {:>3} → 可补 {:>3}（源里也没有 {}{}{}）".format(
                 f.name, n_cand, len(updates), n_none,
-                "，未回查 {}".format(n_unchecked) if n_unchecked else ""))
+                "，未回查 {}".format(n_unchecked) if n_unchecked else "",
+                "，源没答上 {}".format(n_unreach) if n_unreach else ""))
             for i, page in updates[:6]:
                 print("      {} → page={}".format(items[i].get("id"), page))
             if updates and args.apply:
@@ -193,9 +230,11 @@ def main() -> int:
                 print("  （--limit 用完，后续文件未回查）")
                 break
 
-    print("\n合计：候选 {} 条，可补 {} 条，源里也没有定位号 {} 条{}".format(
+    print("\n合计：候选 {} 条，可补 {} 条，源里也没有定位号 {} 条{}{}".format(
         tot_cand, tot_upd, tot_none,
-        "，未回查 {} 条（--limit 用完，不是源里没有）".format(tot_unchecked) if tot_unchecked else ""))
+        "，未回查 {} 条（--limit 用完，不是源里没有）".format(tot_unchecked) if tot_unchecked else "",
+        "，源没答上 {} 条（429/5xx/超时，**不是**源里没有，改天重跑）".format(tot_unreach)
+        if tot_unreach else ""))
     if args.apply:
         print("已写 {} 份文件；原件备份在 {}\n下一步：PYTHONPATH=. python3 scripts/notes_index.py  （重建 all_references.json）"
               .format(tot_files, backup_dir))

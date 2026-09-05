@@ -36,7 +36,7 @@ def test_plan_and_apply_updates_touch_only_page():
         {"id": "d", "type": "book", "DOI": "10.1/d"},
     ]
     table = {"10.1/a": "e10308", "10.1/b": None}
-    updates, n_cand, n_none, n_unchecked = BA.plan_updates(items, lambda doi: table.get(doi))
+    updates, n_cand, n_none, n_unchecked, n_unreach = BA.plan_updates(items, lambda doi: table.get(doi))
     assert updates == [(0, "e10308")] and n_cand == 2 and n_none == 1 and n_unchecked == 0
     before = json.dumps(items[1:], sort_keys=True)
     BA.apply_updates(items, updates)
@@ -192,7 +192,7 @@ def test_plan_updates_counts_unchecked_separately():
             return BA.UNCHECKED
         budget[0] -= 1
         return "e1" if doi.endswith("a") else None
-    updates, n_cand, n_none, n_unchecked = BA.plan_updates(items, lookup)
+    updates, n_cand, n_none, n_unchecked, n_unreach = BA.plan_updates(items, lookup)
     assert n_cand == 4 and updates == [(0, "e1")] and n_none == 1 and n_unchecked == 2
 
 
@@ -223,11 +223,13 @@ def test_make_lookup_caches_none_but_not_unchecked():
     lookup = BA.make_lookup(fetch, budget, {}, delay=0)
     assert lookup("10.1/a") is None and lookup("10.1/a") is None
     assert seen == ["10.1/a"], "None 命中缓存，同 DOI 不再回查"
-    # fetch 抛异常 → None（且不缓存为 UNCHECKED）
+    # fetch 抛异常 → **UNREACHABLE**，不是 None。
+    # 2026-09-05 订正：这里原本断言的是 `is None`，等于把「没问成 = 源里也没有」这个缺陷
+    # 钉成了契约（对抗审计 Lens C）。异常是「没答上」，必须与「问了确实没有」分开。
     def boom(doi):
         raise ConnectionError("x")
     l2 = BA.make_lookup(boom, [1], {}, delay=0)
-    assert l2("10.1/z") is None
+    assert l2("10.1/z") is BA.UNREACHABLE
 
 
 # ---------------- 源没答上 ≠ 源里没有（2026-09-05 生产实跑发现） ----------------
@@ -325,3 +327,36 @@ def test_resume_set_excludes_titles_we_deliberately_never_ask_about(tmp_path, mo
     out = capsys.readouterr().out
     assert "待重查 1 条" in out, "只有 long1 该重查；short1 是故意不问"
     assert "缺 openalex" in out
+
+
+def test_lookup_separates_unreachable_source_from_source_has_none():
+    """crossref_by_doi 把 404/非200/超时一律吞成 None，与「源里确实没有」同形——
+    于是 HTTP 故障会被计进「源里也没有 N 条」，而这个数会被人抄进台账当结论
+    （2026-09-05 对抗审计 Lens C 实证：台账「187 条源里本就没有」就是这么来的）。"""
+    # fetch 抛异常 → UNREACHABLE，且**不写缓存**（本轮后面还能再问）
+    cache = {}
+    def boom(doi):
+        raise ConnectionError("429")
+    lk = BA.make_lookup(boom, [5], cache, delay=0)
+    assert lk("10.1/a") is BA.UNREACHABLE
+    assert "10.1/a" not in cache, "没答上不许进缓存，否则本轮内永远问不成"
+    # fetch 自报 UNREACHABLE（生产里 _fetch 看状态码后返回它）
+    lk2 = BA.make_lookup(lambda d: BA.UNREACHABLE, [5], {}, delay=0)
+    assert lk2("10.1/b") is BA.UNREACHABLE
+    # 源答了、确实没有 → None，照旧缓存
+    c3 = {}
+    lk3 = BA.make_lookup(lambda d: {}, [5], c3, delay=0)
+    assert lk3("10.1/c") is None and c3["10.1/c"] is None
+
+
+def test_plan_updates_counts_unreachable_separately_from_none():
+    """三种「没补上」必须分三个计数：源里没有 / --limit 没轮到 / 源没答上。"""
+    items = [{"type": "article-journal", "DOI": "10.1/a", "id": "a"},
+             {"type": "article-journal", "DOI": "10.1/b", "id": "b"},
+             {"type": "article-journal", "DOI": "10.1/c", "id": "c"},
+             {"type": "article-journal", "DOI": "10.1/d", "id": "d"}]
+    table = {"10.1/a": "281", "10.1/b": None,
+             "10.1/c": BA.UNREACHABLE, "10.1/d": BA.UNCHECKED}
+    upd, n_cand, n_none, n_unchecked, n_unreach = BA.plan_updates(items, lambda d: table[d])
+    assert n_cand == 4 and [p for _, p in upd] == ["281"]
+    assert (n_none, n_unchecked, n_unreach) == (1, 1, 1), "三种口径不许互相吞并"

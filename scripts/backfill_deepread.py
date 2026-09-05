@@ -122,7 +122,12 @@ LLM_UNAVAILABLE_REASON = "llm_unavailable"
 #（计入连败、不进 deterministic_failures、重跑不跳过）。否则四通道默认打开后，一次 OpenAlex 抖动
 # 就会让后面几百篇被记成 no_output 永久沉淀（2026-09-05 第 1 轮审计 R1-2.4）。
 ROUTES_SUPPRESSED_REASON = "routes_suppressed"
-TRANSIENT_REASON_PREFIXES = (LLM_UNAVAILABLE_REASON, ROUTES_SUPPRESSED_REASON)
+# 全文**已经到手**却一条都没产出：不是「没正文可读」，是这一趟处理没成——模型返回不可解析、
+# 抽取零命中之类。**暂时性**：2026-09-05 实测同型 3 篇加 --redo 重跑，成功 3 / 失败 0。
+# 此前它们一律落进 no_output → deterministic_failures → 永久静默跳过（2026-09-05 对抗审计 Lens C）。
+EMPTY_WITH_FULLTEXT_REASON = "empty_with_fulltext"
+TRANSIENT_REASON_PREFIXES = (LLM_UNAVAILABLE_REASON, ROUTES_SUPPRESSED_REASON,
+                             EMPTY_WITH_FULLTEXT_REASON)
 
 
 def classify_failure(cr_diag: dict, err) -> tuple:
@@ -137,6 +142,11 @@ def classify_failure(cr_diag: dict, err) -> tuple:
       - `routes_suppressed:<n>` 额外通道被熔断/额度抑制过且没拿到全文——**暂时性**，与 llm_unavailable
         同待遇（TRANSIENT_REASON_PREFIXES、重跑不跳过），但**不计连败**：四路是锦上添花，
         少了个额外渠道 ≠ 通路死了（第 2 轮审计 R2-1.2）。
+      - `empty_with_fulltext` 全文已到手、却一条带 tag 的句子都没产出（模型返回不可解析、
+        抽取零命中）。**暂时性**：`no_output` 的定义是「真没正文可读」，`had_fulltext=True`
+        直接证伪它。此前这一类被判确定性、进永久跳过集，靠人记得加 `--redo` 才救得回来
+        （2026-09-05 对抗审计 Lens C；账本里实测 4 条，重跑同型 3 篇 3/3 成功）。
+        不计连败——通路是好的，是这一趟没读出东西。
       - `no_output` 真没正文可读（无 DOI / 闭源 / 四条通道全断），**确定性**失败；
         expand 批里它是常态，不计连败（否则熔断天天误跳）。
     """
@@ -152,6 +162,10 @@ def classify_failure(cr_diag: dict, err) -> tuple:
         # 四路里有路被熔断跳过 / 额度用完，这次没全文不等于「真没有」：暂时性、重跑不跳过，
         # 但 llm_dead=False——不计连败（四路被限流是「少了个额外渠道」，不是通路死了）。
         return "{}:{}".format(ROUTES_SUPPRESSED_REASON, sup), False
+    if (cr_diag or {}).get("from_full_text"):
+        # 全文到手却零产出：不许判确定性。no_output 的 docstring 写的是「真没正文可读」，
+        # 这里正文明明在手——把它记成确定性等于让重跑永远跳过一篇本来能读成的论文。
+        return EMPTY_WITH_FULLTEXT_REASON, False
     return "no_output", False
 
 

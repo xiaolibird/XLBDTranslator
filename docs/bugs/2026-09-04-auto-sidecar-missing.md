@@ -120,3 +120,30 @@ PY
 把「没要求写」与「要求了但失败」混成一态。路线 B（量尺渲进 md）不做——`2026-09-04-closeread-heading-contract.md` 刚证明那是全库最脆的契约。
 存量 43 个月的量尺不可恢复，维持 `reading_depth=unknown-legacy` 标记。
 测试：`test/test_bugs_batch_2026_09.py::test_write_notes_reports_sidecar_failure_loudly` / `test_write_notes_sidecar_ok_flag_two_states`。
+
+## 漏了第 6 条链路：书籍精读（2026-09-05 对抗审计 Lens A，构造输入实跑证实会丢数据）
+
+021b33e 的 commit message 写的是「**四条**消费链路都接上」。实际 `write_notes` 有 **6 个**调用方，
+接上的只有 4 个，漏掉的第 6 个是书籍链路，而它是**唯一一条会因此真丢内容**的：
+
+- `book_notes.rebuild_book`（`:350` 调 `write_notes`，`:362-364` 的返回 dict **没有 `sidecar_ok`**）
+- `scripts/book_digest.py:457-468` 照打 `✅ 归档 N 条条目` 并 `return 0`
+  （对照 `read_pdf.py:993/:1005`：同一场景 finalize/regen 是 `return 1`）
+- **复合伤害**：`_archived_keys`（`book_notes.py:283-296`）读的正是这份 sidecar，
+  缺文件返回 `None` → `:327` 的 `if prev:` 整个不成立 → **净删除止损闸在下一轮静默解除**
+
+审计构造输入实跑（只让 sidecar 那一次写盘抛 OSError）+ 对照组：
+
+    第一轮 sidecar 写失败 → 回执 ✅ 归档 2 条、退出码 0
+    第二轮 ch2 被误删     → refused=None、索引 book 条目 2→1、退出码 0（本应触发止损闸）
+    对照组 sidecar 正常   → refused=True、退出码 2、md 里 Ch2 仍在
+
+即一次被吞掉的 sidecar 失败，会让下一轮把**一章已过交叉核验、已归档**的内容悄悄删掉，
+回执全绿。数据可从 chapter bundle 重跑恢复，故定 MAJOR 不定 BLOCKER。
+
+修法：`rebuild_book` 透传 `sidecar_ok`；`book_digest.cmd_finalize` 在其为 False 时
+打 ⚠️ 回执 + 明示「下一轮止损闸会失效」并 `return 1`，与 read_pdf 同口径。
+
+另：第 5 条链路 `cli.run_zotero_sync`（`cli.py:380-402`）同样丢 `sidecar_ok`，**影响可忽略**——
+该路径文件名取 `input_path.stem`，不匹配 `notes_index.NOTE_MD_RE`，产出的 sidecar 从未进过索引
+（真库已核）。记在这里只为让「N 条链路」这个账目准确。

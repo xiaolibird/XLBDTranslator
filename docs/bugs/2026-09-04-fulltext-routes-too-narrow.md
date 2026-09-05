@@ -126,3 +126,22 @@ arXiv（含标题检索）→ EPMC render → OpenAlex → S2。注意三点：
 - 每批额度 80（候选 20 篇 × 4 路）本来就在日额度之内，周度/月度单批不会打满；
   真正会撞上的是**一天里连跑多批**或存量补抓这类大批量场景。
 - 宣称的「四通道」在日额度用尽后实为三通道，漏判率按三路算。
+
+## BLOCKER 补修（2026-09-05 对抗审计 Lens C）：Unpaywall 主路此前完全没有闸
+
+四路（arXiv / EPMC / OpenAlex / S2）全部走 `polite_get`——退避 + 按宿主熔断 + 抑制记账。
+**唯独主路 Unpaywall 是裸 `c.get`**（`fulltext.py:123`）。而它才是开门的那把钥匙：
+库里 2091 篇是 `doi:` 档身份键，非 arXiv 篇目全靠它。`settings.py:191` 那行注释列了
+「EPMC/arXiv 主链路的退避与熔断不受本开关影响」——名单里没有 Unpaywall。
+
+后果比四路严重得多，而且**无上界**：
+
+    Unpaywall 5xx/超时 → 不退避、不跳闸、extra 里没有 routes_suppressed
+      → close_read 记 from_full_text=False → classify_failure 判 no_output
+      → deterministic_failures 永久跳过；而 counts_toward_streak(no_output, expand=True)
+        是 False，--expand 批连熔断都不会跳，可以一路把整批烧成「这篇没有 OA 全文」
+
+不是「熔断暖机窗口头 1~2 篇」那种有界损失——它压根不在熔断器里。
+
+修法：Unpaywall 改走 `polite_get`；非 200 视为没答上；主路没答上时 `routes_suppressed += 1`，
+即使四路健康且确实没有 OA，也记成**暂时性**而不是「真没有」。

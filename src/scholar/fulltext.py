@@ -117,16 +117,29 @@ def resolve_oa_pdf(
                                            if (meta.doi and email) or extra_routes else None)
     try:
         primary: Optional[OAResult] = None
+        unpaywall_down = False
         # 2) Unpaywall（需 DOI + email）
+        #
+        # **必须走 polite_get**：这是主路——库里 2091 篇是 doi: 档身份键，非 arXiv 篇目全靠它开门。
+        # 2026-09-05 对抗审计（Lens C, BLOCKER）发现此前它是全 fulltext.py 唯一的裸 c.get：
+        # 四路（arXiv/EPMC/OpenAlex/S2）都有退避与熔断，唯独主路没有。后果比四路严重得多——
+        # 它挂了既不退避也不跳闸，且不记 routes_suppressed，于是「这次没拿到」与「真没有 OA」同形，
+        # 一路沉淀成 no_output 永久跳过；而 counts_toward_streak(no_output, expand=True) 是 False，
+        # --expand 批连熔断都不会跳，可以一路把整批烧成「这篇没有 OA 全文」。不是有界损失。
         if meta.doi and email:
             try:
-                resp = c.get(f"{UNPAYWALL_API}/{meta.doi}", params={"email": email})
-                resp.raise_for_status()
+                resp = polite_get(c, "{}/{}".format(UNPAYWALL_API, meta.doi),
+                                  params={"email": email})
+                if resp.status_code != 200:
+                    raise RuntimeError("HTTP {}".format(resp.status_code))
                 primary = parse_unpaywall(resp.json())
             except Exception as e:
                 logger.warning("  ⚠️ Unpaywall 解析失败（{}）: {}".format(meta.doi, e))
                 primary = OAResult(oa_status="unknown", source="unpaywall")
+                unpaywall_down = True          # 主路没答上 → 下面按抑制记账，绝不判「真没有」
             if primary.pdf_url or not extra_routes:
+                if unpaywall_down and not primary.pdf_url:
+                    primary.extra = dict(primary.extra or {}, routes_suppressed=1)
                 return primary
 
         # 3) 额外四路
@@ -145,12 +158,16 @@ def resolve_oa_pdf(
             # 没命中，但有路被熔断跳过或额度已用完：这次「没全文」可能是**暂时的**。把抑制次数
             # 写进 extra，让 close_read_segment → backfill_deepread 与确定性 no_output 分开记账，
             # 否则暂时性失败会沉淀成永久跳过（第 1 轮审计 R1-2.4，复发上一批 quota-failure 那一类）。
+            sup = 0
             if budget is not None:
                 sup = (budget.skipped_routes - skipped_before) + (1 if budget.exhausted else 0)
-                if sup > 0:
-                    if primary is None:
-                        primary = OAResult(oa_status="unknown", source=None)
-                    primary.extra = dict(primary.extra or {}, routes_suppressed=sup)
+            # 主路 Unpaywall 没答上，本身就算一次抑制——四路健康但确实没有 OA 时，
+            # sup 会是 0，若不加这一笔，「Unpaywall 挂了」就被记成确定性的「真没有」。
+            sup += 1 if unpaywall_down else 0
+            if sup > 0:
+                if primary is None:
+                    primary = OAResult(oa_status="unknown", source=None)
+                primary.extra = dict(primary.extra or {}, routes_suppressed=sup)
         if primary is not None:
             return primary
     finally:
