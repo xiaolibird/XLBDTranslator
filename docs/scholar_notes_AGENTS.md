@@ -538,6 +538,11 @@ fulltext_chars_raw(抽取到的原始正文长度), fulltext_truncated`。
   要比"读得深不深"请看 `reading_depth`,不要拿 `tag_counts` 当代理指标。
 - `fulltext_truncated`:**缺失 = 未知**,`false` = 确认未截断,二者禁止混同(`fulltext_chars` /
   `fulltext_chars_raw` 同理,存量回填一律留缺失,不猜不填)。
+- 成因拆开(2026-09-05 起,同样缺失 = 未知):`fulltext_truncated_by_total_cap`(过了单页上限仍长于
+  max_chars,丢的是尾部;两轮读能救)/ `fulltext_truncated_by_page_cap`(某页被单页上限削掉后半,
+  抬总上限**无用**)/ `fulltext_tail_chars`(两轮读第二轮喂进去的尾段字符数,None = 没跑第二轮)。
+  两者可同时为真。**挑「最该重跑的几篇」看 by_total_cap,不要看 truncated**。第二轮的分节以
+  「附录·」前缀并入 sections,取证时能分清一句话来自正文还是尾段。
 
 ```bash
 # 取证前先分层:看这批候选各是什么深度

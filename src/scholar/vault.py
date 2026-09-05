@@ -49,6 +49,8 @@ MANAGED_KEYS = (
     # 于是同一个键在文件里出现两次、每次重写都变，幂等性直接破（test_vault 的
     # is_idempotent / untampered_rebuild_is_not_conflict 会红）。
     "reading_depth", "fulltext_truncated", "fulltext_chars", "fulltext_chars_raw",
+    # 截断成因 + 两轮读尾段（2026-09-05）——同上，加 front matter 键必须同步加进这里
+    "fulltext_truncated_by_total_cap", "fulltext_truncated_by_page_cap", "fulltext_tail_chars",
     "tags", "cssclasses", "vault_schema",
 )
 # 受管 tag 前缀：以 "/" 结尾的按前缀匹配，其余按整串相等（否则 `scholar` 会吃掉用户的
@@ -350,6 +352,11 @@ def build_frontmatter(e: Dict[str, Any], preserved: Optional[Dict[str, Any]] = N
         # 按 fulltext_truncated = true 过滤时不能把未知混进来。
         ("reading_depth", _y(e.get("reading_depth"))),
         ("fulltext_truncated", _y(e.get("fulltext_truncated"))),
+        # 成因拆开（2026-09-05）：Dataview 按 fulltext_truncated_by_total_cap = true 才是「抬上限/
+        # 加第二轮有用」的那批；by_page_cap 的抬总上限无用。同样三态透传，null = 老条目没装。
+        ("fulltext_truncated_by_total_cap", _y(e.get("fulltext_truncated_by_total_cap"))),
+        ("fulltext_truncated_by_page_cap", _y(e.get("fulltext_truncated_by_page_cap"))),
+        ("fulltext_tail_chars", _y(e.get("fulltext_tail_chars"))),
         ("fulltext_chars", _y(e.get("fulltext_chars"))),
         ("fulltext_chars_raw", _y(e.get("fulltext_chars_raw"))),
         ("n_highlights", _y(len(hls))),

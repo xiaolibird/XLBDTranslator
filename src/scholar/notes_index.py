@@ -39,6 +39,11 @@ logger = get_logger(__name__)
 # 'single-call' = auto 单跳；'unknown-legacy' = 仅 auto 存量条目（由回填写入）；
 # 键缺失或 null 只可能出现在 has_full_text_reading == false 的非精读条目上。
 # fulltext_truncated：缺失 = 未知，false = 确认未截断——下游禁止把「缺失」当作「未截断」。
+# 2026-09-05 起成因拆开（全部可选、缺失 = 未知，故 SCHEMA_VERSION 不动）：
+#   fulltext_truncated_by_total_cap  过了单页上限之后仍长于 max_chars（丢的是尾部；抬上限/两轮读有用）
+#   fulltext_truncated_by_page_cap   有页被单页上限削掉后半（丢的是病态长页；抬总上限无用）
+#   fulltext_tail_chars              两轮读第二轮喂进模型的尾段字符数；缺失/None = 没跑第二轮
+# 两者可同时为真。「按覆盖率挑最该重跑的几篇」请看 by_total_cap，别看 truncated。
 SCHEMA_VERSION = 5   # 5: 书籍/章节一等公民（entry_type/isbn/book_key… 全部可选，文章条目形状不变）
 INDEX_JSON = "literature_index.json"
 INDEX_MD = "INDEX.md"

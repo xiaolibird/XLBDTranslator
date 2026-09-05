@@ -118,17 +118,25 @@ def select_targets(index: dict, decision: str = "", tier: str = "",
 # ---------------- 账本 ----------------
 
 LLM_UNAVAILABLE_REASON = "llm_unavailable"
+# 额外通道被熔断/额度抑制过、这次没拿到全文：**暂时性**失败——与 llm_unavailable 同待遇
+#（计入连败、不进 deterministic_failures、重跑不跳过）。否则四通道默认打开后，一次 OpenAlex 抖动
+# 就会让后面几百篇被记成 no_output 永久沉淀（2026-09-05 第 1 轮审计 R1-2.4）。
+ROUTES_SUPPRESSED_REASON = "routes_suppressed"
+TRANSIENT_REASON_PREFIXES = (LLM_UNAVAILABLE_REASON, ROUTES_SUPPRESSED_REASON)
 
 
 def classify_failure(cr_diag: dict, err) -> tuple:
-    """把一次「没产出」归类成账本 reason，并回答「要不要计入熔断连败」。返回 (reason, llm_dead)。
+    """把一次「没产出」归类成账本 reason，并回答「是不是模型侧挂了」。返回 (reason, llm_dead)。
 
-    三类必须可分（见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md）：
+    四类必须可分（见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md）：
       - `llm_unavailable:<原因>` 全文/摘要**已经到手**，是模型侧挂了（额度耗尽 / 429 限流 / 鉴权）。
         **暂时性**：额度一恢复原样重跑就成，绝不该沉淀进「待下载清单」等一个根本不需要的 PDF。
         必须计入连败——熔断存在的全部理由就是拦这个（2026-09-04 实测：额度耗尽后一路跑到底，
         把 65 篇烧成失败，其中 35 篇全文明明已经在手）。
       - `error:<异常类型>` 抛异常的其它故障，计入连败。
+      - `routes_suppressed:<n>` 额外通道被熔断/额度抑制过且没拿到全文——**暂时性**，与 llm_unavailable
+        同待遇（TRANSIENT_REASON_PREFIXES、重跑不跳过），但**不计连败**：四路是锦上添花，
+        少了个额外渠道 ≠ 通路死了（第 2 轮审计 R2-1.2）。
       - `no_output` 真没正文可读（无 DOI / 闭源 / 四条通道全断），**确定性**失败；
         expand 批里它是常态，不计连败（否则熔断天天误跳）。
     """
@@ -139,20 +147,31 @@ def classify_failure(cr_diag: dict, err) -> tuple:
         return "{}:{}".format(LLM_UNAVAILABLE_REASON, detail), True
     if err is not None:
         return "error:{}".format(type(err).__name__), True
+    sup = (cr_diag or {}).get("routes_suppressed")
+    if sup and not (cr_diag or {}).get("from_full_text"):
+        # 四路里有路被熔断跳过 / 额度用完，这次没全文不等于「真没有」：暂时性、重跑不跳过，
+        # 但 llm_dead=False——不计连败（四路被限流是「少了个额外渠道」，不是通路死了）。
+        return "{}:{}".format(ROUTES_SUPPRESSED_REASON, sup), False
     return "no_output", False
 
 
-def counts_toward_streak(llm_dead: bool, expand: bool, err) -> bool:
+def counts_toward_streak(reason: str, expand: bool, err) -> bool:
     """这次失败要不要计入熔断连败。
 
-    - 模型侧挂了（`llm_dead`）**一律计入**——熔断存在的全部理由就是拦它。2026-09-04 实测：
+    - `llm_unavailable`（模型侧挂了）**一律计入**——熔断存在的全部理由就是拦它。2026-09-04 实测：
       额度耗尽后一路跑到底把 65 篇烧成失败，其中 35 篇全文明明已经在手，
       正是因为额度耗尽走的是 catch 分支、`err` 恒为 None，被下面那条 expand 豁免吃掉了。
+    - `routes_suppressed`（四路被熔断/额度抑制）**不计**：那是「少了个额外渠道」，不是通路死了——
+      OpenAlex 抖一次不该把整批停掉（第 2 轮审计 R2-1.2）。
     - expand 批里「干净的 no_output」（真抓不到全文，`err is None`）**不计**：那是结构性缺口、
       是常态，计进去会让熔断在正常情况下不停误跳（实测头 29 篇挂 24 篇）。
     - 其余（抛异常的故障、补深度批的任何失败）都计。
     """
-    return bool(llm_dead) or not (expand and err is None)
+    if str(reason or "").startswith(ROUTES_SUPPRESSED_REASON):
+        return False
+    if str(reason or "").startswith(LLM_UNAVAILABLE_REASON):
+        return True
+    return not (expand and err is None)
 
 
 def deterministic_failures(led: dict) -> set:
@@ -162,7 +181,7 @@ def deterministic_failures(led: dict) -> set:
     """
     out = set()
     for k, v in (led.get("failed") or {}).items():
-        if not str((v or {}).get("reason") or "").startswith(LLM_UNAVAILABLE_REASON):
+        if not str((v or {}).get("reason") or "").startswith(TRANSIENT_REASON_PREFIXES):
             out.add(k)
     return out
 
@@ -312,10 +331,10 @@ def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str,
     正文」换掉：分块策略、提示词、数字回查闸全部与自动链路逐字一致，人工补的 PDF 不能
     享受另一套（更松的）标准。
     """
-    from src.scholar.closereading import (AUTO_PAGE_MAX_CHARS, _pdf_text_with_stats,
-                                          deep_close_read, verify_citable_numbers)
-    text, raw = _pdf_text_with_stats(
-        pdf, max_chars=proc.closeread_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
+    from src.scholar.closereading import (AUTO_PAGE_MAX_CHARS, _pdf_text_ex, _set_truncation_causes,
+                                          deep_close_read, read_tail_appendix, verify_citable_numbers)
+    ex = _pdf_text_ex(pdf, max_chars=proc.closeread_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
+    text, raw = ex.text, ex.raw_chars
     if not text.strip():
         logger.warning("  本地 PDF 抽不出文字层（可能是扫描件）：{}".format(pdf.name))
         return None
@@ -330,7 +349,25 @@ def deep_read_local_pdf(seg: PaperSegment, pdf: Path, proc, llm, model: str,
     cr.body_chars = len(text)
     cr.body_chars_raw = raw
     cr.truncated = (raw is not None and raw > len(text))
-    verify_citable_numbers(cr, text, seg.paper_id[:8])
+    _set_truncation_causes(cr, ex)
+    # 两轮读第二轮：与自动链路同一个实现、同一份预算设置（人工补的 PDF 不享受另一套标准）
+    verify_text = text
+    tail_max = int(getattr(proc, "closeread_tail_max_chars", 0) or 0)
+    if ex.tail and tail_max > 0:
+        try:                                     # 第二轮是加法，异常不许拖垮第一轮结果
+            fed = read_tail_appendix(cr, seg, ex.tail, proc.research_interests, llm, model,
+                                     max_chars=tail_max,
+                                     max_chunks=int(getattr(proc, "closeread_tail_max_chunks", 4) or 4),
+                                     source="local-pdf", diag=diag)
+        except Exception as e:                   # noqa: BLE001
+            logger.warning("  ⚠️ 两轮读第二轮异常，保留第一轮结果：{}".format(e))
+            if diag is not None:
+                diag["tail_failed"] = "{}: {}".format(type(e).__name__, str(e)[:120])
+            fed = ""
+        cr.tail_chars = len(fed) if fed else None
+        if fed:
+            verify_text = text + "\n" + fed      # 对照源只加真正喂进第二轮的尾段
+    verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
     return cr
 
 
@@ -537,12 +574,17 @@ def update_sidecar(path: Path, citekey: str, cr) -> str:
     if cr.source:
         hit["reading_source"] = cr.source
     hit["reading_depth"] = getattr(cr, "reading_depth", None) or "chunked"
-    for f in ("body_chars", "body_chars_raw", "truncated"):
+    for f in ("body_chars", "body_chars_raw", "truncated",
+              "truncated_by_total_cap", "truncated_by_page_cap", "tail_chars"):
         v = getattr(cr, f, None)
         if v is not None:
             hit[{"body_chars": "fulltext_chars",
                  "body_chars_raw": "fulltext_chars_raw",
-                 "truncated": "fulltext_truncated"}[f]] = v
+                 "truncated": "fulltext_truncated",
+                 # 成因拆开（2026-09-05）：与 _citekey_utils.entry_from_segment 同一组键名
+                 "truncated_by_total_cap": "fulltext_truncated_by_total_cap",
+                 "truncated_by_page_cap": "fulltext_truncated_by_page_cap",
+                 "tail_chars": "fulltext_tail_chars"}[f]] = v
     note = "sidecar 量尺已更新"
     if "highlights" in hit:
         from src.scholar._citekey_utils import _collect_highlights
@@ -731,8 +773,12 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                     scratch_dir=Path("output/scholar_pdfs"),
                     deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
                     max_chunks=proc.closeread_max_chunks,
+                    tail_max_chars=getattr(proc, "closeread_tail_max_chars", 0),
+                    tail_max_chunks=getattr(proc, "closeread_tail_max_chunks", 4),
                     extra_routes=getattr(proc, "fulltext_extra_routes", False),
                     route_delay=getattr(proc, "fulltext_route_delay", 0.0),
+                    extra_max_per_batch=getattr(proc, "fulltext_extra_max_per_batch", 80),
+                    host_breaker_failures=getattr(proc, "fulltext_host_breaker_failures", 3),
                     diag=_batch_diag)
                 cr_diag.update(_batch_diag.get(seg.paper_id) or {})
         except Exception as e:                        # noqa: BLE001
@@ -764,7 +810,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             # 缺口而非通路故障，实测头 29 篇就这么挂了 24 篇（13 篇有 DOI 但闭源、
             # 11 篇无任何标识）——把它计进连败会让熔断在正常情况下不停误跳。抛异常的
             # 那种才计：限流/欠费/服务不可用走的是异常路径。
-            if counts_toward_streak(llm_dead, expand, err):
+            if counts_toward_streak(reason, expand, err):
                 streak += 1
             # 熔断：单篇失败是常事（抓不到全文/解析不出），但**连着**失败几乎只有一种
             # 成因——通路级故障（订阅限流、欠费、Ollama 挂）。这批要跑十来个小时且每篇
@@ -808,7 +854,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             # 补深度批的目标集本就都是全文精读篇目，连着退化成摘要级 = 全文通路整体坏了，
             # 该停批而不是把 200 篇的额度烧光（第 2 轮压测 CONFIRMED：此前这条 continue
             # 完全绕过 streak）。expand 批沿用既有豁免——那批抓不到全文是结构性常态。
-            if counts_toward_streak(False, expand, None):
+            if counts_toward_streak("abstract_only", expand, None):
                 streak += 1
                 if streak >= (_EXPAND_FAIL_STREAK_STOP if expand else _FAIL_STREAK_STOP) \
                         and not getattr(args, "only_failed", False):

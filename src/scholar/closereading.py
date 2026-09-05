@@ -88,38 +88,365 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
                 pass
 
 
-def _pdf_text_with_stats(path: Path, max_chars: int = 40000,
-                         page_max_chars: Optional[int] = None):
-    """抽全文并同时给出「原始长度」：返回 (text, raw_chars)。失败返回 ("", 0)。
+import dataclasses as _dc
+
+
+@_dc.dataclass
+class PdfText:
+    """一次 PDF 抽文的全部产物（2026-09-05 起 `_pdf_text_ex` 的返回值）。
+
+    - text：喂读正文——先按单页上限削页、再按总上限截尾之后的文本；
+    - raw_chars：全部页 get_text 原长之和，**不受任何上限影响**（回答「这篇有多长」）；
+    - page_dropped：被单页上限丢掉的字符数之和（>0 即「单页上限削页」这种成因成立）；
+    - tail：总上限之外的余量（已过单页上限），供两轮读的第二轮；空串 = 没被总上限截尾；
+    - fractions_fixed：按 drawing 层修回的叠式分数个数。
+    """
+    text: str = ""
+    raw_chars: int = 0
+    page_dropped: int = 0
+    tail: str = ""
+    n_pages: int = 0
+    fractions_fixed: int = 0
+
+    @property
+    def truncated_by_total_cap(self) -> bool:
+        return bool(self.tail)
+
+    @property
+    def truncated_by_page_cap(self) -> bool:
+        return self.page_dropped > 0
+
+
+# ---- 叠式分数（docs/bugs/2026-09-03-ingest-draft-systematic-errors.md 第 1 类） ----
+# PyMuPDF 把「8 над 3」排成两行普通文本，分数线是 drawing 不是字符，文本层拼出 `83`。
+# 几何上这是确定的：一条短细横线，正上方与正下方各有一个短词块且横向重叠。
+_FRAC_LINE_MIN_W = 2.0     # pt；短于这个的是下划线残片/噪点
+_FRAC_LINE_MAX_W = 40.0    # pt；长于这个的是表格线/分隔线
+_FRAC_LINE_MAX_H = 0.8     # pt；线段的垂直偏差上限（真正的水平线）
+_FRAC_GAP = 9.0            # pt；分子底边/分母顶边到分数线的最大距离
+_FRAC_TOKEN_MAX_LEN = 6    # 分子/分母词块的最大长度（8、3、dt、pss、(t) 这类）
+
+
+_FRAC_TOKEN_RE = re.compile(r"^[\w(){}\-+.|·]{1,6}$")     # 不含 [ ] ,：引文标号 [13] 与表格单元 `low,` 不是操作数
+
+
+def _fraction_like(num: str, den: str) -> bool:
+    """分子/分母长得像分数的操作数。宁可漏（漏 = 维持旧行为）也不要误改。
+
+    排除的形态都来自 30 份真 PDF 的扫描（2026-09-05）：表格格线上下的两格单词（Embed/Angle）、
+    引文标号（[13] / in）、表格里的 NA 与小数（0.97 / NA）、`from` 下面一条格线一个 `2`。
+    规则：都是 ≤6 字符的干净词块；不含逗号方括号、不以 . 结尾；任一侧是 ≥2 字母的纯字母串
+    （ex、NA、in、al）就不算——单字母变量（r、n、B、x）允许；且至少一侧含数字/符号，或两侧都 ≤2 字符。
+    """
+    for t in (num, den):
+        if not _FRAC_TOKEN_RE.match(t) or t.endswith((".", ",")):
+            return False
+        if t.isalpha() and len(t) >= 2:
+            return False
+    for t in (num, den):
+        if t.count("(") != t.count(")") or t.count("{") != t.count("}"):
+            return False
+    numeric = lambda t: bool(re.fullmatch(r"-?\d+(?:\.\d+)?", t))     # noqa: E731
+    if numeric(num) and numeric(den):
+        # 两个纯数字上下叠：真分数几乎只有整数比（8/3、1/2）；带负号或 ≥2 位小数的是表格单元格
+        if num.startswith("-") or den.startswith("-"):
+            return False
+        if any(len(t.split(".")[1]) >= 2 for t in (num, den) if "." in t):
+            return False
+    has_digit_or_sym = any(ch.isdigit() or ch in "(){}-+.|" for ch in num + den)
+    return has_digit_or_sym or (len(num) <= 2 and len(den) <= 2)
+
+
+def stacked_fractions(page) -> list:
+    """从 drawing 层认出该页的叠式分数：返回 [(分子, 分母)]，按页面自上而下排序。
+
+    只认「短细横线 + 上下各**恰一个**短词块 + 横向重叠」这一形态；任何一项不满足就不算——
+    宁可漏（漏了 = 维持旧行为）也不要误认。返回 [(分子, 分母, 是否在阅读顺序里相邻)]；
+    多词块分子（`dx(t)`）会漏——取舍见 bug md。
+    """
+    try:
+        drawings = page.get_drawings()
+        # sort=True：与 _pdf_text_ex 抽正文用的 get_text("text", sort=True) 同一阅读顺序，
+        # 这样「分子词块与分母词块在 words 里相邻」⇔「它们在正文里相邻」——几何证据与文本证据
+        # 才真正指向同一位置（2026-09-05 第 1 轮审计 R1-2.1：全页正则找相邻对会改到别处的数字）。
+        words = page.get_text("words", sort=True)  # (x0, y0, x1, y1, text, block, line, word)
+    except Exception:                             # noqa: BLE001
+        return []
+    horiz = []                                     # 该页全部水平线段（任意宽度），用来认表格行线
+    for d in drawings:
+        for it in d.get("items", []):
+            if it[0] == "l":
+                p1, p2 = it[1], it[2]
+                if abs(p1.y - p2.y) <= _FRAC_LINE_MAX_H:
+                    horiz.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
+            elif it[0] == "re" and it[1].height <= _FRAC_LINE_MAX_H:   # 极扁矩形也是画出来的横线
+                r_ = it[1]
+                horiz.append((r_.x0, r_.x1, (r_.y0 + r_.y1) / 2))
+    # 同一条线常被 get_drawings 报两遍（路径描边 + 回程），先按坐标去重，否则一个分数认成两个
+    horiz = sorted({(round(a, 1), round(b, 1), round(yy, 1)) for a, b, yy in horiz})
+    lines = []
+    for x0, x1, y in horiz:
+        if not (_FRAC_LINE_MIN_W < (x1 - x0) < _FRAC_LINE_MAX_W):
+            continue
+        # 分数线是**孤立**的：同一水平高度上还有别的线段 = 表格行线被切成了一格一格
+        #（30 份真 PDF 扫描里 `94 / 0.005`、`72.5 / 78.9` 这类假阳性全是表格）。
+        if sum(1 for a, b, yy in horiz if abs(yy - y) <= 0.6 and not (a == x0 and b == x1)) >= 1:
+            continue
+        lines.append((x0, x1, y))
+    out = []
+    for x0, x1, y in lines:
+        bar_w = x1 - x0
+        cx = (x0 + x1) / 2
+
+        def _pick(pred):
+            """该侧**恰一个**词块：与分数线横向重叠 ≥ 一半自身宽度、居中偏差 < 0.6 倍线宽、
+            自身不比线宽太多（分数线是按操作数宽度画的）。多于一个候选 = 不是干净的分数，放弃。
+            返回 (词块在 words 里的下标, 词面)。"""
+            cand = []
+            for i, w in enumerate(words):
+                tok = w[4]
+                if not tok or len(tok) > _FRAC_TOKEN_MAX_LEN or not pred(w):
+                    continue
+                ww = max(0.1, w[2] - w[0])
+                ov = min(w[2], x1) - max(w[0], x0)
+                if ov < 0.5 * ww:
+                    continue
+                if abs((w[0] + w[2]) / 2 - cx) > 0.6 * max(bar_w, 1.0):
+                    continue
+                if ww > 1.8 * bar_w + 2:
+                    continue
+                cand.append((i, tok))
+            return cand[0] if len(cand) == 1 else None
+
+        pn = _pick(lambda w: w[3] <= y + 1 and (y - w[3]) < _FRAC_GAP)
+        pd_ = _pick(lambda w: w[1] >= y - 1 and (w[1] - y) < _FRAC_GAP)
+        if not pn or not pd_ or not _fraction_like(pn[1], pd_[1]):
+            continue
+        # 分子词块与分母词块在阅读顺序里紧挨着（真实排版里 PyMuPDF 把二者拼成同一行，
+        # 如 `83`）才允许改文本；不相邻说明文本层里它们落在别处，改写无处可落、一律不动。
+        adjacent = (pd_[0] - pn[0]) == 1
+        out.append((y, pn[1], pd_[1], adjacent))
+    out.sort()
+    seen, uniq = set(), []
+    for _y, n, d, adj in out:
+        if (n, d) not in seen:           # 同页同一分数只报一次（fix 时按唯一相邻匹配改）
+            seen.add((n, d))
+            uniq.append((n, d, adj))
+    return uniq
+
+
+def fix_stacked_fractions(text: str, fracs) -> tuple:
+    """把文本层里紧邻出现的「分子 分母」改写成「分子/分母」。返回 (新文本, 改了几处)。
+
+    只在该分子分母对在页文本里**恰好唯一**匹配时才改：分数是几何证据、相邻是文本证据，
+    两者都成立才动手；多处匹配说明词面有歧义（同一页多次出现 `1` 与 `N`），一律不改。
+    """
+    if not text or not fracs:
+        return text, 0
+    n_fixed = 0
+    for fr in fracs:
+        num, den = fr[0], fr[1]
+        if len(fr) > 2 and not fr[2]:
+            continue                      # 几何上是分数，但分子分母在阅读顺序里不相邻：文本无处可改
+        pat = re.compile(r"(?<![\w.])" + re.escape(num) + r"[ \t]*\n?[ \t]*" + re.escape(den) + r"(?![\w])")
+        hits = list(pat.finditer(text))
+        if len(hits) != 1:
+            continue
+        m = hits[0]
+        text = text[:m.start()] + "{}/{}".format(num, den) + text[m.end():]
+        n_fixed += 1
+    return text, n_fixed
+
+
+def _fraction_fix_enabled() -> bool:
+    """settings.processing.pdf_fraction_fix 的进程级开关；这里是纯函数模块，不读 settings，
+    由 settings 加载时写进环境变量 XLBD_PDF_FRACTION_FIX（缺省 = 开）。"""
+    import os
+    return os.environ.get("XLBD_PDF_FRACTION_FIX", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+# ---- 参考文献区识别（两轮读第二轮要把它剔掉，否则尾段预算全喂给了引文列表） ----
+_REF_MARK_RE = re.compile(
+    r"\b(?:19[5-9]\d|20[0-4]\d)[a-z]?\b"          # 年份
+    r"|\[\d{1,3}\]"                                # [12]
+    r"|\bdoi:|10\.\d{4,9}/"                        # DOI
+    r"|\bpp?\.\s*\d|\bvol\.\s*\d|\bno\.\s*\d"      # 页/卷/期
+    r"|\bet al\.?|\bIn:\s|\bProc(?:eedings|\.)\b|\barXiv:\s*\d",
+    re.I)
+_REF_WINDOW = 2000
+_REF_MIN_DENSITY = 7        # 每 2000 字符至少 7 个引文标记才算「引文密度高」（正文段落一般 0~3，但引用密集的讨论段可达 11~12——靠「至少一条像条目的行」这一关挡住，见 strip_reference_block）
+_REF_MIN_WINDOWS = 2        # 至少连续 2 个窗口（≈4000 字符）才认作参考文献区
+
+
+_REF_HEADING_RE = re.compile(r"^\s*(?:\d+\.?\s*)?(?:references|bibliography|literature cited|works cited)\s*$",
+                             re.I | re.M)
+# 一条引文条目的行首形态：[12] / 12. Author / Author, A. / Author AB, / Author, Anne
+_REF_ENTRY_RE = re.compile(r"^\s*(?:\[\d{1,3}\]|\d{1,3}\.\s+[A-Z]|[A-Z][A-Za-z'\-]+,\s+(?:[A-Z]\.|[A-Z][a-z]+)|[A-Z][A-Za-z'\-]+\s+[A-Z]{1,3}[,.])")
+
+
+def _is_ref_entry_line(line: str) -> bool:
+    """行首像条目**且**行内至少有一个引文标记（年份 / [n] / DOI / pp.）才算——
+    「Appendix A. Proof of …」「However, The …」行首也像，但没有年份，不是条目。"""
+    return bool(_REF_ENTRY_RE.match(line)) and _ref_marks(line) > 0
+
+
+def _ref_marks(seg: str) -> int:
+    """窗口内的引文标记数。`w′[1]`、`x[k]` 这类紧跟字母/撇号的方括号不算（那是下标，不是引文）。"""
+    n = 0
+    for m in _REF_MARK_RE.finditer(seg):
+        if m.group(0).startswith("[") and m.start() > 0 and (seg[m.start() - 1].isalnum() or seg[m.start() - 1] in "'′)"):
+            continue
+        n += 1
+    return n
+
+
+def strip_reference_block(text: str, *, window: int = _REF_WINDOW,
+                          min_density: int = _REF_MIN_DENSITY,
+                          min_windows: int = _REF_MIN_WINDOWS) -> tuple:
+    """去掉文本里的参考文献区。返回 (剩余文本, 去掉的字符数)。
+
+    两步：先按固定窗口数引文标记（年份 / [n] / DOI / pp. / et al.）找**最长的连续高密度段**——
+    不认标题（`References` 常与别的字词同行、大小写编号五花八门，实测 10 份里 6 份认不出）；
+    再把边界**收缩到行**：起点向后收到「References 标题行」或第一条像引文条目的行，终点向前收到
+    最后一条像引文条目的行——按 2000 字符整窗切会在首尾各多吞最多 1999 字符正文
+    （第 1 轮审计 R1-2.2）。附录在它之后、正文在它之前，两边都保留并按原序拼接。
+    识别不出来（或收缩后剩不到半个窗口）就原样返回——代价只是第二轮预算里混进引文，不会丢正文。
+    """
+    if not text or len(text) < window * min_windows:
+        return text, 0
+    dens = [_ref_marks(text[s:s + window]) for s in range(0, len(text), window)]
+    best = (0, 0)
+    cur = None
+    for i, d in enumerate(dens + [0]):
+        if d >= min_density and cur is None:
+            cur = i
+        elif d < min_density and cur is not None:
+            if i - cur > best[1] - best[0]:
+                best = (cur, i)
+            cur = None
+    if best[1] - best[0] < min_windows:
+        return text, 0
+    s, e = best[0] * window, min(best[1] * window, len(text))
+
+    # ---- 边界收缩到行 ----
+    # 起点：往前一个窗口里若有 References 标题行，从标题行开始；否则从密集段内第一条像条目的行开始
+    lo = max(0, s - window)
+    head = _REF_HEADING_RE.search(text, lo, e)
+    if head is not None:
+        s2 = head.start()
+    else:
+        m = _REF_ENTRY_RE.search(text[s:e], 0, len(text[s:e]))
+        # 用 finditer 在段内按行找第一条条目行
+        s2 = None
+        for lm in re.finditer(r"(?m)^.*$", text[s:e]):
+            if _is_ref_entry_line(lm.group(0)):
+                s2 = s + lm.start()
+                break
+        if s2 is None:
+            # 既没有 References 标题、也没有任何一条像引文条目的行——这不是参考文献区，
+            # 而是引用密集的正文（讨论/相关工作里 `(Smith et al., 2019)` 式引用让标记数达标）。
+            # 整窗切会把正文当参考文献剔掉（第 2 轮审计 R2-3.5），必须原样返回。
+            return text, 0
+        del m
+    # 终点：向后再看一个窗口，取最后一条像条目的行的行尾
+    hi = min(len(text), e + window)
+    e2 = None
+    for lm in re.finditer(r"(?m)^.*$", text[s2:hi]):
+        if _is_ref_entry_line(lm.group(0)):
+            e2 = s2 + lm.end()
+    if e2 is None or e2 <= s2:
+        e2 = e
+    if e2 - s2 < window // 2:
+        return text, 0
+    return text[:s2] + text[e2:], e2 - s2
+
+
+def _pdf_text_ex(path: Path, max_chars: int = 40000,
+                 page_max_chars: Optional[int] = None,
+                 fix_fractions: Optional[bool] = None) -> PdfText:
+    """抽全文并给出全部量尺（见 PdfText）。失败返回空 PdfText（text=""、raw_chars=0）。
+
+    测试替身兼容：既有测试（test_closereading / test_closereading_deep / test_fulltext_extra_routes）
+    monkeypatch 的是模块属性 `_pdf_text_with_stats`。若发现它被换成了别的可调用对象，就把抽取交给
+    替身、只带回 (text, raw)——尾段与削页量在替身下为空/0，符合替身语义。真正的抽取在
+    `_pdf_text_ex_impl`；薄包装 `_pdf_text_with_stats` 直接调 impl 而不是本函数，所以
+    「spy 型」替身（替身内部再调回原函数）不会绕成无限递归（第 1 轮审计 R1-1.2）。
+    """
+    cur = globals().get("_pdf_text_with_stats")
+    if cur is not None and cur is not _PDF_TEXT_WITH_STATS_ORIG:
+        t, r = cur(path, max_chars=max_chars, page_max_chars=page_max_chars)
+        return PdfText(text=t or "", raw_chars=int(r or 0))
+    return _pdf_text_ex_impl(path, max_chars=max_chars, page_max_chars=page_max_chars,
+                             fix_fractions=fix_fractions)
+
+
+def _pdf_text_ex_impl(path: Path, max_chars: int = 40000,
+                      page_max_chars: Optional[int] = None,
+                      fix_fractions: Optional[bool] = None) -> PdfText:
+    """真正的抽取（不查测试替身）。
 
     raw_chars = 全部页 get_text 的原长之和，**不受 page_max_chars / max_chars 影响**——
     它要回答的是「这篇论文有多长」，而 text 回答的是「我们喂进去多少」，二者相减才是截断量。
     若 raw 也按单页上限收，truncated 判定会自证为假（cap 后的长度 == 喂进去的长度）。
     只遍历一次 PDF：抽两遍要多付一次解析开销，且两次结果不保证逐字节一致。
+
+    fix_fractions（缺省取进程开关）：按 drawing 层修叠式分数，见 stacked_fractions。
     """
     try:
         import fitz  # PyMuPDF
     except Exception as e:
         logger.warning("  ⚠️ 未安装 PyMuPDF，无法抽全文: {}".format(e))
-        return "", 0
+        return PdfText()
+    if fix_fractions is None:
+        fix_fractions = _fraction_fix_enabled()
     try:
         parts = []
         raw_chars = 0
+        page_dropped = 0
+        n_fixed = 0
+        n_pages = 0
         # 不再在页循环里按累计长度提前 break：读完所有页、末尾统一截断。
         # 对输出逐字节无影响（原 break 发生在越界页 append 之后），但让后续统计能拿到全页原始长度。
         with fitz.open(str(path)) as doc:
             for page in doc:
+                n_pages += 1
                 t = page.get_text("text", sort=True)
                 if not t:
                     continue
+                if fix_fractions:
+                    fr = stacked_fractions(page)
+                    if fr:
+                        t, k = fix_stacked_fractions(t, fr)
+                        n_fixed += k
                 raw_chars += len(t)          # 先记原长，再做任何截断
-                if page_max_chars is not None:
+                if page_max_chars is not None and len(t) > page_max_chars:
+                    page_dropped += len(t) - page_max_chars
                     t = t[:page_max_chars]
                 parts.append(t)
-        return "".join(parts)[:max_chars], raw_chars
+        joined = "".join(parts)
+        if n_fixed:
+            logger.info("  叠式分数修回 {} 处（{}）".format(n_fixed, Path(path).name))
+        return PdfText(text=joined[:max_chars], raw_chars=raw_chars, page_dropped=page_dropped,
+                       tail=joined[max_chars:], n_pages=n_pages, fractions_fixed=n_fixed)
     except Exception as e:
         logger.warning("  ⚠️ 抽全文失败({}): {}".format(path, e))
-        return "", 0
+        return PdfText()
+
+
+def _pdf_text_with_stats(path: Path, max_chars: int = 40000,
+                         page_max_chars: Optional[int] = None):
+    """抽全文并同时给出「原始长度」：返回 (text, raw_chars)。失败返回 ("", 0)。
+
+    薄包装：真正的抽取在 `_pdf_text_ex`（2026-09-05 起），签名与返回类型向后兼容——
+    既有调用方（pdf_ingest.extract_pdf_text_with_stats、测试桩）不必改。
+    """
+    # 直接调 impl（不经 _pdf_text_ex 的替身检查）：spy 型替身调回本函数时不会再绕回替身
+    r = _pdf_text_ex_impl(path, max_chars=max_chars, page_max_chars=page_max_chars)
+    return r.text, r.raw_chars
+
+
+# 供 _pdf_text_ex 判断「_pdf_text_with_stats 有没有被测试 monkeypatch 成替身」（见其函数头注释）。
+_PDF_TEXT_WITH_STATS_ORIG = _pdf_text_with_stats
 
 
 def pdf_to_text(path: Path, max_chars: int = 40000,
@@ -375,9 +702,70 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     return cr
 
 
-def _route_kwargs(extra_routes: bool, route_delay: float) -> dict:
-    """额外通道开着才产出关键字参数；关着返回空 dict → 下游调用形状与历史版本完全一致。"""
-    return {"extra_routes": True, "route_delay": route_delay} if extra_routes else {}
+def _route_kwargs(extra_routes: bool, route_delay: float, budget=None) -> dict:
+    """额外通道开着才产出关键字参数；关着返回空 dict → 下游调用形状与历史版本完全一致。
+
+    budget（fulltext.RouteBudget）非空时一并透传：同一精读批共享一份额度与熔断状态。"""
+    if not extra_routes:
+        return {}
+    kw = {"extra_routes": True, "route_delay": route_delay}
+    if budget is not None:
+        kw["budget"] = budget
+    return kw
+
+
+def _set_truncation_causes(cr: CloseReading, ex: Optional["PdfText"]) -> None:
+    """把两种截断成因写到 CloseReading 上。ex=None（EPMC/摘要路径，没有页级信息）时只能判总上限：
+    EPMC 正文没有「页」，page_cap 恒 False；total_cap 由 raw > body 推得。"""
+    if ex is not None:
+        cr.truncated_by_total_cap = ex.truncated_by_total_cap
+        cr.truncated_by_page_cap = ex.truncated_by_page_cap
+    else:
+        cr.truncated_by_page_cap = False
+        cr.truncated_by_total_cap = bool(cr.truncated)
+
+
+def read_tail_appendix(cr: CloseReading, seg: PaperSegment, tail_text: str,
+                       research_interests: str, llm, model: Optional[str],
+                       *, max_chars: int, max_chunks: int, source: Optional[str],
+                       diag: Optional[dict] = None) -> str:
+    """两轮读的第二轮：把总上限之外的尾段（去掉参考文献区）按独立预算再读一遍，
+    产出的分节以「附录·」前缀并入 cr.sections。返回**真正喂进模型的尾段文本**（"" = 没读）——
+    调用方用它（而不是整段原始尾段）拼数字回查的对照源，长度即 tail_chars。
+
+    为什么不是抬上限：closeread_max_chars 与汇总预算是零和耦合，抬上限 = 拿已读章节的保真度
+    换尾部覆盖（settings 注释与 test_closeread_chunk_coupling.py 钉着这条）。另起一轮各自预算
+    才是加法。前缀「附录·」让 notes_index._CR_SECTION_RE 照常解析、highlights 的 section 溯源
+    能区分两轮，vault 单篇页也能一眼看出哪些句子来自尾段。
+    """
+    if not tail_text or max_chars <= 0:
+        return ""
+    body, n_refs = strip_reference_block(tail_text)
+    body = body[:max_chars]
+    if diag is not None:
+        diag["tail_refs_cut"] = n_refs                 # 被当成参考文献剔掉的字符数，可回查
+    if len(body.strip()) < 2000:                 # 去掉引文后只剩零碎，不值一次汇总
+        if diag is not None:
+            diag["tail_skipped"] = "尾段去掉参考文献（{} 字符）后仅 {} 字符".format(n_refs, len(body.strip()))
+        return ""
+    cr2 = deep_close_read(seg, body, research_interests, llm, model=model,
+                          source=source, from_full_text=True, max_chunks=max_chunks)
+    if cr2 is None or not cr2.sections:
+        if diag is not None:
+            diag["tail_failed"] = True
+        return ""
+    for sec in cr2.sections:
+        sec.heading = "附录·" + sec.heading
+    cr.sections.extend(cr2.sections)
+    cr.n_chunks = (cr.n_chunks or 0) + (cr2.n_chunks or 0)
+    if cr2.synth_truncated:
+        cr.synth_truncated = True
+        cr.synth_dropped_chunks = (cr.synth_dropped_chunks or 0) + (cr2.synth_dropped_chunks or 0)
+    logger.info("  两轮读第二轮：尾段 {} 字符（剔除参考文献 {}）→ {} 块 / {} 节".format(
+        len(body), n_refs, cr2.n_chunks, len(cr2.sections)))
+    # 返回**真正喂进模型的尾段**：数字回查的对照源只能是模型读过的文本，不能是整段原始尾段
+    #（被剔掉的参考文献里年份/页码必然命中，会给编出来的数字背书——第 1 轮审计 R1-2.6）。
+    return body
 
 
 def close_read_segment(seg: PaperSegment, research_interests: str, llm,
@@ -385,7 +773,8 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
                        scratch_dir: Optional[Path] = None, oa=None,
                        deep: bool = False, max_chars: Optional[int] = None,
                        max_chunks: int = 12, *, extra_routes: bool = False,
-                       route_delay: float = 0.0,
+                       route_delay: float = 0.0, route_budget=None,
+                       tail_max_chars: int = 0, tail_max_chunks: int = 4,
                        diag: Optional[dict] = None) -> Optional[CloseReading]:
     """端到端精读一篇：解析 OA → 下 PDF → 抽全文 → 精读；无全文则用摘要降级。
 
@@ -400,9 +789,11 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
     if oa is None:
         # 额外通道参数只在开关打开时才传：默认路径的调用形状与历史逐字节一致
         #（既有测试与调用方的 resolve_oa_pdf 桩不认这两个关键字）。
-        oa = resolve_oa_pdf(seg.metadata, email=email, **_route_kwargs(extra_routes, route_delay))
+        oa = resolve_oa_pdf(seg.metadata, email=email,
+                            **_route_kwargs(extra_routes, route_delay, route_budget))
     full_text, from_full, source = "", False, None
     raw_chars: Optional[int] = None
+    pdf_ex: Optional[PdfText] = None            # PDF 路径才有页级量尺（削页 / 尾段）
     # 预算必须对 PDF 与 EPMC 两条全文来源同时生效：只放宽 PDF 那条的话，
     # EPMC 正文仍被钉死在 40k，对现存的 europepmc 条目是净回退。
     eff_max_chars = max_chars if (deep and max_chars) else AUTO_MAX_CHARS
@@ -421,19 +812,29 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
                     logger.info("  额外通道候选命中：{}".format(u[:80]))
                 break
         if pdf:
-            full_text, pdf_raw = _pdf_text_with_stats(
-                pdf, max_chars=eff_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
+            pdf_ex = _pdf_text_ex(pdf, max_chars=eff_max_chars, page_max_chars=AUTO_PAGE_MAX_CHARS)
+            full_text = pdf_ex.text
             if full_text.strip():
-                from_full, source, raw_chars = True, oa.source, pdf_raw
+                from_full, source, raw_chars = True, oa.source, pdf_ex.raw_chars
+            else:
+                pdf_ex = None
     if not from_full:
         # PDF 拿不到不等于没有全文：Elsevier/Cell、MDPI、OUP 对机器人下 PDF 回 403，
         # 但同一篇的 OA 全文在 Europe PMC 有干净 XML。降级成摘要前先走这条。
         # return_stats=True 时被调方在所有出口（含 return None 那几条）一律返回 2-元组，
         # 解包才安全——这行对每一篇拿不到 PDF 的论文都会执行，绝大多数走的正是失败出口。
-        epmc, epmc_raw = europepmc_fulltext(doi=seg.metadata.doi, pmid=seg.metadata.pmid,
-                                            max_chars=eff_max_chars, return_stats=True)
+        _res = europepmc_fulltext(doi=seg.metadata.doi, pmid=seg.metadata.pmid,
+                                  max_chars=eff_max_chars, return_stats=True, return_tail=True)
+        # 向后兼容：既有测试替身返回 2-元组 (text, raw) 甚至裸 None；真实实现返回 3-元组 (text, raw, tail)
+        if isinstance(_res, tuple):
+            epmc, epmc_raw, epmc_tail = (tuple(_res) + (0, ""))[:3]
+        else:
+            epmc, epmc_raw, epmc_tail = _res, 0, ""
         if epmc and epmc.strip():
             full_text, from_full, source, raw_chars = epmc, True, "europepmc", epmc_raw
+            # EPMC 正文没有「页」，但总上限之外的余量同样能走两轮读的第二轮——否则
+            # 「by_total_cap ⇒ 两轮读能救」这句话对 EPMC 来源不成立（第 1 轮审计 R1-1.1）。
+            pdf_ex = PdfText(text=epmc, raw_chars=int(epmc_raw or 0), page_dropped=0, tail=epmc_tail or "")
     if not from_full:
         # 降级：用摘要。摘要本身就是全部可得文本，不存在截断
         full_text = seg.translated_abstract or seg.original_abstract or ""
@@ -449,6 +850,11 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
     if diag is not None:
         diag["from_full_text"] = bool(from_full)
         diag["source"] = source
+        # 额外通道被熔断/额度抑制过 → 这次「没全文」可能是暂时的，不是「真没有」。
+        # 记进 diag，让 backfill_deepread 把它与确定性 no_output 分开记账（第 1 轮审计 R1-2.4）。
+        sup = ((getattr(oa, "extra", None) or {}).get("routes_suppressed") if oa is not None else None)
+        if sup:
+            diag["routes_suppressed"] = sup
     if deep and from_full:
         # 摘要降级篇一律走单跳：几千字符切块无意义，且这是 from_full_text 被污染的唯一入口
         cr = deep_close_read(seg, full_text, research_interests, llm, model=model,
@@ -458,11 +864,32 @@ def close_read_segment(seg: PaperSegment, research_interests: str, llm,
             cr.body_chars = len(full_text)
             cr.body_chars_raw = raw_chars
             cr.truncated = (raw_chars is not None and raw_chars > len(full_text))
+            _set_truncation_causes(cr, pdf_ex)
+            # 两轮读第二轮：PDF 与 EPMC 两条全文来源都带尾段（EPMC 经 _jats_to_text_ex）；
+            # tail_max_chars=0 = 关掉，行为与旧版一致。
+            if pdf_ex is not None and pdf_ex.tail and tail_max_chars > 0:
+                # 第二轮是加法：它自己出任何异常都不许把第一轮 13 次调用的产物拖下水（R1-2.7）
+                try:
+                    fed = read_tail_appendix(cr, seg, pdf_ex.tail, research_interests, llm, model,
+                                             max_chars=tail_max_chars, max_chunks=tail_max_chunks,
+                                             source=source, diag=diag)
+                except Exception as e:                                  # noqa: BLE001
+                    logger.warning("  ⚠️ 两轮读第二轮异常，保留第一轮结果({}): {}".format(seg.paper_id[:8], e))
+                    if diag is not None:
+                        diag["tail_failed"] = "{}: {}".format(type(e).__name__, str(e)[:120])
+                    fed = ""
+                cr.tail_chars = len(fed) if fed else None
+                if fed:
+                    # 数字回查的对照源只加**真正喂进第二轮的尾段**（不是整段原始尾段：被剔掉的
+                    # 参考文献里年份/页码必然命中，会给编出来的数字背书——R1-2.6）
+                    verify_text = full_text + "\n" + fed
             verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
             return cr
     cr = close_read(seg, full_text, research_interests, llm, model=model,
                     from_full_text=from_full, source=source, raw_chars=raw_chars, diag=diag)
     if cr is not None:
+        if from_full:
+            _set_truncation_causes(cr, pdf_ex)
         # 数字回查压在唯一出口上：deep 与单跳两条路径的精读都过同一道闸
         verify_citable_numbers(cr, verify_text, seg.paper_id[:8])
     return cr
@@ -474,7 +901,9 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                         prefer_full_text: bool = True, candidate_factor: int = 4,
                         deep: bool = False, max_chars: Optional[int] = None,
                         max_chunks: int = 12, *, extra_routes: bool = False,
-                        route_delay: float = 0.0,
+                        route_delay: float = 0.0, extra_max_per_batch: int = 80,
+                        host_breaker_failures: int = 3,
+                        tail_max_chars: int = 0, tail_max_chunks: int = 4,
                         diag: Optional[dict] = None) -> int:
     """对高优先级 top-N 篇做精读，就地写入 seg.close_reading。返回成功篇数。
 
@@ -483,11 +912,18 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
     这样避免 top-N 恰好都是付费墙论文导致全文精读 0/5。
 
     extra_routes=True 时择优阶段的 OA 预解析也走额外四路（每篇候选多打 2~3 个 API，
-    route_delay 节流）；默认关，行为与历史一致。
+    route_delay 节流）。整批共享一份 fulltext.RouteBudget：额外四路总调用不超过
+    extra_max_per_batch，同一宿主连续 host_breaker_failures 次终局失败即熔断——
+    择优阶段 candidate_factor*top_n 篇不再能放大成几十次请求（2026-09-05 默认打开时配套）。
+    tail_max_chars/tail_max_chunks：两轮读第二轮的预算（0 = 关），透传给 close_read_segment。
     """
     ranked = sorted(segments, key=lambda s: s.priority_score, reverse=True)
     n = max(0, top_n)
     oa_map = {}
+    budget = None
+    if extra_routes:
+        from .fulltext import RouteBudget
+        budget = RouteBudget(max_calls=extra_max_per_batch, breaker_failures=host_breaker_failures)
     if prefer_full_text and 0 < n < len(ranked):
         cand = ranked[:max(n, candidate_factor * n)]
         # 候选逐篇都打同两个 API（Unpaywall/EPMC），共享连接免得每篇重做 TCP+TLS 握手；
@@ -496,16 +932,22 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
             for seg in cand:
                 try:
                     oa = resolve_oa_pdf(seg.metadata, email=email, client=xc,
-                                        **_route_kwargs(extra_routes, route_delay))
+                                        **_route_kwargs(extra_routes, route_delay, budget))
                 except Exception:
                     oa = None
                 oa_map[id(seg)] = oa
             has_ft = [s for s in cand if oa_map.get(id(s)) and oa_map[id(s)].pdf_url]
             # 无 OA PDF 的再问一次 Europe PMC——否则 Elsevier/MDPI/OUP 这批（PDF 被反爬挡死、
             # 但 EPMC 有全文）会被择优逻辑系统性判成"拿不到全文"而让位给摘要降级篇。
+            # 结果走 fulltext._PMCID_CACHE：route_epmc_render 已经问过的 DOI 这里不重复触网；
+            # 仍要触网的按 route_delay 节流，免得把 www.ebi.ac.uk 打跳闸（第 2 轮审计 R2-1.3）。
+            import time as _time
+            _sleep = _time.sleep
             for seg in cand:
                 if seg in has_ft:
                     continue
+                if route_delay > 0:
+                    _sleep(route_delay)
                 try:
                     if europepmc_pmcid(doi=seg.metadata.doi, pmid=seg.metadata.pmid, client=xc):
                         has_ft.append(seg)
@@ -530,7 +972,9 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                                     model=model, scratch_dir=scratch_dir,
                                     oa=oa_map.get(id(seg)), deep=deep,
                                     max_chars=max_chars, max_chunks=max_chunks,
+                                    tail_max_chars=tail_max_chars, tail_max_chunks=tail_max_chunks,
                                     diag=sub,
+                                    **({"route_budget": budget} if budget is not None else {}),
                                     **_route_kwargs(extra_routes, route_delay))
         except Exception as e:
             logger.warning("  ⚠️ 精读失败({}): {}".format(seg.paper_id[:8], e))
@@ -552,14 +996,21 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                 # 截断分两种成因，后果完全不同（见 docs/bugs/2026-09-04-truncated-flag-conflates-two-causes.md）：
                 #   总上限截尾（body_chars 恰好等于 eff_max_chars）—— 丢的是正文**尾部**，抬上限有用；
                 #   单页上限削页（body_chars 小于上限）—— 丢的是某张病态长页的后半，抬总上限**完全无用**。
-                # 索引字段暂不新增（那要五处联动，另开一轮），但日志里先把成因说清楚——
-                # 这一条就够挡住「按覆盖率排序挑最该重跑的几篇」那类误判。
-                cap = max_chars if (deep and max_chars) else AUTO_MAX_CHARS
+                # 成因由抽取环节直接记在 CloseReading 上（truncated_by_total_cap / truncated_by_page_cap），
+                # 日志里说清这一条，就够挡住「按覆盖率排序挑最该重跑的几篇」那类误判。
                 cause = ""
                 if cr.truncated:
-                    cause = ("（已截断·总上限截尾，抬 closeread_max_chars 有用）"
-                             if (cr.body_chars or 0) >= cap
-                             else "（已截断·单页上限削页，抬总上限无用）")
+                    # 2026-09-05 起成因由抽取环节直接记在 CloseReading 上（可同时为真），不再从
+                    # body_chars 与上限的相等关系倒推——那种倒推在「页削 + 总截同时发生」时只说得出一半。
+                    parts_c = []
+                    if cr.truncated_by_total_cap:
+                        parts_c.append("总上限截尾" + ("，尾段已另起一轮读 {} 字符".format(cr.tail_chars)
+                                                     if cr.tail_chars else "，抬 closeread_tail_max_chars 有用"))
+                    if cr.truncated_by_page_cap:
+                        parts_c.append("单页上限削页（抬总上限无用）")
+                    if not parts_c:
+                        parts_c.append("成因未知：老量尺")
+                    cause = "（已截断·" + "；".join(parts_c) + "）"
                 logger.warning(
                     "  ⚠️ 精读偏薄({}): 可取证句 {} 条，正文 {}/{} 字符{}".format(
                         seg.paper_id[:8], n_tagged, cr.body_chars, cr.body_chars_raw, cause))

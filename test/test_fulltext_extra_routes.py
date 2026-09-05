@@ -91,11 +91,15 @@ def test_default_off_without_email_makes_no_call_at_all():
     assert oa2.oa_status == "unknown" and c.calls == []
 
 
-def test_settings_default_is_off():
+def test_settings_default_is_on_with_the_three_safeguards():
+    """2026-09-05 默认打开（用户拍板）。打开的前提是三道闸同时在：路间礼貌间隔、每批总额度、
+    按宿主熔断——任何一道的默认值被改掉，这条先红。"""
     from src.scholar.settings import ProcessingSettings
     s = ProcessingSettings()
-    assert s.fulltext_extra_routes is False
+    assert s.fulltext_extra_routes is True
     assert s.fulltext_route_delay == 1.5
+    assert s.fulltext_extra_max_per_batch == 80
+    assert s.fulltext_host_breaker_failures == 3
 
 
 # ---------------- 开启后的顺序 / 去重 / 换宿主 ----------------
@@ -373,7 +377,11 @@ def test_close_read_segments_passes_extra_routes_only_when_on(monkeypatch):
     monkeypatch.setattr(CR, "resolve_oa_pdf",
                         lambda meta, email="", client=None, **kw: got.append(kw) or None)
     CR.close_read_segments(segs, "ri", llm=None, top_n=1, extra_routes=True, route_delay=0.2)
-    assert got and all(k == {"extra_routes": True, "route_delay": 0.2} for k in got)
+    from src.scholar.fulltext import RouteBudget
+    # 2026-09-05 起整批共享一份 RouteBudget（额度 + 熔断阈值）一并透传；同一批里是同一个对象
+    assert got and all(k["extra_routes"] is True and k["route_delay"] == 0.2
+                       and isinstance(k.get("budget"), RouteBudget) for k in got)
+    assert len({id(k["budget"]) for k in got}) == 1
 
 
 def test_download_pdf_validate_accepts_magic_beyond_first_five_bytes(tmp_path):

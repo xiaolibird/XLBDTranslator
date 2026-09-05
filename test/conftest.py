@@ -30,3 +30,29 @@ def _isolate_repo_overrides(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(
         ni, "REPO_OVERRIDES_PATH",
         tmp_path_factory.mktemp("no_repo_overrides") / ni.DEDUP_OVERRIDES_JSON)
+
+
+@pytest.fixture(autouse=True)
+def _reset_host_breaker():
+    """fulltext.HOST_BREAKER / EPMC_BREAKER 是进程级状态（2026-09-05 四通道默认打开的配套熔断）。
+    任何用 403/429 桩的测试都可能把某个宿主跳闸，下一条测试就会拿到合成 429 而不触网——
+    顺序依赖型的假红/假绿。每条用例前后复位；PMCID 缓存也一并清空（R2-1.3）。"""
+    try:
+        from src.scholar import fulltext as _ft
+        _ft.HOST_BREAKER.reset()
+        _ft.HOST_BREAKER.failures = 3
+        _ft.EPMC_BREAKER.reset()
+        _ft.EPMC_BREAKER.failures = 3
+        _ft.reset_pmcid_cache()
+    except Exception:
+        pass
+    yield
+    try:
+        from src.scholar import fulltext as _ft
+        _ft.HOST_BREAKER.reset()
+        _ft.HOST_BREAKER.failures = 3
+        _ft.EPMC_BREAKER.reset()
+        _ft.EPMC_BREAKER.failures = 3
+        _ft.reset_pmcid_cache()
+    except Exception:
+        pass

@@ -411,8 +411,12 @@ def _rehydrate_close_readings(out_dir: Path, filename: str,
     # （ck2dk 已经在读同一份文件），顺手带出来回填进 CloseReading。
     # 注意这只救得了**有 sidecar** 的月份；缺 sidecar 那 43 个月无解，
     # 见 docs/bugs/2026-09-04-auto-sidecar-missing.md。
+    # 六元组：三件套 + 成因两项 + 第二轮尾段字符数（2026-09-05）。老 sidecar 没有后三项 → None（=未知）。
     ck2ruler = {e["citekey"]: (e.get("fulltext_chars"), e.get("fulltext_chars_raw"),
-                               e.get("fulltext_truncated"))
+                               e.get("fulltext_truncated"),
+                               e.get("fulltext_truncated_by_total_cap"),
+                               e.get("fulltext_truncated_by_page_cap"),
+                               e.get("fulltext_tail_chars"))
                 for e in sidecar.get("papers", [])
                 if isinstance(e, dict) and e.get("citekey")}
     # md → 按 citekey 收集精读结构（行首锚定，与 parse_note_md 同一状态机走法）
@@ -434,8 +438,10 @@ def _rehydrate_close_readings(out_dir: Path, filename: str,
         if crm:
             cur_cr = CloseReading(from_full_text=(crm.group(1) == "全文精读"),
                                   source=crm.group(2), sections=[])
-            _used, _raw, _trunc = ck2ruler.get(cur_ck, (None, None, None))
+            _used, _raw, _trunc, _tot, _pg, _tail = ck2ruler.get(cur_ck, (None,) * 6)
             cur_cr.body_chars, cur_cr.body_chars_raw, cur_cr.truncated = _used, _raw, _trunc
+            cur_cr.truncated_by_total_cap, cur_cr.truncated_by_page_cap = _tot, _pg
+            cur_cr.tail_chars = _tail
             readings[cur_ck] = cur_cr
             cur_sec = None
             continue
@@ -572,8 +578,12 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
                 scratch_dir=Path("output/scholar_pdfs"),
                 deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
                 max_chunks=proc.closeread_max_chunks,
+                tail_max_chars=getattr(proc, "closeread_tail_max_chars", 0),
+                tail_max_chunks=getattr(proc, "closeread_tail_max_chunks", 4),
                 extra_routes=getattr(proc, "fulltext_extra_routes", False),
-                route_delay=getattr(proc, "fulltext_route_delay", 0.0))
+                route_delay=getattr(proc, "fulltext_route_delay", 0.0),
+                extra_max_per_batch=getattr(proc, "fulltext_extra_max_per_batch", 80),
+                host_breaker_failures=getattr(proc, "fulltext_host_breaker_failures", 3))
         finally:
             llm_client.close()
         if top_n > 0 and pending and done == 0:

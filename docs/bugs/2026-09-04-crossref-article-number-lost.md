@@ -1,8 +1,8 @@
 # Crossref 的 article-number 被丢弃：e-locator 期刊的书目条目没有定位号
 
 日期：2026-09-04
-状态：**代码已修（2026-09-04）；存量 36 条回填待跑**，见文末。原状态：未修
-严重度：中——不影响检索与入库，影响**投稿书目的正确性**（36 条已确认可补回）
+状态：**代码已修（2026-09-04）；存量用 `scripts/backfill_article_numbers.py` 定向回填（脚本口径 227 条，按当日 dry-run 为准）**，见文末。原状态：未修
+严重度：中——不影响检索与入库，影响**投稿书目的正确性**（脚本口径 227 条可回补，非最初数的 36 条）
 发现者：xiaolibird / Claude（2026-09-03 付费墙三篇补入会话）
 
 ---
@@ -91,7 +91,12 @@ Intensive Care Medicine Experimental、Frontiers in Medicine、Journal of Intens
 `scripts/repair_references.py` 走同一个归一化 dict，随之生效。走 CSL `page` 而非 `number`：与本条第 1 点一致，以实际出稿样式为准。
 测试：`test/test_crossref.py`（新增 article-number 用例）。
 
-**存量回填未在本批执行**（改的是生产 references.json，且需联网逐条回查 Crossref）。建议命令，逐月对涉及的 36 个 citekey 所在月跑：
+**存量回填（2026-09-05 补）**：不用 `repair_references.py --force`（那是整月重建，每条都回查、索引兜底会
+覆盖既有更权威的字段）。改用定向脚本 `scripts/backfill_article_numbers.py`——只碰缺 page 且带非 arXiv DOI 的
+期刊条目、只改 page 一个键，默认 dry-run，`--apply` 前把原件拷进 `.refs_backfill_backup/<时间戳>/`。
+按脚本口径（缺 page、带**非 arXiv** DOI 的期刊条目）只读扫到 **227 条**候选；若把 arXiv DOI（Crossref 对它们
+本就不给定位号，脚本刻意不查）也算进去是 432 条。本条最初数的 36 条是子集。跑法与结果见本批压测记录。
+原先建议的整月重建命令保留在下面备查：
 ```bash
 PYTHONPATH=. python3.12 scripts/repair_references.py --month <YYYY-MM> --force --email <邮箱> --dry-run   # 先看
 PYTHONPATH=. python3.12 scripts/repair_references.py --month <YYYY-MM> --force --email <邮箱>             # 再落盘

@@ -182,16 +182,32 @@ class ProcessingSettings(BaseModel):
     # 主链路此前只走 arXiv 直链 + Unpaywall（+ EPMC 的 JATS 全文 XML），实测对 148 篇"判死"
     # 篇目另跑四条公开通道能捞回 20 篇（13.5%）：EPMC 渲染版 PDF（与 XML 接口是两套，XML 404
     # ≠ 没 PDF）、arXiv 按标题检索副本、OpenAlex best_oa_location（含 NCBI PMC → EPMC 换宿主）、
-    # Semantic Scholar openAccessPdf。**默认关**：打开后每篇候选多打 2~3 个 API，月度择优阶段
-    # candidate_factor*top_n 篇会放大成几十次请求，且限流误判需要真网络验证；关闭时主链路
-    # 行为与今天逐字节一致。手动 / 回填批可打开。不做任何绕出版商反爬的事（那类进人工清单）。
+    # Semantic Scholar openAccessPdf。不做任何绕出版商反爬的事（那类进人工清单）。
+    # 2026-09-05 默认打开：配套了三道闸——(1) 每批额外通道总调用上限 fulltext_extra_max_per_batch，
+    # 择优阶段 candidate_factor*top_n 篇不再能放大成几十次请求；(2) 按宿主熔断：同一 API 连续
+    # fulltext_host_breaker_failures 次 403/429 终局或传输异常后，本进程内不再打它（polite_get 直接返回
+    # 合成 429，不发网络，冷却后半开放行一次）；(3) 路与路之间 fulltext_route_delay 礼貌间隔。真网络
+    # 实测见 docs/bugs/2026-09-04-fulltext-routes-too-narrow.md「打开」节。
+    # 关掉 = 不再跑额外四路；EPMC/arXiv 主链路的退避与熔断（R1-2.3）不受本开关影响。
     fulltext_extra_routes: bool = Field(
-        False,
-        description="取全文时在 arXiv/Unpaywall 之后再试 EPMC 渲染 PDF / arXiv 标题检索 / OpenAlex / S2 四路（默认关）"
+        True,
+        description="取全文时在 arXiv/Unpaywall 之后再试 EPMC 渲染 PDF / arXiv 标题检索 / OpenAlex / S2 四路"
     )
     fulltext_route_delay: float = Field(
         1.5,
         description="额外通道每次 API 调用之间的礼貌间隔（秒；仅 fulltext_extra_routes=True 生效）"
+    )
+    # 口径：**候选篇数 × 4 路**。择优阶段看 candidate_factor*top_n = 20 篇候选，每篇最多打 4 路 → 80。
+    # 2026-09-05 真网络实测：定 24 时 6 篇候选就把额度吃光（4 路 × 6 篇），第 7 篇起只走主链路——
+    # 额度本意是防「放大成几十次请求」，不是把择优阶段的后半截候选静默降级。限流真来了由
+    # HOST_BREAKER 按宿主熔断兜，额度只是总量保险丝。
+    fulltext_extra_max_per_batch: int = Field(
+        80,
+        description="一次精读批（close_read_segments 一次调用）里额外四路的总调用上限（= 候选篇数 × 4 路）；超出后只走主链路"
+    )
+    fulltext_host_breaker_failures: int = Field(
+        3,
+        description="同一 API 宿主连续这么多次 403/429 终局、5xx 服务端故障或传输异常即熔断（1800s 后半开放行一次）"
     )
     notes_dir: Path = Field(
         Path("output/scholar_notes"),
@@ -211,7 +227,8 @@ class ProcessingSettings(BaseModel):
         description="每次精读覆盖的高优先级论文数（控成本）"
     )
     # 分块深读（复用 manual 精读的 chunk→synth 通路）。**默认关**：它是唯一真正抬高
-    # 无人值守产线成本的开关（单批 top_n=5 约 42 次 LLM 调用，最坏 65 次），
+    # 无人值守产线成本的开关（单批 top_n=5 约 42 次 LLM 调用，最坏 65 次；2026-09-05 两轮读默认开后，
+    # 被总上限截尾的篇目每篇最坏再 +4 块 +1 汇总 = 18 次/篇，单批最坏 90 次；closeread_tail_max_chars=0 回到 65），
     # 不打开则全部产线行为与今天逐字节一致，回退 = 把开关关回去。
     closeread_deep: bool = Field(
         False,
@@ -238,6 +255,29 @@ class ProcessingSettings(BaseModel):
     closeread_max_chunks: int = Field(
         12,
         description="深读模式下的块数硬顶（防病态长 PDF 切出几十块吃掉整夜窗口）"
+    )
+    # 两轮读（2026-09-05，docs/bugs/2026-09-04-closeread-still-truncates.md）：
+    # 超过 closeread_max_chars 的尾段**不是**靠抬上限去够——那会把汇总预算按块数摊薄、拿已读章节
+    # 的保真度换尾部覆盖——而是另起一轮：尾段先去掉参考文献区，再按独立预算切块通读、独立汇总，
+    # 产出的分节以「附录·」前缀并入。两轮的汇总预算各自独立，故与 _SYNTH_NOTES_BUDGET 无耦合；
+    # 块数上限与字符上限之间仍有同款耦合：ceil((46200-600)/(12000-600)) = 4，恰好吃满 4 块，
+    # 改一个数必须同时改另一个并跑 test_closeread_chunk_coupling.py。0 = 关掉第二轮（行为与旧版逐字节一致）。
+    closeread_tail_max_chars: int = Field(
+        46200,
+        description="两轮读第二轮（尾段/附录）喂进模型的正文上限；0 = 不跑第二轮（深读路径下生效："
+                    "ingest/CLI 需 closeread_deep=True，backfill_deepread 本地 PDF 无条件走深读、只看本值 > 0）"
+    )
+    closeread_tail_max_chunks: int = Field(
+        4,
+        description="第二轮的块数硬顶（与 closeread_tail_max_chars 耦合，见注释）"
+    )
+    # PDF 叠式分数修复（docs/bugs/2026-09-03-ingest-draft-systematic-errors.md 第 1 类）：
+    # PyMuPDF 把「8 над 3」的分子/分母当两行普通文本、分数线是 drawing 不是字符，文本层拼出 `83`。
+    # 抽文时按 drawing 层认分数线（短细横线 + 上下各一个短词块、横向重叠），把文本层里紧邻的
+    # 分子分母改写成 `8/3`。只在几何证据与文本唯一匹配同时成立时才改，改不了就原样留下。
+    pdf_fraction_fix: bool = Field(
+        True,
+        description="抽 PDF 文本时按 drawing 层修复叠式分数（8/3 被拼成 83）；关掉 = 历史行为"
     )
     # 样式化 docx 输出
     notes_emit_docx: bool = Field(
@@ -346,4 +386,8 @@ def load_scholar_settings(config="config/scholar.env", *,
         logger.info("LLM provider 从 gemini 自动切换为 deepseek（model={}）".format(settings.llm.model))
     settings.processing.notes_dir = repo_path(settings.processing.notes_dir)
     settings.processing.output_dir = repo_path(settings.processing.output_dir)
+    # closereading 是纯函数模块、不读 settings；叠式分数修复的开关经环境变量桥过去
+    # （closereading._fraction_fix_enabled 读它，缺省 = 开）。
+    import os as _os
+    _os.environ["XLBD_PDF_FRACTION_FIX"] = "1" if getattr(settings.processing, "pdf_fraction_fix", True) else "0"
     return settings

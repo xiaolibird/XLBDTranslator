@@ -89,8 +89,10 @@ def _pdf_route(monkeypatch, tmp_path, body):
         pdf_url = "http://x/y.pdf"
         source = "unpaywall"
 
+    # 2026-09-05 起 fulltext_extra_routes 默认打开，resolve_oa_pdf 会多收 extra_routes/route_delay/budget
+    # 三个关键字——替身必须接得住，否则 TypeError 会被当成「精读失败」让闸门误响
     monkeypatch.setattr(cr, "resolve_oa_pdf",
-                        lambda meta, email="", client=None: _OA())
+                        lambda meta, email="", client=None, **kw: _OA())
     monkeypatch.setattr(cr, "download_pdf", lambda url, dest, **kw: tmp_path / "y.pdf")
     monkeypatch.setattr(cr, "_pdf_text_with_stats",
                         lambda path, max_chars=40000, page_max_chars=None: (body, len(body)))

@@ -352,6 +352,18 @@ class CloseReading(BaseModel):
     # 边界：EPMC 路线仅当文章正文超过 2,000,000 字符时 body_chars_raw 退化为下界。
     body_chars_raw: Optional[int] = Field(None, description="抽取到的原始正文长度（未经任何截断）")
     truncated: Optional[bool] = Field(None, description="正文是否被截断：body_chars_raw > body_chars")
+    # 截断的**成因**拆开记（2026-09-05）：两种成因后果相反——总上限截尾丢的是正文尾部，
+    # 抬 closeread_max_chars 有用；单页上限削页丢的是某张病态长页（图表矢量文字层）的后半，
+    # 抬总上限完全无用。只有一个 truncated 时，「按覆盖率挑最该重跑的几篇」必然把后者算进去。
+    # 缺失 = 未知（老 sidecar / 老 bundle），与 truncated 同一套「缺失≠false」口径。
+    truncated_by_total_cap: Optional[bool] = Field(
+        None, description="是否被总上限(max_chars)截尾：过了单页上限之后的全文仍长于 max_chars")
+    truncated_by_page_cap: Optional[bool] = Field(
+        None, description="是否有页被单页上限(page_max_chars)削掉过后半")
+    # 两轮读的第二轮：总上限之外的尾段（去掉参考文献区）另起独立预算再读一遍，产出的分节以
+    # 「附录·」前缀并入 sections。tail_chars = 第二轮真正喂进模型的字符数；None = 没跑第二轮
+    #（没截断 / 开关关着 / 尾段去掉参考文献后不足以成文）。body_chars 仍只算第一轮。
+    tail_chars: Optional[int] = Field(None, description="两轮读第二轮（尾段/附录）喂进模型的字符数")
     n_chunks: Optional[int] = Field(None, description="分块精读的块数（单跳为 1）")
     # 汇总步的预算裁剪留痕。缺失 = 未知（老 bundle / 老 digest JSON），不是"没裁过"——
     # 与 fulltext_chars 那组量尺同一套「缺失≠false」口径。n_chunks 说的是"读了几块"，

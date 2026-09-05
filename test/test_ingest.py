@@ -320,6 +320,42 @@ def test_closeread_partial_success_still_writes(tmp_path, monkeypatch):
     assert rep["status"] == "ok" and rep["count"] == 2
 
 
+def test_run_ingest_forwards_tail_and_route_budgets(tmp_path, monkeypatch):
+    """R2-3.11：run_ingest 必须把 tail/四路额度这些 settings 透传给 close_read_segments——
+    删掉那几行，周度 ingest（launchd 无人值守）就静默回到单轮读/四路全关，而既有的
+    close_read_segments 桩都是 `(segments, *a, **k)` 吞掉 kwargs、不看内容。"""
+    settings = _settings(tmp_path)
+    # 设成非默认值：删掉透传后 close_read_segments 会落到自己的默认签名值，这里立刻露馅
+    settings.processing.closeread_tail_max_chars = 7777
+    settings.processing.closeread_tail_max_chunks = 9
+    settings.processing.fulltext_extra_max_per_batch = 12
+    settings.processing.fulltext_host_breaker_failures = 5
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "resolve_citekeys",
+                        lambda segs, base: {s.paper_id: None for s in segs})
+    import src.scholar.closereading as closereading
+    import src.scholar.llm_client as llm_client
+    got = {}
+
+    def fake_close_read_segments(segments, *a, **k):
+        got.update(k)
+        return 1
+    monkeypatch.setattr(closereading, "close_read_segments", fake_close_read_segments)
+    monkeypatch.setattr(llm_client, "LLMClient",
+                        lambda cfg: type('Mock', (), {'close': lambda self: None})())
+    import src.scholar.notes as notes
+    monkeypatch.setattr(notes, "write_notes",
+                        lambda *a, **k: {"note_path": str(tmp_path / "n.md"), "docx_path": None})
+
+    rep = ING.run_ingest([_seg(1, "A", doi="10.1/a")], settings, "2026-08-03",
+                         top_n=1, close_read=True, seen=set())
+    assert rep["status"] == "ok"
+    assert got["tail_max_chars"] == 7777
+    assert got["tail_max_chunks"] == 9
+    assert got["extra_max_per_batch"] == 12
+    assert got["host_breaker_failures"] == 5
+
+
 # ---------------- G. 周札记覆盖保护（同 label 第二次入库不得整篇覆盖丢弃上一批） ----------------
 
 def _seed_existing_note(notes_dir: Path, label: str, dedup_keys):

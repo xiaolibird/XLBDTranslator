@@ -195,12 +195,17 @@ def test_sidecar_updates_scale_fields(tmp_path):
         encoding="utf-8")
     cr = _cr([("研究问题", [("x", None)])])
     cr.body_chars, cr.body_chars_raw, cr.truncated = 120000, 167539, True
+    # R2-3.9：截断的两个成因与第二轮读量也必须落进 sidecar（消费方按这三个键名回读，
+    # 见 test_rehydrate_reads_the_cause_fields_from_sidecar）。删掉映射里任意一键，这里就拦。
+    cr.truncated_by_total_cap, cr.truncated_by_page_cap, cr.tail_chars = True, False, 46200
     cr.reading_depth = "chunked"
     bd.update_sidecar(p, "a", cr)
     e = json.loads(p.read_text(encoding="utf-8"))["papers"][0]
     assert e["reading_depth"] == "chunked"
     assert (e["fulltext_chars"], e["fulltext_chars_raw"], e["fulltext_truncated"]) == \
         (120000, 167539, True)
+    assert (e["fulltext_truncated_by_total_cap"], e["fulltext_truncated_by_page_cap"],
+            e["fulltext_tail_chars"]) == (True, False, 46200)
     assert "highlights" not in e     # 老 sidecar 不含该字段时不擅自添加：由 md 解析供给
 
 
@@ -267,6 +272,28 @@ def test_find_local_pdf_refuses_weak_title_match(tmp_path, monkeypatch):
                                         "title": "Deep learning for sepsis prediction"}) is None
     # 标题太短时直接放弃词面匹配（词少了随便撞上几个就超阈值）
     assert bd.find_local_pdf(tmp_path, {"citekey": "x", "title": "AI"}) is None
+
+
+def test_deep_read_local_pdf_runs_second_pass_when_tail_and_budget(monkeypatch):
+    """R2-3.10：本地 PDF 通道的两轮读必须与自动链路共用 read_tail_appendix——删掉
+    `if ex.tail and tail_max > 0:` 这一支，手工补的 PDF 就静默丢掉了尾段第二读。"""
+    import src.scholar.closereading as C
+    from src.scholar.schema import PaperSegment, PaperMetadata
+    from types import SimpleNamespace
+    seg = PaperSegment(segment_id=1, paper_id="p1",
+                       metadata=PaperMetadata(paper_id="p1", title="T"))
+    proc = SimpleNamespace(closeread_max_chars=5000, research_interests="ri",
+                           closeread_max_chunks=4, closeread_tail_max_chars=1000,
+                           closeread_tail_max_chunks=2)
+    monkeypatch.setattr(C, "_pdf_text_ex",
+                        lambda pdf, max_chars=40000, page_max_chars=None, fix_fractions=None:
+                        C.PdfText(text="body " * 500, raw_chars=9000, tail="tail " * 500))
+    main = _cr([("研究问题", [("x", None)])])
+    monkeypatch.setattr(C, "deep_close_read", lambda *a, **k: main)
+    fed = []
+    monkeypatch.setattr(C, "read_tail_appendix", lambda *a, **k: fed.append(1) or "tail " * 100)
+    out = bd.deep_read_local_pdf(seg, Path("/tmp/x.pdf"), proc, llm=None, model="m")
+    assert out is main and len(fed) == 1 and out.tail_chars == len("tail " * 100)
 
 
 # ---------------- 额度耗尽 ≠ 抓不到全文（docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md） ----------------
@@ -399,11 +426,11 @@ def test_cmd_run_wires_the_streak_and_gate_helpers():
     import inspect
     src = inspect.getsource(bd.cmd_run)
     assert "reason, llm_dead = classify_failure(cr_diag, err)" in src
-    assert "if counts_toward_streak(llm_dead, expand, err):" in src
+    assert "if counts_toward_streak(reason, expand, err):" in src
     assert "skip |= deterministic_failures(led)" in src
     # 摘要级拒收发生在 LLM 已经读完之后，每篇都真花了额度——这条 continue 也必须过熔断，
     # 否则全文通路整体坏掉时会把整批额度烧光（第 2 轮压测 CONFIRMED）
-    assert "if counts_toward_streak(False, expand, None):" in src
+    assert "if counts_toward_streak(\"abstract_only\", expand, None):" in src
 
 
 def test_abstract_level_never_overwrites_an_existing_fulltext_reading():
@@ -437,18 +464,21 @@ def test_abstract_only_gate_predicate(accept_abstract, had_ft, should_refuse):
     assert refused is should_refuse
 
 
-@pytest.mark.parametrize("llm_dead,expand,err,expect", [
-    (True,  True,  None,             True),   # 额度耗尽：即便在 expand 批也必须计入连败
-    (True,  False, None,             True),
-    (True,  True,  RuntimeError("x"), True),
-    (False, True,  None,             False),  # expand 批的干净 no_output：结构性缺口，不计
-    (False, True,  RuntimeError("x"), True),  # 抛异常的故障：计
-    (False, False, None,             True),   # 补深度批：任何失败都计
+@pytest.mark.parametrize("reason,expand,err,expect", [
+    ("llm_unavailable:429 RESOURCE_EXHAUSTED", True,  None,             True),   # 额度耗尽：即便在 expand 批也必须计入连败
+    ("llm_unavailable:429 RESOURCE_EXHAUSTED", False, None,             True),
+    ("llm_unavailable:429 RESOURCE_EXHAUSTED", True,  RuntimeError("x"), True),
+    ("no_output",                            True,  None,             False),  # expand 批的干净 no_output：结构性缺口，不计
+    ("error:RuntimeError",                    True,  RuntimeError("x"), True),  # 抛异常的故障：计
+    ("no_output",                            False, None,             True),   # 补深度批：任何失败都计
+    ("routes_suppressed:2",                   True,  None,             False),  # 四路被抑制：暂时性但不计连败（R2-1.2）
+    ("routes_suppressed:2",                   False, None,             False),
 ])
-def test_counts_toward_streak(llm_dead, expand, err, expect):
-    """R41 变异存活暴露的接线缺口：`classify_failure` 算出的 llm_dead 有没有真的接进熔断判断。
-    额度耗尽走 catch 分支、err 恒为 None，正是被 `expand and err is None` 那条豁免吃掉的。"""
-    assert bd.counts_toward_streak(llm_dead, expand, err) is expect
+def test_counts_toward_streak(reason, expand, err, expect):
+    """R41 变异存活暴露的接线缺口：`classify_failure` 算出的 reason 有没有真的接进熔断判断。
+    额度耗尽走 catch 分支、err 恒为 None，正是被 `expand and err is None` 那条豁免吃掉的——
+    所以入参从 llm_dead 换成 reason，让 llm_unavailable 前缀能把它捞回来（R2-1.2）。"""
+    assert bd.counts_toward_streak(reason, expand, err) is expect
 
 
 # ---------------- 第 3 轮压测的三条（BLOCKER + 2 MAJOR） ----------------
@@ -584,3 +614,20 @@ def test_insert_branch_puts_the_new_section_before_the_paper_separator():
     assert old_n == 0 and new_n == 3
     # 第二篇一个字节都不许动
     assert "## 🔴 高 2. Other [@li2024Other]" in out and out.count("---") == md.count("---")
+
+
+def test_routes_suppressed_is_a_transient_failure_like_llm_unavailable():
+    """R2-1.2：额外通道被熔断/额度抑制过而没拿到全文 → 暂时性失败（与 llm_unavailable 同待遇：
+    不进永久跳过集、重跑不跳过），但**不计连败**——四路是锦上添花，少了个额外渠道 ≠ 通路死了，
+    OpenAlex 抖一次不该把整批停掉。"""
+    reason, dead = bd.classify_failure({"routes_suppressed": 2, "from_full_text": False}, None)
+    assert reason.startswith(bd.ROUTES_SUPPRESSED_REASON) and dead is False, \
+        "routes_suppressed 是暂时性但不是通路死了：不计连败"
+    assert bd.counts_toward_streak(reason, expand=False, err=None) is False
+    assert bd.counts_toward_streak(reason, expand=True, err=None) is False
+    # 全文其实到手了（只是别的原因没产出）→ 不算 routes_suppressed
+    reason2, dead2 = bd.classify_failure({"routes_suppressed": 2, "from_full_text": True}, None)
+    assert reason2 == "no_output" and dead2 is False
+    led = {"failed": {"a": {"reason": "routes_suppressed:2"}, "b": {"reason": "no_output"},
+                      "c": {"reason": "llm_unavailable:429"}}}
+    assert bd.deterministic_failures(led) == {"b"}

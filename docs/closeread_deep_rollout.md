@@ -8,9 +8,10 @@
 `PROCESSING__CLOSEREAD_DEEP`（`ScholarSettings.processing.closeread_deep`），**默认 False**。
 
 打开后 auto 精读从「一次单跳」变成「切块逐块通读 + 汇总」，一篇论文的 LLM 调用从 1 次放大到
-N+1 次（实测一批约 42 次、最坏 65 次），走的是同一份 Claude 订阅额度。
+N+1 次（实测一批约 42 次、最坏 65 次；2026-09-05 两轮读默认开后，被总上限截尾的篇目每篇最坏再 +5 = 18 次/篇，
+单批最坏 90 次；`closeread_tail_max_chars=0` 回到 65），走的是同一份 Claude 订阅额度。
 
-相关预算：`closeread_max_chars` 默认 120000（深读模式下的正文上限），`closeread_top_n` 默认 5。
+相关预算：`closeread_max_chars` 默认 137400（2026-08-28 起，恰好吃满 12 块；两轮读第二轮另有 46200/4），`closeread_top_n` 默认 5。
 
 ## 开关的实际暴露面
 

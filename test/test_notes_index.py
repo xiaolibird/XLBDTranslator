@@ -722,7 +722,9 @@ def test_schema_version_is_v5():
 
 # ---------------- 阅读深度量尺四键 ----------------
 
-_DEPTH_KEYS = ("fulltext_chars", "fulltext_chars_raw", "fulltext_truncated", "reading_depth")
+_DEPTH_KEYS = ("fulltext_chars", "fulltext_chars_raw", "fulltext_truncated",
+               "fulltext_truncated_by_total_cap", "fulltext_truncated_by_page_cap",
+               "fulltext_tail_chars", "reading_depth")
 
 
 def _seg_with_cr(cr=None, pid="dp"):
@@ -733,19 +735,26 @@ def _seg_with_cr(cr=None, pid="dp"):
 
 def test_depth_keys_none_when_no_close_reading():
     e = ni.entry_from_segment(_seg_with_cr(None), "no2020Read", rank=0, total=1)
-    assert [e[k] for k in _DEPTH_KEYS] == [None, None, None, None]
+    assert [e[k] for k in _DEPTH_KEYS] == [None, None, None, None, None, None, None]
 
 
 def test_depth_keys_from_auto_close_reading():
     cr = CloseReading(from_full_text=True, source="arxiv", body_chars=40000,
                       body_chars_raw=221101, truncated=True, n_chunks=1,
                       reading_depth="single-call",
+                      truncated_by_total_cap=True, truncated_by_page_cap=False,
+                      tail_chars=46200,
                       sections=[CloseReadSection(heading="结论", sentences=[
                           CloseReadSentence(text="AUC 0.9。", tag="可引用证据")])])
     e = ni.entry_from_segment(_seg_with_cr(cr), "au2025Paper", rank=0, total=1)
     assert e["fulltext_chars"] == 40000
     assert e["fulltext_chars_raw"] == 221101
     assert e["fulltext_truncated"] is True
+    # R2-3.12：成因两个键 + 第二轮读量也要过 entry_from_segment——此前只靠 getsource 字符串
+    # 守卫，把 fulltext_tail_chars 写死 None 没任何测试能拦，整条链路量尺静默缺失。
+    assert e["fulltext_truncated_by_total_cap"] is True
+    assert e["fulltext_truncated_by_page_cap"] is False
+    assert e["fulltext_tail_chars"] == 46200
     assert e["reading_depth"] == "single-call"
 
 

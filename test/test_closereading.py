@@ -672,6 +672,9 @@ def test_thin_reading_warning_names_the_truncation_cause(monkeypatch, tmp_path, 
         c = CloseReading(from_full_text=True, source="unpaywall", sections=[
             CloseReadSection(heading="h", sentences=[CloseReadSentence(text="s", tag=None)])])
         c.body_chars, c.body_chars_raw, c.truncated = body_chars, raw, raw > body_chars
+        # 2026-09-05 起成因由抽取环节直接记在 CloseReading 上，日志按字段说话、不再倒推
+        c.truncated_by_total_cap = body_chars >= 137400
+        c.truncated_by_page_cap = body_chars < 137400
         return c
 
     segs = [PaperSegment(segment_id=1, paper_id="p1", priority_score=1.0,

@@ -368,8 +368,12 @@ def run_zotero_sync(args, settings):
             model=(settings.llm.closeread_model or settings.llm.model),
             deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
             max_chunks=proc.closeread_max_chunks,
+            tail_max_chars=getattr(proc, "closeread_tail_max_chars", 0),
+            tail_max_chunks=getattr(proc, "closeread_tail_max_chunks", 4),
             extra_routes=getattr(proc, "fulltext_extra_routes", False),
             route_delay=getattr(proc, "fulltext_route_delay", 0.0),
+            extra_max_per_batch=getattr(proc, "fulltext_extra_max_per_batch", 80),
+            host_breaker_failures=getattr(proc, "fulltext_host_breaker_failures", 3),
         )
 
     # 聚合札记：一个时间窗一篇，文件名取 digest 输入名

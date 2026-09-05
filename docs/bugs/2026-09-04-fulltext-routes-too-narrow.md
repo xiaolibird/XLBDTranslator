@@ -1,8 +1,7 @@
 # 取全文只走两条路：月度流水线系统性漏掉本来拿得到的全文
 
 日期：2026-09-04
-状态：**代码已下沉进主链路，但开关默认关（2026-09-04）**——因此**月度链路的漏判率一点没变**，
-这条缺陷的本体（每月都在少读）在打开开关之前不算解决。见文末「修复」与「怎么打开」。原状态：未修复
+状态：**已修复，默认打开（2026-09-05）**——配套三道闸见文末「打开」节。原状态：代码下沉但默认关（2026-09-04）
 严重度：高——不报错、不丢数据，但每月都在少读；受影响的篇目会被当成「没全文」永久停在索引层
 发现者：xiaolibird / Claude（2026-09-03 索引层升格会话）
 
@@ -93,8 +92,24 @@ arXiv（含标题检索）→ EPMC render → OpenAlex → S2。注意三点：
 命中则 `pdf_url` 取第一个、全部候选进新字段 `OAResult.candidates`。下载侧 `closereading.download_pdf(..., validate=True)` 加三闸
 （`%PDF` magic 出现在前 1024 字节内 / 体积 ≥1KB / pypdf 可解析页数 ≥2；对抗审计后从 20KB 放宽——2 页纯文本短文只有 ~1.2KB，20KB 会误杀）+ PDF Accept 头 + 403/429 退避（`polite_get`），`close_read_segment` 对候选逐个试到一个过校验为止。
 
-**开关**：`settings.processing.fulltext_extra_routes`（默认 False）、`fulltext_route_delay`（1.5s），五处 `close_read_segments` 调用方透传
-（workflow / cli / ingest / backfill_notes / backfill_deepread）。关着时月度链路零变化；补深度/expand 批可在 `config/scholar.env` 里
-`PROCESSING__FULLTEXT_EXTRA_ROUTES=true` 打开。真网络下的限流表现未验证——这是默认关的原因；`fetch_missing_pdfs.py` 保留为独立补抓入口。
+**开关**：`settings.processing.fulltext_extra_routes`（默认 True，2026-09-05 起）、`fulltext_route_delay`（1.5s），五处 `close_read_segments` 调用方透传
+（workflow / cli / ingest / backfill_notes / backfill_deepread）。`fetch_missing_pdfs.py` 保留为独立补抓入口。
 「不该怎么修」一节的边界原样保留：不做任何绕出版商反爬的改写。
 测试：`test/test_fulltext_extra_routes.py`（全部假 client，不发网络）。`scripts/fetch_missing_pdfs.py` 已改为**委托**这套实现，不再自持副本——第 2 轮审计实测那份副本没跟上「arXiv 标题检索改双向重合」的修复。
+
+---
+
+## 打开（2026-09-05）
+
+`fulltext_extra_routes` 默认 True。「真网络限流表现没验证过」那条顾虑用三道闸兜住，不再靠关着：
+
+1. **每批额度** `fulltext_extra_max_per_batch=80`（= 候选篇数 20 × 4 路）：`close_read_segments` 一次调用里
+   额外四路总共最多 80 次（`fulltext.RouteBudget`，整批共享）。真网络实测定 24 时 6 篇就吃光、后半截候选被静默降级，
+   故按候选篇数定；限流真来了由熔断兜，额度只是总量保险丝。
+2. **按宿主熔断** `fulltext_host_breaker_failures=3`：同一 API 宿主连续 3 次 403/429 退避用尽或
+   传输异常 → 本进程内不再请求它（`polite_get` 直接返回合成 429、不触网）。按宿主而不按通道：
+   同一宿主被择优预解析与精读下载两个入口共用。成功一次即清零连败。
+3. **路间礼貌间隔** `fulltext_route_delay=1.5`（原有），arXiv 标题检索也改走 `polite_get`。
+
+关掉 = `PROCESSING__FULLTEXT_EXTRA_ROUTES=false`，不再跑额外四路；EPMC/arXiv 主链路的退避与熔断（R1-2.3）不受本开关影响。
+测试：`test/test_fulltext_breaker.py`。真网络实测见本批压测记录（docs/decisions）。

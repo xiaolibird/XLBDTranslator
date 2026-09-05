@@ -1,7 +1,7 @@
 # 存量条目缺 DOI 从未回补：36 篇连身份标识都没有，取全文与去重同时失效
 
 日期：2026-09-04
-状态：**未修复，推后（2026-09-04 台账批不做）**——第一步是联网只读盘点，属数据操作而非代码缺陷；回填须按「改身份键要扫派生物」流程走。原状态同。
+状态：**第一步（只读盘点）脚本已落地（2026-09-05）**：`scripts/inventory_missing_ids.py`；回填仍待人按盘点结果决定。原状态：未修复，推后——第一步是联网只读盘点，属数据操作而非代码缺陷；回填须按「改身份键要扫派生物」流程走。原状态同。
 严重度：中——这批篇目在库里等同「无法定位」，任何按标识找全文的通道都开不了门
 发现者：xiaolibird / Claude（2026-09-03 索引层升格会话）
 
@@ -57,3 +57,15 @@
 
 这 36 篇里估计有相当比例本来就不值得补（预印本重复、poster、无法定位的条目）。
 盘点那一步应当同时给出「建议放弃」的判据，别默认全都要救。
+
+---
+
+## 第一步落地（2026-09-05）
+
+`scripts/inventory_missing_ids.py`：对无 DOI/arXiv/PMID 的 keeper（现库 317 篇：`title:` 263 /
+`pmlr:` 44 / `openreview:` 10；INCLUDE 186 / MAYBE 131；另 `isbn:` 5 篇被 `select_targets` 排除、不查）
+拿标题查 Crossref 与 OpenAlex
+（后者按记忆里的教训用 `filter=title.search`），三分类 fillable / ambiguous / no_hit，再叠一层
+「建议放弃」（PMLR/OpenReview 键本就有出版方稳定标识；MAYBE 裁决不值得动身份键）。
+只写 `output/scholar_notes/_inventory/missing_ids_<时间戳>.{json,md}`，**不改索引**。
+第二步回填仍须走「改身份键要扫派生物」流程。测试：`test/test_backfill_scripts_2026_09_05.py`。

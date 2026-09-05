@@ -1,7 +1,7 @@
 # `fulltext_truncated` 混用两种成因，覆盖率百分比是误导性指标
 
 日期：2026-09-04
-状态：**部分修复（2026-09-04 台账批）**——索引字段仍未拆（那要五处联动，另开一轮），
+状态：**已修复（2026-09-05，索引字段已拆）**，见文末。原状态：部分修复（2026-09-04 台账批）——索引字段未拆，
 但**日志里已经把两种成因分开说了**：`close_read_segments` 的「精读偏薄」警告现在打
 「已截断·总上限截尾，抬 closeread_max_chars 有用」或「已截断·单页上限削页，抬总上限无用」。
 这一条就够挡住本文要防的那类误判（按覆盖率排序挑「最该重跑的几篇」）。
@@ -92,3 +92,18 @@ for x in sorted((p for p in ps if p.get('fulltext_truncated')),
     print(f"{fc:>8,} / {raw:>8,}  {cause:<28} {x.get('citekey')}")
 PY
 ```
+
+---
+
+## 修复（2026-09-05）
+
+五处联动一次做完：`_pdf_text_ex` 出参 `page_dropped` / `tail` → `CloseReading.truncated_by_total_cap` /
+`truncated_by_page_cap` / `tail_chars` → sidecar 与索引键 `fulltext_truncated_by_total_cap` /
+`fulltext_truncated_by_page_cap` / `fulltext_tail_chars`（`_citekey_utils` 构造条目、
+`backfill_deepread` 写回 sidecar）→ vault front matter 三个键（并进受管键元组，否则幂等性破）→
+`ingest._rehydrate_close_readings` 回读。两者**可同时为真**。缺失 = 未知（老 sidecar），
+`SCHEMA_VERSION` 不动。`fulltext_truncated` 保留不变；「按覆盖率挑最该重跑的几篇」请看
+`by_total_cap`。「精读偏薄」告警改按字段说话，不再从 body_chars 与上限的相等关系倒推。
+
+现库 19 篇截断 keeper：14 篇总上限截尾（两轮读能救）/ 5 篇单页削页（抬总上限无用）。
+测试：`test/test_truncation_two_pass.py`（① ⑤ 节）。

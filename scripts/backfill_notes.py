@@ -214,8 +214,12 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args,
                 # 月度回填仍单跳，两代札记在同一索引里无声混存
                 deep=proc.closeread_deep, max_chars=proc.closeread_max_chars,
                 max_chunks=proc.closeread_max_chunks,
+                tail_max_chars=getattr(proc, "closeread_tail_max_chars", 0),
+                tail_max_chunks=getattr(proc, "closeread_tail_max_chunks", 4),
                 extra_routes=getattr(proc, "fulltext_extra_routes", False),
-                route_delay=getattr(proc, "fulltext_route_delay", 0.0))
+                route_delay=getattr(proc, "fulltext_route_delay", 0.0),
+                extra_max_per_batch=getattr(proc, "fulltext_extra_max_per_batch", 80),
+                host_breaker_failures=getattr(proc, "fulltext_host_breaker_failures", 3))
         finally:
             llm_client.close()
         if args.top_n > 0 and fresh and done == 0:

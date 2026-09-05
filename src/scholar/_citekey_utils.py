@@ -481,6 +481,11 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "fulltext_chars": (cr.body_chars if cr else None),
         "fulltext_chars_raw": (cr.body_chars_raw if cr else None),
         "fulltext_truncated": (cr.truncated if cr else None),
+        # 截断成因拆开记（2026-09-05）：两种成因后果相反（总上限截尾 → 抬/加第二轮有用；
+        # 单页削页 → 抬总上限无用）。缺失 = 未知（老 sidecar），同 fulltext_truncated 的口径。
+        "fulltext_truncated_by_total_cap": (getattr(cr, "truncated_by_total_cap", None) if cr else None),
+        "fulltext_truncated_by_page_cap": (getattr(cr, "truncated_by_page_cap", None) if cr else None),
+        "fulltext_tail_chars": (getattr(cr, "tail_chars", None) if cr else None),
         "reading_depth": _reading_depth(cr, series),
         "tag_counts": tag_counts,
         "highlights": highlights,
