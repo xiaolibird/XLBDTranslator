@@ -217,3 +217,48 @@ def test_announce_renames_only_when_caller_declares_keys_retired(tmp_path):
     txt = page.read_text(encoding="utf-8")
     assert out2["topics_renamed"] and "[@kNew]" in txt and "kOld" not in txt
     assert generated_block_tampered(txt) is False, "改完不许把页面打成 conflict"
+
+
+def test_concurrent_renames_do_not_lose_updates(tmp_path):
+    """`_atomic_write` 保证「单次写不撕裂」，**不保证「不丢更新」**：两个进程各自
+    读全文→改→整篇写回，后写的会把先写的整篇覆盖，两边还都报成功
+    （2026-09-05 压测实测 15 轮丢 14 轮）。加锁后必须两边的改动都留下。"""
+    import multiprocessing as mp
+    topics = tmp_path / "topics"
+    topics.mkdir(parents=True)
+    for i in range(20):
+        (topics / "p{}.md".format(i)).write_text("[@aOld] [@bOld]\n", encoding="utf-8")
+    ctx = mp.get_context("fork")
+    ps = [ctx.Process(target=_rename_worker, args=(str(tmp_path), "aOld", "aNew")),
+          ctx.Process(target=_rename_worker, args=(str(tmp_path), "bOld", "bNew"))]
+    for p in ps:
+        p.start()
+    for p in ps:
+        p.join(timeout=60)
+    bad = [i for i in range(20)
+           if (topics / "p{}.md".format(i)).read_text(encoding="utf-8") != "[@aNew] [@bNew]\n"]
+    assert bad == [], "丢更新的页：{}".format(bad[:5])
+
+
+def _rename_worker(notes_dir, old, new):
+    from pathlib import Path as _P
+    ni.rename_citekeys_in_topic_pages(_P(notes_dir), [(old, new)], apply=True)
+
+
+def test_find_dangling_citations_catches_unresolvable_keys(tmp_path):
+    """概念页引了全局书目里不存在的键 → pandoc 渲染成 `(key?)`，而此前无人报。
+
+    这是「keeper 持后缀键而基键悬空」那类问题的**症状侧**判据。为什么不从键的词形去猜：
+    `_is_suffix_key` 是词面判据，拿它对全库自截尾会把 2295 条正常键全判成孤儿
+    （2026-09-05 实测，第一版就是这么写错的）。「引用解析不了」是确定性的，不会误报。
+    """
+    topics = tmp_path / "topics"
+    (topics / "qa").mkdir(parents=True)
+    (topics / "p.md").write_text("见 [@aLive] 与 [@bGone]\n", encoding="utf-8")
+    (topics / "qa" / "q.md").write_text("答：[@cGone]\n", encoding="utf-8")
+    idx = {"papers": [{"citekey": "aLive"}]}
+    got = ni.find_dangling_citations(tmp_path, idx)
+    assert [(g["page"], g["key"]) for g in got] == [("p.md", "bGone"), ("qa/q.md", "cGone")]
+    # 全部可解析时零报告——别把告警面训练成噪音
+    assert ni.find_dangling_citations(
+        tmp_path, {"papers": [{"citekey": k} for k in ("aLive", "bGone", "cGone")]}) == []

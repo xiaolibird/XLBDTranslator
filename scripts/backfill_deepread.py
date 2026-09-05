@@ -295,9 +295,26 @@ def save_ledger(notes_dir: Path, led: dict, expand: bool = False) -> None:
     # 垃圾、A 整批进度静默蒸发、下次 load 直接「拒绝继续」（压测 A6 实测 5.4MB 不可解析文件）。
     tmp = dst.with_name("{}.tmp-{}".format(dst.name, os.getpid()))
     # allow_nan=False：Infinity/NaN 原样写出的不是合法 JSON，账本会变成只有 Python 能读
-    tmp.write_text(json.dumps(led, ensure_ascii=False, indent=1, allow_nan=False),
-                   encoding="utf-8")
-    tmp.replace(dst)
+    body = json.dumps(led, ensure_ascii=False, indent=1, allow_nan=False)
+    try:
+        # fsync tmp + fsync 父目录：只 write+replace 挡得住进程被杀，挡不住断电——
+        # 那时 rename 可能先落盘而数据块没落，账本会变成截断文件（压测 A4）。
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(dst)
+        dfd = os.open(str(dst.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except Exception:
+        try:
+            tmp.unlink()           # ENOSPC 时别留孤儿 tmp
+        except OSError:
+            pass
+        raise
 
 
 # ---------------- 段落重建 ----------------
@@ -768,6 +785,26 @@ def cmd_scan(notes_dir: Path, index: dict, expand: bool = False) -> int:
     return 0
 
 
+def _save_ledger_or_shout(notes_dir: Path, led: dict, expand: bool, ck: str, bdir) -> bool:
+    """保存账本；失败时**大声说清后果与恢复路径**，绝不静默。
+
+    这一步失败是最贵的一种：此时该篇的 md/sidecar **已经改写完**（LLM 额度已经烧掉），
+    账本却没记上——下一轮会把它当没跑过重跑一遍，钱花两次，而这正是账本存在的理由
+    （2026-09-05 压测 A4：ENOSPC 时 OSError 直接从 cmd_run 冒出去，连一句提示都没有）。
+    返回 True/False 让调用方决定是否继续；不抛，免得把后面篇目的进度也一起带走。
+    """
+    try:
+        save_ledger(notes_dir, led, expand)
+        return True
+    except Exception as e:                                # noqa: BLE001
+        logger.error("⛔ 账本写入失败（{}）：{} 的 md/sidecar **已经改完**，但进度没记上。", e, ck)
+        logger.error("   下一轮会把它当没跑过重跑一遍（再烧一次 LLM 额度）。")
+        logger.error("   立刻处理：① 腾出磁盘空间/修好权限后重跑本命令（它会跳过已完成的）；")
+        logger.error("   ② 若要回退这一篇：{} 下有原件，用 `backfill_deepread.py restore` 还原。",
+                     bdir)
+        return False
+
+
 def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
     expand = bool(getattr(args, "expand", False))
     accept_abstract = bool(getattr(args, "accept_abstract", False))
@@ -985,8 +1022,12 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
             text = md_path.read_text(encoding="utf-8")
             new_text, o_lines, n_lines = replace_closeread(
                 text, ck, entry.get("note_line"), _render_closeread(cr))
-            tmp = md_path.with_suffix(".tmp")
-            tmp.write_text(new_text, encoding="utf-8")
+            # tmp 带 pid：固定名时两个进程会共用同一路径、互相截断（同 save_ledger 那条）
+            tmp = md_path.with_name("{}.tmp-{}".format(md_path.name, os.getpid()))
+            with open(tmp, "w", encoding="utf-8") as _f:
+                _f.write(new_text)
+                _f.flush()
+                os.fsync(_f.fileno())
             tmp.replace(md_path)
             note = update_sidecar(sc_path, ck, cr)
         except Exception as e:                        # noqa: BLE001
@@ -1002,9 +1043,14 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                            "note_file": entry.get("note_file"), "backup": bdir.name}
         ok += 1
         streak = 0
-        save_ledger(notes_dir, led, expand)
+        _save_ledger_or_shout(notes_dir, led, expand, ck, bdir)
 
-    save_ledger(notes_dir, led, expand)
+    try:
+        save_ledger(notes_dir, led, expand)
+    except Exception as e:                                # noqa: BLE001
+        logger.error("⛔ 收尾写账本失败（{}）：本轮成功 {} 篇的进度可能没落盘，"
+                     "下一轮会重跑它们。请修好磁盘/权限后重跑。", e, ok)
+        return 1
     print("\n完成：成功 {} / 失败 {}{}".format(
         ok, fail, "" if args.apply else "（干跑，未写盘）"))
     if ok and args.apply:

@@ -307,7 +307,8 @@ lin2025Addressing → lin2025Addressingb | keeper manual 2026-09-02-插补扭曲
 `[@a; @b]` 等 pandoc 变体不在判据内（真库 1388 处引用里 0 命中）。
 
 ## 遗留
-- **`shi2025Federated` 基键永久悬空，且工具已经报不出它了**（2026-09-05 审计发现）。
+- ~~**`shi2025Federated` 基键永久悬空**~~ **已于 2026-09-05 处置完毕**（详见文末「shi 存量处置」）。
+  原记录（2026-09-05 审计发现）：
   本文 `:215` 列的「8 处引用自动恢复」= 6 处 `@lin2025Addressing` + 2 处 `@shi2025Federated`。
   09-05 只执行了 lin 那 1 条改键；shi 这边实测：
 
@@ -319,5 +320,24 @@ lin2025Addressing → lin2025Addressingb | keeper manual 2026-09-02-插补扭曲
   为什么工具看不见：09-03 的「止血」（见本文 `:127-131`）把 duplicate 的行内键**改成了后缀键**，
   于是行内键与 keeper 两侧一致、陈旧检测天然不报。当时那节自己就写着「这个方向让丑键成为规范键……
   是止血，不是修法」——代价现在兑现了：`--fix-inline-citekeys` **永远不会再把它列进计划**。
-  要救回只能人工发起一次 keeper 改键（`shi2025Federatedb → shi2025Federated`），属改身份键操作，
-  未在本批执行。
+  要救回只能人工发起一次 keeper 改键（`shi2025Federatedb → shi2025Federated`），属改身份键操作。
+
+## shi 存量处置（2026-09-05 执行完毕）
+
+作用面先摸清再动：库内 6 个文件带该键（2025-10 与 2026-09 两个月的 md/references/index、
+`topics/adversarial-evidence.md`），基键 `shi2025Federated` **无人占用**，向量库 70 chunk 全挂旧键。
+备份进 `output/_prod_backup_20260905/shi_rekey/`（6 份原件）后按词边界正则逐文件替换
+（防误伤近亲键），共改 7 处；重建索引 → 全局书目 2427 条、旧键在非备份区归零；
+`notes_embed.py` 同步后 70 chunk 全部迁到新键。P4 主稿那 8 处
+（6 处 `@lin2025Addressing` + 2 处 `@shi2025Federated`）现在**全部可解析**。
+
+**为什么没有做成通用检测**：我先写了个「keeper 持后缀键而基键无人占用」的检测器，
+拿 `_is_suffix_key(ck[:-n], ck)` 判——真库上报出 **2295 条假阳性**（几乎全库）。
+根因是 `_is_suffix_key` 的 docstring 自己写着「这是**词面**判据」，它安全的前提是只用在
+「已知同簇且键不同」的配对上，而我对全库自截尾用，完全无护栏：任何以 b–z 结尾的键
+切掉尾字母都「像」后缀关系。已撤掉。
+
+改用**症状侧**判据 `find_dangling_citations(notes_dir, index)`：扫 topics/（含 qa/）里引了
+全局书目中不存在的 citekey。「引用解析不了」是确定性的、与键怎么生成无关，且正是用户会
+真正撞到的后果（pandoc 渲染成 `(key?)`）。真库当前 0 处。
+它接不住 shi 这一例——因为引用它的是**仓库外**的 P4 手稿——但会接住库内的同类。

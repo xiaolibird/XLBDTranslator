@@ -906,6 +906,35 @@ def _stale_inline_shape(dup_key: str, keeper_key: str) -> str:
     return "suffix-keeper" if _is_suffix_key(dup_key, keeper_key) else "stale-dup"
 
 
+def find_dangling_citations(notes_dir, index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """topics/（含 qa/）里引了**全局书目中不存在**的 citekey。
+
+    这是「keeper 持后缀键而基键悬空」那类问题的**症状侧**判据，比从键的词形去猜可靠得多：
+    `_is_suffix_key` 是词面判据，拿它对全库自截尾会把 2295 条正常键全判成孤儿
+    （2026-09-05 实测——我第一版就是这么写错的）。而「引用解析不了」是确定性的、
+    与键怎么生成无关，且正是用户会真正撞到的那个后果（pandoc 渲染成 `(key?)`）。
+
+    典型来源：改键漏扫派生物；或 keeper 拿了后缀键而别处按基键引用
+    （`2026-09-04-manual-upgrade-citekey-suffix.md`，实例 shi2025Federated）。
+    返回 [{"page": 相对路径, "key": 悬空键}]，按页名+键排序。
+    """
+    live = {e.get("citekey") for e in (index.get("papers") or []) if e.get("citekey")}
+    topics_dir = Path(notes_dir) / "topics"
+    out: List[Dict[str, Any]] = []
+    if not topics_dir.is_dir():
+        return out
+    for page in sorted(topics_dir.rglob("*.md")):
+        try:
+            text = page.read_text(encoding="utf-8")
+        except Exception:                                  # noqa: BLE001
+            continue
+        rel = str(page.relative_to(topics_dir))
+        for k in sorted(set(re.findall(r"\[@([A-Za-z0-9\u00c0-\uffff]+)\]", text))):
+            if k not in live:
+                out.append({"page": rel, "key": k})
+    return out
+
+
 def find_stale_inline_citekeys(index: Dict[str, Any]) -> List[Dict[str, Any]]:
     """列出行内 citekey 与其 keeper 不一致的 duplicate 条目（纯函数，不写盘）。
 
@@ -1308,10 +1337,34 @@ def write_outputs(index: Dict[str, Any], notes_dir: Path) -> Dict[str, bool]:
 # ---------------- citekey 撞键修复 ----------------
 
 def _atomic_write(path: Path, content: str) -> None:
-    """原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致。"""
+    """原子写：避免崩溃导致 md/references.json/sidecar 三文件不一致。
+
+    tmp 带 pid：固定名时两个进程会共用同一路径，后者的 `"w"` 截断前者写到一半的内容、
+    再 replace 成正式文件，而前者的 fd 仍指着那个 inode 继续写 → 带 NUL 空洞的垃圾。
+
+    **fsync 两次**：tmp 落盘、父目录落盘。只做 `write+replace` 挡得住进程被杀（页缓存还在），
+    挡不住断电/内核 panic——那时 rename 可能先落盘而数据块没落，仍会得到截断文件
+    （2026-09-05 压测指出的缺口，原 docstring「避免崩溃」略微超售）。
+    失败不吞：写不进去必须让调用方知道，不能留下「以为写了」的假象。
+    """
     tmp = path.with_suffix(path.suffix + ".tmp-{}".format(os.getpid()))
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)          # 目录项也要落盘，否则 rename 可能在断电后消失
+        finally:
+            os.close(dfd)
+    except Exception:
+        try:
+            tmp.unlink()           # 别把半截 tmp 留在盘上（压测 A4：ENOSPC 会留孤儿）
+        except OSError:
+            pass
+        raise
 
 
 RENAME_OK = "ok"              # 三处（凡存在者）都已改到位
@@ -1541,6 +1594,64 @@ def _reject_chained_pairs(pairs):
         raise ValueError("同一旧键映射到多个新键：{}".format(sorted(dup)))
 
 
+class _TopicsLock:
+    """topics/ 改名的排他文件锁（阻塞等待，有上限；拿不到就 fail-open 并标 degraded）。
+
+    `_atomic_write` 保证的是「单次写不撕裂」，**不是「不丢更新」**：两个进程同时对同一
+    topics/ 改不同的键时，各自读全文→改→整篇写回，后写的会把先写的整篇覆盖掉，
+    两边都报成功、errors 都是空（2026-09-05 压测实测 15 轮里 14 轮丢更新）。
+    现实触发路径：一边跑改名一边 `build_topics.py` 重合成，或两个会话并行。
+
+    **作用域仅限本函数**：`build_topics` / `qa` / `lint` 写同一批页面时不持这把锁，
+    所以它挡的是「改名 vs 改名」，挡不住「改名 vs 重合成」。要根治得把锁上提到
+    topics 写入层，那是另一件事——这里先把可控的一半锁住，并把边界写清楚。
+    flock 随进程退出自动释放；锁文件留着不删（删它会让两个进程各锁各的 inode）。
+    """
+
+    def __init__(self, topics_dir: Path, timeout: float = 60.0):
+        self.path = Path(topics_dir) / ".rekey.lock"
+        self.timeout = timeout
+        self.degraded = False
+        self._fd = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+        except ImportError:                      # Windows：不加锁
+            self.degraded = True
+            return self
+        import time as _t
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            self.degraded = True                 # 目录只读等：fail-open，别把改名整个挡死
+            return self
+        deadline = _t.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if _t.monotonic() >= deadline:
+                    self.degraded = True
+                    return self
+                _t.sleep(0.2)
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except Exception:                    # noqa: BLE001
+                pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+        return False
+
+
 def rename_citekeys_in_topic_pages(notes_dir, rekey_map, *, apply: bool = False):
     """把 topics/（含 qa/）里**已注销**的旧 citekey 就地换成新键。确定性、不用 LLM。
 
@@ -1572,6 +1683,19 @@ def rename_citekeys_in_topic_pages(notes_dir, rekey_map, *, apply: bool = False)
     topics_dir = Path(notes_dir) / "topics"
     if not pairs or not topics_dir.is_dir():
         return out
+    with _TopicsLock(topics_dir) as lk:
+        if lk.degraded:
+            out["lock_degraded"] = True
+            logger.warning("  ⚠️ topics/ 改名未能加锁（另一进程占用超时 / 目录只读）："
+                           "若此刻有别的进程在写同一批页面，可能发生丢更新。")
+        _rename_pages(topics_dir, pairs, out, apply=apply)
+    out["applied"] = bool(apply and out["pages"] and not out["errors"])
+    return out
+
+
+def _rename_pages(topics_dir, pairs, out, *, apply: bool):
+    """改名主体，由 `rename_citekeys_in_topic_pages` 持锁后调用。"""
+    from .vault import generated_block_tampered
     for page in sorted(topics_dir.rglob("*.md")):
         try:
             text = page.read_text(encoding="utf-8")
@@ -1606,8 +1730,6 @@ def rename_citekeys_in_topic_pages(notes_dir, rekey_map, *, apply: bool = False)
                 _atomic_write(page, _rehash_generated_block(new_text))
             except Exception as e:                         # noqa: BLE001
                 out["errors"].append({"page": rel0, "error": "{}: {}".format(type(e).__name__, e)})
-    out["applied"] = bool(apply and out["pages"] and not out["errors"])
-    return out
 
 
 

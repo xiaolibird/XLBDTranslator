@@ -52,6 +52,7 @@
 |---|---|
 | ~~陈旧行内键 / 后缀 keeper（`lin2025Addressing` 等）~~ | **已于 2026-09-05 执行**：改键 1 条、向量库已同步。⚠️ 概念页 `missingness-causal.md` 的 2 处旧键**路由没覆盖到**（路由按新键找页，而该页只写着旧键），已手工改掉；工具侧缺口见 decisions 文档教训节 |
 | ~~227 条缺定位号的期刊书目条目~~ | **已于 2026-09-05 执行**：候选 232、实补 **45** 条（其余 187 条 Crossref 源里本就没有 article-number）、写 13 份 references.json、备份 `.refs_backfill_backup/20260905T133323/`、全局书目已重建为 2427 条。**别用** `repair_references.py --force`：那是整月重建、索引兜底会覆盖既有更权威字段 |
+| ~~`shi2025Federated` 基键悬空~~ | **已于 2026-09-05 处置**：改键 7 处、索引与向量库（70 chunk）已同步、P4 主稿 8 处引用全部可解析。备份 `output/_prod_backup_20260905/shi_rekey/` |
 | Zotero 里三条未归档条目 | 人在 Zotero 里拖进 ScholarDigest |
 | 270 篇被吞掉的篇末 `---`（原记 169，2026-09-05 复核订正）| 见 `2026-09-04-replace-closeread-eats-trailing-content.md` 文末的 dry-run 脚本（纯版面，不影响解析，补不补由你定）|
 | ~~额度失败被记成 `no_output` 的 3 篇~~ | **已于 2026-09-05 执行**：成功 3 / 失败 0，三篇均拿到真全文（37/34/35 条带 tag），索引与向量库已同步。**必须带 `--redo`**，否则被 `deterministic_failures` 静默跳过。全库同型陈旧条目还剩 4 篇（`liao2021Improving` / `li2023Prediction` / `jin2024Transferb` / `yoo2025Review`），要救回同法加 `--citekey` |
