@@ -228,3 +228,100 @@ def test_make_lookup_caches_none_but_not_unchecked():
         raise ConnectionError("x")
     l2 = BA.make_lookup(boom, [1], {}, delay=0)
     assert l2("10.1/z") is None
+
+
+# ---------------- 源没答上 ≠ 源里没有（2026-09-05 生产实跑发现） ----------------
+
+def test_classify_incomplete_when_a_source_never_answered():
+    """OpenAlex 改成按日额度计费后，额度耗尽的那半批若判 no_hit，等于把「压根没问成」
+    沉淀成「问过了确实没有」——与本批 R3-A1（5xx 被当成功）是同一个病。"""
+    assert INV.classify(_entry(), [], None)[0] == "no_hit", "两源都答了、都没命中 → no_hit"
+    cat, best, _ = INV.classify(_entry(), [], ["openalex"])
+    assert cat == "incomplete" and best is None, "有源没答上 → incomplete，不是 no_hit"
+    # 已经有像样命中时，缺一源不影响定性（结论已经立得住）
+    assert INV.classify(_entry(), [_hit(0.98)], ["openalex"])[0] == "fillable"
+
+
+def test_answered_reads_sources_ok_and_degrades_safely_on_legacy_reports():
+    """续跑判据：新报告读 sources_ok；旧报告没这个字段时退化成「出过命中的源即算答过」——
+    只会把「答了但没命中」的源多问一次（安全方向），绝不把没问成的当成结论。"""
+    assert INV._answered({"sources_ok": ["crossref"]}) == {"crossref"}
+    assert INV._answered({"sources_ok": []}) == set(), "空列表是「两源都没答上」，不是缺字段"
+    legacy = {"hits": [{"source": "openalex", "doi": "10.1/x"}]}
+    assert INV._answered(legacy) == {"openalex"}, "旧报告：出过命中必然答过"
+    assert INV._answered({"hits": []}) == set(), "旧报告无命中 → 无从判断，全部重问"
+    assert INV.ALL_SOURCES - INV._answered(legacy) == {"crossref"}
+
+
+def test_render_md_calls_out_incomplete_and_how_to_resume():
+    recs = [{"citekey": "a1", "category": "incomplete", "best": None, "sources_failed": ["openalex"],
+             "year": 2024, "authors": [], "drop_reason": ""},
+            {"citekey": "b2", "category": "no_hit", "best": None, "sources_failed": [],
+             "year": 2024, "authors": [], "drop_reason": ""}]
+    md = INV.render_md(recs, "20260905T000000")
+    assert "incomplete 1" in md and "--resume-from" in md
+    assert "a1（缺 openalex）" in md
+    assert "b2" in md.split("## no_hit")[1].split("##")[0], "no_hit 名单里只该有真答过的"
+
+
+def test_query_crossref_separates_http_failure_from_no_match():
+    """crossref_lookup 把 HTTP 失败与「查了没有」一律吞成 None，正是本脚本要分的那两态——
+    所以 query_crossref 自己发请求自己看状态码。429 必须记「没答上」，不能记成「源里没有」。"""
+    class _R:
+        def __init__(self, code, payload=None):
+            self.status_code, self._p = code, payload or {}
+
+        def json(self):
+            return self._p
+
+    class _C:
+        def __init__(self, resp):
+            self.resp, self.calls = resp, []
+
+        def get(self, url, **kw):
+            self.calls.append(url)
+            return self.resp
+
+    title = "Federated learning for missing data in electronic health records"
+    # 429（额度/限流）→ 没答上
+    hit, ok = INV.query_crossref(title, "", _C(_R(429)))
+    assert hit is None and ok is False, "429 是没答上，不是源里没有"
+    # 200 但零结果 → 答上了、确实没有
+    hit2, ok2 = INV.query_crossref(title, "", _C(_R(200, {"message": {"items": []}})))
+    assert hit2 is None and ok2 is True
+    # 200 且命中
+    item = {"title": [title], "DOI": "10.1000/abc",
+            "author": [{"given": "Wei", "family": "Wang"}],
+            "issued": {"date-parts": [[2024, 5, 1]]}}
+    hit3, ok3 = INV.query_crossref(title, "", _C(_R(200, {"message": {"items": [item]}})))
+    assert ok3 is True and hit3 and hit3["doi"] == "10.1000/abc" and hit3["source"] == "crossref"
+
+
+def test_resume_set_excludes_titles_we_deliberately_never_ask_about(tmp_path, monkeypatch, capsys):
+    """实词不足的篇目是**故意不问**（问了也不可信），不是「没问成」。若把它们算进重查集，
+    每次续跑都会把它们列进「待重查」却永远问不成，计数永远消不掉。"""
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    (nd / "literature_index.json").write_text(json.dumps({"entries": [
+        {"citekey": "short1", "title": "Jimeng Sun", "dedup_key": "title:jimeng",
+         "decision": "INCLUDE", "year": 2021, "month": "2021-01"},
+        {"citekey": "long1", "dedup_key": "title:federated",
+         "title": "Federated learning for missing data in electronic health records",
+         "decision": "INCLUDE", "year": 2024, "month": "2024-01"},
+    ]}), encoding="utf-8")
+    prev = tmp_path / "prev.json"
+    prev.write_text(json.dumps({"records": [
+        {"citekey": "short1", "title": "Jimeng Sun", "category": "ambiguous",
+         "hits": [], "sources_ok": [], "sources_failed": []},
+        {"citekey": "long1", "category": "incomplete",
+         "title": "Federated learning for missing data in electronic health records",
+         "hits": [], "sources_ok": ["crossref"], "sources_failed": ["openalex"]},
+    ]}), encoding="utf-8")
+
+    monkeypatch.setattr(INV, "repo_path", lambda x: (nd if str(x).endswith("notes") else tmp_path / str(x)))
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(nd),
+                                      "--resume-from", str(prev), "--dry-run"])
+    assert INV.main() == 0
+    out = capsys.readouterr().out
+    assert "待重查 1 条" in out, "只有 long1 该重查；short1 是故意不问"
+    assert "缺 openalex" in out

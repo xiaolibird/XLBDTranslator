@@ -69,3 +69,42 @@
 「建议放弃」（PMLR/OpenReview 键本就有出版方稳定标识；MAYBE 裁决不值得动身份键）。
 只写 `output/scholar_notes/_inventory/missing_ids_<时间戳>.{json,md}`，**不改索引**。
 第二步回填仍须走「改身份键要扫派生物」流程。测试：`test/test_backfill_scripts_2026_09_05.py`。
+
+## 生产实跑（2026-09-05）与 OpenAlex 计费变更
+
+首次全量盘点跑完 317 篇，但**结论只有前 ~105 篇是两源的**：第 105 篇左右
+`api.openalex.org` 连续 3 次终局失败被熔断，尾部 208 篇只问到了 Crossref。
+探查真因不是限流，是 **OpenAlex 已改成按日额度计费**：
+
+```
+429 {"error":"Rate limit exceeded",
+     "message":"Insufficient budget. This request costs $0.001 but you only have $0 remaining.
+                Resets at midnight UTC. Need more? Add funds at https://openalex.org/pricing"}
+```
+
+每请求 $0.001、免费额度约 $0.1/日（≈100 请求）、UTC 零点重置，带不带 mailto 一样。
+**放慢速度没有任何用**，全库一天跑不完是常态。
+
+因此脚本补了一处与本批 R3-A1 同源的记账修正 + 续跑能力：
+
+- 两个 `query_*` 改成返回 `(命中, 源是否答上)`；记录里存 `sources_ok` / `sources_failed`。
+- `classify` 第四类 **`incomplete`**：没有像样命中**且有源没答上**时判它，不再判 `no_hit`。
+  「问过了确实没有」和「压根没问成」不是一回事——后者记成结论就是把暂时性失败沉淀成永久判死，
+  和额度耗尽被记成 `no_output` 是同一个病。
+- `--resume-from <上次报告.json>`：只补问**还没答上的那一源**，其余原样结转、不再花额度。
+  旧报告没有 `sources_ok` 时退化成「出过命中的源即算答过」——只会多问一次，不会误判成结论。
+
+补这层记账时发现修法自己漏了一半：`crossref_lookup` 同样把 HTTP 失败与「查了没有」一律吞成
+`None`（`crossref.py:137`），而包装函数却声称 Crossref 答上了。已改成在本脚本里自己发请求、
+自己看状态码（命中解析仍复用 `best_match`，判据只留一份），顺带让 Crossref 也走 `polite_get`
+的退避与按宿主熔断——此前它是裸 `c.get`。
+
+**当前报告**（`_inventory/missing_ids_20260905T160744.{json,md}`，Crossref 单源）：
+`fillable 21 / ambiguous 20 / no_hit 0 / incomplete 276`，70 篇带「建议放弃」；
+301 篇 `sources_ok=[crossref] / sources_failed=[openalex]`，16 篇两源都没问
+（标题实词 <4，故意不问，**不进重查集**，否则每次续跑都消不掉）。
+`no_hit` 归零是这次修正的直接体现：OpenAlex 缺席时，"两源都说没有"一条都不成立。
+
+续跑：`--resume-from output/scholar_notes/_inventory/missing_ids_20260905T160744.json`
+（已验证：待重查 301 条、原样结转 16 条），按每日 ~100 次免费额度约需 3 个自然日。
+第二步回填仍须走「改身份键要扫派生物」流程，与本次变更无关。

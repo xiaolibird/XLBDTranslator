@@ -113,3 +113,16 @@ arXiv（含标题检索）→ EPMC render → OpenAlex → S2。注意三点：
 
 关掉 = `PROCESSING__FULLTEXT_EXTRA_ROUTES=false`，不再跑额外四路；EPMC/arXiv 主链路的退避与熔断（R1-2.3）不受本开关影响。
 测试：`test/test_fulltext_breaker.py`。真网络实测见本批压测记录（docs/decisions）。
+
+## 补记（2026-09-05 生产实跑）：OpenAlex 那一路每天只有约 100 次
+
+盘点脚本在真库上跑 317 篇时实测到，`api.openalex.org` 已改成**按日额度计费**
+（每请求 $0.001、免费约 $0.1/日、UTC 零点重置），用尽后一律 429 `Insufficient budget`。
+所以四路里的 `route_openalex` 每天实际可用**约 100 次**，之后由 `HOST_BREAKER` 挡下。
+
+这属于设计内的降级、不是缺陷：被挡下的篇目记 `routes_suppressed`，账本按**暂时性失败**处理，
+不进永久跳过集，下批会重试。但两条预期要按此修正：
+
+- 每批额度 80（候选 20 篇 × 4 路）本来就在日额度之内，周度/月度单批不会打满；
+  真正会撞上的是**一天里连跑多批**或存量补抓这类大批量场景。
+- 宣称的「四通道」在日额度用尽后实为三通道，漏判率按三路算。

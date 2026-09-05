@@ -43,18 +43,18 @@
 
 | 缺陷 | 具体位置 | 状态 |
 |---|---|---|
-| [存量条目缺 DOI 从未回补](2026-09-04-missing-identifier-backfill.md) | `scripts/inventory_missing_ids.py` | **第一步已落地**：只读盘点脚本；回填待人按盘点结果决定（改身份键流程） |
+| [存量条目缺 DOI 从未回补](2026-09-04-missing-identifier-backfill.md) | `scripts/inventory_missing_ids.py` | **第一步已跑但未跑完**：OpenAlex 改按日额度计费（免费 ≈100 请求/日、UTC 零点重置），317 篇里只有前 ~105 篇是两源结论；脚本已补 `incomplete` 分类 + `--resume-from`，须隔天续跑约 3 天。回填待人按盘点结果决定（改身份键流程） |
 | [P4 的五处门/证据缺口](2026-09-04-p4-gate-gaps.md) | `~/Desktop/Lab/P4` | **不属本仓库**，应整体搬去该仓库 |
 
-## 已修但有存量数据待处置（跑之前先 dry-run）
+## 已修但有存量数据待处置（划掉的已于 2026-09-05 在真库执行完毕）
 
 | 事项 | 命令 |
 |---|---|
-| 陈旧行内键 / 后缀 keeper（`lin2025Addressing` 等） | **第 1 步**：`PYTHONPATH=. python3.12 scripts/notes_index.py --fix-inline-citekeys`（看计划）→ 加 `--apply`（工具自带三处原子齐改与重建索引） |
-| 227 条缺定位号的期刊书目条目 | **第 2 步**：`PYTHONPATH=. python3.12 scripts/backfill_article_numbers.py --email <邮箱>`（dry-run 看）→ 加 `--apply`（原件先拷进 `.refs_backfill_backup/<时间戳>/`）→ **第 3 步** `scripts/notes_index.py` 重建全局书目。**别用** `repair_references.py --force`：那是整月重建、索引兜底会覆盖既有更权威字段（见 crossref 那条文末）。回滚点：第 1 步失败看工具回执的 refused/partial 清单；第 2 步失败用备份目录整份还原再重建索引 |
+| ~~陈旧行内键 / 后缀 keeper（`lin2025Addressing` 等）~~ | **已于 2026-09-05 执行**：改键 1 条、向量库已同步。⚠️ 概念页 `missingness-causal.md` 的 2 处旧键**路由没覆盖到**（路由按新键找页，而该页只写着旧键），已手工改掉；工具侧缺口见 decisions 文档教训节 |
+| ~~227 条缺定位号的期刊书目条目~~ | **已于 2026-09-05 执行**：候选 232、实补 **45** 条（其余 187 条 Crossref 源里本就没有 article-number）、写 13 份 references.json、备份 `.refs_backfill_backup/20260905T133323/`、全局书目已重建为 2427 条。**别用** `repair_references.py --force`：那是整月重建、索引兜底会覆盖既有更权威字段 |
 | Zotero 里三条未归档条目 | 人在 Zotero 里拖进 ScholarDigest |
 | 169 篇被吞掉的篇末 `---` | 见 `2026-09-04-replace-closeread-eats-trailing-content.md` 文末的 dry-run 脚本（纯版面，不影响解析，补不补由你定）|
-| 额度失败被记成 `no_output` 的篇目：35 篇里 32 篇已随第 3 段 expand 重试自愈，**剩 3 篇**（`zhu2025Fedweight` / `zhao2025Multimodal` / `hong202624hour`） | `PYTHONPATH=. python3.12 scripts/backfill_deepread.py run --expand --apply --citekey zhu2025Fedweight --citekey zhao2025Multimodal --citekey hong202624hour`（需 LLM 额度；见该条文末「后续」） |
+| ~~额度失败被记成 `no_output` 的 3 篇~~ | **已于 2026-09-05 执行**：成功 3 / 失败 0，三篇均拿到真全文（37/34/35 条带 tag），索引与向量库已同步。**必须带 `--redo`**，否则被 `deterministic_failures` 静默跳过。全库同型陈旧条目还剩 4 篇（`liao2021Improving` / `li2023Prediction` / `jin2024Transferb` / `yoo2025Review`），要救回同法加 `--citekey` |
 
 ---
 
