@@ -168,6 +168,16 @@ def load_keeper_index(notes_dir: Path) -> Dict[str, dict]:
     return keepers_by_citekey(index)
 
 
+def _load_backfill_deepread():
+    """按文件路径加载同目录的 backfill_deepread.py，只为取 reason 词汇这一个出处。"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_bd_reasons", Path(__file__).resolve().parent / "backfill_deepread.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_failed(notes_dir: Path, ledger: str) -> List[str]:
     """账本里**真的缺 PDF**的篇目。
 
@@ -176,16 +186,31 @@ def load_failed(notes_dir: Path, ledger: str) -> List[str]:
     `_fetch_report.json` 的人工下载清单里（2026-09-04 第 4 轮审计 CONFIRMED；那天有 35 篇
     正是这样进的清单——见 docs/bugs/2026-09-04-quota-failure-looks-like-no-fulltext.md）。
     额度恢复后它们该走的是 `backfill_deepread run --only-failed`，不是本脚本。
+
+    **判据从 backfill_deepread 单一出处取**，不在这里另写一份字面量：2026-09-05 加了
+    `empty_with_fulltext`（全文已到手、只是这趟没读出东西）之后，这里若还硬编码
+    `llm_unavailable` 一个前缀，就会把它们送去补抓 PDF——白跑公开 API，还混进人工下载清单，
+    正是本函数 docstring 声明自己要防的那件事（对抗审核 MAJOR-5）。
+    `routes_suppressed` 语义上确实没拿到全文，补抓 PDF 合理，故**不**在剔除之列。
     """
     name = ("backfill_expand_progress.json" if ledger == "expand"
             else "backfill_deepread_progress.json")
     p = notes_dir / name
     if not p.exists():
         raise SystemExit("账本不存在：{}".format(p))
-    failed = json.loads(p.read_text(encoding="utf-8")).get("failed") or {}
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    failed = raw.get("failed") or {}
+    # 「全文已到手」的两类：模型侧挂了 / 读了但零产出。都不该来补抓 PDF。
+    _bd = _load_backfill_deepread()
+    have_fulltext = (_bd.LLM_UNAVAILABLE_REASON, _bd.EMPTY_WITH_FULLTEXT_REASON)
+    ver, cur = raw.get("schema_version"), _bd.LEDGER_SCHEMA_VERSION
+    if ver != cur:
+        print("⚠️ 账本 schema v{}（当前 v{}）：reason 词汇在版本之间变过，"
+              "本脚本的剔除判据按当前版本执行。".format(ver if ver is not None else "1(无戳)", cur),
+              flush=True)
     out, skipped = [], 0
     for ck, v in failed.items():
-        if str((v or {}).get("reason") or "").startswith("llm_unavailable"):
+        if str((v or {}).get("reason") or "").startswith(have_fulltext):
             skipped += 1
             continue
         out.append(ck)

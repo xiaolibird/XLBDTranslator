@@ -34,7 +34,7 @@ def test_is_index_fallback_only_flags_entries_missing_both_volume_and_page():
     assert RR._is_index_fallback({"DOI": "10.1/a", "page": "e0266516"}) is False
 
 
-def test_crossref_or_unreachable_separates_404_from_429():
+def test_crossref_or_unreachable_separates_404_from_429(monkeypatch):
     """404 = 源答了确实没有；429/5xx/异常 = 没答上。crossref_by_doi 把两者都吞成 None，
     于是一次抖动写下的兜底事后再也分辨不出该不该补。"""
     class _R:
@@ -52,8 +52,16 @@ def test_crossref_or_unreachable_separates_404_from_429():
             return self.r
     got, ok = RR._crossref_or_unreachable("10.1/a", "", _C(_R(404)))
     assert got is None and ok is True, "404 是源答了：确实没有"
+    # polite_get 对 429 会退避重试（默认真睡 17.5s），注入 sleep 免等
+    import src.scholar.fulltext as _FT
+    real = _FT.polite_get
+    monkeypatch.setattr(_FT, "polite_get",
+                        lambda c, u, **k: real(c, u, **dict(k, sleep=lambda s: None)))
     got, ok = RR._crossref_or_unreachable("10.1/a", "", _C(_R(429)))
     assert got is None and ok is False, "429 是没答上"
+    # 200 但 message 缺失：同样是没答上，不许和 404 混为一谈
+    got, ok = RR._crossref_or_unreachable("10.1/a", "", _C(_R(200, {})))
+    assert got is None and ok is False
 
 
 def test_repair_fallbacks_upgrades_only_and_never_downgrades(tmp_path, monkeypatch):
@@ -69,12 +77,13 @@ def test_repair_fallbacks_upgrades_only_and_never_downgrades(tmp_path, monkeypat
 
     def fake(doi, email, client):
         if doi == "10.1/a":
-            return {"doi": doi, "title": "A", "volume": "12", "page": "e0266516"}, True
+            # 形状照 crossref.parse_crossref_work 的输出（pages 不是 page）
+            return {"doi": doi, "title": "A", "pages": "e0266516", "volume": "12",
+                    "container_title": "某刊"}, True
         raise AssertionError("不该问已权威条目或 arXiv 条目：{}".format(doi))
     monkeypatch.setattr(RR, "_crossref_or_unreachable", fake)
-    monkeypatch.setattr(RR, "_csl_from_crossref",
-                        lambda got, old: {"volume": got["volume"], "page": got["page"],
-                                          "container-title": ""})   # 空值不许覆盖旧值
+    # **不许桩掉 _csl_from_crossref**：第一版就是把它桩掉了，于是「CSL 条目没有 citekey 键」
+    # 这个必崩的 bug 一路绿灯上线（2026-09-05 对抗审核 BLOCKER 2）。这里用真的。
     import src.scholar.fulltext as FT
     monkeypatch.setattr(FT, "ipv4_client",
                         lambda **k: type("C", (), {"__enter__": lambda s: None,
@@ -82,10 +91,12 @@ def test_repair_fallbacks_upgrades_only_and_never_downgrades(tmp_path, monkeypat
     assert RR._repair_fallbacks(f, _A()) == 0
     out = json.loads(f.read_text(encoding="utf-8"))
     assert out[0]["volume"] == "12" and out[0]["page"] == "e0266516"
+    assert out[0]["id"] == "a2024X", "身份键必须沿用 CSL 的 id（CSL 没有 citekey 键）"
+    assert out[0]["title"] == "A"
     assert out[1] == original[1], "已权威条目必须一字节不动"
-    assert out[2] == original[2], "arXiv 条目不该被碰"
-    assert "container-title" not in out[0], "新值为空不许写进去（只升不降）"
-    assert (tmp_path / "科研札记_2026-06_全文精读.references.json.bak").exists(), "改前必须备份"
+    assert out[2] == original[2], "arXiv 条目不该被碰（预印本本来就没有卷页）"
+    baks = list(tmp_path.glob("*.bak"))
+    assert len(baks) == 1 and "20" in baks[0].name, "备份必须带时间戳，不能同名互相覆盖"
 
 
 def test_repair_fallbacks_does_not_write_when_source_is_unreachable(tmp_path, monkeypatch):
@@ -109,8 +120,7 @@ def test_repair_fallbacks_dry_run_touches_nothing(tmp_path, monkeypatch):
     f.write_text(json.dumps(original), encoding="utf-8")
     before = f.read_bytes()
     monkeypatch.setattr(RR, "_crossref_or_unreachable",
-                        lambda *a: ({"doi": "10.1/a", "volume": "9"}, True))
-    monkeypatch.setattr(RR, "_csl_from_crossref", lambda got, old: {"volume": "9"})
+                        lambda *a: ({"doi": "10.1/a", "title": "A", "volume": "9"}, True))
     import src.scholar.fulltext as FT
     monkeypatch.setattr(FT, "ipv4_client",
                         lambda **k: type("C", (), {"__enter__": lambda s: None,

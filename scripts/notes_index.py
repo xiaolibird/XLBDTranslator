@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.scholar.paths import repo_path  # noqa: E402
 from src.scholar.notes_index import (  # noqa: E402
     update_index, write_outputs, fix_citekey_collisions, fix_inline_citekeys,
-    rename_citekeys_in_topic_pages,
 )
 
 
@@ -63,13 +62,8 @@ def main():
     ap.add_argument("--fix-inline-citekeys", action="store_true",
                     help="修复 duplicate 条目行内 citekey 与 keeper 不一致（默认只打印计划；配 --apply 落盘。"
                          "stale-dup 形态改 dup 所在月三处；suffix-keeper 形态把 keeper 的 <基键>b 改回基键）")
-    ap.add_argument("--fix-topic-citekeys", action="store_true",
-                    help="把 topics/（含 qa/）里**已注销**的旧 citekey 就地改成新键（默认只打印计划；"
-                         "配 --apply 落盘）。改完会重算生成块哈希，故不会把页面打成 conflict。"
-                         "**只碰已注销的旧键**——撞键消歧那条路上基键仍由 keeper 持有，"
-                         "页面引用指谁要人判断，工具不替你猜。")
     ap.add_argument("--apply", action="store_true",
-                    help="与 --fix-inline-citekeys / --fix-topic-citekeys 连用：真正写盘（否则 dry-run）")
+                    help="与 --fix-inline-citekeys 连用：真正写盘（否则 dry-run）")
     args = ap.parse_args()
 
     notes_dir = repo_path(args.notes_dir)   # 相对路径锚死仓库根，别随 cwd 漂
@@ -77,35 +71,6 @@ def main():
         print("❌ 札记目录不存在: {}".format(notes_dir))
         return 1
     rc = 0
-    if args.fix_topic_citekeys:
-        import json as _json
-        idx_p = notes_dir / "literature_index.json"
-        live, rmap = set(), []
-        if idx_p.exists():
-            idx = _json.loads(idx_p.read_text(encoding="utf-8"))
-            live = {e.get("citekey") for e in (idx.get("papers") or []) if e.get("citekey")}
-            # 陈旧行内键的 (旧→新) 就是待改的 pair 来源；索引里已记在 stale_inline_citekeys
-            for row in (idx.get("stale_inline_citekeys") or []):
-                o, n = row.get("inline") or row.get("old"), row.get("keeper") or row.get("new")
-                if o and n:
-                    rmap.append((o, n))
-        got = rename_citekeys_in_topic_pages(notes_dir, rmap, live, apply=args.apply)
-        if got["skipped_live"]:
-            print("⏭️ 跳过 {} 个**仍在用**的旧键（撞键路径：基键仍由 keeper 持有，"
-                  "页面引用指谁要人判断）：{}".format(len(got["skipped_live"]),
-                                              ", ".join(got["skipped_live"][:8])))
-        if not got["pages"]:
-            print("✅ topics/ 里没有需要改的已注销 citekey。")
-        else:
-            print("{} {} 页{}：".format("🔧 已改" if args.apply else "📋 计划改",
-                                      len(got["pages"]), "" if args.apply else "（dry-run，未写盘；加 --apply 落盘）"))
-            for d in got["pages"]:
-                print("   {}（{} 个键）".format(d["page"], d["n"]))
-        for e in got["errors"]:
-            print("   ⛔ {} 写盘失败：{}".format(e["page"], e["error"]))
-            rc = 1
-        if not args.apply:
-            return rc
     if args.fix_inline_citekeys:
         side = {}
         res = fix_inline_citekeys(notes_dir, apply=args.apply, side_out=side)

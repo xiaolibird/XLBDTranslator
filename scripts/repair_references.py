@@ -19,6 +19,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -83,12 +84,39 @@ def _crossref_or_unreachable(doi, email, client):
         item = (r.json() or {}).get("message")
     except Exception:                                      # noqa: BLE001
         return None, False
-    return (parse_crossref_work(item) if item else None), True
+    if not item:
+        return None, False      # 200 却没有 message：没答上，别和 404 混为一谈
+    return parse_crossref_work(item), True
+
+
+# 预印本仓库的 DOI 前缀：这些在 Crossref 里**命中良好，但本来就没有卷、没有页**，
+# 拿「缺卷缺页」当「索引兜底」判据会把它们全收进来，每跑一次重查一次、永远修不成。
+# 真库实测：无卷无页且带 DOI 的 375 条里，arXiv 206 + Research Square 43 + bioRxiv/medRxiv 38
+# + SSRN 9 = 296 条（79%）属于此类（2026-09-05 对抗审核 MAJOR-1）。
+_PREPRINT_DOI_PREFIXES = (
+    "10.48550",   # arXiv
+    "10.21203",   # Research Square
+    "10.1101",    # bioRxiv / medRxiv
+    "10.2139",    # SSRN
+    "10.36227",   # TechRxiv
+    "10.31234", "10.31235",   # PsyArXiv / SocArXiv
+)
 
 
 def _is_index_fallback(it):
-    """索引兜底形态：既没卷也没页。Crossref 命中的期刊条目至少会有其一。"""
-    return not (it.get("volume") or it.get("page"))
+    """疑似「索引兜底」形态：期刊条目、既没卷也没页、且不是预印本。
+
+    ⚠️ 这是**启发式**不是判据——真正的索引兜底没有留下任何标记，只能按形状猜。
+    排除预印本后仍可能有 online-first / e-locator 型的正刊条目落进来；它们重查一次
+    发现源里也没有就会计进 `still_none`，不会被改坏（只填空缺、不覆盖已有值），
+    但会占用一次网络请求。宁可多问一次，也不能漏掉真正被抖动写坏的那些。
+    """
+    if it.get("volume") or it.get("page"):
+        return False
+    if str(it.get("type") or "") not in ("", "article-journal"):
+        return False                      # posted-content / chapter 等本就不该有卷页
+    doi = str(it.get("DOI") or "").lower()
+    return not doi.startswith(_PREPRINT_DOI_PREFIXES)
 
 
 def _repair_fallbacks(out_path, args):
@@ -118,11 +146,20 @@ def _repair_fallbacks(out_path, args):
             if not got:
                 still_none += 1
                 continue
-            new = _csl_from_crossref(got, items[i])
-            # 只升不降：新值为空的字段一律保留旧值
+            # `_csl_from_crossref(item, entry)` 的 entry 是**索引行**（取 entry["citekey"]），
+            # 而这里手上是**CSL 条目**（身份键叫 id，全库 2507 条没有一条带 citekey）。
+            # 直接传进去必 KeyError——第一版就是这么写的，一命中真数据就崩，
+            # 而当时的测试恰好把这个函数桩掉了（2026-09-05 对抗审核 BLOCKER 1/2）。
+            shim = {"citekey": items[i].get("id"), "title": items[i].get("title")}
+            new = _csl_from_crossref(got, shim)
+            # **只填空缺，不覆盖已有值**。「新值非空就写」挡得住空值，挡不住**精度降级**：
+            # issued 恒为非空 dict，Crossref 若只给年份，会把盘上的 [[2024,5,1]] 覆写成 [[2024]]；
+            # author 同理会被空格切分的名整体替换（对抗审核 M1，真库 137 条在射程内）。
             merged = dict(items[i])
             for k, v in new.items():
-                if v not in (None, "", [], {}):
+                if v in (None, "", [], {}):
+                    continue
+                if merged.get(k) in (None, "", [], {}):        # 只补空缺
                     merged[k] = v
             if merged != items[i]:
                 items[i] = merged
@@ -134,7 +171,10 @@ def _repair_fallbacks(out_path, args):
         print("【dry-run】未写盘。")
         return 0
     if fixed:
-        bak = out_path.with_suffix(".json.bak")
+        # 备份名带时间戳：固定名会让「第一趟修一半、网络恢复后按提示再跑一趟」把原件盖掉——
+        # 保险恰好在它唯一该起作用的场景（多趟修复要回滚）失效（对抗审核 MAJOR-2）。
+        bak = out_path.with_name("{}.{}.bak".format(out_path.name,
+                                                   datetime.now().strftime("%Y%m%dT%H%M%S")))
         bak.write_bytes(out_path.read_bytes())
         out_path.write_text(_json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
         print("已写 {}（原件备份 {}）\n   下一步：PYTHONPATH=. python scripts/notes_index.py"
@@ -179,7 +219,14 @@ def main() -> int:
     suffix = "全文精读" if args.series == "auto" else "手动精读"
     stem = "科研札记_{}_{}".format(args.month, suffix)
     out_path = nd / "{}.references.json".format(stem)
-    if out_path.exists() and args.repair_fallbacks:
+    if args.repair_fallbacks:
+        if not out_path.exists():
+            print("--repair-fallbacks 需要已存在的书目文件，但它不在：{}\n"
+                  "（要新建整月书目请去掉该参数）".format(out_path), file=sys.stderr)
+            return 2
+        if args.force:
+            print("⚠️ --repair-fallbacks 与 --force 同时给出：按定向修复执行，--force 被忽略。",
+                  file=sys.stderr)
         return _repair_fallbacks(out_path, args)
     if out_path.exists() and not args.force:
         print("已存在且更权威，拒绝覆盖：{}\n"

@@ -271,17 +271,40 @@ lin2025Addressing → lin2025Addressingb | keeper manual 2026-09-02-插补扭曲
    `(基键 → 后缀键)` 而 keeper 仍持基键。把页面上所有 `[@基键]` 一律改指 duplicate 就是猜，
    猜错的那半会静默指向另一篇论文，无备份、不可逆。
 
-**第二版（现行）**：
+**第二版也被压测打回**（两条 BLOCKER）：
 
-- `retired_rekey_pairs(rekey_map, live_citekeys)`：**只处理旧键确已注销**的 pair
-  （陈旧行内键那条路 `后缀键 → 基键`）；撞键路径的键仍在用，一律跳过并明示原因。
+- 我把修复入口做成 `scripts/notes_index.py --fix-topic-citekeys`，从索引的
+  `stale_inline_citekeys` 取 pair——但那个字段落盘时是 `List[str]`（给人读的中文句子），
+  按 dict 解析必 `AttributeError`。今天真库恰好是 0 条，所以「只要出现第一条陈旧键、
+  也就是唯一需要它的时刻，就崩」。
+- 更根本的是**判据本身不成立**：我用「old 键是否还在 `papers[]` 里」来区分两条改键路，
+  可两条路的 old 键**都**在里面（撞键是 `(基键→后缀键)`，陈旧行内键是 `(后缀键→基键)`），
+  于是 `retired_rekey_pairs` 把 100% 的 pair 全滤掉，功能是死的。
+
+**第三版（现行）**：
+
+- **判据由调用方声明，不再事后推断**：`announce_rekey_side_effects(..., old_keys_retired=)`
+  默认 False。只有 `fix_inline_citekeys`（pair 是 `陈旧行内键 → keeper 的键`，旧键真的注销了）
+  传 True；`fix_citekey_collisions` 那条路 keeper 仍持基键，只告警不改。
+  教训：**「哪个方向」这个知识只存在于产生 pair 的那个操作里，索引里没有，别去猜。**
+- 本来就 tampered 的页（有人手改过生成块）**跳过不动**并单列告警——无条件重算哈希会洗掉
+  这个冲突信号，下次重建就直接覆盖掉人写的东西，而那是哨兵存在的唯一理由。
+- 拒绝级联/环的 rekey_map（`A→B` 与 `B→C` 同时出现会把 `[@A]` 变成 `[@C]`，环还会让两条
+  引用塌成一条且不可逆）；`_lint.md` 的 `re.sub` 替换串改用 lambda，新键里的 `\1` 不再被
+  当反向引用。
 - `_rehash_generated_block(text)`：改完重算 `h=`，页面不会被打成 conflict。
 - 逐页 try：一页写不进去只记 `errors` 并报出来，不掀翻调用方后面的重刷索引与向量库同步。
 - `announce_rekey_side_effects` 恢复成**只读**，但同时给两条命令并写清职责：
   `scripts/notes_index.py --fix-topic-citekeys`（修文本，默认 dry-run）
   与 `build_topics --affected-by`（更新内容，另一件事）。
-- 测试 `test/test_rekey_topics_rename_2026_09_05.py` 12 条，含两条 BLOCKER 回归与接线层断言；
-  手工变异验证过有牙（摘掉重算哈希 → 红；放开已注销守卫 → 红）。
+- 测试 `test/test_rekey_topics_rename_2026_09_05.py` **14 条**，含前两版四条 BLOCKER 的回归
+  与接线层断言；手工变异逐条验证有牙（摘掉重算哈希 / 不跳过 tampered / 不拒级联 /
+  替换串不转义 → 各自红，还原 → 14 绿）。
+
+**未修的已知项**（压测报告，都属潜在或超出本条范围）：并发无锁会丢更新
+（两个进程同时改同一 topics/，后写覆盖先写）；`_atomic_write` 无 fsync（防进程死不防断电）
+且 ENOSPC 会留孤儿 tmp；非 UTF-8 页被静默跳过不计入 errors；NFC/NFD 不归一化；
+`[@a; @b]` 等 pandoc 变体不在判据内（真库 1388 处引用里 0 命中）。
 
 ## 遗留
 - **`shi2025Federated` 基键永久悬空，且工具已经报不出它了**（2026-09-05 审计发现）。

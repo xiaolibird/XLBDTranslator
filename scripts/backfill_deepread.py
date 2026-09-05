@@ -77,6 +77,8 @@ EXPAND_LEDGER_NAME = "backfill_expand_progress.json"   # --expand 批独立记�
 #   2 = 2026-09-04 起：classify_failure 四类 + had_fulltext
 #   3 = 2026-09-05 起：新增 empty_with_fulltext（全文在手却零产出，暂时性）
 LEDGER_SCHEMA_VERSION = 3
+# 这些失败发生在「拿全文」之前，账本里本来就不带 had_fulltext——不是旧口径遗留
+_NO_FULLTEXT_FIELD_REASONS = ("fewer:", "no_md", "write:")
 BACKUP_DIR = ".backfill_deepread_backup"
 TARGET_DEPTH = "unknown-legacy"
 _FAIL_STREAK_STOP = 3   # 连续失败几篇就判通路级故障并中止（见 cmd_run 的熔断）
@@ -224,7 +226,13 @@ def legacy_skipped(led: dict) -> set:
     out = set()
     for k, v in (led.get("failed") or {}).items():
         v = v or {}
-        if str(v.get("reason") or "").startswith(TRANSIENT_REASON_PREFIXES):
+        reason = str(v.get("reason") or "")
+        if reason.startswith(TRANSIENT_REASON_PREFIXES):
+            continue
+        # 这三类现役写入本来就不记 had_fulltext（它们在拿到全文之前就失败了），
+        # 把它们算成「旧口径」是可证伪的假话——真库里有 3 条 `write:` 与带 had_fulltext 的
+        # v2 记录同一秒写下（2026-09-05 对抗审核 MAJOR-4）。
+        if reason.startswith(_NO_FULLTEXT_FIELD_REASONS):
             continue
         if "had_fulltext" not in v:
             out.add(k)
@@ -244,16 +252,20 @@ def load_ledger(notes_dir: Path, expand: bool = False) -> dict:
                            "重复改写札记。请先修复或删除它。".format(p, e))
     ver = d.get("schema_version")
     if ver != LEDGER_SCHEMA_VERSION:
-        stale = legacy_skipped(d)
         logger.warning(
             "  ⚠️ 账本 {} 是 schema v{}（当前 v{}）：reason 的语义在版本之间变过，"
             "旧记录正被拿新规则解释。".format(p.name, ver if ver is not None else "1(无戳)",
                                         LEDGER_SCHEMA_VERSION))
-        if stale:
-            logger.warning(
-                "     其中 {} 条在永久跳过集里但**口径存疑**（没记 had_fulltext，无从判断当初"
-                "是真没正文还是全文在手没读成）。要救回：加 --redo 并 --citekey 点名，"
-                "或先删掉这些 failed 记录。".format(len(stale)))
+    # **与版本是否匹配无关**：只要还有口径存疑的条目躺在跳过集里，就每次都报。
+    # 第一版只在 ver != V 时报，而 save_ledger 会无条件把戳刷成 v3——于是「跑一次 → 报一次 →
+    # 戳变新 → 从此永远静默」，把持续可见的问题换成一次性提醒 + 一个内容不实的版本戳
+    #（2026-09-05 对抗审核 MAJOR-3）。静默沉淀正是这条缺陷本身的成因，不能由修法再犯一次。
+    stale = legacy_skipped(d)
+    if stale:
+        logger.warning(
+            "  ⚠️ 账本 {} 里 {} 条在永久跳过集中但**口径存疑**（写于 had_fulltext 之前，"
+            "无从判断当初是真没正文还是全文在手没读成）。要救回：加 --redo 并 --citekey 点名；"
+            "确认不必救就删掉这些 failed 记录，本提醒随之消失。".format(p.name, len(stale)))
     return d
 
 

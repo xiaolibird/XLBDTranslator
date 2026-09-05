@@ -1525,22 +1525,23 @@ def _rehash_generated_block(text: str) -> str:
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
-def retired_rekey_pairs(rekey_map, live_citekeys):
-    """只保留**旧键确已注销**的那些 pair。
+def _reject_chained_pairs(pairs):
+    """拒绝会级联的 rekey_map：`A→B` 与 `B→C` 同时出现时，按顺序替换会把 `[@A]` 变成 `[@C]`。
 
-    改键有两条路，方向相反，混着处理必然改错一半（2026-09-05 对抗审核 BLOCKER 2）：
-      - 陈旧行内键（`fix_inline_citekeys`）：`(后缀键 → 基键)`，旧键**真的没了** → 可以改名。
-      - 撞键消歧（`fix_citekey_collisions`）：`(基键 → 后缀键)`，而**最早月的 keeper 仍持基键**
-        （notes_index.py:1761 `for e in group[1:]` 的语义）。页面上的 `[@基键]` 到底指 keeper
-        还是指那条 duplicate，代码没有任何信息能判断——无条件改指 duplicate 就是猜，
-        猜错的那半会静默指向另一篇论文。这一类只能继续走告警 + 重合成，不许自动改。
+    替换是在**上一轮的输出**上继续做的，所以结果依赖 pair 顺序，环（A↔B）还会让两条不同引用
+    塌成一条且不可逆（2026-09-05 压测实证）。当前两条真实调用链都造不出这种 map，
+    但这是公开函数，宁可当场拒绝也不要静默改错。
     """
-    live = set(live_citekeys or ())
-    return [(o, n) for o, n in (rekey_map or [])
-            if o and n and o != n and o not in live]
+    olds, news = {o for o, _ in pairs}, {n for _, n in pairs}
+    bad = olds & news
+    if bad:
+        raise ValueError("rekey_map 存在级联/环（既是旧键又是新键）：{}".format(sorted(bad)))
+    dup = {o for o in olds if sum(1 for x, _ in pairs if x == o) > 1}
+    if dup:
+        raise ValueError("同一旧键映射到多个新键：{}".format(sorted(dup)))
 
 
-def rename_citekeys_in_topic_pages(notes_dir, rekey_map, live_citekeys=(), *, apply: bool = False):
+def rename_citekeys_in_topic_pages(notes_dir, rekey_map, *, apply: bool = False):
     """把 topics/（含 qa/）里**已注销**的旧 citekey 就地换成新键。确定性、不用 LLM。
 
     为什么必须是改名而不是重合成：扫描判据是「页面文本含旧键」（文本问题），而
@@ -1548,18 +1549,26 @@ def rename_citekeys_in_topic_pages(notes_dir, rekey_map, live_citekeys=(), *, ap
     证据集）。语料涨大后被 max_evidence 挤出证据集的篇目，页面上仍写着旧键而路由看不见它；
     `topics/qa/` 更是根本没有重合成通路（specs 只来自 config/topics.yaml）。
 
-    三条硬约束（都是对抗审核换来的）：
-      1. 只改 `live_citekeys` 里已经不存在的旧键——见 `retired_rekey_pairs`。
-      2. 改完必须重算生成块哈希——见 `_rehash_generated_block`。
+    **调用方必须保证 `rekey_map` 里的旧键确已注销。** 这个判据无法从索引事后推断——
+    撞键消歧的 `(基键→后缀键)` 与陈旧行内键的 `(后缀键→基键)`，两者的旧键都还在 `papers[]` 里，
+    只有产生这批 pair 的那个操作知道哪个方向（2026-09-05 压测 BLOCKER 2：按索引猜会 100% 全滤掉）。
+    故本函数只由 `fix_inline_citekeys` 调用；`fix_citekey_collisions` 那条路的 keeper 仍持基键，
+    页面引用指谁要人判断，**不许自动改**。
+
+    四条硬约束（都是对抗审核与压测换来的）：
+      1. 改完必须重算生成块哈希——见 `_rehash_generated_block`。
+      2. **本来就 tampered 的页跳过**：无条件重算会把「用户手改过」的冲突信号洗掉，
+         下次重建就直接覆盖掉人写的东西，而那正是哨兵存在的唯一理由（压测 M1）。
       3. 逐页容错：一页写不进去不许掀翻整个收尾流程（调用方后面还要重刷索引、同步向量库）。
+      4. 拒绝级联/环的 rekey_map，替换串转义——见 `_reject_chained_pairs`。
 
     vault `02-主题/` 是 topics/ 的派生镜像，改完源头由既有 vault 同步带过去。
     返回 {"pages": [...], "skipped_live": [...], "errors": [...], "applied": bool}。
     """
-    out = {"pages": [], "skipped_live": [], "errors": [], "applied": False}
-    all_pairs = [(o, n) for o, n in (rekey_map or []) if o and n and o != n]
-    pairs = retired_rekey_pairs(all_pairs, live_citekeys)
-    out["skipped_live"] = sorted({o for o, _ in all_pairs} - {o for o, _ in pairs})
+    from .vault import generated_block_tampered
+    out = {"pages": [], "skipped_tampered": [], "errors": [], "applied": False}
+    pairs = [(o, n) for o, n in (rekey_map or []) if o and n and o != n]
+    _reject_chained_pairs(pairs)
     topics_dir = Path(notes_dir) / "topics"
     if not pairs or not topics_dir.is_dir():
         return out
@@ -1567,6 +1576,13 @@ def rename_citekeys_in_topic_pages(notes_dir, rekey_map, live_citekeys=(), *, ap
         try:
             text = page.read_text(encoding="utf-8")
         except Exception:                                  # noqa: BLE001
+            continue
+        rel0 = str(page.relative_to(topics_dir))
+        if generated_block_tampered(text):
+            # 这一页的生成块本来就与 h= 对不上（用户手改过）。重算哈希会把这个冲突信号抹平，
+            # 下次 build_topics 就直接覆盖掉他写的东西。宁可留着旧键，也不许洗掉冲突标记。
+            if any(_page_cites_old_key(text, o, page.name == "_lint.md") for o, _ in pairs):
+                out["skipped_tampered"].append(rel0)
             continue
         is_lint = page.name == "_lint.md"
         new_text, n = text, 0
@@ -1576,19 +1592,20 @@ def rename_citekeys_in_topic_pages(notes_dir, rekey_map, live_citekeys=(), *, ap
             before = new_text
             new_text = new_text.replace("[@{}]".format(old), "[@{}]".format(new))
             if is_lint:
+                # repl 用 lambda 而不是裸字符串：新键里若含 `\1` / `\g<0>` 这类序列，
+                # 裸字符串会被当反向引用解析（`re.error` 直接逃出本函数，或静默替换成整段匹配）。
                 new_text = re.sub(r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(old)),
-                                  new, new_text)
+                                  lambda _m, _n=new: _n, new_text)
             if new_text != before:
                 n += 1
         if not n:
             continue
-        rel = str(page.relative_to(topics_dir))
-        out["pages"].append({"page": rel, "n": n})
+        out["pages"].append({"page": rel0, "n": n})
         if apply:
             try:
                 _atomic_write(page, _rehash_generated_block(new_text))
             except Exception as e:                         # noqa: BLE001
-                out["errors"].append({"page": rel, "error": "{}: {}".format(type(e).__name__, e)})
+                out["errors"].append({"page": rel0, "error": "{}: {}".format(type(e).__name__, e)})
     out["applied"] = bool(apply and out["pages"] and not out["errors"])
     return out
 
@@ -1599,6 +1616,7 @@ def announce_rekey_side_effects(notes_dir: Path,
                                 renamed_entries: List[Dict[str, Any]],
                                 *, settings: Any = None,
                                 rekey_map: Optional[List[Tuple[str, str]]] = None,
+                                old_keys_retired: bool = False,
                                 ) -> Dict[str, Any]:
     """改键收尾：把两个**派生物**的失效讲出来，并 best-effort 把向量库同步回去。
 
@@ -1665,7 +1683,8 @@ def announce_rekey_side_effects(notes_dir: Path,
     # ---- topics/qa 页与 _lint.md：按页聚合列清单，刷新命令用新键并集 ----
     out["topics_pages"] = []
     out["topics_refresh_hint"] = None
-    out["topics_fix_hint"] = None
+    out["topics_renamed"] = []
+    out["topics_skipped_tampered"] = []
     if rekey_map:
         # 去重：撞键组 ≥3 条时同一旧键出现多次（(key,keyb),(key,keyc)），不去重会让
         # 页面命中计数虚高（审计实证：引一次报 2 个旧键）
@@ -1702,12 +1721,25 @@ def announce_rekey_side_effects(notes_dir: Path,
                 logger.warning("      {}（{} 个旧键）".format(p["page"], p["n_old_keys"]))
             if len(out["topics_pages"]) > 20:
                 logger.warning("      …等共 {} 页".format(len(out["topics_pages"])))
-            # 修复文本用文本工具（确定性、会重算生成块哈希、只碰已注销的旧键）；
-            # 重合成是另一件事，管的是**内容**新鲜度，按语义召回路由，盖不全本清单。
-            # 两条命令职责分开写清——此前只给重合成那条，照着跑完旧键还在（本条缺陷的核心）。
-            out["topics_fix_hint"] = "PYTHONPATH=. python scripts/notes_index.py --fix-topic-citekeys --apply"
-            logger.warning("      修文本（推荐，先不加 --apply 看计划）：{}"
-                           .format(out["topics_fix_hint"].replace(" --apply", "")))
+            # 文本问题用文本修法——但**只有调用方知道旧键是否真的注销了**：
+            # 撞键消歧是 (基键→后缀键) 且 keeper 仍持基键，陈旧行内键是 (后缀键→基键) 旧键真没了。
+            # 两者的旧键都还在 papers[] 里，事后从索引推断必然全军覆没（压测 BLOCKER 2 实证）。
+            if old_keys_retired:
+                ren = rename_citekeys_in_topic_pages(notes_dir, rekey_map, apply=True)
+                out["topics_renamed"] = ren["pages"]
+                out["topics_skipped_tampered"] = ren["skipped_tampered"]
+                if ren["pages"]:
+                    logger.warning("      ✅ 已就地改名 {} 页（含 qa/，已重算生成块哈希）：{}".format(
+                        len(ren["pages"]), ", ".join(d["page"] for d in ren["pages"][:8])))
+                for d in ren["skipped_tampered"]:
+                    logger.warning("      ⚠️ {} 生成块本就与 h= 对不上（有人手改过），"
+                                   "跳过不动——重算哈希会洗掉这个冲突信号。请手工改键或先解决冲突。"
+                                   .format(d))
+                for e in ren["errors"]:
+                    logger.error("      ⛔ {} 写盘失败：{}".format(e["page"], e["error"]))
+            else:
+                logger.warning("      ⚠️ 撞键路径：旧键仍由 keeper 持有，页面引用指 keeper 还是指 "
+                               "duplicate 无从判断——**工具不替你猜**，请人工核对后手改。")
             cmd_keys = sorted(affected_new) or new_keys
             out["topics_refresh_hint"] = (
                 "PYTHONPATH=. python scripts/build_topics.py "
@@ -1966,7 +1998,9 @@ def fix_inline_citekeys(notes_dir: Path, *, apply: bool = False,
         for s in result["refused"]:
             logger.warning("      {}".format(s))
     if touched:
-        side = announce_rekey_side_effects(notes_dir, touched, rekey_map=rekey_pairs) or {}
+        # 这条路的 pair 是 (陈旧行内键 → keeper 的键)：旧键**真的注销了**，可以就地改概念页。
+        side = announce_rekey_side_effects(notes_dir, touched, rekey_map=rekey_pairs,
+                                           old_keys_retired=True) or {}
         if side_out is not None:
             side_out.update(side)
     if result["applied"] or result["partial"]:

@@ -663,6 +663,19 @@ def test_legacy_skipped_flags_entries_with_unknown_provenance():
     assert bd.legacy_skipped(led) == {"old1"}
 
 
+def test_legacy_skipped_excludes_reasons_that_never_record_had_fulltext():
+    """`fewer:` / `no_md` / `write:` 是现役写入，本来就不带 had_fulltext（失败发生在拿全文之前）。
+    把它们算成「旧口径遗留」是可证伪的假话——真库里有 3 条 write: 与 v2 记录同一秒写下
+    （2026-09-05 对抗审核 MAJOR-4）。"""
+    led = {"failed": {
+        "a": {"reason": "write:定位失败：note_line=524 对不上"},
+        "b": {"reason": "fewer:只找到 2 段"},
+        "c": {"reason": "no_md"},
+        "d": {"reason": "no_output"},                     # 这条才是真存疑
+    }}
+    assert bd.legacy_skipped(led) == {"d"}
+
+
 def test_load_ledger_warns_once_on_version_mismatch(tmp_path):
     """旧账本（无戳）读进来要告警，并报出存疑条数；新账本不许打扰。"""
     import json
@@ -678,7 +691,9 @@ def test_load_ledger_warns_once_on_version_mismatch(tmp_path):
         _lg.remove(hid)
     txt = "\n".join(lines)
     assert "schema v" in txt and "口径存疑" in txt and led["failed"]
-    # 打过戳的账本：安静
+    # 打过戳之后：版本行安静了，但**存疑提醒必须还在**。
+    # 第一版把「戳变新就永远静默」写成了期望——那等于用一个内容不实的版本戳给问题封口，
+    # 而静默沉淀正是这条缺陷本身的成因（2026-09-05 对抗审核 MAJOR-3）。
     bd.save_ledger(tmp_path, led, expand=True)
     lines.clear()
     hid = _lg.add(lambda m: lines.append(str(m)), level="WARNING")
@@ -686,4 +701,6 @@ def test_load_ledger_warns_once_on_version_mismatch(tmp_path):
         bd.load_ledger(tmp_path, expand=True)
     finally:
         _lg.remove(hid)
-    assert "schema v" not in "\n".join(lines), "版本对得上就别刷屏"
+    txt2 = "\n".join(lines)
+    assert "schema v" not in txt2, "版本对得上就别刷版本行"
+    assert "口径存疑" in txt2, "但只要存疑条目还在，提醒就得一直在"
