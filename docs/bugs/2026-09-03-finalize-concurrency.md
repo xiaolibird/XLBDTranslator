@@ -16,7 +16,7 @@
 | 具体位置 | `scripts/read_pdf.py:408` —— `if (broken or skipped) and not allow_removals:` |
 | 报错情况 | **无任何报错**。`refused=None`，退出码 0，回执是绿的；论文被静默抹出 md / references / sidecar / 全局索引 |
 | 数据是否丢失 | **否**。bundle 仍在 `output/scholar_notes/manual/<月>/`，重跑 `finalize` 即复原 |
-| 复现测试 | `test/test_read_pdf_cli.py::test_rebuild_month_must_not_drop_bundle_still_on_disk`（`xfail(strict=True)`） |
+| 复现测试 | `test/test_read_pdf_cli.py::test_rebuild_month_must_not_drop_bundle_still_on_disk`（**标记已于 2026-09-04 摘除，现在正常 pass**；当时是 `xfail(strict=True)`） |
 | 修法要点 | flock 与「路径集 + mtime 签名重查」**两者都要**，防的不是同一件事（见文末） |
 
 ---

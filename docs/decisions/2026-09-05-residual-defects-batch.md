@@ -74,7 +74,16 @@
    派生物按回执逐一扫过：概念页 `build_topics.py --affected-by lin2025Addressing` 刷新 2 页；
    **第 3 页 `missingness-causal.md` 路由没选中**（它引的是旧键、而路由按新键找受影响页，
    自然找不到自己），2 处旧键由编排者手工改掉——这条是工具的真实缺口，见下方教训。
-   docx 提示的那份实际不存在（本库当前不留 docx 产物），无须重渲染。
+   **docx 那条我一开始判错了**：当时用 `find output/scholar_notes …` 查，返回 0，就写下了
+   「本库当前不留 docx 产物」。实际盘上有 **94 份 docx**——错因是 Bash 的工作目录跨调用保持，
+   前一条命令 `cd` 进了 `output/scholar_notes`，于是这句在找 `output/scholar_notes/output/scholar_notes`，
+   而 `2>/dev/null` 把「路径不存在」吞了。**工具本来就不会误报**：`stale_docx` 的构造条件就是
+   `if docx.exists()`，报出来 = 文件必然在。
+   已订正并处置：那份 `科研札记_2026-09-02-插补扭曲_手动精读.docx` 确实还写着 `lin2025Addressingb`，
+   已备份原件、重渲染、替换，复核 94 份 docx 全库无旧键残留。
+   **顺带暴露同一个病的第三例**：告警看的是 `notes_dir/<名>.docx`（`notes_index.py:1532`），
+   而它建议的 `scripts/render_notes.sh` 写到 `$NOTES_DIR/rendered/`（`render_notes.sh:58`）——
+   照命令跑完，告警看的那份一个字没变。顶层 94 份 vs `rendered/` 2 份，就是这么攒出来的。
 2. `scripts/backfill_article_numbers.py --email <邮箱> --apply`（约 227 条缺 page 的期刊条目按 DOI 回查 Crossref 补定位号）。
    **回滚**：原件整份在 `.refs_backfill_backup/<时间戳>/`，还原 = `cp <备份>/<文件名> output/scholar_notes/`（脚本本身无 restore 子命令，就是整份拷回）。
    **实跑**：候选 232 条（比台账估的 227 多 5，期间新入库了几篇），**可补 45 条**、

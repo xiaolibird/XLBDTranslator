@@ -103,7 +103,8 @@ PY
 `backfill_deepread` 写回 sidecar）→ vault front matter 三个键（并进受管键元组，否则幂等性破）→
 `ingest._rehydrate_close_readings` 回读。两者**可同时为真**。缺失 = 未知（老 sidecar），
 `SCHEMA_VERSION` 不动。`fulltext_truncated` 保留不变；「按覆盖率挑最该重跑的几篇」请看
-`by_total_cap`。「精读偏薄」告警改按字段说话，不再从 body_chars 与上限的相等关系倒推。
+`by_total_cap`——但**只对 2026-09-05 之后新写的条目有效**，存量老条目该键一律缺失，
+拿它筛存量会得到 0 篇（见 closeread-still-truncates 那条的警告）。「精读偏薄」告警改按字段说话，不再从 body_chars 与上限的相等关系倒推。
 
 现库 19 篇截断 keeper：14 篇总上限截尾（两轮读能救）/ 5 篇单页削页（抬总上限无用）。
 测试：`test/test_truncation_two_pass.py`（① ⑤ 节）。

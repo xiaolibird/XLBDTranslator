@@ -68,5 +68,11 @@
 - 三条链路都接了：周度 ingest / 月度 backfill_notes / backfill_deepread（含本地 PDF 路径）。
   `closeread_tail_max_chars=0` = 关掉第二轮，行为与旧版逐字节一致。
 
-测试：`test/test_truncation_two_pass.py`（④ 节）。存量 14 篇总上限截尾的 keeper 可按
-`fulltext_truncated_by_total_cap == true` 挑出来重跑（见 truncated-flag 那条）。
+测试：`test/test_truncation_two_pass.py`（④ 节）。
+
+⚠️ **存量 14 篇不能按 `fulltext_truncated_by_total_cap == true` 挑**（2026-09-05 审计实测：
+这样筛出 **0 篇**）。那 14 篇是 2026-09-05 之前写的，压根没有这个键——正是本批自己定的
+「缺失 = 未知（老 sidecar）」。全库 2525 条里只有 35 条带此键（全是 09-05 之后新写的），
+其中 true 0 条。**可用的筛法是本文「复现」块里的 `fulltext_chars >= 119000`**，
+跑出 19 篇截断 keeper = 14 总上限 + 5 单页削页。
+新字段只对**今后**新写的条目有判别力，拿它筛存量必然空手而归。

@@ -35,7 +35,7 @@
 | [精读节标题是机读锚点：加后缀会静默丢 reading_source](2026-09-04-closeread-heading-contract.md) | 测试 | **已防复发**：另两对渲染↔解析契约补了往返测试 |
 | [Zotero connector 的 saveItems 吞掉 target](2026-09-04-zotero-saveitems-target-ignored.md) | `zotero_sync.save_items(target)` + `updateSession` | **已修**（随本批提交）；BBT 非 ASCII 键加告警 |
 | [额度耗尽被记成 `no_output`：35 篇「全文已到手但没读成」混进待下载清单](2026-09-04-quota-failure-looks-like-no-fulltext.md) | `closereading.is_llm_unavailable` + `diag` 出参 / `backfill_deepread.classify_failure` | **已修复；35 篇存量已清零**（32 自愈 + 3 篇 2026-09-05 `--redo` 重跑）。⚠️ 同型陈旧条目另有 4 篇未处理，见该条文末 |
-| [`replace_closeread` 吞掉精读节之后到下一篇之间的全部内容](2026-09-04-replace-closeread-eats-trailing-content.md) | `backfill_deepread.replace_closeread` | **已修复**（审计中发现）；存量 169 篇的篇末 `---` 已丢，补不补见该文末 |
+| [`replace_closeread` 吞掉精读节之后到下一篇之间的全部内容](2026-09-04-replace-closeread-eats-trailing-content.md) | `backfill_deepread.replace_closeread` | **已修复**（审计中发现）；存量 **270** 篇的篇末 `---` 已丢（原记 169，09-05 复核订正），补不补见该文末 |
 | [一次 run 内第二篇的备份会覆盖第一篇的原件](2026-09-04-backup-stamp-overwrites-original.md) | `backfill_deepread.backup_files` | **已修复**（审计中发现，判 BLOCKER）：同名已存在就不覆盖 |
 | [`find_local_pdf` 单向词面匹配会认下别篇论文的 PDF](2026-09-04-find-local-pdf-one-way-match.md) | `backfill_deepread.find_local_pdf` | **已修复**（审计中发现）：加反向覆盖 + 实词下限，与 fulltext 同一套判据 |
 
@@ -43,7 +43,7 @@
 
 | 缺陷 | 具体位置 | 状态 |
 |---|---|---|
-| [存量条目缺 DOI 从未回补](2026-09-04-missing-identifier-backfill.md) | `scripts/inventory_missing_ids.py` | **第一步已跑但未跑完**：OpenAlex 改按日额度计费（免费 ≈100 请求/日、UTC 零点重置），317 篇里只有前 ~105 篇是两源结论；脚本已补 `incomplete` 分类 + `--resume-from`，须隔天续跑约 3 天。回填待人按盘点结果决定（改身份键流程） |
+| [存量条目缺 DOI 从未回补](2026-09-04-missing-identifier-backfill.md) | `scripts/inventory_missing_ids.py` | **第一步已跑但未跑完**：OpenAlex 改按日额度计费（免费 ≈100 请求/日、UTC 零点重置），首轮 317 篇里只有前 ~105 篇问到了两源，但补上 provenance 后已用新口径全量重跑，**当前报告两源都答上的是 0 条**：301 条只有 crossref、16 条故意不问；脚本已补 `incomplete` 分类 + `--resume-from`，**待重查 301 条**，按日额度约 3 天。回填待人按盘点结果决定（改身份键流程） |
 | [P4 的五处门/证据缺口](2026-09-04-p4-gate-gaps.md) | `~/Desktop/Lab/P4` | **不属本仓库**，应整体搬去该仓库 |
 
 ## 已修但有存量数据待处置（划掉的已于 2026-09-05 在真库执行完毕）
@@ -53,7 +53,7 @@
 | ~~陈旧行内键 / 后缀 keeper（`lin2025Addressing` 等）~~ | **已于 2026-09-05 执行**：改键 1 条、向量库已同步。⚠️ 概念页 `missingness-causal.md` 的 2 处旧键**路由没覆盖到**（路由按新键找页，而该页只写着旧键），已手工改掉；工具侧缺口见 decisions 文档教训节 |
 | ~~227 条缺定位号的期刊书目条目~~ | **已于 2026-09-05 执行**：候选 232、实补 **45** 条（其余 187 条 Crossref 源里本就没有 article-number）、写 13 份 references.json、备份 `.refs_backfill_backup/20260905T133323/`、全局书目已重建为 2427 条。**别用** `repair_references.py --force`：那是整月重建、索引兜底会覆盖既有更权威字段 |
 | Zotero 里三条未归档条目 | 人在 Zotero 里拖进 ScholarDigest |
-| 169 篇被吞掉的篇末 `---` | 见 `2026-09-04-replace-closeread-eats-trailing-content.md` 文末的 dry-run 脚本（纯版面，不影响解析，补不补由你定）|
+| 270 篇被吞掉的篇末 `---`（原记 169，2026-09-05 复核订正）| 见 `2026-09-04-replace-closeread-eats-trailing-content.md` 文末的 dry-run 脚本（纯版面，不影响解析，补不补由你定）|
 | ~~额度失败被记成 `no_output` 的 3 篇~~ | **已于 2026-09-05 执行**：成功 3 / 失败 0，三篇均拿到真全文（37/34/35 条带 tag），索引与向量库已同步。**必须带 `--redo`**，否则被 `deterministic_failures` 静默跳过。全库同型陈旧条目还剩 4 篇（`liao2021Improving` / `li2023Prediction` / `jin2024Transferb` / `yoo2025Review`），要救回同法加 `--citekey` |
 
 ---

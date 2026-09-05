@@ -1,7 +1,7 @@
 # `replace_closeread` 吞掉精读节之后到下一篇之间的全部内容（篇末 `---` 与人手写批注）
 
 日期：2026-09-04
-状态：**已修复（2026-09-04 台账批）**；**存量 169 篇的篇末 `---` 已经丢了**，处置见文末
+状态：**已修复（2026-09-04 台账批）**；**存量 270 篇的篇末 `---` 已经丢了**（2026-09-05 复核订正，原记 169 偏低 101 篇），处置见文末
 严重度：中——不丢论文、不丢精读句，丢的是篇末分隔线与写在那里的人工批注；解析不受影响（`_SECTION_RE` 认的是 `## ` 标题）
 发现者：2026-09-04 台账批第 3 轮对抗审计（压测镜片报出，验伪镜片用**生产数据**证实）
 
@@ -39,8 +39,14 @@ merged = lines[:cr_start] + new_lines + lines[cr_end:]
 
 | 口径 | 篇数 | 丢了篇末 `---` |
 |---|---|---|
-| 被 `backfill_deepread` 改写过的 | 272 | **169** |
-| 未被改写过的 | 2223 | **0** |
+| 修复前（< `021b33e`）被 `backfill_deepread` 改写过的 | 279 | **270** |
+| 修复后被改写过的（45 篇 09-04 23:xx + 3 篇 09-05） | 48 | **0** |
+| 从未被改写过的 | 2103 | **0** |
+
+> 2026-09-05 复核订正：原表记「272 篇 / 丢 169」。正确的归因是把「下一篇标题前最后一个非空行」
+> 算到**上一篇**头上（那才是 `replace_closeread` 实际吞掉的东西）；按本篇归因只得 80，是错的。
+> 因果结论不变（对照组恰好 0），只是数字偏低了 101 篇。审计之后再无「修复前」的重写发生，
+> 这 270 篇是个不再增长的闭集。
 
 对照组是干净的 0，因果链没有别的解释。
 
@@ -55,14 +61,21 @@ merged = lines[:cr_start] + new_lines + lines[cr_end:]
 
 ## 存量处置（未做，需要人决定）
 
-那 169 篇的 `---` 无法从任何备份**精确**还原（`.backfill_deepread_backup` 只保留每次 run 的
+那 270 篇的 `---` 无法从任何备份**精确**还原（`.backfill_deepread_backup` 只保留每次 run 的
 原件，且早期的 run 已被上一条缺陷
 `2026-09-04-quota-failure-looks-like-no-fulltext.md` 之外的另一条 BLOCKER 覆盖过——见本批对
 `backup_files` 的修复）。但这条分隔线是**纯粹的版面元素**、位置完全确定（每篇 `## ` 标题之前），
 可以机械补回：
 
+⚠️ **下面这个脚本判据不对，别照着落盘**（2026-09-05 审计实测）：它原样跑会报
+**94 个文件、364 处**，其中 **94 处是每份 md 的 `## 优先级速览` 小节标题**——那不是论文边界，
+本来就不该有 `---`。照它落盘会往 94 个文件的概览节前插入错误分隔线。
+`l.startswith('## ')` 数不准（把非论文小节也算进去），「往前看 3 行」也筛不净。
+
+**正确的判据是拿索引的 `note_line` 定位论文边界**（下面第二段），它给出 270 处，与实证表一致。
+
 ```bash
-# 先 dry-run 看会改几处；确认后再落盘。改前务必自己拷一份 output/scholar_notes。
+# ❌ 原始脚本，仅作记录，报 364 处（含 94 处误报）
 python3 - <<'PY'
 import glob, re
 for f in sorted(glob.glob('output/scholar_notes/科研札记_*.md')):
@@ -72,6 +85,32 @@ for f in sorted(glob.glob('output/scholar_notes/科研札记_*.md')):
             and '---' not in [x.strip() for x in lines[max(0, i-3):i]]]
     if need:
         print(f, '缺分隔线', len(need), '处')
+PY
+```
+
+```bash
+# ✅ 按索引 note_line 定论文边界，只数真正的篇末（给出 270 处）
+PYTHONPATH=. python3 - <<'PY'
+import json
+from pathlib import Path
+idx = json.load(open('output/scholar_notes/literature_index.json'))
+byfile = {}
+for e in idx['papers']:          # 顶层键是 papers，不是 entries
+    nf, nl = e.get('note_file'), e.get('note_line')
+    if nf and nl:
+        byfile.setdefault(nf, []).append((nl, e.get('citekey')))
+lost = []
+for nf, lst in sorted(byfile.items()):
+    p = Path('output/scholar_notes') / nf
+    if not p.exists():
+        continue
+    lines = p.read_text(encoding='utf-8').split('\n')
+    lst.sort()
+    for i, (nl, ck) in enumerate(lst[:-1]):          # 末篇没有「下一篇」，不参与
+        seg = [l for l in lines[nl:lst[i + 1][0] - 1] if l.strip()]
+        if seg and seg[-1].strip() != '---':
+            lost.append((nf, ck))
+print('缺篇末分隔线', len(lost), '处，涉及', len({f for f, _ in lost}), '份 md')
 PY
 ```
 

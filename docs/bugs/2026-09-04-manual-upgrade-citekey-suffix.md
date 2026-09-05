@@ -1,7 +1,7 @@
 # 手动精读升级已入库论文时，keeper 拿到后缀键、干净基键被 duplicate 占住并从全局书目里消失
 
 日期：2026-09-04（观察发生在 2026-09-03 的精读入库会话）
-状态：**A+B 均已修（2026-09-04）；存量已于 2026-09-05 在真库处置完毕**（`lin2025Addressingb → lin2025Addressing`，成功 1 / 拒绝 0 / 半改 0，向量库已同步；但概念页 `missingness-causal.md` 的 2 处旧键路由没覆盖到、由人手工改掉，见文末「存量处置」）。原状态：未修
+状态：**A+B 均已修（2026-09-04）；存量只处置了一半（2026-09-05）**——`lin2025Addressing` 已闭环，但 **`shi2025Federated` 仍悬空且工具已看不见它**（见文末「遗留」）（`lin2025Addressingb → lin2025Addressing`，成功 1 / 拒绝 0 / 半改 0，向量库已同步；但概念页 `missingness-causal.md` 的 2 处旧键路由没覆盖到、由人手工改掉，见文末「存量处置」）。原状态：未修
 严重度：**中高**——不丢数据，但**已发出的 `[@基键]` 引用在全局书目里悬空**，且已实际波及 npj 主稿 v10
 发现者：xiaolibird / Claude（2026-09-03 `read-paper` 精读 `shi2025Federatedb` 会话）
 
@@ -256,3 +256,17 @@ lin2025Addressing → lin2025Addressingb | keeper manual 2026-09-02-插补扭曲
 ## 遗留
 
 - 上面那条概念页路由缺口（未修）。
+- **`shi2025Federated` 基键永久悬空，且工具已经报不出它了**（2026-09-05 审计发现）。
+  本文 `:215` 列的「8 处引用自动恢复」= 6 处 `@lin2025Addressing` + 2 处 `@shi2025Federated`。
+  09-05 只执行了 lin 那 1 条改键；shi 这边实测：
+
+      all_references.json  有 shi2025Federatedb / 没有 shi2025Federated
+      向量库              shi2025Federatedb 70 chunk / shi2025Federated 0 chunk
+      P4 手稿             manuscript_npj_v2.md 仍写 [@shi2025Federated]
+      find_stale_inline_citekeys(index) → 0 条
+
+  为什么工具看不见：09-03 的「止血」（见本文 `:127-131`）把 duplicate 的行内键**改成了后缀键**，
+  于是行内键与 keeper 两侧一致、陈旧检测天然不报。当时那节自己就写着「这个方向让丑键成为规范键……
+  是止血，不是修法」——代价现在兑现了：`--fix-inline-citekeys` **永远不会再把它列进计划**。
+  要救回只能人工发起一次 keeper 改键（`shi2025Federatedb → shi2025Federated`），属改身份键操作，
+  未在本批执行。
