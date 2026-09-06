@@ -252,7 +252,11 @@ def test_answered_reads_sources_ok_and_degrades_safely_on_legacy_reports():
     legacy = {"hits": [{"source": "openalex", "doi": "10.1/x"}]}
     assert INV._answered(legacy) == {"openalex"}, "旧报告：出过命中必然答过"
     assert INV._answered({"hits": []}) == set(), "旧报告无命中 → 无从判断，全部重问"
-    assert INV.ALL_SOURCES - INV._answered(legacy) == {"crossref"}
+    # 2026-09-06 起 ALL_SOURCES 多了 zotero_ts（本机 translation-server 直链源），
+    # 所以旧报告要重问的不只 crossref。断言改成「答过的不再问、没答过的都要问」，
+    # 不再把源的个数钉死。
+    assert INV.ALL_SOURCES - INV._answered(legacy) == INV.ALL_SOURCES - {"openalex"}
+    assert "crossref" in INV.ALL_SOURCES - INV._answered(legacy)
 
 
 def test_render_md_calls_out_incomplete_and_how_to_resume():
@@ -360,3 +364,75 @@ def test_plan_updates_counts_unreachable_separately_from_none():
     upd, n_cand, n_none, n_unchecked, n_unreach = BA.plan_updates(items, lambda d: table[d])
     assert n_cand == 4 and [p for _, p in upd] == ["281"]
     assert (n_none, n_unchecked, n_unreach) == (1, 1, 1), "三种口径不许互相吞并"
+
+
+def test_extract_url_identifier_reads_ids_the_entry_already_carries():
+    """条目自己的 url 里常写着标识——抽出来零网络、零额度，而且是直链不是模糊匹配。"""
+    f = INV.extract_url_identifier
+    assert f("https://pubmed.ncbi.nlm.nih.gov/35309007/") == ("pmid", "35309007")
+    assert f("https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8378618/") == ("pmc", "PMC8378618")
+    assert f("https://dl.acm.org/doi/10.1145/3459930.3469547") == ("doi", "10.1145/3459930.3469547")
+    assert f("https://doi.org/10.1038/s41591-021-01506-3") == ("doi", "10.1038/s41591-021-01506-3")
+    assert f("https://arxiv.org/abs/2401.12345") == ("arxiv", "2401.12345")
+    # Scholar 跳转 / 聚合站：没有标识可抽，必须返回 None 而不是瞎猜
+    assert f("https://scholar.google.com/scholar_url?url=xxx") is None
+    assert f("https://search.proquest.com/docview/123") is None
+    assert f("") is None and f(None) is None
+
+
+def test_direct_link_hits_use_a_lower_similarity_floor():
+    """直链的相似度只承担**确认**职责，标题检索要承担**识别**职责，门槛本就不同。
+    实测 31 条真结果：min 0.75 / 中位 1.00 / 0.70 以下为零（2026-09-06）。
+    用 0.92 那档会把 9 条正确的直链命中全判成 ambiguous。"""
+    entry = {"title": "Fluid balance and acute lung injury in children and young adults",
+             "year": 2026, "authors": ["Seo"], "decision": "INCLUDE", "dedup_key": "title:x"}
+    ts_hit = {"source": INV.TS_SOURCE, "title": entry["title"], "doi": "10.1007/s00431-026-07285-8",
+              "year": 2026, "authors": ["Seo"], "sim": 0.85}
+    cat, best, _ = INV.classify(entry, [ts_hit])
+    assert cat == "fillable" and best["doi"].startswith("10.1007")
+    # 同样 0.85 但来自标题检索 → 只能是 ambiguous（识别职责没达标，0.85 < SIM_FILLABLE 0.92）
+    assert INV.classify(entry, [dict(ts_hit, source="crossref")])[0] == "ambiguous"
+    # 更低的 0.79：标题检索连候选门槛（SIM_CANDIDATE 0.80）都进不去 → no_hit；
+    # 直链同分仍可用（门槛 0.70），这正是分档的意义
+    assert INV.classify(entry, [dict(ts_hit, source="crossref", sim=0.79)])[0] == "no_hit"
+    assert INV.classify(entry, [dict(ts_hit, sim=0.79)])[0] == "fillable"
+    # 直链也不是免检：年份对不上照样降级交人看
+    assert INV.classify(dict(entry, year=2019), [ts_hit])[0] == "ambiguous"
+
+
+def test_confirmed_pmid_counts_as_a_usable_identifier():
+    """TS 用 url 里的 PMID 解出正确标题后，那个 PMID **就是**可用身份（dedup_key 有 pmid: 档）。
+    只认 DOI 会把已确认身份的条目报成 no_hit——「确认了却说没找到」是记账错误。"""
+    entry = {"title": "Recurrent neural network based time-series modeling",
+             "year": 2021, "authors": ["Nayebi"], "decision": "INCLUDE", "dedup_key": "title:x"}
+    hit = {"source": INV.TS_SOURCE, "title": entry["title"], "doi": None, "pmid": "35309007",
+           "year": 2021, "authors": ["Nayebi"], "sim": 1.0}
+    cat, best, _ = INV.classify(entry, [hit])
+    assert cat == "fillable" and best["pmid"] == "35309007"
+    # 没有任何标识的命中仍然不算
+    assert INV.classify(entry, [dict(hit, pmid=None)])[0] == "no_hit"
+
+
+def test_resume_carries_forward_previously_answered_sources(tmp_path, monkeypatch, capsys):
+    """上一轮答上的源必须结转进新报告的 sources_ok，否则下次续跑会把它们当没问过重问——
+    `--resume-from` 的全部意义就是「只补问没答上的那一源」
+    （2026-09-07 实测：不结转会让 crossref 对全部 301 条重问一遍）。"""
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    (nd / "literature_index.json").write_text(json.dumps({"papers": [
+        {"citekey": "a2024X", "dedup_key": "title:fed",
+         "title": "Federated learning for missing data in electronic health records",
+         "decision": "INCLUDE", "year": 2024, "month": "2024-01"}]}), encoding="utf-8")
+    prev = tmp_path / "prev.json"
+    prev.write_text(json.dumps({"records": [
+        {"citekey": "a2024X", "category": "incomplete", "hits": [],
+         "title": "Federated learning for missing data in electronic health records",
+         "sources_ok": ["crossref"], "sources_failed": ["openalex", "zotero_ts"]}]}),
+        encoding="utf-8")
+    monkeypatch.setattr(INV, "repo_path", lambda x: nd if str(x).endswith("notes") else tmp_path / str(x))
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(nd),
+                                      "--resume-from", str(prev), "--dry-run"])
+    assert INV.main() == 0
+    out = capsys.readouterr().out
+    assert "待重查 1 条" in out and "crossref" not in out.split("待重查")[1][:60], \
+        "crossref 已答过，不该再出现在待重查的缺源清单里"

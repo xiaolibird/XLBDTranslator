@@ -52,7 +52,20 @@ SIM_STRONG = 0.97            # 相似度极高时允许首作者缺失/对不上
 SIM_CANDIDATE = 0.80         # 低于这个连 ambiguous 都不算，视为没命中
 YEAR_TOLERANCE = 1           # 预印本 vs 正刊差一年是常态
 MIN_TITLE_WORDS = 4          # 实词太少的标题对谁都像，不查（同 fulltext._ARXIV_TITLE_MIN_WORDS）
-ALL_SOURCES = {"crossref", "openalex"}
+ZOTERO_TS = "http://127.0.0.1:1969"      # 本机 docker 里的 Zotero translation-server
+TS_SOURCE = "zotero_ts"
+ALL_SOURCES = {"crossref", "openalex", TS_SOURCE}
+
+# **直链**来源（url → 出版商页 → DOI）的相似度门槛，比标题检索低。
+# 依据不是想象，是实测：2026-09-06 拿 31 条真候选跑 translation-server，29 条拿到 DOI，
+# 相似度 min 0.75 / p25 0.80 / 中位 1.00，**0.70 以下一条都没有**；低分那几条逐条人工核过，
+# 全是同一篇（差异来自标题长度与分词，不是指错论文）。
+# 为什么可以低：标题检索是「拿标题去猜哪篇」，相似度承担**识别**职责；直链是「顺着本条目
+# 自己的 url 走到出版商页」，相似度只承担**确认**职责——两者要求本就不同。
+# 年份与首作者两道闸照旧生效（实测里 martin2019Predictingr 库年份 2019 而 DOI 是 2025 刊，
+# 正是靠年份闸判进 ambiguous 交人看的）。
+SIM_DIRECT_LINK = 0.70
+DIRECT_LINK_SOURCES = {TS_SOURCE}
 
 
 def _answered(rec: Dict[str, Any]) -> set:
@@ -110,7 +123,15 @@ def classify(entry: Dict[str, Any], hits: List[Dict[str, Any]],
     if len(title_words(entry.get("title") or "")) < MIN_TITLE_WORDS:
         return "ambiguous", None, (drop or "标题实词不足 {} 个，检索结果不可信".format(MIN_TITLE_WORDS))
 
-    good = [h for h in hits if h.get("doi") and (h.get("sim") or 0) >= SIM_CANDIDATE]
+    def _floor(h):
+        """候选门槛按来源分档：直链只需确认，标题检索要承担识别。"""
+        return SIM_DIRECT_LINK if h.get("source") in DIRECT_LINK_SOURCES else SIM_CANDIDATE
+
+    def _ident(h):
+        """这条命中给出了可用身份标识没有——DOI 或（经直链确认的）PMID/PMC 都算。"""
+        return h.get("doi") or h.get("pmid") or h.get("pmc")
+
+    good = [h for h in hits if _ident(h) and (h.get("sim") or 0) >= _floor(h)]
     if not good:
         if failed_sources:
             return "incomplete", None, (drop or "")
@@ -130,7 +151,10 @@ def classify(entry: Dict[str, Any], hits: List[Dict[str, Any]],
         drop = "裁决为 MAYBE 且相似度 {:.2f} < {:.2f}，不值得为它动身份键".format(sim, SIM_STRONG)
     yo = year_ok(entry.get("year"), best.get("year"))
     fa = first_author_matches(entry.get("authors") or [], best.get("authors") or [])
-    if sim >= SIM_FILLABLE and yo is not False and (fa is True or (fa is None and sim >= SIM_STRONG) or sim >= 0.99):
+    fill_at = SIM_DIRECT_LINK if best.get("source") in DIRECT_LINK_SOURCES else SIM_FILLABLE
+    if sim >= fill_at and yo is not False and (
+            best.get("source") in DIRECT_LINK_SOURCES        # 直链：来源即证据，不再要首作者
+            or fa is True or (fa is None and sim >= SIM_STRONG) or sim >= 0.99):
         return "fillable", best, drop
     return "ambiguous", best, drop
 
@@ -140,6 +164,65 @@ def _norm_doi(d) -> str:
 
 
 # ---------------- 联网：两源 ----------------
+
+_URL_ID_PATS = [
+    ("pmid",  re.compile(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d{6,9})", re.I)),
+    ("pmc",   re.compile(r"/pmc/articles/(PMC\d+)", re.I)),
+    ("doi",   re.compile(r"doi\.org/(10\.\d{4,9}/[^?#\s]+)", re.I)),
+    ("doi",   re.compile(r"/doi/(?:abs/|full/|pdf/|epdf/)?(10\.\d{4,9}/[^?#\s]+)", re.I)),
+    ("arxiv", re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", re.I)),
+]
+
+
+def extract_url_identifier(url: str):
+    """条目自己的 url 里是否直接写着标识。返回 (类型, 值) 或 None。
+
+    这批条目的 url 是入库时记下的落地页，标识就嵌在里面——`pubmed.../35309007/`、
+    `/pmc/articles/PMC8378618/`、`/doi/10.1145/xxx`。抽出来零网络、零额度、且是**直链**，
+    比拿标题去模糊检索可信得多。真库实测 301 条待查里 41 条属此类。
+    """
+    u = (url or "").strip()
+    for kind, pat in _URL_ID_PATS:
+        m = pat.search(u)
+        if m:
+            return kind, m.group(1).rstrip(".,;")
+    return None
+
+
+def query_translation_server(payload: str, *, endpoint: str = "web", timeout: float = 45.0):
+    """本机 Zotero translation-server：`/web` 收 url、`/search` 收标识。返回 (命中|None, 是否答上)。
+
+    为什么用它：`/web` 顺着条目自己的 url 走到出版商页面把 DOI 抓回来，是**直链**而非模糊匹配；
+    本地 docker、无外部日额度，不受 OpenAlex 按日计费的限制（2026-09-06 实测出版商域名 29/31 命中）。
+    抓不动的（聚合站、反爬页）返回 (None, False) 落到下一个源，绝不当成「源里也没有」。
+    """
+    import urllib.error
+    import urllib.request
+    url = "{}/{}".format(ZOTERO_TS, endpoint)
+    req = urllib.request.Request(url, data=(payload or "").encode("utf-8"),
+                                 headers={"Content-Type": "text/plain"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8"))
+    except Exception:                                      # noqa: BLE001
+        return None, False                                 # 服务没起 / 抓不动 / 解析不出：没答上
+    it = body[0] if isinstance(body, list) and body else (body if isinstance(body, dict) else {})
+    if not isinstance(it, dict) or not it.get("title"):
+        return None, False
+    doi = (it.get("DOI") or "").strip() or None
+    year = None
+    m = re.search(r"(\d{4})", str(it.get("date") or ""))
+    if m:
+        year = int(m.group(1))
+    authors = []
+    for c in (it.get("creators") or []):
+        if (c or {}).get("creatorType") == "author":
+            nm = (c.get("lastName") or "").strip() or (c.get("name") or "").strip()
+            if nm:
+                authors.append(nm)
+    return {"source": TS_SOURCE, "title": it.get("title") or "", "doi": doi,
+            "year": year, "authors": authors, "sim": 0.0}, True
+
 
 def query_crossref(title: str, email: str, client) -> Tuple[Optional[Dict[str, Any]], bool]:
     """返回 (命中|None, 源是否答上)。**「源答了但没有」与「源根本没答上」必须分开**——
@@ -242,7 +325,9 @@ def render_md(records: List[Dict[str, Any]], stamp: str) -> str:
             continue
         b = r.get("best") or {}
         lines.append("| {} | {} | {} | {:.2f} | {} | {}/{} | {} |".format(
-            r["citekey"], r.get("decision") or "", b.get("source"), b.get("sim") or 0, b.get("doi") or "",
+            r["citekey"], r.get("decision") or "", b.get("source"), b.get("sim") or 0,
+            b.get("doi") or ("PMID:" + b["pmid"] if b.get("pmid") else "")
+            or ("PMC:" + b["pmc"] if b.get("pmc") else ""),
             r.get("year") or "", b.get("year") or "", r.get("drop_reason") or ""))
     lines += ["", "## ambiguous（有命中但要人看）", "",
               "| citekey | 命中源 | 相似度 | DOI | 年份(库/源) | 首作者(库/源) | 备注 |", "|---|---|---|---|---|---|---|"]
@@ -333,6 +418,30 @@ def main() -> int:
             ask = set(ask_by_key.get(e.get("citekey"), sorted(ALL_SOURCES)))
             prev_hits = (prev_recs.get(e.get("citekey"), {}) if args.resume_from else {}).get("hits") or []
             hits.extend(h for h in prev_hits if h.get("source") not in ask)
+            # ---- 直链优先：本条目自己的 url 就指向那篇论文，不必拿标题去猜 ----
+            # 顺序是有意的：先走零成本/精确的路，标题模糊检索只用来补它们够不到的。
+            # 这也把 OpenAlex 的日额度留给真正只能靠标题的那些条目。
+            if TS_SOURCE in ask:
+                u = (e.get("url") or "").strip()
+                got = ok = None
+                ident = extract_url_identifier(u)
+                if ident:                                  # ① url 里直接写着标识 → /search
+                    got, ok = query_translation_server(ident[1], endpoint="search")
+                if got is None and u:                      # ② 落地页 → /web
+                    got, ok2 = query_translation_server(u, endpoint="web")
+                    ok = ok or ok2
+                if got:
+                    got["sim"] = title_similarity(title, got.get("title") or "")
+                    # url 里抽到的 PMID/PMC 一旦被 TS 用标题确认，它**本身就是可用的身份标识**
+                    # （dedup_key 支持 pmid: 档）。不带进来的话，这类条目会被报成 no_hit——
+                    # 「身份已经确认了却说没找到」，与本轮一直在修的是同一类记账错误。
+                    if ident and ident[0] in ("pmid", "pmc") and not got.get("doi"):
+                        got[ident[0]] = ident[1]
+                    hits.append(got)
+                elif u:
+                    failed.append(TS_SOURCE)               # 抓不动 ≠ 源里没有
+                if args.delay > 0 and u:
+                    time.sleep(args.delay)
             if len(title_words(title)) >= MIN_TITLE_WORDS:
                 if "crossref" in ask:
                     cr, cr_ok = query_crossref(title, args.email, cli)
@@ -357,7 +466,12 @@ def main() -> int:
                             "authors": list(e.get("authors") or [])[:3], "decision": e.get("decision"),
                             "dedup_key": e.get("dedup_key"), "month": e.get("month"),
                             "category": cat, "best": best, "hits": hits, "drop_reason": drop,
-                            "sources_ok": sorted(ask - set(failed)), "sources_failed": failed})
+                            # 上一轮已答上的源要**结转**，否则下次续跑会把它们当没问过重问一遍——
+                            # `--resume-from` 的全部意义就是「只补问没答上的那一源」
+                            # （2026-09-07 实测：不结转会让 crossref 对全部 301 条重问）。
+                            "sources_ok": sorted((_answered(prev_recs.get(e.get("citekey"), {}))
+                                                  - set(ask)) | (ask - set(failed))),
+                            "sources_failed": failed})
             if i % 25 == 0 or i == len(targets):
                 from collections import Counter
                 c = Counter(r["category"] for r in records)
