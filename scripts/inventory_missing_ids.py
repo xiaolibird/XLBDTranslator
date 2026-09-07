@@ -359,7 +359,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="不联网，只列出候选")
     ap.add_argument("--resume-from", default="",
                     help="上一份报告的 .json：只重查其中 incomplete（有源没答上）的篇目，其余原样结转。"
-                         "OpenAlex 免费额度按日重置（UTC 零点），全库跑不完时隔天用它续跑。")
+                         "OpenAlex 免费额度按日重置（UTC 零点），全库跑不完时隔天用它续跑。"
+                         "给 `latest` 则自动挑 _inventory/ 里最新那份（每日续跑用这个，"
+                         "免得手抄时间戳抄错）。")
     args = ap.parse_args()
 
     nd = repo_path(args.notes_dir)
@@ -369,6 +371,17 @@ def main() -> int:
         return 2
     index = json.loads(ip.read_text(encoding="utf-8"))
     targets = select_targets(index)
+    if str(args.resume_from).strip().lower() == "latest":
+        # 每日续跑：自己挑最新报告。手抄时间戳是纯粹的出错来源，抄错的后果是
+        # 「拿旧报告当基线」——已答上的源被当没答过重问，白烧当天的额度。
+        inv_dir = repo_path(args.out_dir) if args.out_dir else nd / "_inventory"
+        found = sorted(inv_dir.glob("missing_ids_*.json"))
+        if not found:
+            print("--resume-from latest：{} 下还没有报告，请先跑一次全量。".format(inv_dir),
+                  file=sys.stderr)
+            return 2
+        args.resume_from = str(found[-1])       # 文件名带 %Y%m%dT%H%M%S，字典序即时间序
+        print("续跑基线（latest 自动选中）：{}".format(found[-1].name))
     prev_recs: Dict[str, Dict[str, Any]] = {}
     carried: List[Dict[str, Any]] = []
     ask_by_key: Dict[str, List[str]] = {}

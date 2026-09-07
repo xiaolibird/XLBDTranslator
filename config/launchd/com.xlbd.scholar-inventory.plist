@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  无标识 keeper 盘点的**每日续跑**（launchd 用户代理）。
+  由 scripts/install_inventory_resume.sh 安装：占位符替换后拷入 ~/Library/LaunchAgents/。
+
+  这是**临时任务**，与其它 6 个常驻 job 不同：OpenAlex 免费额度约 100 请求/日
+  （UTC 零点重置），全库一天问不完，故每天补问一批，问完即止。
+
+  排程语义：
+  - StartCalendarInterval 每日 09:10：UTC 零点后额度已重置（本机 UTC+8，零点 = 08:00），
+    留 70 分钟余量；避开周一 09:00 digest 与 09:30 weekly-ingest 的窗口，
+    也避开月度 1 号 21:30。本 job 只读外部 API + 写 _inventory/ 报告，
+    与那几个 job 无共享写目标，撞上也只是抢带宽。
+  - **不设 RunAtLoad**：与备份 job 不同，漏跑一天没有任何损失（第二天补上即可），
+    而 RunAtLoad 会让每次登录都白烧一次当日额度。
+  - `--resume-from latest` 自己挑最新报告，不必每天改命令。
+  - **自停**：脚本在「没有待重查条目」时直接退出、不写新报告；届时用
+    `bash scripts/install_inventory_resume.sh --uninstall` 摘掉本 job（不会自动摘，
+    留着也只是每天空跑一次、不产生副作用）。
+  - TCC：与既有 5 个 job 复用同一 python 实体二进制，无需重复授权。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-inventory</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/inventory_missing_ids.py</string>
+        <string>--resume-from</string>
+        <string>latest</string>
+        <string>--email</string>
+        <string>__EMAIL__</string>
+        <string>--delay</string>
+        <string>0.8</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_inventory.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_inventory.err.log</string>
+</dict>
+</plist>

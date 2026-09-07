@@ -461,3 +461,33 @@ def test_entries_without_url_are_not_marked_as_asked_by_translation_server(tmp_p
     rec = rep["records"][0]
     assert INV.TS_SOURCE not in (rec.get("sources_ok") or [])
     assert INV.TS_SOURCE not in (rec.get("sources_failed") or [])
+
+
+def test_resume_from_latest_picks_the_newest_report(tmp_path, monkeypatch, capsys):
+    """每日续跑用 `--resume-from latest`：手抄时间戳是纯粹的出错来源，
+    抄错的后果是「拿旧报告当基线」——已答上的源被当没答过重问，白烧当天额度。"""
+    nd = tmp_path / "notes"
+    inv = nd / "_inventory"
+    inv.mkdir(parents=True)
+    (nd / "literature_index.json").write_text(json.dumps({"papers": []}), encoding="utf-8")
+    for stamp, n in (("20260901T000000", 1), ("20260907T042904", 2), ("20260903T000000", 3)):
+        (inv / "missing_ids_{}.json".format(stamp)).write_text(
+            json.dumps({"n": n, "records": []}), encoding="utf-8")
+    monkeypatch.setattr(INV, "repo_path", lambda x: nd if str(x).endswith("notes") else tmp_path / str(x))
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(nd),
+                                      "--resume-from", "latest", "--dry-run"])
+    assert INV.main() == 0
+    out = capsys.readouterr().out
+    assert "missing_ids_20260907T042904.json" in out, "文件名带时间戳，字典序即时间序"
+
+
+def test_resume_from_latest_refuses_when_there_is_no_baseline(tmp_path, monkeypatch, capsys):
+    """没有基线报告时必须明确退 2，不能拿字面量 'latest' 当文件名去 open（那是 FileNotFoundError 裸栈）。"""
+    nd = tmp_path / "notes"
+    (nd / "_inventory").mkdir(parents=True)
+    (nd / "literature_index.json").write_text(json.dumps({"papers": []}), encoding="utf-8")
+    monkeypatch.setattr(INV, "repo_path", lambda x: nd if str(x).endswith("notes") else tmp_path / str(x))
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(nd),
+                                      "--resume-from", "latest", "--dry-run"])
+    assert INV.main() == 2
+    assert "还没有报告" in capsys.readouterr().err
