@@ -436,3 +436,28 @@ def test_resume_carries_forward_previously_answered_sources(tmp_path, monkeypatc
     out = capsys.readouterr().out
     assert "待重查 1 条" in out and "crossref" not in out.split("待重查")[1][:60], \
         "crossref 已答过，不该再出现在待重查的缺源清单里"
+
+
+def test_entries_without_url_are_not_marked_as_asked_by_translation_server(tmp_path, monkeypatch):
+    """没有 url 就**没问过** translation-server，不能记进 sources_ok——
+    否则日后给该条目补了 url，续跑会跳过 TS。同一个病：没问成不许记成问过。"""
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    (nd / "literature_index.json").write_text(json.dumps({"papers": [
+        {"citekey": "nourl2024A", "dedup_key": "title:a", "title": "A study of missing data in records",
+         "decision": "INCLUDE", "year": 2024, "month": "2024-01"}]}), encoding="utf-8")
+    monkeypatch.setattr(INV, "repo_path", lambda x: nd if str(x).endswith("notes") else tmp_path / str(x))
+    monkeypatch.setattr(INV, "query_crossref", lambda *a, **k: (None, True))
+    monkeypatch.setattr(INV, "query_openalex", lambda *a, **k: (None, True))
+    monkeypatch.setattr(INV, "query_translation_server",
+                        lambda *a, **k: pytest.fail("没有 url 时不该调 TS"))
+    monkeypatch.setattr(INV, "ipv4_client",
+                        lambda **k: type("C", (), {"__enter__": lambda s: None,
+                                                   "__exit__": lambda *a: False})())
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(nd), "--out-dir", str(tmp_path / "o"),
+                                      "--delay", "0"])
+    assert INV.main() == 0
+    rep = json.loads(next((tmp_path / "o").glob("missing_ids_*.json")).read_text(encoding="utf-8"))
+    rec = rep["records"][0]
+    assert INV.TS_SOURCE not in (rec.get("sources_ok") or [])
+    assert INV.TS_SOURCE not in (rec.get("sources_failed") or [])

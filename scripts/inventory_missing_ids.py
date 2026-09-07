@@ -423,6 +423,10 @@ def main() -> int:
             # 这也把 OpenAlex 的日额度留给真正只能靠标题的那些条目。
             if TS_SOURCE in ask:
                 u = (e.get("url") or "").strip()
+                if not u:
+                    # 没有 url 就**没问过**，不能记成「答上了」——那会让日后补了 url 的条目
+                    # 在续跑时被跳过。同一个病：没问成不许记成问过（本轮反复在修的那类）。
+                    ask.discard(TS_SOURCE)
                 got = ok = None
                 ident = extract_url_identifier(u)
                 if ident:                                  # ① url 里直接写着标识 → /search
