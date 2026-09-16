@@ -32,7 +32,8 @@
     "li-baohong 影子变量三篇": "非同文：Baohong Li 组 2024 年三篇不同论文，同主题词导致标题相似度 0.45–0.58。li2024Learning=影子变量『表示学习』(collider bias)；li2024Generative=『生成式+OOD 视角』(collider bias)；li2024Twostage=『两阶段 IV』且问题设定是 latent confounding 而非 collider bias。三篇各有 59–65 条独立证据，2026-08-25 人工确认。",
     "covid 跨语言假阳性": "非同文：dayan2021（英文，联邦学习预测 COVID-19 临床结局，Roth/Zhong/Harouni）与 куксенко2024（乌克兰语，天气与社会活动对 COVID-19 传播的影响，有 DOI）。作者/年份/语言/主题全不同，唯一共同点是 COVID-19，属共享高频词噪声（cos=0.4509，卡在报告阈值下沿）。2026-08-25 人工确认。",
     "xiang dual-masked autoencoding (arXiv 版本形态)": "同一篇：arXiv 2602.15159 的无版本形态与 v1 形态。手动精读路径的 _ARXIV_RE 保留 vN、自动链路剥掉，同一篇经两条路进库拿到两个一级键。现在靠 _entry_keys 的规范标题二级键合并——标题是派生量（库内已有 32 条解析截断的残条），标题一漂合并就静默失效，故写死人工裁决。",
-    "lee unified multi-modal EHR (arXiv DOI vs arxiv 档)": "同一篇：arXiv 2305.02504 的 DataCite DOI 形态（doi: 档）与 arxiv:…v1 形态。键梯 DOI 优先于 arXiv，两条路各停一档。同上，现靠标题二级键合并，写死人工裁决防标题漂移。"
+    "lee unified multi-modal EHR (arXiv DOI vs arxiv 档)": "同一篇：arXiv 2305.02504 的 DataCite DOI 形态（doi: 档）与 arxiv:…v1 形态。键梯 DOI 优先于 arXiv，两条路各停一档。同上，现靠标题二级键合并，写死人工裁决防标题漂移。",
+    "amrollahi 学位论文 vs yan 学位论文": "非同文(2026-09-16 亲读全文核实)：anon2024Generalizable 实为 Fatemeh Amrollahi 2023 UCSD 博士论文《Generalizable Risk Predictive Deep Learning Models》(导师 Nemati/Wardi；ICU 脓毒症预测的跨院泛化：Ch2 持续学习 WUPERR、Ch3 联邦学习按外部 AUC softmax 加权聚合、Ch4 GAN 合成 EHR 回放)；yan2022Towards 为 Yujun Yan 2022 密歇根大学博士论文(图神经网络泛化)。作者/机构/年份/领域全不同，唯一交集是标题词 Generalizable（cos=0.45 卡报告下沿）。另：Amrollahi 论文 Ch2 逐字转载 Sci Rep 2022 即库内 amrollahi2022Leveraging(10.1038/s41598-022-12497-7)，属「包含」关系而非同文，不合并。"
   },
   "distinct": [
     [
@@ -102,6 +103,10 @@
     [
       "title:federatedlearningforpredictingclinicaloutcomesinpatientswithcovid19",
       "doi:10.11603/2411-1597.2023.3-4.14543"
+    ],
+    [
+      "title:generalizableriskpredictivedeeplearningmodels",
+      "title:towardsgeneralizableneuralnetworksforgraphapplications"
     ]
   ]
 }
