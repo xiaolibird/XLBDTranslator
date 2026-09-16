@@ -39,19 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.paths import repo_path                                           # noqa: E402
 from src.scholar.notes_index import iter_keepers                                    # noqa: E402
-from src.scholar.crossref import (CROSSREF_API, best_match, title_similarity,       # noqa: E402
-                                  _norm_title)
+from src.scholar.crossref import CROSSREF_API, best_match, title_similarity         # noqa: E402
 from src.scholar.fulltext import ipv4_client, polite_get                            # noqa: E402
 from src.utils.logger import get_logger                                             # noqa: E402
 
 logger = get_logger(__name__)
 
-OPENALEX_API = "https://api.openalex.org/works"
-SIM_FILLABLE = 0.92          # 标题相似度：三项齐才算 fillable
-SIM_STRONG = 0.97            # 相似度极高时允许首作者缺失/对不上（元数据首作者本就常错）
-SIM_CANDIDATE = 0.80         # 低于这个连 ambiguous 都不算，视为没命中
-YEAR_TOLERANCE = 1           # 预印本 vs 正刊差一年是常态
-MIN_TITLE_WORDS = 4          # 实词太少的标题对谁都像，不查（同 fulltext._ARXIV_TITLE_MIN_WORDS）
+# 标题检索判据与 OpenAlex 查询已抽到 src/scholar/title_lookup.py（入库补全同源复用）；
+# 这里 re-export 原名，保持 `INV.year_ok` / monkeypatch `INV.query_openalex` 等用法不变。
+from src.scholar.title_lookup import (OPENALEX_API, SIM_FILLABLE, SIM_STRONG,          # noqa: E402,F401
+                                      SIM_CANDIDATE, YEAR_TOLERANCE, MIN_TITLE_WORDS,
+                                      title_words, family_name, first_author_matches,
+                                      year_ok, query_openalex)
 ZOTERO_TS = "http://127.0.0.1:1969"      # 本机 docker 里的 Zotero translation-server
 TS_SOURCE = "zotero_ts"
 ALL_SOURCES = {"crossref", "openalex", TS_SOURCE}
@@ -76,35 +75,6 @@ def _answered(rec: Dict[str, Any]) -> set:
 
 
 # ---------------- 纯函数：可单测 ----------------
-
-def title_words(t: str) -> List[str]:
-    return re.findall(r"[a-z]{4,}", (t or "").lower())
-
-
-def family_name(author: str) -> str:
-    """'Xiaoli Bird' / 'Bird, Xiaoli' / 'X. Bird' → 'bird'。"""
-    a = (author or "").strip()
-    if not a:
-        return ""
-    if "," in a:
-        return _norm_title(a.split(",")[0])
-    return _norm_title(a.split()[-1])
-
-
-def first_author_matches(entry_authors: List[str], hit_authors: List[str]) -> Optional[bool]:
-    """None = 任一侧没有作者信息（不算对上也不算对不上）。"""
-    if not entry_authors or not hit_authors:
-        return None
-    return family_name(entry_authors[0]) == family_name(hit_authors[0]) and bool(family_name(entry_authors[0]))
-
-
-def year_ok(entry_year, hit_year) -> Optional[bool]:
-    try:
-        a, b = int(entry_year), int(hit_year)
-    except (TypeError, ValueError):
-        return None
-    return abs(a - b) <= YEAR_TOLERANCE
-
 
 def classify(entry: Dict[str, Any], hits: List[Dict[str, Any]],
              failed_sources: Optional[List[str]] = None) -> Tuple[str, Optional[Dict[str, Any]], str]:
@@ -252,38 +222,6 @@ def query_crossref(title: str, email: str, client) -> Tuple[Optional[Dict[str, A
     return {"source": "crossref", "title": got.get("title") or "", "doi": got.get("doi"),
             "year": year, "authors": list(got.get("authors") or []),
             "sim": title_similarity(title, got.get("title") or "")}, True
-
-
-def query_openalex(title: str, email: str, client) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """返回 (命中|None, 源是否答上)。
-
-    2026-09-05 实测：OpenAlex 已改成**按日额度计费**（每请求 $0.001，免费额度约 $0.1/日、
-    UTC 零点重置），额度用完一律 429 `Insufficient budget`。这不是限流、放慢没用，
-    因此必须记成「没答上」而不是「源里没有」，否则一整批尾巴会被永久判成 no_hit。
-    """
-    # 记忆里踩过：无 DOI 的 PMLR 论文必须用 filter=title.search，别用 search=（那会全走 arXiv 侧）
-    q = re.sub(r"[^\w\s\-]", " ", title)[:200]
-    params = {"filter": "title.search:{}".format(q), "per-page": 3}
-    if email:
-        params["mailto"] = email
-    try:
-        r = polite_get(client, OPENALEX_API, params=params, timeout=30.0)
-        if r.status_code != 200:
-            return None, False
-        results = (r.json() or {}).get("results") or []
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("  ⚠️ OpenAlex 检索失败（{}）: {}".format(title[:40], e))
-        return None, False
-    best = None
-    for w in results:
-        t = w.get("title") or w.get("display_name") or ""
-        sim = title_similarity(title, t)
-        if best is None or sim > best["sim"]:
-            doi = (w.get("doi") or "").replace("https://doi.org/", "") or None
-            authors = [((a.get("author") or {}).get("display_name") or "") for a in (w.get("authorships") or [])]
-            best = {"source": "openalex", "title": t, "doi": doi, "year": w.get("publication_year"),
-                    "authors": authors, "sim": sim}
-    return best, True
 
 
 def select_targets(index: Dict[str, Any]) -> List[Dict[str, Any]]:

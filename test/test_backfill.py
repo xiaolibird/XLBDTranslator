@@ -115,7 +115,7 @@ def test_run_month_undecided_not_in_notes(tmp_path, monkeypatch):
 
     captured = {}
     monkeypatch.setattr(bn, "ScholarWorkflow", FakeWF)
-    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(bn, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
 
@@ -242,7 +242,7 @@ def test_failed_month_keys_not_in_seen_for_later_months(tmp_path, monkeypatch):
             return make_digest()
 
     monkeypatch.setattr(bn, "ScholarWorkflow", FakeWF)
-    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(bn, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.closereading as closereading
@@ -735,7 +735,7 @@ def test_run_month_report_carries_sidecar_ok(tmp_path, monkeypatch):
             return digest
 
     monkeypatch.setattr(bn, "ScholarWorkflow", FakeWF)
-    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(bn, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(bn, "resolve_citekeys", lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.closereading as closereading
     monkeypatch.setattr(closereading, "close_read_segments", lambda *a, **k: 1)

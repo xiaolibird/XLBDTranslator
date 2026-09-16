@@ -53,3 +53,106 @@ def test_strip_title_bleed_no_false_positive():
     title = "A Completely Different Title About Graphs"
     raw = "Jie Huang, Pengfei Yin"
     assert P._clean_author_list(raw, title) == ["Jie Huang", "Pengfei Yin"]
+
+
+# ---------------------------------------------------------------------------
+# 元数据行解析（2026-09-16）：anon2024Generalizable 追查出的解析缺陷回归
+#
+# fixture 为真实推送（2024-01-28 与 2026-09-16 两封）里原样截取的 5 个论文块，只替换了链接。
+# 真实 HTML 没有换行：旧解析器 block.get_text() 无分隔符 → "Models" 与作者粘连、
+# "2023" 与摘要 "The" 粘连（\b 失效）→ 空作者 / 丢首作者 / 无年份。
+# ---------------------------------------------------------------------------
+from datetime import date, datetime
+from pathlib import Path
+
+import pytest
+
+from src.scholar.schema import EmailMetadata
+
+FIXTURE = Path(__file__).parent / "data" / "scholar_alert_2024_2026_samples.html"
+
+
+@pytest.mark.parametrize("line, authors, venue, year", [
+    ("F Amrollahi - 2023", ["F Amrollahi"], None, 2023),
+    ("AAS Soltan, A Thakur, J Yang, A Chauhan, LG D'Cruz… - The Lancet Digital Health, 2024",
+     ["AAS Soltan", "A Thakur", "J Yang", "A Chauhan", "LG D'Cruz"], "The Lancet Digital Health", 2024),
+    ("S Tang, FP Huang, C Idegawa - arXiv preprint arXiv:2609.11747, 2026",
+     ["S Tang", "FP Huang", "C Idegawa"], "arXiv preprint arXiv:2609.11747", 2026),
+    # Scholar 截断的刊名不写进书目（残缺刊名比留空更糟）
+    ("SJ Conklin, F Albrecht - Journal of Neurologic Physical …", ["SJ Conklin", "F Albrecht"], None, None),
+    ("YT Tseng - … Epidemiology, Biomarkers & …, 2026", ["YT Tseng"], None, 2026),
+    ("J Doe - example.com", ["J Doe"], None, None),              # 出版方域名不是期刊
+    ("付茗睿， 冯钰茹， 薛晓君 - 河南工业大学学报自然科学版, 2026",
+     ["付茗睿", "冯钰茹", "薛晓君"], "河南工业大学学报自然科学版", 2026),
+])
+def test_parse_meta_line_known_shapes(line, authors, venue, year):
+    assert P._parse_meta_line(line) == (authors, venue, year)
+
+
+def test_parse_meta_line_rejects_non_meta():
+    assert P._parse_meta_line("Background Multicentre training could reduce biases") == ([], None, None)
+    # 无着色标记时的按行判定：摘要句子不能被当成元数据行
+    assert not P._looks_like_meta_line("The broad adoption - of EHR, 2020")
+    assert P._looks_like_meta_line("F Amrollahi - 2023")
+
+
+def test_authors_only_line_requires_explicit_trust():
+    line = "H Xie, Y Yang, H Cui, C Yang"
+    assert P._parse_meta_line(line) == ([], None, None)
+    assert P._parse_meta_line(line, authors_only_ok=True) == (["H Xie", "Y Yang", "H Cui", "C Yang"], None, None)
+
+
+def test_clean_author_list_strips_ellipsis():
+    assert P._clean_author_list("K Liu…, …") == ["K Liu"]
+
+
+@pytest.fixture(scope="module")
+def parsed():
+    em = EmailMetadata(email_id="f" * 16, subject="s", sender="scholaralerts-noreply@google.com",
+                       received_at=datetime(2024, 1, 28))
+    segs = P().parse_email(FIXTURE.read_text(encoding="utf-8"), em)
+    return {s.metadata.title[:20]: s for s in segs}
+
+
+def test_fixture_block_count(parsed):
+    assert len(parsed) == 5
+
+
+def test_single_author_thesis_not_anon(parsed):
+    m = parsed["Generalizable Risk P"].metadata
+    assert m.authors == ["F Amrollahi"]
+    # 年份来自元数据行（2023），不是邮件年份（2024），也不是摘要里的数字
+    assert m.publication_date == date(2023, 1, 1)
+    assert m.date_precision == "year"
+
+
+def test_first_author_kept_and_ellipsis_dropped(parsed):
+    m = parsed["A scalable federated"].metadata
+    assert m.authors[0] == "AAS Soltan"
+    assert not any("…" in a for a in m.authors)
+    assert m.journal == "The Lancet Digital Health"
+    assert m.publication_date == date(2024, 1, 1)
+
+
+def test_arxiv_venue_yields_arxiv_id(parsed):
+    m = parsed["Precise bubble wall "].metadata
+    assert m.authors[0] == "S Tang"
+    assert m.arxiv_id == "2609.11747"
+
+
+def test_cjk_authors(parsed):
+    m = parsed["抗性糊精制备工艺研究现状及在食品中的应用"[:20]].metadata
+    assert m.authors[:2] == ["付茗睿", "冯钰茹"]
+    assert m.publication_date == date(2026, 1, 1)
+
+
+def test_authors_only_colored_line(parsed):
+    seg = parsed["Federated Learning f"]
+    assert seg.metadata.authors == ["H Xie", "Y Yang", "H Cui", "C Yang"]
+    assert seg.metadata.publication_date is None
+
+
+def test_abstract_excludes_meta_line(parsed):
+    abstract = parsed["A scalable federated"].original_abstract
+    assert abstract.startswith("Background Multicentre training")
+    assert "Soltan" not in abstract

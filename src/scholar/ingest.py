@@ -56,8 +56,12 @@ def dedup_key(meta: PaperMetadata) -> str:
 
 
 def enrich_segments(segs: Sequence[PaperSegment], email: str,
-                    ts_url: str, max_workers: int = 4) -> Tuple[int, int, int]:
+                    ts_url: str, max_workers: int = 4,
+                    openalex_title: bool = False) -> Tuple[int, int, int]:
     """Crossref 标题检索补 DOI/作者 + arXiv id 补作者 + PubMed 补摘要 + translation-server 权威解析。
+
+    `openalex_title=True` 时，Crossref 未命中且无 DOI/arXiv 的条目再按标题查 OpenAlex
+    （判据见 title_lookup.confident_title_hit）；额度耗尽整批熔断、只记日志不抛错。
 
     4-worker 分片并行（同 resolve_citekeys 的模板）：每篇 1-2 次 Crossref 往返全串行时，
     周批 30-50 篇要纯等 1-3 分钟、按月回填/作者语料批（99 篇）5-10 分钟级。每个 worker
@@ -68,9 +72,15 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
     from .fulltext import ipv4_client
     from .translation_server import resolve_batch
 
+    import threading
+    from .title_lookup import enrich_from_openalex_title
+
     seg_list = list(segs)
     if not seg_list:
         return 0, 0, 0
+    oa_exhausted = threading.Event()
+    oa_counts = {"hit": 0, "unanswered": 0}
+    oa_lock = threading.Lock()
 
     def _enrich_batch(batch) -> Tuple[int, int, int]:
         cr = ax = pm = 0
@@ -87,8 +97,20 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
                     try:
                         if enrich_from_arxiv(seg.metadata, client=xc):
                             ax += 1
+                            hit = True
                     except Exception as e:
                         logger.debug("arXiv enrich 失败 [{}]: {}", seg.paper_id, e)
+                if not hit and openalex_title:
+                    try:
+                        got = enrich_from_openalex_title(seg.metadata, email, xc, exhausted=oa_exhausted)
+                    except Exception as e:                        # noqa: BLE001
+                        logger.debug("OpenAlex 标题补全失败 [{}]: {}", seg.paper_id, e)
+                        got = None
+                    with oa_lock:
+                        if got:
+                            oa_counts["hit"] += 1
+                        elif got is None and oa_exhausted.is_set():
+                            oa_counts["unanswered"] += 1
                 # 无摘要的论文若拿不到 OA 全文，精读会因空正文整篇落空——先去 PubMed 补一份
                 if not (seg.original_abstract or "").strip():
                     try:
@@ -111,6 +133,11 @@ def enrich_segments(segs: Sequence[PaperSegment], email: str,
     pm = sum(r[2] for r in results)
     if pm:
         logger.info("  PubMed 补摘要：{} 篇（原本无摘要，避免精读空转）".format(pm))
+    if openalex_title and (oa_counts["hit"] or oa_counts["unanswered"]):
+        logger.info("  OpenAlex 按标题补全：命中 {} 篇{}".format(
+            oa_counts["hit"],
+            "；额度耗尽/未答上，{} 篇没问成（明天续，或关掉 enrich_openalex_title）".format(
+                oa_counts["unanswered"]) if oa_counts["unanswered"] else ""))
 
     ts = 0
     if ts_url:
@@ -498,7 +525,8 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
         return {"label": label, "status": "empty", "count": 0}
 
     email = proc.zotero_email or proc.external_email or ""
-    cr, ax, ts = enrich_segments(segs, email, proc.zotero_translation_server_url)
+    cr, ax, ts = enrich_segments(segs, email, proc.zotero_translation_server_url,
+                                 openalex_title=proc.enrich_openalex_title)
 
     # 增强后再去一次重：digest JSON 是 Step 4 固化的，此时多数条目还没有 DOI，
     # dedup_key 只能退到标题；Crossref 补上 DOI 后键会变，可能撞上库里已有的 DOI 键。

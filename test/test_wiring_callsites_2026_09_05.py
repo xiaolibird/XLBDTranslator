@@ -85,7 +85,7 @@ def test_run_ingest_forwards_existing_key_owners_to_write_notes(tmp_path, monkey
 
     settings = _settings(tmp_path)
     got = {}
-    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(ING, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     # 非默认值：删掉透传后 write_notes 收到的就是 None/缺席，断言立刻红

@@ -122,7 +122,7 @@ def _mock_ingest_io(monkeypatch, llm):
     """只挡掉 run_ingest 的网络/落盘副作用，**保留真的 close_read_segments**——
     闸门测的是「真精读结果 → 是否 raise」，把精读也 mock 掉就只剩同义反复。
     返回记录 write_notes 调用的列表。"""
-    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(ING, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.llm_client as llm_client

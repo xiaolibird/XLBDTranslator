@@ -295,14 +295,17 @@ class ScholarEmailParser:
             if not title:
                 return None
             
+            # 元数据行（作者 - 期刊, 年）：Scholar 推送里是标题 h3 后紧跟的 #006621 着色 div
+            meta_line = self._find_meta_line(block, title)
+
             # 提取作者（传入干净标题，剥除粘连的标题尾巴）
-            authors = self._extract_authors(block, title)
+            authors = self._extract_authors(block, title, meta_line)
             
             # 提取摘要/描述
-            abstract = self._extract_abstract(block)
+            abstract = self._extract_abstract(block, meta_line)
             
             # 提取发布信息
-            journal, pub_date = self._extract_publication_info(block)
+            journal, pub_date = self._extract_publication_info(block, meta_line)
             
             # 尝试提取 DOI
             doi = self._extract_doi(block, url)
@@ -448,8 +451,9 @@ class ScholarEmailParser:
         # 截断到 " - "（Scholar 引用行的作者/期刊分隔），去掉期刊年份尾巴
         text = re.split(r"\s[-–—]\s", text)[0]
         out: List[str] = []
-        for tok in text.split(","):
-            t = tok.strip()
+        for tok in re.split(r"[,\uff0c\u3001]", text):   # 中文推送用全角逗号/顿号分隔作者
+            # Scholar 截断作者表时在最后一位后面粘「…」（"LG D'Cruz…"），或单独成 token
+            t = re.sub(r"(?:\u2026|\.{3})+$", "", tok.strip()).strip()
             if not t:
                 continue
             if any(ch.isdigit() for ch in t):      # 排除年份/卷期等
@@ -464,11 +468,106 @@ class ScholarEmailParser:
             out.append(t)
         return out[:10]
 
-    def _extract_authors(self, block: Any, title: str = "") -> List[str]:
-        """提取作者列表（传入干净标题以剥除粘连的标题尾巴）"""
-        raw = ""
+    # Scholar 元数据行的着色（新旧版推送都是 #006621 绿）
+    _META_COLOR_RE = re.compile(r"color\s*:\s*#006621", re.I)
+    # 标题前的类型标签，get_text 粘连时会挡住 _strip_title_bleed
+    _TYPE_TAG_RE = re.compile(r"^\s*\[(?:PDF|HTML|BOOK|B|CITATION|C)\]\s*", re.I)
+    _META_SPLIT_RE = re.compile(r"\s[-\u2013\u2014]\s")
+    _YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+    _VENUE_YEAR_RE = re.compile(r"^(.*?),\s*((?:19|20)\d{2})$")
+    _DOMAIN_RE = re.compile(r"^[\w.-]+\.[a-z]{2,}$", re.I)
+    # 作者 token：首字母缩写 + 姓（"AAS Soltan"）或全名（"David T Zhu"），允许 ' - 与非 ASCII 字母
+    _AUTHOR_TOKEN_RE = re.compile(r"^[^\W\d_][\w'.\u2019-]*(?:\s+[^\W\d_][\w'.\u2019-]*){0,5}$", re.U)
 
-        # Google Scholar 邮件中作者通常是灰色/绿色着色文本
+    @classmethod
+    def _parse_meta_line(cls, line: str,
+                         authors_only_ok: bool = False) -> Tuple[List[str], Optional[str], Optional[int]]:
+        """解析 Scholar 元数据行 → (作者, 期刊/来源, 年)。纯函数，离线可测。
+
+        已知形态（2024-01 与 2026-09 真实推送核对过）：
+          "AAS Soltan, A Thakur, … - The Lancet Digital Health, 2024"
+          "F Amrollahi - 2023"                         （学位论文：无期刊，只有年）
+          "S Tang, FP Huang - arXiv preprint arXiv:2609.11747, 2026"
+          "J Doe - example.com"                         （只有出版方域名，无年）
+          "H Xie, Y Yang, H Cui"                        （只有作者；仅当来自 #006621 着色节点时
+                                                         才可信，调用方传 authors_only_ok=True）
+        不是元数据行（没有 " - " 或作者段不像人名）时返回 ([], None, None)。
+        """
+        if not line:
+            return [], None, None
+        text = re.sub(r"\s+", " ", line).strip()
+        parts = cls._META_SPLIT_RE.split(text)
+        if len(parts) < 2 and not authors_only_ok:
+            return [], None, None
+        author_part, rest = parts[0], parts[1:]
+        authors = cls._clean_author_list(author_part)
+        if not authors or not all(cls._AUTHOR_TOKEN_RE.match(a) for a in authors):
+            return [], None, None
+        venue: Optional[str] = None
+        year: Optional[int] = None
+        for part in rest:
+            part = part.strip()
+            if not part or part == "\u2026":
+                continue
+            if year is None and cls._YEAR_RE.match(part):
+                year = int(part)
+                continue
+            m = cls._VENUE_YEAR_RE.match(part)
+            if m and year is None:
+                venue = venue or (m.group(1).strip() or None)
+                year = int(m.group(2))
+                continue
+            if cls._DOMAIN_RE.match(part):
+                continue                       # 出版方域名不是期刊
+            venue = venue or part
+        # Scholar 会把长刊名截成 "Acta Orthopaedica et …"：残缺刊名写进书目比留空更糟，
+        # 留空让 Crossref/translation-server 补全去填
+        if venue and ("\u2026" in venue or venue.rstrip().endswith("...")):
+            venue = None
+        return authors, venue, year
+
+    # Scholar 作者一律是「首字母缩写 + 姓」（"AAS Soltan"）；中文推送为 CJK 姓名
+    _INITIALS_AUTHOR_RE = re.compile(r"^(?:[A-Z]{1,4}\s+\S|[\u4e00-\u9fff])")
+
+    @classmethod
+    def _looks_like_meta_line(cls, line: str) -> bool:
+        """无着色标记时的判定（按行扫描用），比着色节点严格：摘要里的 "X - Y, 2020"
+        句子也能被 _parse_meta_line 拆开，所以额外要求至少一位作者是缩写式姓名。"""
+        authors, venue, year = cls._parse_meta_line(line)
+        if not authors or (venue is None and year is None):
+            return False
+        return any(cls._INITIALS_AUTHOR_RE.match(a) for a in authors)
+
+    def _find_meta_line(self, block: Any, title: str = "") -> str:
+        """定位论文块里的元数据行原文；找不到返回空串。
+
+        优先认 #006621 着色节点（Scholar 用 style 属性，旧逻辑只认 color= 属性从未命中）；
+        否则按行（separator="\n"，避免标题/作者/摘要粘连）找第一条像元数据行的行。
+        """
+        for elem in block.find_all(["div", "font", "span"]):
+            style = elem.get("style") or ""
+            color = elem.get("color") or ""
+            if self._META_COLOR_RE.search(style) or color.lower() == "#006621":
+                text = elem.get_text(" ", strip=True)
+                if self._parse_meta_line(text, authors_only_ok=True)[0]:
+                    return text
+        lines = [ln.strip() for ln in block.get_text(separator="\n").split("\n") if ln.strip()]
+        title_norm = re.sub(r"\s+", " ", title or "").strip().lower()
+        for ln in lines[:8]:                  # 元数据行紧跟标题，不去摘要深处找
+            if title_norm and re.sub(r"\s+", " ", ln).strip().lower() == title_norm:
+                continue
+            if self._looks_like_meta_line(ln):
+                return ln
+        return ""
+
+    def _extract_authors(self, block: Any, title: str = "", meta_line: str = "") -> List[str]:
+        """提取作者列表：优先元数据行；否则回退旧的着色节点/正则路径。"""
+        if meta_line:
+            authors, _, _ = self._parse_meta_line(meta_line, authors_only_ok=True)
+            if authors:
+                return authors
+
+        raw = ""
         gray_texts = block.find_all(['font', 'span'],
             attrs={'color': re.compile(r'#[0-9a-fA-F]{6}|gray', re.I)})
         for elem in gray_texts:
@@ -477,21 +576,23 @@ class ScholarEmailParser:
                 raw = text
                 break
 
-        # 回退：从 "Author - Journal, Year" 或 "by Author1, Author2" 中取
         if not raw:
-            text = block.get_text()
+            # separator="\n"：不带分隔符时标题与作者行、年份与摘要会粘成一串
+            text = self._TYPE_TAG_RE.sub("", block.get_text(separator="\n"))
             meta_match = re.search(r'([^-\n]+)\s+-\s+[^-\n]+,\s+\d{4}', text)
             if meta_match:
                 raw = meta_match.group(1).strip()
-            else:
-                by_match = re.search(r'by\s+([^-\n]+)', text, re.IGNORECASE)
-                if by_match:
-                    raw = by_match.group(1)
 
         return self._clean_author_list(raw, title)
     
-    def _extract_abstract(self, block: Any) -> str:
+    def _extract_abstract(self, block: Any, meta_line: str = "") -> str:
         """提取摘要/描述"""
+        # Scholar 推送的摘要片段有专门的 class，直接取，避免把元数据行混进摘要
+        sni = block.find(class_="gse_alrt_sni")
+        if sni is not None:
+            abstract = re.sub(r'\s+', ' ', sni.get_text(" ", strip=True)).strip()
+            if abstract:
+                return abstract[:2000] + ('...' if len(abstract) > 2000 else '')
         # 获取块中的所有文本（用换行符连接节点，让后续 split('\n') 能按行拆分）
         full_text = block.get_text(separator='\n', strip=True)
         
@@ -505,6 +606,8 @@ class ScholarEmailParser:
             if len(line) < 30:
                 continue
             if any(skip in line.lower() for skip in ['cited by', 'related articles', 'save']):
+                continue
+            if meta_line and line == meta_line.strip():
                 continue
             abstract_lines.append(line)
         
@@ -521,13 +624,29 @@ class ScholarEmailParser:
     
     def _extract_publication_info(
         self, 
-        block: Any
+        block: Any,
+        meta_line: str = "",
     ) -> Tuple[Optional[str], Optional[date]]:
-        """提取期刊和发布日期"""
+        """提取期刊和发布日期：优先元数据行（年份只认这里，不去摘要里捞第一个四位数）。"""
         journal = None
         pub_date = None
-        
-        text = block.get_text()
+
+        if meta_line:
+            authors, venue, year = self._parse_meta_line(meta_line, authors_only_ok=True)
+            if authors:
+                if year:
+                    pub_date = date(year, 1, 1)  # 只有年份，精度见构造处
+                journal = venue
+                if not journal:
+                    italic = block.find('i')
+                    if italic:
+                        jt = italic.get_text(strip=True)
+                        if 3 < len(jt) < 100:
+                            journal = jt
+                return journal, pub_date
+
+        # 回退：没有元数据行时按行扫（separator 防止 "2023The" 粘连让 \b 失效）
+        text = block.get_text(separator="\n")
         
         # 查找年份
         year_match = re.search(r'\b(19|20)\d{2}\b', text)
@@ -652,7 +771,16 @@ class ScholarEmailParser:
             # 获取链接周围的上下文作为摘要
             parent = link.find_parent(['div', 'td', 'tr', 'p'])
             abstract = ""
+            authors: List[str] = []
+            journal = None
+            pub_date = None
             if parent:
+                for ln in parent.get_text(separator="\n").split("\n"):
+                    ln = ln.strip()
+                    if ln and ln != text and self._looks_like_meta_line(ln):
+                        authors, journal, year = self._parse_meta_line(ln)
+                        pub_date = date(year, 1, 1) if year else None
+                        break
                 abstract = parent.get_text(separator=' ', strip=True)
                 # 移除标题本身
                 abstract = abstract.replace(text, '').strip()
@@ -667,6 +795,10 @@ class ScholarEmailParser:
             metadata = PaperMetadata(
                 paper_id=paper_id,
                 title=text,
+                authors=authors,
+                publication_date=pub_date,
+                date_precision="year" if pub_date else None,
+                journal=journal,
                 url=url,
                 doi=doi,
                 field=self._infer_field(text, abstract, email_metadata.alert_query),

@@ -279,7 +279,7 @@ def _settings(tmp_path):
 
 def _mock_pipeline(monkeypatch, done):
     """把网络/LLM 依赖全 mock 掉，只留 run_ingest 的门控逻辑。done 为精读成功篇数。"""
-    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(ING, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.closereading as closereading
@@ -330,7 +330,7 @@ def test_run_ingest_forwards_tail_and_route_budgets(tmp_path, monkeypatch):
     settings.processing.closeread_tail_max_chunks = 9
     settings.processing.fulltext_extra_max_per_batch = 12
     settings.processing.fulltext_host_breaker_failures = 5
-    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(ING, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.closereading as closereading
@@ -504,7 +504,7 @@ def _seed_note_with_close_reading(notes_dir: Path, label: str, citekey: str,
 
 
 def _mock_enrich_and_citekeys(monkeypatch):
-    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts: (0, 0, 0))
+    monkeypatch.setattr(ING, "enrich_segments", lambda segs, email, ts, **k: (0, 0, 0))
     monkeypatch.setattr(ING, "resolve_citekeys",
                         lambda segs, base: {s.paper_id: None for s in segs})
     import src.scholar.llm_client as llm_client

@@ -170,6 +170,11 @@ class ProcessingSettings(BaseModel):
         True,
         description="写库前用 Crossref 标题检索规范作者+补 DOI（修正 Scholar 邮件解析的脏作者）"
     )
+    enrich_openalex_title: bool = Field(
+        False,
+        description="入库补全：Crossref 未命中且无 DOI/arXiv 时按标题查 OpenAlex 补作者/年份/DOI。"
+                    "OpenAlex 按日额度计费（免费约 100 次/日），与无标识盘点任务共用额度，默认关"
+    )
     zotero_translation_server_url: str = Field(
         "",
         description="Zotero translation-server 地址（如 http://localhost:1969）。设了则把标识符交给它做权威解析；空=用自建 item"

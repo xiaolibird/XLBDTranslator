@@ -176,7 +176,8 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args,
         return {"month": label, "status": "empty", "included": len(segs), "fresh": 0}
 
     email = proc.zotero_email or proc.external_email or ""
-    cr, ax, ts = enrich_segments(fresh, email, proc.zotero_translation_server_url)
+    cr, ax, ts = enrich_segments(fresh, email, proc.zotero_translation_server_url,
+                                 openalex_title=proc.enrich_openalex_title)
 
     # 增强后再去一次重（同 run_ingest 的补丁）：上面那轮去重算键时多数条目还没有
     # DOI，dedup_key 退到标题；Crossref 补上 DOI 后键会变，可能撞上早前月已收录的
