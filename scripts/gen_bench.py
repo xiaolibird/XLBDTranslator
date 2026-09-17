@@ -56,8 +56,21 @@ from src.scholar.page_parse import iter_pages, parse_page  # noqa: E402
 
 TOPICS_DIR = REPO / "output" / "scholar_notes" / "topics"
 
-# 页面解析走 page_parse（与 entail_audit 共用）；这里只留重建论断行时要用的引用正则
-_CITE_RE = re.compile(r"\[@([^\]\s]+)\]")
+# 页面解析走 page_parse（与 entail_audit 共用）；这里只留重建论断行时要用的引用正则。
+# 必须容忍书籍证据的页码定位符 `[@key, p. 247]`（2026-09-17）。
+#
+# N2（2026-09-17 R1 对抗审核订正）：**数字接地那部分的"假 ungrounded"不归这条正则管**
+# ——`audit_claim` 传给 `check_numbers` 的是**原始** `claim`（未经这里任何处理），
+# 页码数字会不会被误当成论断自己的数字去查接地，完全由 `check_numbers` 内部那份
+# 独立的 `src.scholar.grounding._CITE_RE`（已单独修过）负责剥离，与本文件这份正则
+# 无关。本文件这份正则只管两件本地的事：(1) `keys = _CITE_RE.findall(claim)` 抽出
+# 引用的 citekey 去建 `pool`——漏抽一个书籍证据的 citekey 会让 pool 少一块文本，
+# 制造"证据其实在、但 pool 没收进来"这种假 ungrounded（成因是 pool 不完整，不是
+# 页码数字泄漏）；(2) `body = _norm(_CITE_RE.sub("", claim))` 剥完引用去算词面
+# 覆盖率（`lexical_overlap`，模块 docstring 里的"弱信号"）——漏剥会把定位符文本
+# 混进词面 token，给这个本就只当参考的指标添噪声。两件事都不影响主指标
+# `numeric_grounding` 的判定，那条防线在 grounding.py 那一侧。
+_CITE_RE = re.compile(r"\[@([^\],\s]+)(?:,[^\]]*)?\]")
 
 
 

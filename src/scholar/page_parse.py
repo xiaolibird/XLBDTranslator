@@ -17,9 +17,16 @@ from typing import Dict, List, Tuple
 _EVIDENCE_HEAD_RE = re.compile(r"^##\s+本页证据")
 # 用户批注区——生成块之外，绝不纳入评测
 _USER_ZONE_RE = re.compile(r"^##\s+我的批注")
-# 证据行： - ● **E1** `[@citekey]` 🟩role · section · 来源:行号
+# 证据行： - ● **E1** `[@citekey]` 🟩role · section · 来源:行号 · p.247
+# 证据表的反引号 `` `[@key]` `` **从不带**页码定位符（那是 pandoc 引用语法，写进
+# 代码格式的反引号里没有意义，定位符只出现在论断正文的真引用里）——这条正则
+# 不需要跟着改，`(.*)$` 本就会把 loc 里新增的 " · p.247" 一并吃进 group(3)。
 _EVIDENCE_ROW_RE = re.compile(r"^-\s+[●○]\s+\*\*E(\d+)\*\*\s+`\[@([^\]]+)\]`(.*)$")
-_CITE_RE = re.compile(r"\[@([^\]\s]+)\]")
+# 论断正文里的真引用：`[@key]` 或书籍证据带页码定位符的 `[@key, p. 247]`（见
+# topics._cite_str）。与 topics.py/grounding.py 的同名正则同一个道理：只留一个
+# 捕获组（citekey），`.findall()` 在 `parse_page` 里取的是"这一条论断引了哪些
+# citekey"的纯列表，不该因为多了个定位符捕获组就变成 `(key, locator)` 元组。
+_CITE_RE = re.compile(r"\[@([^\],\s]+)(?:,[^\]]*)?\]")
 _QUOTE_RE = re.compile(r"^\s*>\s*(.+)$")
 _SMALL_RE = re.compile(r"<small>(.*?)</small>")
 
@@ -136,8 +143,14 @@ def parse_page(path: Path) -> Page:
                 # （如「## #1 关键问题」）会被过度裁剪成「1 关键问题」。
                 section = re.sub(r"^#+\s*", "", ln).strip()
             elif ln.startswith("- ") and _CITE_RE.search(ln):
+                # N3（2026-09-17 R1 对抗审核）：去重保序。此前从不去重——一条论断
+                # 引同一 citekey 两次本就可能（如今多页定位符场景下概率更高，
+                # 同一本书的两页各是一条引用），下游 entail_audit.py 展示证据列表
+                # 时截 `citekeys[:3]`，重复项会占掉本该展示别的文献的位置。
+                # `pool_for`/`rows_for`（page_parse.Page）内部走 `set(citekeys)`，
+                # 去重前后行为不变，这里去重不影响它们。
                 page.claims.append(Claim(text=ln[2:].strip(),
-                                         citekeys=_CITE_RE.findall(ln),
+                                         citekeys=list(dict.fromkeys(_CITE_RE.findall(ln))),
                                          section=section))
         elif zone == "evidence":
             m = _EVIDENCE_ROW_RE.match(ln)

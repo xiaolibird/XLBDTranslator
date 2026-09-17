@@ -465,7 +465,13 @@ def keys_in_tampered_topic_pages(notes_dir: Path) -> Dict[str, str]:
 
     改名工具会跳过这类页（不能洗掉「用户手改过」的冲突信号），于是那页上的旧键在改键后悬空
     （R2 审计实测 topics/adversarial-evidence.md 的 [@eilbeck2022Standard]）。计划阶段就把这些键
-    排除：只修元数据、不改键，等页面重建后再处理。"""
+    排除：只修元数据、不改键，等页面重建后再处理。
+
+    2026-09-17：正则加了 `(?:,[^\\]]*)?` 容忍书籍证据的页码定位符
+    （`[@little2020rubin, p. 247]`，见 `topics._cite_str`）——原字符类
+    `[^\\]\\s;,]` 一遇到逗号（定位符的起点）就把整个带定位符的引用判不出 citekey，
+    等于书籍证据的引用在手改页里永远保护不到，改键计划仍会把它排进去、
+    在这页上留下一个悬空引用，而这正是本函数存在的全部理由。"""
     from src.scholar.vault import generated_block_tampered
     out: Dict[str, str] = {}
     topics_dir = Path(notes_dir) / "topics"
@@ -477,7 +483,7 @@ def keys_in_tampered_topic_pages(notes_dir: Path) -> Dict[str, str]:
         except OSError:
             continue
         if generated_block_tampered(text):
-            for k in re.findall(r"\[@([^\]\s;,]+)\]", text):
+            for k in re.findall(r"\[@([^\]\s;,]+)(?:,[^\]]*)?\]", text):
                 out.setdefault(k, str(page.relative_to(topics_dir)))
     return out
 

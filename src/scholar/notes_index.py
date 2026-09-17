@@ -906,6 +906,9 @@ def _stale_inline_shape(dup_key: str, keeper_key: str) -> str:
     return "suffix-keeper" if _is_suffix_key(dup_key, keeper_key) else "stale-dup"
 
 
+_DANGLING_CITE_RE = re.compile(r"\[@([A-Za-z0-9À-￿]+)(?:,[^\]]*)?\]")
+
+
 def find_dangling_citations(notes_dir, index: Dict[str, Any]) -> List[Dict[str, Any]]:
     """topics/（含 qa/）里引了**全局书目中不存在**的 citekey。
 
@@ -913,6 +916,13 @@ def find_dangling_citations(notes_dir, index: Dict[str, Any]) -> List[Dict[str, 
     `_is_suffix_key` 是词面判据，拿它对全库自截尾会把 2295 条正常键全判成孤儿
     （2026-09-05 实测——我第一版就是这么写错的）。而「引用解析不了」是确定性的、
     与键怎么生成无关，且正是用户会真正撞到的那个后果（pandoc 渲染成 `(key?)`）。
+
+    2026-09-17：正则加了 `(?:,[^\\]]*)?` 容忍书籍证据的页码定位符
+    （`[@little2020rubin, p. 247]`，见 `topics._cite_str`）——首版这里的字符类
+    `[A-Za-z0-9\\u00c0-\\uffff]+` 遇到逗号/空格就断，会让**整个**带定位符的引用
+    连匹配都匹配不上，等于书籍证据的悬空引用永远查不出来，而这条判据恰恰挂在
+    改键收尾的 `finalized` 判定上（`backfill_scholar_metadata.run_rekeys`）——
+    漏检不是"报告少一行"，是"明明还有悬空引用却被判定为改键已完成"。
 
     典型来源：改键漏扫派生物；或 keeper 拿了后缀键而别处按基键引用
     （`2026-09-04-manual-upgrade-citekey-suffix.md`，实例 shi2025Federated）。
@@ -929,7 +939,7 @@ def find_dangling_citations(notes_dir, index: Dict[str, Any]) -> List[Dict[str, 
         except Exception:                                  # noqa: BLE001
             continue
         rel = str(page.relative_to(topics_dir))
-        for k in sorted(set(re.findall(r"\[@([A-Za-z0-9\u00c0-\uffff]+)\]", text))):
+        for k in sorted(set(_DANGLING_CITE_RE.findall(text))):
             if k not in live:
                 out.append({"page": rel, "key": k})
     return out
@@ -1554,14 +1564,33 @@ REKEY_SYNC_HINT = "PYTHONPATH=. python scripts/notes_embed.py"
 REKEY_RENDER_HINT = "scripts/render_notes.sh"
 
 
+def _cited_bracket_re(key: str) -> "re.Pattern":
+    """`[@key]` 或书籍证据带页码定位符的 `[@key, p. 247]`（见 topics._cite_str）。
+
+    捕获组是"citekey 之后、到闭方括号为止"的尾巴（要么就是 `]`，要么是
+    `, p. 247]` 这类定位符 + `]`）——改名时把 citekey 换掉、尾巴原样拼回去，
+    页码定位符才不会在改键那一刻被吞掉。**只在本函数与 `_rename_pages` 内用**：
+    不复用 `topics._CITE_RE`（避免给 notes_index.py 加一条跨模块 import——
+    `topics.py` 本身在模块顶层 `from .notes_index import write_if_changed`，
+    反向在模块顶层 import 会成环；本仓库对这类几行的小正则允许各模块各自维护
+    一份，见 grounding.py/page_parse.py 头部同型注释）。
+
+    后面紧跟的字符要么是 `,`（定位符起点）要么直接是 `]`：`old="k"` 不会误配
+    `[@k2024X]`（"k" 后面紧跟 "2"，两种分支都不成立）——与改动前
+    `"[@{}]".format(old) in text` 的精确匹配语义完全一致，只是多认一种尾巴形状。
+    """
+    return re.compile(r"\[@" + re.escape(key) + r"((?:,[^\]]*)?\])")
+
+
 def _page_cites_old_key(text: str, old: str, is_lint_page: bool) -> bool:
     """页面文本里有没有引用旧键。**扫描与改名共用这一个判据**——两处同义判据只留一份。
 
-    `[@key]` 是正文引用形态；`_lint.md` 的 coverage 节孤儿 ID 是**裸 citekey**，故那一份
-    额外走词边界匹配（撞键消歧的 b/c 后缀让旧键天然是近亲键的前缀，裸子串会假阳性）。
+    `[@key]`（含带页码定位符的 `[@key, p. 247]`）是正文引用形态；`_lint.md` 的
+    coverage 节孤儿 ID 是**裸 citekey**，故那一份额外走词边界匹配（撞键消歧的
+    b/c 后缀让旧键天然是近亲键的前缀，裸子串会假阳性）。
     qa 页「未纳入的近邻论文」的裸反引号键是 qa.py 刻意的非引用形态，不在此判据内。
     """
-    if "[@{}]".format(old) in text:
+    if _cited_bracket_re(old).search(text):
         return True
     return bool(is_lint_page and re.search(
         r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format(re.escape(old)), text))
@@ -1736,7 +1765,16 @@ def _rename_pages(topics_dir, pairs, out, *, apply: bool):
             if not _page_cites_old_key(new_text, old, is_lint):
                 continue
             before = new_text
-            new_text = new_text.replace("[@{}]".format(old), "[@{}]".format(new))
+            # 用捕获组把"尾巴"（`]` 或 `, p. 247]`）原样拼回去，而不是裸字符串替换
+            # `"[@old]" -> "[@new]"`——那种写法在 old 页面带页码定位符时（`[@old, p. 247]`）
+            # 根本不是那个子串，会**静默不改**，留下一条指向已注销旧键的死引用（且连
+            # `_page_cites_old_key` 的扫描都不会点名是哪一页，因为上面那行已经改用了
+            # 定位符感知的判据，会先发现"该改"，但旧的裸替换这一步却改不动）。
+            # 回调而不是字符串模板：`new` 若含 `\1`/`\g<0>` 这类序列，字符串模板会被
+            # `re.sub` 当反向引用解析——`_rename_pages` 别处（is_lint 分支）已经因为
+            # 这个原因改用回调，这里保持同一条纪律。
+            new_text = _cited_bracket_re(old).sub(
+                lambda m, _n=new: "[@{}{}".format(_n, m.group(1)), new_text)
             if is_lint:
                 # repl 用 lambda 而不是裸字符串：新键里若含 `\1` / `\g<0>` 这类序列，
                 # 裸字符串会被当反向引用解析（`re.error` 直接逃出本函数，或静默替换成整段匹配）。

@@ -239,6 +239,13 @@ class Evidence:
     year: Optional[int] = None
     tier: Optional[str] = None
     title: Optional[str] = None
+    # 书籍链路（2026-09-17）：句级页码定位符与章节定位，直接透传自
+    # embed_store.Chunk 同名字段（见 store.records 的 _CHUNK_COLUMNS）。论文证据
+    # 恒为 None——完全向后兼容，凡是不读这两个字段的旧代码路径行为不变。
+    # pages 例：单页 "247"、区间 "241-259"（`h.get("pages")` 原样透传，不做拆分/校验）；
+    # chapter 例："Ch.7 · pp.241-259 · Nonignorable models"（章节定位，供展示用）。
+    pages: Optional[str] = None
+    chapter: Optional[str] = None
     # bucket 命中的加分（DEFAULT_BUCKET_BONUS），只用于 select_evidence 内部排序。
     # score 字段本身永远是原始余弦相似度——展示、以及任何要跟 min_sim 比较的地方，
     # 都不该被这个加成污染。
@@ -285,6 +292,7 @@ def select_evidence(candidates: Sequence[Evidence], max_evidence: int,
             ref="E{}".format(i), citekey=e.citekey, text=e.text, role=e.role,
             section=e.section, note_file=e.note_file, note_line=e.note_line,
             score=e.score, year=e.year, tier=e.tier, title=e.title,
+            pages=e.pages, chapter=e.chapter,
             bucket_boost=e.bucket_boost,
         ))
     return out
@@ -367,6 +375,13 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
                 section=r.get("section"), note_file=r.get("note_file"),
                 note_line=r.get("note_line"), score=float(score), bucket_boost=boost,
                 year=r.get("year"), tier=r.get("tier"),
+                # 书籍链路：store 记录里的 pages/chapter 透传（文章记录里这两列恒为
+                # None，见 embed_store.chunks_from_index 的 docstring）。MINOR-6：
+                # 同 `text`（368 行）一样要过 flatten_linebreaks——不然 chapter 里
+                # 一旦带内嵌换行，证据表那一行会被断成两半，_EVIDENCE_ROW_RE（单行
+                # 正则）匹配不到，这条证据从 --verify 统计里静默消失。
+                pages=_flatten_optional_locator(r.get("pages")),
+                chapter=_flatten_optional_locator(r.get("chapter")),
             )
     return select_evidence(list(best.values()), spec.max_evidence, per_paper_cap)
 
@@ -875,6 +890,27 @@ def flatten_linebreaks(s: str) -> str:
     return re.sub(r"[\r\n\x0b\x0c\u2028\u2029]+", " ", s or "")
 
 
+def _flatten_optional_locator(v):
+    """`flatten_linebreaks` 的 `Optional` 版本，给 `pages`/`chapter` 这类"可选
+    定位符字段"用（MINOR-6，2026-09-17 R2 对抗审核）。
+
+    `flatten_linebreaks` 本身对 `None`/空值已安全（内部 `s or ""`），但会把
+    它们**规范成空字符串**返回——那对 `text`/论断这类"总是要有值"的字段是对的
+    （模块 docstring 那条"三处必须用同一个口径"说的就是它们），但
+    `Evidence.pages`/`.chapter` 类型是 `Optional[str] = None`，下游一律用
+    `if e.pages:`/`elif e.chapter:` 判断"有没有"——保持 `None` 比引入一个
+    "看起来有值、实际是空串"的中间态更干净，调用处不用记住两种"空"的写法。
+
+    真实后果（这条修复要堵的）：书籍精读把 `chapter` 写成跨行的长描述（PDF
+    抽文/人工换行都可能带出内嵌换行）时，若不做这层归一化，证据表那一行
+    `- ● **E1** ... · Ch.7 · ...` 会被硬生生断成两个物理行，`_EVIDENCE_ROW_RE`
+    （单行正则）匹配不到，这条证据从 `--verify`/`audit_topic_pages` 的统计里
+    **静默消失**——citekey 依然在页面上、pandoc 依然能渲染，看起来一切正常，
+    只是这一条再也不会被任何自检发现。
+    """
+    return flatten_linebreaks(str(v)) if v else None
+
+
 def _check_grounding(text: str, refs: Sequence[str], ev_map: Dict[str, Evidence],
                      report: ValidationReport, n_evidence: int,
                      where: str = "") -> None:
@@ -996,8 +1032,41 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
 # 渲染
 # ---------------------------------------------------------------------------
 
-def _cite_str(citekeys: Sequence[str]) -> str:
-    return " ".join("[@{}]".format(k) for k in citekeys)
+def _cite_str(refs: Sequence[str], ev_map: Dict[str, Evidence]) -> str:
+    """把回译好的证据编号列表渲染成 pandoc 引用串。
+
+    **一条引用一个方括号**（`[@k1] [@k2]`），沿用既有约定（此前直接拿
+    `_refs_to_keys` 按 citekey 去重后的结果拼接）。书籍证据额外带 pandoc 页码
+    定位符：`[@little2020rubin, p. 247]`——格式与 `scripts/notes_query.py::_cite_one`
+    已经在用的形态逐字一致，pandoc-citeproc 认得这个语法。
+
+    **多页定位符的取舍**：同一论断若引了同一本书的不同页（两条不同的句级证据、
+    同一 citekey、不同 pages），这里选择**逐页各开一个方括号**
+    （`[@k, p. 12] [@k, p. 40]`），而不是挤进一个 `[@k, pp. 12, 40]`——
+    理由有二：(1) 去重粒度天然是 `(citekey, pages)` 二元组而不再是单纯 citekey，
+    "一个 citekey 一个方括号"这条心智模型不用改，只是键变宽了；(2) pandoc-citeproc
+    对复合 locator（一个方括号里塞多个页码）的解析规则比"重复一次引用"更容易在
+    不同 CSL 样式下走样，而重复引用是任何 pandoc 版本都保证认得的基本语法。
+    代价是同一 citekey 可能在一条论断后面出现两次，但那正是"这条论断分别用了
+    这本书的第 12 页和第 40 页"这件事本身要传达的信息，不是缺陷。
+
+    去重键 `(citekey, pages or "")`：两条不同编号、同一篇、都没有 pages（普通论文，
+    或书籍的章级/无页码证据）时仍按 citekey 去重成一条——**这是对旧行为的精确
+    保序复现**，不是新规则；pages 不同才分别保留。
+    """
+    seen: set = set()
+    parts: List[str] = []
+    for r in refs:
+        e = ev_map.get(r)
+        if e is None:
+            continue
+        token = (e.citekey, e.pages or "")
+        if token in seen:
+            continue
+        seen.add(token)
+        parts.append("[@{}, p. {}]".format(e.citekey, e.pages) if e.pages
+                     else "[@{}]".format(e.citekey))
+    return " ".join(parts)
 
 
 def render_generated_block(spec: TopicSpec, synthesis: dict,
@@ -1006,6 +1075,7 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
 
     证据表列出全部召回证据（含未被引用的），并标注哪些没被用上。
     """
+    ev_map = {e.ref: e for e in evidences}       # _cite_str 据此把编号回译成定位符引用
     used_refs = {r for sec in synthesis["sections"] for c in sec["claims"] for r in c["refs"]}
     # 分歧区引用的证据同样算"被采用"——曾经漏了这一段，只在「⚔️ 分歧与冲突」里出现的
     # 证据会被误标 ○（validate_synthesis 的 report.used_refs 其实一直算了 disputes，
@@ -1022,7 +1092,7 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
         lines.append("## {}".format(sec["heading"]))
         lines.append("")
         for c in sec["claims"]:
-            lines.append("- {} {}".format(c["text"], _cite_str(c["citekeys"])))
+            lines.append("- {} {}".format(c["text"], _cite_str(c["refs"], ev_map)))
         lines.append("")
 
     if synthesis["disputes"]:
@@ -1030,8 +1100,8 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
         for d in synthesis["disputes"]:
             lines.append("### {}".format(d["issue"]))
             lines.append("")
-            lines.append("- **一方**：{} {}".format(d["position_a"], _cite_str(d["citekeys_a"])))
-            lines.append("- **另一方**：{} {}".format(d["position_b"], _cite_str(d["citekeys_b"])))
+            lines.append("- **一方**：{} {}".format(d["position_a"], _cite_str(d["refs_a"], ev_map)))
+            lines.append("- **另一方**：{} {}".format(d["position_b"], _cite_str(d["refs_b"], ev_map)))
             if d["note"]:
                 lines.append("- *为何分歧*：{}".format(d["note"]))
             lines.append("")
@@ -1057,6 +1127,22 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
         loc = ""
         if e.note_file:
             loc = " · {}{}".format(e.note_file, ":{}".format(e.note_line) if e.note_line else "")
+        # 书籍证据的句级页码：note_line 指向的是整本书条目在 note_file 里的**入口行**
+        # （章节标题所在处），全书所有证据共用同一个 note_line，本身没有定位价值
+        # （见模块内 note_line 调查结论）；pages 才是这一条证据自己的原书页码。
+        #
+        # N1（2026-09-17 R1 对抗审核）：`pages` 缺失时退而显示 `chapter`。真实库
+        # 目前没有"有 chapter 无 pages"的 highlight（两者当下总是一起来），但
+        # `embed_store.Chunk` 里这两列的来源是**独立**的——`pages` 只认显式的
+        # `h["pages"]`，`chapter` 除了显式 `h["chapter"]` 还会从 `section` 用正则
+        # 派生（`_chapter_of_section`），未来完全可能出现只标了章节、没标具体页码
+        # 的精读句。此处只补证据表这一行**展示**用的定位信息，**不进正文引用**
+        # ——pandoc 的 locator 语法只认页码，"Ch.7" 塞进 `[@key, Ch.7]` 不是合法
+        # 的 citeproc locator，`_cite_str` 那条通道维持只认 `pages` 不变。
+        if e.pages:
+            loc += " · p.{}".format(e.pages)
+        elif e.chapter:
+            loc += " · {}".format(e.chapter)
         lines.append("- {} **{}** `[@{}]` {}{}".format(
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
@@ -1142,8 +1228,15 @@ def _render_frontmatter(items: Dict[str, Any]) -> str:
             continue
         key = ks if (_SAFE_KEY.match(ks) and ks.lower() not in _YAML_WORDS) else _y(ks)
         if isinstance(v, list):
-            lines.append("{}:".format(key))
-            lines += ["  - {}".format(_y(x)) for x in v]
+            if not v:
+                # 空列表必须写成 flow-style `key: []`，不能只写 `key:` 空着——那样
+                # YAML 会把它解析成 `None` 而不是 `[]`（2026-09-17 加 qa 页 ask_query/
+                # ask_role 两个可能为空的列表字段时实测踩到：往返一趟，空列表变成了
+                # None，reask 的「旧页无存档参数」判定被这个 None 污染成假阳性）。
+                lines.append("{}: []".format(key))
+            else:
+                lines.append("{}:".format(key))
+                lines += ["  - {}".format(_y(x)) for x in v]
         elif isinstance(v, dict):
             # 受管键从不产出 dict；只有用户手写的嵌套 YAML 才可能走到这里。
             # json.dumps 的转义集合是 YAML 双引号标量/流式对象的子集，天然合法。
@@ -1957,7 +2050,22 @@ def audit_topic_pages(topics_dir: Path, index: dict) -> List[PageAudit]:
 
 VAULT_TOPICS_DIR = "02-主题"
 
-_CITE_RE = re.compile(r"\[@([^\]\s]+)\]")
+# `[@citekey]` 或 `[@citekey, <定位符>]`（书籍证据的 pandoc 页码定位符，见
+# `_cite_str`）。**只暴露一个捕获组**（citekey 本身）——全仓其余调用点
+# （`audit_topic_pages`/`lint_checks.cited_by_page`/`cited_citekeys`/
+# `parse_page_claims`/`grounding.check_numbers`/`page_parse.parse_page`……）
+# 全部用 `.findall()`/`.sub()` 取"纯 citekey 列表"或"整段抹掉"，两个捕获组会让
+# `.findall()` 处处退化成 `(key, locator)` 元组，逐一改调用点的风险远大于给
+# `to_wiki_links`（唯一需要保留定位符文本的一处）单独开一条正则
+# （见下面的 `_CITE_LOCATOR_RE`）。定位符本身用非捕获组 `(?:,[^\]]*)?` 吃掉——
+# `,` 之后到 `]` 之前的任意内容（含空格），不关心它具体长什么样。
+_CITE_RE = re.compile(r"\[@([^\],\s]+)(?:,[^\]]*)?\]")
+
+# `to_wiki_links` 专用：比 `_CITE_RE` 多一个捕获组，把定位符（含开头的逗号，
+# 没有定位符时是空串）单独取出来，好在转成 wiki 链接时原样拼回显示文本——
+# 否则 `[@little2020rubin, p. 247]` 转完会变成 `[[little2020rubin|little2020rubin]]`，
+# 页码锚在 Obsidian 里凭空消失。
+_CITE_LOCATOR_RE = re.compile(r"\[@([^\],\s]+)((?:,[^\]]*)?)\]")
 
 
 def to_wiki_links(text: str, filenames: Dict[str, str]) -> str:
@@ -1968,14 +2076,21 @@ def to_wiki_links(text: str, filenames: Dict[str, str]) -> str:
 
     不在 filenames 里的 citekey **保持 `[@key]` 原样**——那是"论文在库里但没进
     vault"（如只有摘要没精读的条目），转成 wiki 链接只会得到一个点开是空白的死链。
+
+    书籍证据带的页码定位符（`[@key, p. 247]`）**保留在链接显示文本里**
+    （`[[文件名|key, p. 247]]`）：这不是合法的 pandoc 引用语法（vault 侧本来就
+    不经 pandoc 渲染），但页码是读者在 Obsidian 里核对原句时最想要的那条信息，
+    丢掉比留着更糟——Obsidian 的 wiki 链接显示文本可以是任意字符串，`, p. 247`
+    不含 `]]` 或 `|`，不会破坏链接语法。
     """
     def _sub(m):
-        key = m.group(1)
+        key, loc = m.group(1), m.group(2)
         fname = filenames.get(key)
         if not fname:
             return m.group(0)
-        return "[[{}|{}]]".format(fname, key) if fname != key else "[[{}]]".format(key)
-    return _CITE_RE.sub(_sub, text)
+        display = key + loc
+        return "[[{}|{}]]".format(fname, display) if fname != display else "[[{}]]".format(key)
+    return _CITE_LOCATOR_RE.sub(_sub, text)
 
 
 def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, str],

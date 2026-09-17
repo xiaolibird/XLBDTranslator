@@ -116,6 +116,11 @@ PYTHONPATH=. python scripts/lint_notes.py --vault-dir ~/Documents/ScholarVault  
    结构化撤稿记录有已知覆盖缺口)。**读结论前先读它上面那行分母**——本库 2256 篇 keeper
    里 358 篇压根没有 DOI,"0 篇撤稿"从来不等于"库是干净的"。命中时 CLI 退出码 1,
    **且这个 1 优先于报告落盘冲突的 2**(发现绝不能因为报告写不进磁盘而丢失)。
+   命中的每一条会**分别**列出「已被概念页引用:X、Y」与「已被问答页引用:X、Y」
+   (2026-09-17 起新增后者)——概念页引用意味着"这几页的论断可能建立在被撤销的
+   结论上,标记后必须重跑这几页";问答页不会自动重合成,正确动作是重问
+   (`ask_notes.py --reask <slug>`,报告里直接给可粘贴的命令)。两者都没有才会写
+   "未被任何概念页或问答页引用"。
 2. **⚔️ 跨文献对撞**(唯一调 LLM 的一项):全库 `citable ↔ refutable` 的跨论文语义近邻句对,
    由 LLM 分成 `结论冲突 / 单篇内部自相矛盾 / 方法学分歧 / 适用范围限定 / 同题但不构成张力`
    五档,只报前四档。**相似度只是候选生成器**——它找的是"在讲同一件事"而不是"互相矛盾",
@@ -188,7 +193,8 @@ PYTHONPATH=. python scripts/lint_notes.py --vault-dir ~/Documents/ScholarVault  
 - **本轮跳过的一节会结转上一次的结果并标明时效**:标题下方那条 `⏸ 本轮未执行……以下是
   N 天前那次运行的结果,不代表当前状态` 就是结转来的。所以 `--offline` 这种窄跑不会再
   把撤稿那节清空,但**结转的结论也不是当前状态**(撤稿那节的"已被概念页引用:X、Y"
-  同样是那一轮的页面快照,动手前先核实)。
+  与"已被问答页引用:X、Y"同样都是那一轮的页面快照——概念页可能已经重合成过、
+  问答页可能已经被重问过,动手前先核实)。
 - 距上次对撞超过 45 天(`--contradiction-reminder-days` 可调)时,报告顶部与 stdout 都会
   提醒补跑。月度自动化明确不跑对撞(成本),它完全依赖人自己想起来。
 - **陈旧/孤儿两节每节开头有一行 delta**:「本轮新增 N · 与上轮相同 M · 已消失 K」。
@@ -307,6 +313,35 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
 - `--verify` 除了死键/失锚,还报**残留证据编号**与**防线版本**:归档页是"生成它那一刻
   的代码"的快照,低于当前版本的页面会标 ⚠️ 并给出重跑命令(纯本地扫描,不花 LLM)。
 
+### 重问(`--reask` / `--reask-all`,2026-09-17 起)
+
+检索参数(`-q`/`--role`/`--min-sim`/`--max-evidence`/`--per-paper-cap`)从这一版起
+随每一页归档进 frontmatter(`ask_query`/`ask_role`/`ask_min_sim`/`ask_max_evidence`/
+`ask_per_paper_cap`,**全量写**而不是只写与默认值不同的那些——默认值本身会随代码
+演进而变,重问要复现"当年实际用的那次检索"),重问时不用自己再记一遍当年怎么问的:
+
+```bash
+PYTHONPATH=. python scripts/ask_notes.py --reask qa-mnar-ehr-1f424623   # 重问一页
+PYTHONPATH=. python scripts/ask_notes.py --reask A --reask B            # 可重复,一次重问多页
+PYTHONPATH=. python scripts/ask_notes.py --reask-all                    # 只打印「计划重问 N 页」,不动手
+PYTHONPATH=. python scripts/ask_notes.py --reask-all --yes              # 真的按顺序全部重问一遍
+PYTHONPATH=. python scripts/ask_notes.py --reask-all --dry-run          # 每页只跑召回,不调 LLM、不落盘
+```
+
+- **三级合并语义**:命令行显式给出的 `-q`/`--role`/`--min-sim`/`--max-evidence`/
+  `--per-paper-cap` **覆盖**(替换,不是并集)那一页的存档值;没显式给的字段用存档值;
+  两者都没有(2026-09-17 之前生成的旧页,或全新提问)退回代码默认值。
+- **`--reask-all` 默认只打印计划**(多少页、每页问题)不动手——它可能一口气触发几十次
+  LLM 调用,加 `--yes` 才真的执行。`--dry-run` 与两者组合时不受 `--yes` 门槛限制,
+  因为它不调 LLM、不落盘。
+- **批量场景单页失败不中断其余页**,跑完打印一份汇总(成功/冲突/失败各多少页、
+  各自是哪几页)。退出码:本轮出现过冲突页退 1;没有冲突但出现过失败页(含 slug
+  被占用的 `taken`)退 2;全部成功退 0。
+- 旧页(没存过检索参数)重问时会打印一句提示,只用问题本身 + 当前默认/命令行参数。
+- `--reask <slug>` 若磁盘上没有这个文件名(常见于 2026-08-17 之前的旧 digest 口径
+  文件从未被重命名过),会反查存量页里有没有"按今天算法重算问题文本会得到这个 slug"
+  的那一页,找到就沿用真实文件名并提示映射关系;找不到才报错(提示先 `--list`)。
+
 ## 语义检索(中文找英文表述、换述同义词用)
 
 `jq`/`notes_query.py` 是精确子串匹配；查不到换述表达（如中文"缺失机制不可忽略"查不到英文
@@ -328,6 +363,13 @@ PYTHONPATH=. python scripts/ask_notes.py --verify          # 自检引用是否�
 
 **`highlights[]`——句级取证的核心**:每项 `{role, tag, section, text}`。`role` 是按**对后续工作流的用途**的三分:
 `citable`(可引用证据:含数字/效应量/可溯源结果)、`refutable`(可反驳观点:作者主张/可质疑处,写 critique 的靶子;手动精读还含对抗核验的纠错条)、`method`(方法论借鉴:可迁移的方法思路)。`tag` 是对应的中文原标记,`section` 是精读分节名(溯源用)。**书籍条目的 highlights 额外带 `pages`**(原书页码锚,如 "247"/"241-259"),写作时据此产出 pandoc 定位符 `[@key, p. 247]`;专著的 `section` 形如 `Ch.7 · pp.151-184 · <章名> · <分节>`,可直接溯源到章。工作流按 role 跨全库直取句子,无需打开 md。历史条目的 role 由旧标记规则近似映射(方法学创新→method、重要发现→citable、研究背景→丢弃),新精读由 LLM/subagent 直接精确产出。
+
+**2026-09-17 起,概念页(`topics/`)与问答归档(`topics/qa/`)自动生成的正文引用
+也带这个定位符**:书籍句级证据回译成 `[@key, p. N]`(而不再只有裸 `[@key]`),
+同一论断引同一本书的不同页时逐页各开一个方括号(`[@key, p. 12] [@key, p. 40]`);
+证据表那一行显示句级页码(`· p.N`),没有页码锚时退而显示章节定位。此前这两层
+只有 `scripts/notes_query.py --cite`(手动取证)会产出定位符,自动生成的页面丢了
+这层信息——现已补齐,首次重合成/重问就会带出来。
 
 顶层还有 `months{}`(按**文件 stem** 键,含 month/series)、`citekey_collisions[]`(撞键警告,见下)与
 `title_near_duplicates[]`(疑似同文待人工确认,见下)。

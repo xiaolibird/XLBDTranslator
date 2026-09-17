@@ -1892,6 +1892,17 @@ def _main_src():
     return inspect.getsource(ask_notes.main)
 
 
+def _run_one_src():
+    """`main()` 单问题/`--reask`/`--reask-all` 三条路径共用的单次问答逻辑
+    （2026-09-17 起从 `main()` 里拆成 `_run_one`，好让 `--reask-all` 能在一次
+    进程里循环调用它）。查/概念页比对这类"每问一次都要跑"的行为现在住在这里，
+    不再住在 `main()` 里。"""
+    import inspect
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import ask_notes                                          # noqa: E402
+    return inspect.getsource(ask_notes._run_one)
+
+
 def test_cli_passes_qa_dir_so_legacy_pages_stay_reachable():
     """`qa_slug` 的身份扫描只在给了 `qa_dir` 时才走。CLI 漏传 = 存量页全部变孤儿，
     而这正是上一轮亲手造出来的那个缺陷。"""
@@ -1901,14 +1912,21 @@ def test_cli_passes_qa_dir_so_legacy_pages_stay_reachable():
 def test_cli_topic_check_is_not_gated_by_the_dedup_switch():
     """B1：首版把概念页比对放在 `--no-dedup-check` 的 if 里，于是带上那个 flag 重跑
     一页时，生成块顶部的 `📎 相关概念页` 会被静默删掉，状态仍是 merged ✅。
-    两件不同的事不许共用一个开关。"""
-    src = _main_src()
-    i = src.index("if not args.no_topic_check:")
-    # 概念页那段必须在 dedup 的 if 之外：它自己那行的缩进是 8 空格（函数体一级），
-    # 落在 dedup 块里就会是 12 空格。
+    两件不同的事不许共用一个开关。
+
+    2026-09-17：这段逻辑随 `--reask`/`--reask-all` 重构搬进了 `_run_one`（`main()`
+    改成对单个问题/每一页 `--reask` 目标都调它一次），改查 `_run_one` 的源码；
+    判据本身（"概念页比对不许缩在 dedup 的 if 块里"）一个字没变。
+    """
+    src = _run_one_src()
+    i = src.index("if not no_topic_check:")
+    # 概念页那段必须在 dedup 的 if 之外：它自己那行的缩进是 4 空格（_run_one 函数体
+    # 一级，普通函数不像方法那样多一层缩进），落在 dedup 块里就会是 8 空格。
     line_start = src.rindex("\n", 0, i) + 1
-    assert src[line_start:i] == " " * 8, "概念页比对不许缩在 --no-dedup-check 块内"
-    assert "topic_vecs = Q.topic_vectors(topic_specs, embed_client)" in src
+    assert src[line_start:i] == " " * 4, "概念页比对不许缩在 --no-dedup-check 块内"
+    # topic_vecs 只算一次（B7）：--reask-all 循环调 _run_one 多次，这行必须留在
+    # main() 里、传参数下去，不能挪回 _run_one 变成每页重算一次。
+    assert "topic_vecs = Q.topic_vectors(topic_specs, embed_client)" in _main_src()
 
 
 # ---------------------------------------------------------------------------
