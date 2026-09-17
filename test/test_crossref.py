@@ -159,3 +159,15 @@ def test_repair_references_csl_carries_article_number_as_page():
     item = parse_crossref_work(_work(**{"article-number": "e10308"}))
     csl = rr._csl_from_crossref(item, {"citekey": "ladobaleato2025Testing"})
     assert csl["page"] == "e10308" and csl["id"] == "ladobaleato2025Testing"
+
+
+def test_parse_crossref_work_cleans_jats_markup_and_wrapped_whitespace():
+    # 实测 10.1088/0951-7715/26/2/r69：标题带 <sup> 与排版换行，札记 `##` 标题被劈成三行、
+    # 索引切不出该节（xu2012Potential 的 note_line=None）
+    from src.scholar.crossref import parse_crossref_work, clean_title
+    raw = ("signal-induced Ca\n                    <sup>2+</sup>\n                    oscillation")
+    assert parse_crossref_work(_work(title=[raw]))["title"] == "signal-induced Ca2+ oscillation"
+    assert clean_title("Levels of CO<sub>2</sub>  in <i>E. coli</i> &amp; soil") == "Levels of CO2 in E. coli & soil"
+    assert clean_title("<jats:title>Deep\n learning</jats:title>") == "Deep learning"
+    assert clean_title("x < y and a<b") == "x < y and a<b"
+    assert clean_title("") == ""

@@ -8,6 +8,7 @@ Scholar 邮件解析出的作者常把标题片段混入作者列表，且普遍
 带标题相似度门槛（token Jaccard），避免匹配到无关论文污染文献库；不达标则保留原始元数据。
 公开接口、无需密钥；mailto 礼貌参数走 polite pool。HTTP 与解析分离，便于 mock 测试。
 """
+import html
 import re
 from datetime import date
 from typing import List, Dict, Any, Optional
@@ -30,6 +31,17 @@ def _norm_title(t: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
 
 
+def clean_title(t: str) -> str:
+    """Crossref 标题里常夹 JATS 行内标记与排版换行（「Ca\\n  <sup>2+</sup>\\n oscillation」），
+    原样写进札记会把 `## 标题` 劈成多行、索引切不出该节。上下标贴合前一个词（Ca2+），
+    其余标签剥掉，空白折叠成单空格。"""
+    t = t or ""
+    t = re.sub(r"\s*<(sup|sub|inf)\b[^>]*>\s*", "", t, flags=re.I)
+    t = re.sub(r"\s*</(sup|sub|inf)>", "", t, flags=re.I)
+    t = re.sub(r"</?[A-Za-z][\w:.-]*(\s[^<>]*)?/?>", "", t)
+    return re.sub(r"\s+", " ", html.unescape(t)).strip()
+
+
 def title_similarity(a: str, b: str) -> float:
     """两标题的 token Jaccard 相似度（0-1）。"""
     ta, tb = set(_norm_title(a).split()), set(_norm_title(b).split())
@@ -41,7 +53,7 @@ def title_similarity(a: str, b: str) -> float:
 def parse_crossref_work(item: Dict[str, Any]) -> Dict[str, Any]:
     """把单条 Crossref work 映射为归一化 dict（纯函数）。"""
     title_list = item.get("title") or []
-    title = title_list[0] if title_list else ""
+    title = clean_title(title_list[0]) if title_list else ""
 
     authors: List[str] = []
     for a in item.get("author") or []:

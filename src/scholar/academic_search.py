@@ -112,7 +112,7 @@ class AcademicSearchClient:
         root = ET.fromstring(xml_text)
         results: List[Dict[str, Any]] = []
         for entry in root.findall(f"{_ATOM_NS}entry"):
-            title = (entry.findtext(f"{_ATOM_NS}title") or "").strip().replace("\n", " ")
+            title = re.sub(r"\s+", " ", entry.findtext(f"{_ATOM_NS}title") or "").strip()
             summary = (entry.findtext(f"{_ATOM_NS}summary") or "").strip().replace("\n", " ")
             authors = [
                 (a.findtext(f"{_ATOM_NS}name") or "").strip()
