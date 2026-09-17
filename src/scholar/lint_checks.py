@@ -922,6 +922,42 @@ def cited_by_page(topics_dir) -> Dict[str, List[str]]:
     return out
 
 
+def cited_by_qa_page(topics_dir) -> Dict[str, List[str]]:
+    """每页归档问答出现过的 citekey：`{qa_slug: [citekey, ...]}`。
+
+    与 `cited_by_page` 同构、故意**不**塞进那个函数——两者语义不同，混在一起会
+    把"这篇撤稿论文渗进了哪几页**概念页**"这句话的主语悄悄扩大成"概念页∪问答页"，
+    而 `cited_by_page` 现有的调用方（`coverage_report`/`stale_claims` 走的是
+    `cited_citekeys`，那个已经特意放宽到 qa/；但 `cited_by_page` 自己至今只服务
+    撤稿节这一个消费方，语义收紧留着没关系，改宽了才是真正的行为变更）不该被
+    这次改动连带影响，见 `cited_by_page` 自己的 docstring 与 `_coverage_scan_files`
+    旁边那条"四处 glob 里唯一该放宽到 qa 子目录的一处"的说明。
+
+    只扫 `topics/qa/`、认 frontmatter 的 `qa` 键（不是 `topic`）——`is_topic_page_file`
+    按文件名判"是不是一份派生产物"的逻辑对 `topics/` 与 `topics/qa/` 两层通用
+    （`INDEX.md`/`_` 前缀两条约定在哪一层都一样），可以直接复用，不必再从 qa.py
+    导入一份 `is_qa_page_file`（两者定义逐字相同，见 qa.py 里的说明）。
+    """
+    out: Dict[str, List[str]] = {}
+    qa_dir = Path(topics_dir) / "qa"
+    if not qa_dir.is_dir():
+        return out
+    for path in sorted(qa_dir.glob("*.md")):
+        if not is_topic_page_file(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError 是 ValueError 的子类，只捕 OSError 挡不住它——
+            # 同文件其余四处 glob 扫描一致的处理（见上面几处同型注释）。
+            continue
+        fm, _ = split_frontmatter(text)
+        if not isinstance(fm, dict) or not fm.get("qa"):
+            continue
+        out[str(fm["qa"])] = sorted(set(_CITE_RE.findall(text)))
+    return out
+
+
 def _coverage_scan_files(topics_dir) -> List[Path]:
     """覆盖率统计要扫的文件：概念页 + **归档问答**（`topics/qa/*.md`）。
 

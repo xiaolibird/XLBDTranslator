@@ -47,6 +47,7 @@ from .lint_checks import (                                        # noqa: F401
     build_contradiction_prompt,
     check_retractions,
     cited_by_page,
+    cited_by_qa_page,
     cited_citekeys,
     coverage_report,
     find_contradiction_candidates,

@@ -357,6 +357,7 @@ def main() -> int:
         verdicts=verdicts, candidates=candidates, verdict_report=vrep,
         retraction=retraction, stale_claims=stale_claims, coverage=coverage,
         cited_by_page=L.cited_by_page(topics_dir),
+        cited_by_qa_page=L.cited_by_qa_page(topics_dir),
         params={"pair_min_sim": args.pair_min_sim, "max_pairs": args.max_pairs,
                 "batch_size": args.batch_size},
         contradictions_skipped=contradictions_skipped,

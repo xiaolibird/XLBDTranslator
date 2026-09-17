@@ -58,6 +58,7 @@
      它拦住的正是"同一个问题被问第四次"。
 """
 import hashlib
+import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -555,6 +556,21 @@ def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
     拿字符串用）。没有它的话，只在 `answer` 或 `gaps` 里被提到的那条证据会在证据表里
     标 ○，而表头写着"未被引用的证据标 ○"——页面上明明有 `[@key]`，两个数字互相自洽
     却都与页面事实不符，CLI 的"引用率"也跟着少算。
+
+    ## 已知局限（记账不修，2026-09-17 R2 对抗审核）
+
+    - **MINOR-3**：模型有时会在自由文本里复述证据原句已经带的页码（如某条
+      highlight 原文本身写着"(p.3)"，模型转述成"E7 在第 3 页显示……"）；若 E7
+      恰好是带 `pages` 定位符的书籍证据，回译后会读成"`[@key, p. 3]` 在第 3
+      页显示……"——页码信息视觉上重复了一次。这是内容层面的措辞冗余，不是引用
+      本身出错（citekey 与页码都仍然准确、可追溯），修它要么在模型自由文本里
+      做页码字符串匹配再删除（容易连累正常叙述），要么放弃给自由文本回译加
+      定位符（倒退回本轮之前的行为）——两个方向代价都不小，记账不修。
+    - **NIT-2**：`_INLINE_REF_RE` 逐个匹配 `E\\d+`，模型写"E1-E3 均支持"这种
+      range 语法时，中间的连字符不属于任何一个匹配，回译后变成
+      `[@a]-[@c]`——两个引用都对，只是连着它们的连字符成了一个孤立字符，
+      读起来略怪。这是本模块一直就有的既有行为（不是本轮改动引入的），
+      记账不修。
     """
     def _sub(m):
         ref = "E{}".format(int(m.group(1)))
@@ -564,7 +580,11 @@ def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
             return ""
         if used is not None:
             used.add(ref)
-        return "[@{}]".format(ev.citekey)
+        # 书籍证据带页码定位符（同 topics._cite_str/qa._cite_str 的既有格式）：
+        # 自由文本里模型随手提到的证据编号一样可能指向一条书籍句级证据，回译时
+        # 不能只给 citekey——那会让这句话与证据表里同一条证据的引用形态不一致。
+        pages = getattr(ev, "pages", None)
+        return "[@{}, p. {}]".format(ev.citekey, pages) if pages else "[@{}]".format(ev.citekey)
 
     out = _INLINE_REF_RE.sub(_sub, text)
     # 剔除越界编号后可能留下 "……（ 的流程图" 之类的空档
@@ -701,8 +721,26 @@ def synthesize_qa(llm, prompt: str, *, model: Optional[str] = None,
 # 渲染
 # ---------------------------------------------------------------------------
 
-def _cite_str(citekeys: Sequence[str]) -> str:
-    return " ".join("[@{}]".format(k) for k in citekeys)
+def _cite_str(refs: Sequence[str], ev_map: Dict[str, Any]) -> str:
+    """同 `topics._cite_str`（qa.py 自己独立维护一份，两模块历史上就没共用这个
+    渲染函数——见模块 docstring「不重新实现一份」那条原则的例外说明：这一个
+    确实是各写各的，逐字同形，改一边记得改另一边，同 `qa_assemble`/`topics.assemble`
+    的既有关系）。书籍证据带页码定位符：`[@key, p. 247]`；同一论断引同一本书
+    多页时逐页各开一个方括号，取舍与理由见 `topics._cite_str` 的 docstring。"""
+    seen: set = set()
+    parts: List[str] = []
+    for r in refs:
+        e = ev_map.get(r)
+        if e is None:
+            continue
+        token = (e.citekey, getattr(e, "pages", None) or "")
+        if token in seen:
+            continue
+        seen.add(token)
+        pages = getattr(e, "pages", None)
+        parts.append("[@{}, p. {}]".format(e.citekey, pages) if pages
+                     else "[@{}]".format(e.citekey))
+    return " ".join(parts)
 
 
 def _gap_hit_lines(hits: Sequence["GapHit"]) -> List[str]:
@@ -737,6 +775,7 @@ def render_qa_block(question: str, qa: dict, evidences, *,
 
     那一节的措辞是本轮改得最重的地方，见下面的注释。
     """
+    ev_map = {e.ref: e for e in evidences}        # _cite_str 据此把编号回译成定位符引用
     used_refs = {r for it in (qa["points"] + qa["caveats"]) for r in it["refs"]}
     used_refs |= set(qa.get("inline_refs") or ())
     L: List[str] = ["# {}".format(normalize_question(question)), ""]
@@ -752,11 +791,11 @@ def render_qa_block(question: str, qa: dict, evidences, *,
 
     if qa["points"]:
         L += ["## 依据", ""]
-        L += ["- {} {}".format(p["text"], _cite_str(p["citekeys"])) for p in qa["points"]]
+        L += ["- {} {}".format(p["text"], _cite_str(p["refs"], ev_map)) for p in qa["points"]]
         L.append("")
     if qa["caveats"]:
         L += ["## ⚠️ 用之前要知道的", ""]
-        L += ["- {} {}".format(c["text"], _cite_str(c["citekeys"])) for c in qa["caveats"]]
+        L += ["- {} {}".format(c["text"], _cite_str(c["refs"], ev_map)) for c in qa["caveats"]]
         L.append("")
     if qa["gaps"]:
         # A1【本轮最严重】首版这一节叫「本次没答上来的」，正文写着
@@ -798,6 +837,14 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         loc = ""
         if e.note_file:
             loc = " · {}{}".format(e.note_file, ":{}".format(e.note_line) if e.note_line else "")
+        # 书籍证据的句级页码（同 topics.render_generated_block 的同型处理）：
+        # note_line 全书共用同一个入口行、没有定位价值，pages 才是这一条自己的页码。
+        # N1：pages 缺失时退而显示 chapter（不进正文引用，pandoc locator 只认页码，
+        # 理由见 topics.render_generated_block 的同型注释——两侧必须同步）。
+        if getattr(e, "pages", None):
+            loc += " · p.{}".format(e.pages)
+        elif getattr(e, "chapter", None):
+            loc += " · {}".format(e.chapter)
         L.append("- {} **{}** `[@{}]` {}{}".format(
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
@@ -825,12 +872,35 @@ def render_qa_block(question: str, qa: dict, evidences, *,
 
 def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
                          report: ValidationReport, generated_at: str,
-                         preserved: Optional[Dict[str, Any]] = None) -> str:
+                         preserved: Optional[Dict[str, Any]] = None, *,
+                         extra_queries: Sequence[str] = (),
+                         roles: Sequence[str] = (),
+                         min_sim: Optional[float] = None,
+                         max_evidence: Optional[int] = None,
+                         per_paper_cap: Optional[int] = None) -> str:
     """受管键由生成器覆盖，用户自加键原样保留（同 topics/vault 的既有约定）。
 
     `first_asked_at` 是**唯一一个"存在就不覆盖"的受管键**：同一个问题再问一次是
     原地更新，`generated_at` 要前进，但"我第一次是什么时候问的"是这一页的历史，
     重新生成不该把它抹掉。
+
+    ## 检索参数存档（`--reask`，2026-09-17）
+
+    `extra_queries`/`roles`/`min_sim`/`max_evidence`/`per_paper_cap` 是这一次
+    生成实际用的检索参数——写进 `ask_query`/`ask_role`/`ask_min_sim`/
+    `ask_max_evidence`/`ask_per_paper_cap` 五个键，`--reask` 读它们原样重问。
+
+    **全量写，不是只写与默认值不同的那些**：检索默认值本身会随代码演进而变
+    （`DEFAULT_QA_MAX_EVIDENCE` 的取值就改过一次，见模块内的历史注释），
+    `--reask` 要**复现这一页当年实际用的那次检索**，而不是"悄悄捡今天的代码
+    默认值再跑一遍"——那已经是另一次检索了，只是恰好落在同一个 slug 上。全写
+    还让"旧页有没有存过这些参数"的判定不必猜测——"缺的那个键，是从没写过还是
+    恰好等于默认值被省略了"这种歧义不存在了。
+
+    `has_params` 的判定（`read_archived_ask_params`）专门探测 `ask_max_evidence`
+    是不是一个数字：调用方没传这五个新参数时（旧调用点、或刻意模拟"旧页"的
+    测试）它们默认 `None`，写出来是 YAML 的 `null`，读回来天然就是"没存过"——
+    不需要另开一个版本号或标记键。
     """
     preserved = preserved or {}
     # **不要求它是 `str`**：YAML 把 `first_asked_at: 2026-01-01`（没引号）解析成
@@ -862,6 +932,12 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
         "stripped_cites": report.stripped_cites,
         "numbers_checked": report.numbers_checked,
         "ungrounded_numbers": report.ungrounded_numbers,
+        # 检索参数存档（供 --reask 原样重问，见本函数 docstring「检索参数存档」）。
+        "ask_query": list(extra_queries),
+        "ask_role": list(roles),
+        "ask_min_sim": min_sim,
+        "ask_max_evidence": max_evidence,
+        "ask_per_paper_cap": per_paper_cap,
         "tags": ["札记/问答归档"],
     }
     items = dict(managed)
@@ -1425,12 +1501,173 @@ def archived_question(qa_dir, slug: str) -> str:
     return str((fm or {}).get("question") or "")
 
 
+# ---------------------------------------------------------------------------
+# --reask：读回一页存档的检索参数，原样重问
+# ---------------------------------------------------------------------------
+
+# 哨兵字段：见 `read_archived_ask_params` 的 docstring。
+ASK_PARAMS_MARKER_KEY = "ask_max_evidence"
+
+# MINOR-4（2026-09-17 R2 对抗审核）：max_evidence/per_paper_cap 存档值的宽松上界。
+# 不是业务下限（那个在 `scripts/ask_notes.py::_validate_numeric_params`，CLI 侧
+# 硬拒绝，口径与这里对称）——这里挡的是"读出来就不像话"的量级：`DEFAULT_QA_
+# MAX_EVIDENCE` 是 28，500 已经远超任何正常配置，一个手误多打一两个零
+# （28 -> 280/2800）或数据损坏不该被悄悄接受。`ask_notes.py` 也引用这个常量
+# （而不是各自维护一份魔数），两侧的"多大算离谱"必须是同一个数。
+ASK_NUMERIC_UPPER_BOUND = 500
+
+
+@dataclass
+class ArchivedAskParams:
+    """一页 qa 页 frontmatter 里存档的检索参数（`build_qa_frontmatter` 写、
+    `read_archived_ask_params` 读）。
+
+    `has_params=False` = 这一页没存过这些键——2026-09-17 之前生成的旧页，
+    或调用 `build_qa_frontmatter`/`write_qa_page` 时没传这五个新参数（默认值
+    全是 `None`，写出来是 YAML `null`）。`--reask` 据此打一句"旧页无存档参数"
+    的提示，只用问题本身 + 当前的默认/命令行参数重问，不假装读到了什么。
+    """
+    extra_queries: List[str] = field(default_factory=list)
+    roles: List[str] = field(default_factory=list)
+    min_sim: Optional[float] = None
+    max_evidence: Optional[int] = None
+    per_paper_cap: Optional[int] = None
+    has_params: bool = False
+
+
+def _fm_str_list(v: Any) -> List[str]:
+    """frontmatter 里的一个列表字段 -> 去空白后的字符串列表。非列表一律当空
+    （手改 frontmatter 把 `ask_query` 写成裸字符串之类的情形，不该让整个
+    reask 流程崩溃，退化成"当没存过这条"更安全）。
+
+    MINOR-5（2026-09-17 R2 对抗审核）：列表元素里混进非字符串项（`None`/dict/
+    数字……，YAML 手改或结构损坏都可能产生）此前会被 `str(x)` 无差别强转成
+    字面量塞进结果——`ask_query: [foo, null]` 会读出 `["foo", "None"]`，
+    "None" 混进 `-q` 参数当成一条真实检索词发给 embedding，静默且很难查。
+    改成显式类型过滤：**只收字符串项**，非字符串的一律丢弃并打 warning
+    （空白字符串仍静默丢弃，不算"垃圾"——那只是普通的格式噪音）。
+    """
+    if not isinstance(v, list):
+        return []
+    out: List[str] = []
+    for x in v:
+        if isinstance(x, str):
+            if x.strip():
+                out.append(x)
+            continue
+        logger.warning("qa 页 frontmatter 的列表字段里有一项不是字符串（{!r}），已丢弃", x)
+    return out
+
+
+def _fm_num(fm: Dict[str, Any], key: str, cast, *,
+           min_val: Optional[float] = None, max_val: Optional[float] = None):
+    """frontmatter 里的一个数值字段 -> cast 后的值；不是数字（含手改成字符串/
+    None/bool）一律返回 None。**显式排除 bool**：YAML 里 `true`/`false` 在
+    Python 里是 `int` 的子类，`isinstance(True, int)` 为真，裸放行会把
+    `ask_min_sim: true` 这种手改出来的怪值当成 `1.0` 喂给检索。
+
+    M2（2026-09-17 R1 对抗审核）：NaN/Inf 与可选的 `[min_val, max_val]` 范围校验。
+    **YAML 认得 `.nan`/`.inf`**（`split_frontmatter` 靠 `yaml.safe_load`，PyYAML
+    对这两个字面量原生支持），手改或损坏的 frontmatter 完全可能带出
+    `ask_min_sim: .nan`——`isinstance(nan, (int, float))` 为真，改动前的版本会
+    原样放行。真实后果：`retrieve_evidence` 里 `eff_min = max(min_sim, ...)` 一旦
+    有 NaN 参与，`max()`/`score < eff_min` 全部按 IEEE 754 语义恒假，相似度下限
+    整个失效，库里任何一条低分证据都会被喂给 LLM，且没有任何报错或提示——这比
+    "退化成没存过"严重得多，必须主动拦。范围校验同理：`ask_min_sim` 是余弦相似度
+    阈值，合法范围是 `[-1, 1]`，调用方（`read_archived_ask_params`）据此只给
+    `ask_min_sim` 传界，`ask_max_evidence`/`ask_per_paper_cap` 不传（那两个的
+    "正数"约束由 `_validate_numeric_params` 统一硬拒绝，不在这里做——这里只挡
+    "读出来就不像话"的值，真正的业务下限在别处）。
+
+    非法值一律退化成 `None`（同"没存过"），但**额外打一条 warning**——"这个键
+    没写"和"这个键写了但是垃圾"必须能区分开，前者是每天都会发生的正常情形，
+    后者是数据损坏，用户需要知道。
+
+    MAJOR-2（2026-09-17 R2 对抗审核）：`cast is int` 时额外要求"值本身就是
+    整数"（`float(v).is_integer()`）。此前 `int(3.7)` 会静默截断成 `3`——既不
+    退化 `None` 也不 warning，直接违反上一段那条"写了但是垃圾必须能区分"的
+    契约：`ask_max_evidence: 3.7`（典型手误，如从别处复制粘贴时带了小数点）
+    会被当成"合法值 3"悄悄采纳，用户永远不会知道自己存的不是他以为的那个数。
+    `cast is float`（`ask_min_sim`）不受这条约束——它本来就该是小数。
+
+    MAJOR-R3-1（2026-09-17 R3 对抗审核）：四类拒绝分支此前只有"类型完全不对"
+    （bool/字符串/dict……）这一支静默返回、不打 warning——与"键压根不存在"走的
+    是同一条路径，而这两者性质不同：键不存在是每天都会发生的正常情形（旧页/
+    全新提问），键存在但类型错了是数据损坏，理应和 NaN/Inf/非整数/越界三支
+    一样出声。改成显式区分：**键不存在或值为 `None`**（`ask_min_sim: null`，
+    `build_qa_frontmatter` 在调用方没传对应参数时就是这么写的，属于"明确表示
+    没有值"，与"键不存在"同义）保持静默；**键存在且值不是 `None` 但类型不对**
+    才 warning，并把键名与实际类型一起报出来，跟另外三支的详细程度对齐。
+    """
+    v = fm.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        logger.warning("qa 页 frontmatter 的 {} 类型不对（应为数字，实际是 {}：{!r}），"
+                       "当作没存过处理", key, type(v).__name__, v)
+        return None
+    fv = float(v)
+    if math.isnan(fv) or math.isinf(fv):
+        logger.warning("qa 页 frontmatter 的 {} 是 NaN/Inf（{}），当作没存过处理", key, v)
+        return None
+    if cast is int and not fv.is_integer():
+        logger.warning("qa 页 frontmatter 的 {} = {} 不是整数（该字段要求整数值，"
+                       "多半是手误多打了小数点），当作没存过处理", key, v)
+        return None
+    if (min_val is not None and fv < min_val) or (max_val is not None and fv > max_val):
+        logger.warning("qa 页 frontmatter 的 {} = {} 超出合法范围 [{}, {}]，当作没存过处理",
+                       key, v, min_val, max_val)
+        return None
+    return cast(v)
+
+
+def read_archived_ask_params(fm: Optional[Dict[str, Any]]) -> ArchivedAskParams:
+    """`build_qa_frontmatter` 存档的检索参数读回来。`fm` 是 `read_existing`/
+    `split_frontmatter` 解析出来的 frontmatter dict（可能是 `None`——文件不存在
+    或解析失败，一律当"没存过参数"，不抛异常）。
+
+    `has_params` 只探测 `ask_max_evidence` 是不是一个真数字：五个键要么一起写
+    （`build_qa_frontmatter` 的既定写法），要么一个都没有（老页面），选它当哨兵
+    字段是任意的，但必须**只选一个**——分别判断五个键会在"部分字段被手改成
+    非法值"时给出自相矛盾的 `has_params`。
+
+    MAJOR-R3-1（2026-09-17 R3 对抗审核）：哨兵字段**存在但非法**（如手改成
+    `true`/字符串）时，`_fm_num` 已经就那一个字段本身打过一条 warning，但那条
+    warning 没说清"这会连累其余四个合法字段一起被当成没存过"这个更大的后果
+    ——哨兵一坏，`has_params` 直接是 `False`，下面 `ArchivedAskParams(...)` 那
+    一大段根本不会执行，`ask_min_sim`/`ask_query` 等哪怕本身写得好好的也不会
+    被读。这里额外补一句，把"为什么其它字段也没了"讲清楚。哨兵**真的不存在**
+    （老页面）时不重复警告——那是正常情形，`_fm_num` 内部已经静默处理。
+    """
+    fm = fm if isinstance(fm, dict) else {}
+    marker_present = fm.get(ASK_PARAMS_MARKER_KEY) is not None
+    if _fm_num(fm, ASK_PARAMS_MARKER_KEY, int) is None:
+        if marker_present:
+            logger.warning("qa 页 frontmatter 的哨兵字段 {} 存在但不合法，"
+                           "整页检索参数按未存档处理（其余字段哪怕本身合法也不读了）",
+                           ASK_PARAMS_MARKER_KEY)
+        return ArchivedAskParams()
+    return ArchivedAskParams(
+        extra_queries=_fm_str_list(fm.get("ask_query")),
+        roles=_fm_str_list(fm.get("ask_role")),
+        min_sim=_fm_num(fm, "ask_min_sim", float, min_val=-1.0, max_val=1.0),
+        max_evidence=_fm_num(fm, "ask_max_evidence", int, max_val=ASK_NUMERIC_UPPER_BOUND),
+        per_paper_cap=_fm_num(fm, "ask_per_paper_cap", int, max_val=ASK_NUMERIC_UPPER_BOUND),
+        has_params=True,
+    )
+
+
 def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
                   report: ValidationReport, *, dry_run: bool = False,
                   related_topics: Sequence[str] = (),
                   nearby_papers: Sequence[str] = (),
                   titles: Optional[Dict[str, str]] = None,
-                  now: Optional[datetime] = None) -> Tuple[Path, str]:
+                  now: Optional[datetime] = None,
+                  extra_queries: Sequence[str] = (),
+                  roles: Sequence[str] = (),
+                  min_sim: Optional[float] = None,
+                  max_evidence: Optional[int] = None,
+                  per_paper_cap: Optional[int] = None) -> Tuple[Path, str]:
     """落盘 `topics/qa/<slug>.md`，走与概念页同一套哨兵合并。返回 `(路径, 状态)`。
 
     状态：`new` / `merged` / `conflict` / `unchanged` / `taken`。
@@ -1445,6 +1682,11 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
     但显式 `--slug` 复用完全可能——而 `--verify` 的报错文案恰恰在教用户手打 `--slug`。
     实测后果：状态 `merged`、图标 ✅、退出码 0，甲的整块答案被替换，`first_asked_at`
     却继承自甲，页面看起来像一段连续历史。所以这里宁可拒绝也不合并。
+
+    `extra_queries`/`roles`/`min_sim`/`max_evidence`/`per_paper_cap`：这次检索
+    实际用的参数，原样转给 `build_qa_frontmatter` 存档（供 `--reask` 原样重问，
+    见该函数 docstring）。不传就是旧调用点的默认行为——五个键写成 `null`，
+    `read_archived_ask_params` 据此判定这一页"没存过参数"。
     """
     now = now or datetime.now()
     qa_dir = Path(qa_dir)
@@ -1457,7 +1699,9 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
                                 titles=titles,
                                 nearby_papers=nearby_papers)
     fm = build_qa_frontmatter(question, slug, qa, evidences, report,
-                              now.isoformat(timespec="seconds"), preserved=fresh_fm)
+                              now.isoformat(timespec="seconds"), preserved=fresh_fm,
+                              extra_queries=extra_queries, roles=roles, min_sim=min_sim,
+                              max_evidence=max_evidence, per_paper_cap=per_paper_cap)
     content, status = merge_qa_page(fm, gen_block, fresh_existing, generator=QA_GENERATOR)
     if content is None:
         return path, "conflict"

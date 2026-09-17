@@ -95,6 +95,7 @@ def render_lint_report(*, verdicts: Sequence[Verdict], candidates: Sequence[Cand
                        verdict_report: VerdictReport, retraction: RetractionScan,
                        stale_claims: Sequence[StaleClaim], coverage: CoverageReport,
                        cited_by_page: Optional[Dict[str, List[str]]] = None,
+                       cited_by_qa_page: Optional[Dict[str, List[str]]] = None,
                        params: Optional[Dict[str, Any]] = None,
                        contradictions_skipped: bool = False,
                        stale_skipped: bool = False,
@@ -142,6 +143,7 @@ def render_lint_report(*, verdicts: Sequence[Verdict], candidates: Sequence[Cand
     """
     params = params or {}
     cited_by_page = cited_by_page or {}
+    cited_by_qa_page = cited_by_qa_page or {}
     now = now or datetime.now()
     now_iso = now.isoformat(timespec="seconds")
     previous = previous or {}
@@ -149,7 +151,7 @@ def render_lint_report(*, verdicts: Sequence[Verdict], candidates: Sequence[Cand
     previous_counts = previous_counts if isinstance(previous_counts, dict) else {}
 
     fresh: Dict[str, List[str]] = {
-        "retraction": _retraction_section(retraction, cited_by_page),
+        "retraction": _retraction_section(retraction, cited_by_page, cited_by_qa_page),
         "contradictions": _contradiction_section(
             verdicts, candidates, verdict_report, params, acks),
         "stale": [SECTION_HEADING["stale"], ""] + _stale_section(
@@ -271,7 +273,8 @@ def _never_ran_section(key: str) -> List[str]:
 
 
 def _retraction_section(retraction: RetractionScan,
-                        cited_by_page: Dict[str, List[str]]) -> List[str]:
+                        cited_by_page: Dict[str, List[str]],
+                        cited_by_qa_page: Optional[Dict[str, List[str]]] = None) -> List[str]:
     L: List[str] = [SECTION_HEADING["retraction"], ""]
     L += ["扫描口径：keeper {} 篇 → 有 DOI {} 篇 → OpenAlex 解析到 {} 篇"
           "（覆盖率 {:.0%}）。无 DOI {} 篇、查无此条 {} 篇、本轮未查成 {} 篇——"
@@ -284,8 +287,10 @@ def _retraction_section(retraction: RetractionScan,
               "**札记保留**，只标记 + 踢出向量库）：在该条的「裁决」行加 `⚑ RETRACTED`，"
               "然后跑 `notes_index.py` + `notes_embed.py`。".format(
                   len(retraction.unhandled)), ""]
+    cited_by_qa_page = cited_by_qa_page or {}
     for h in retraction.hits:
         pages = [slug for slug, keys in cited_by_page.items() if h.citekey in keys]
+        qa_pages = [slug for slug, keys in cited_by_qa_page.items() if h.citekey in keys]
         L.append("- {} `[@{}]` **{}**".format(
             "✅ 已标记" if h.acknowledged else "🚨 **未标记**", h.citekey, h.title[:110]))
         L.append("  - 信号：{}{}".format(
@@ -300,8 +305,18 @@ def _retraction_section(retraction: RetractionScan,
         if pages:
             L.append("  - ⚠️ **已被概念页引用**：{}——这几页的论断可能建立在被撤销的"
                      "结论上，标记后必须重跑这几页".format("、".join(sorted(pages))))
-        elif not h.acknowledged:
-            L.append("  - 未被任何概念页引用")
+        if qa_pages:
+            # cited_by_page 有意只扫概念页（返回值键是概念页 slug，见该函数
+            # docstring）——问答页不随新论文自动重合成，"必须重跑"对它没意义，
+            # 正确动作是 `ask_notes.py --reask <slug>`，措辞与概念页那一行区分开。
+            # 命令按 --reask 可重复的约定拼成一条能直接粘的多页重问命令。
+            reask_cmd = "PYTHONPATH=. python scripts/ask_notes.py --reask {}".format(
+                " --reask ".join(sorted(qa_pages)))
+            L.append("  - ⚠️ **已被问答页引用**：{}——这几页的回答可能建立在被撤销的"
+                     "结论上，标记后需要重问：`{}`".format(
+                         "、".join(sorted(qa_pages)), reask_cmd))
+        if not pages and not qa_pages and not h.acknowledged:
+            L.append("  - 未被任何概念页或问答页引用")
     if retraction.hits:
         L.append("")
     else:
