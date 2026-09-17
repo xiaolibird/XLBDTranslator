@@ -105,12 +105,45 @@ def main():
         
         args = parser.parse_args()
         
+        # 命令行文档路径的存在性/格式校验**必须在加载 config.env 之前**：
+        # FileSettings 的校验器对不存在的 FILES__DOCUMENT_PATH 当场 raise，若 config.env
+        # 里残留一个已被移动/删除的旧路径，`python main.py newbook.pdf` 会在配置构造阶段
+        # 就崩掉，CLI 传入的有效新路径根本没机会生效（实测踩过，记录在案）。校验通过后
+        # 注入进程环境变量——pydantic-settings 的优先级是 进程环境 > dotenv 文件，
+        # 于是过期的 config.env 值在构造时就被覆盖，schema 的存在性校验契约原样保留。
+        if args.file_path:
+            file_path = Path(args.file_path)
+            if not file_path.exists():
+                logger.error(f"❌ 指定的文档不存在: {file_path}")
+                sys.exit(1)
+            if file_path.suffix.lower() not in ['.pdf', '.epub']:
+                logger.error(f"❌ 不支持的文档格式: {file_path.suffix}（仅支持 .pdf 和 .epub）")
+                sys.exit(1)
+
         # 初始化设置（从指定的配置文件读取）
         config_path = Path(args.config)
         if not config_path.exists():
             logger.error(f"❌ 配置文件不存在: {config_path}")
             sys.exit(1)
-        base_settings = Settings.from_env_file(config_path)
+        # 注入放在 config 存在性检查**之后**、紧贴 try/finally：任何提前 sys.exit
+        # 都不会留下环境变量残留（第 2 轮对抗审计：--config 缺失路径曾漏在 finally 外）
+        if args.file_path:
+            os.environ['FILES__DOCUMENT_PATH'] = str(Path(args.file_path))
+        try:
+            base_settings = Settings.from_env_file(config_path)
+        except (FileNotFoundError, ValueError) as e:
+            # 最常见成因：config.env 的 FILES__DOCUMENT_PATH 指向已不存在的文件。
+            # 此前它落进末尾的通用 except，只报「发生未预期的严重错误」，看不出
+            # 根因是一个过期的 env 值。
+            logger.error(f"❌ 配置加载失败: {e}")
+            logger.error("   若报错涉及 document/文档路径：config.env 里的 FILES__DOCUMENT_PATH "
+                         "可能指向已移动/删除的文件——请更新或删除该行，或在命令行显式传入文档路径")
+            sys.exit(1)
+        finally:
+            # 注入只为覆盖 from_env_file 这一次加载（builder.document_path 随后会把
+            # 同一路径落到 settings 对象上）；用完即收，不给同进程后续逻辑留全局残留
+            if args.file_path:
+                os.environ.pop('FILES__DOCUMENT_PATH', None)
 
         # 使用 Builder 统一构建最终 Settings（避免在 main 中直接改 settings 字段）
         builder = SettingsBuilder(base_settings)
@@ -125,16 +158,10 @@ def main():
         if args.provider:
             builder.translation_provider(args.provider)
 
-        # 命令行参数覆盖文档路径
+        # 命令行参数覆盖文档路径（存在性/格式已在配置加载前校验并注入环境变量；
+        # 这里仍显式走 Builder，保证 build() 后的 settings 与注入值一致）
         if args.file_path:
-            file_path = Path(args.file_path)
-            if not file_path.exists():
-                logger.error(f"❌ 指定的文档不存在: {file_path}")
-                sys.exit(1)
-            if file_path.suffix.lower() not in ['.pdf', '.epub']:
-                logger.error(f"❌ 不支持的文档格式: {file_path.suffix}（仅支持 .pdf 和 .epub）")
-                sys.exit(1)
-            builder.document_path(file_path)
+            builder.document_path(Path(args.file_path))
 
         # 构建一个可用的 settings（用于日志/UI/模式加载等）
         settings = builder.build()

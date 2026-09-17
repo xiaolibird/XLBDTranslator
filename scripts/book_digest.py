@@ -224,8 +224,23 @@ def cmd_triage(args):
 
     pages = extract_pages(Path(man.pdf_path))
     llm = LLMClient(settings.llm)
-    fresh = triage_book(man, pages, specs, llm, _interests(), model=args.model,
-                        only=only, max_workers=args.workers)
+
+    def _save_partial(partial):
+        """每完成一章就把分诊结果并进 manifest 落盘：中断时已花钱的调用不作废。"""
+        m0 = {int(k): ChapterTriage.from_dict(v) for k, v in (man.triage or {}).items()}
+        m0.update(partial)
+        man.triage = {str(k): v.to_dict() for k, v in sorted(m0.items())}
+        man.save(bdir)
+
+    try:
+        fresh = triage_book(man, pages, specs, llm, _interests(), model=args.model,
+                            only=only, max_workers=args.workers, on_result=_save_partial)
+    finally:
+        # LLMClient 契约：完成后显式 close（防 fd 泄漏）。hasattr 守卫与 read_pdf 一致：
+        # 本仓库测试桩有把 LLMClient monkeypatch 成 None 的既定写法，finally 里抛
+        # AttributeError 还会顶掉 try 块正在传播的真实异常。
+        if hasattr(llm, "close"):
+            llm.close()
     merged = {int(k): ChapterTriage.from_dict(v) for k, v in (man.triage or {}).items()}
     merged.update(fresh)
     man.triage = {str(k): v.to_dict() for k, v in sorted(merged.items())}
@@ -588,4 +603,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # 顶层 handler 包着全部子命令，文案须子命令无关（第 3 轮终审：verify/status 等
+        # 没有 --only 也没有"分诊结果"，硬提示会误导）
+        print("\n🛑 已中断。若中断的是 triage：已完成的章分诊已增量落盘保留，"
+              "续跑用 --only 指定剩余章号（裸重跑会把已分诊的章重付一遍 LLM）")
+        raise SystemExit(130)

@@ -17,10 +17,24 @@ final.json 的结构：
 bundle 会把几万 token 的脚本草稿吃进上下文。这里只做定点字段替换 + 原子落盘。
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 from src.scholar.schema import CloseReading
+
+
+def _load_json(path: Path, what: str):
+    """读 JSON，失败给「哪个文件、什么问题」的可操作报错（返回 None 表示失败）。
+    本脚本的典型调用者是写 JSON 的 agent——漏字段/半截 JSON 正是它最常犯的错，
+    裸 KeyError/JSONDecodeError 栈看不出病灶在哪个文件哪个字段。"""
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        print("❌ {} 不存在: {}".format(what, path))
+    except json.JSONDecodeError as e:
+        print("❌ {} 不是合法 JSON（{}）: {}".format(what, path, e))
+    return None
 
 
 def main():
@@ -28,11 +42,31 @@ def main():
         print(__doc__)
         return 2
     bundle_file, final_file = Path(sys.argv[1]), Path(sys.argv[2])
-    b = json.loads(bundle_file.read_text("utf-8"))
-    f = json.loads(final_file.read_text("utf-8"))
+    b = _load_json(bundle_file, "bundle")
+    f = _load_json(final_file, "final.json")
+    if b is None or f is None:
+        return 2
 
+    missing = [k for k in ("close_reading_final", "cross_check_report", "one_line")
+               if not f.get(k)]
+    if missing:
+        print("❌ final.json 缺必填字段：{}（结构见本脚本 docstring）".format("、".join(missing)))
+        return 2
     cr = f["close_reading_final"]
-    CloseReading.model_validate(cr)          # 校验失败就别落盘
+    try:
+        CloseReading.model_validate(cr)      # 校验失败就别落盘
+    except Exception as e:
+        print("❌ close_reading_final 不符合 CloseReading schema：{}".format(str(e)[:500]))
+        return 2
+    # 归档硬前提与 read_pdf.py cmd_finalize 同一道门：verified_count ≥ 1。此前这里
+    # 原样透传，一份没有 verified_count 的 report 若之后走「同月其他 bundle 触发的
+    # 整月重建」路径（legacy 兼容对缺失字段放行），会绕过 cmd_finalize 的强校验入库。
+    vc = f["cross_check_report"].get("verified_count") if isinstance(f["cross_check_report"], dict) else None
+    if not isinstance(vc, int) or isinstance(vc, bool) or vc < 1:
+        # isinstance(vc, bool)：bool 是 int 子类，`true` 会以 True>=1 冒充合法计数（压测抓到）
+        print("❌ cross_check_report.verified_count 须为 ≥1 的整数（现为 {!r}）——"
+              "亲读核验是归档硬前提，缺失或为 0 都拒绝".format(vc))
+        return 2
 
     b["close_reading_final"] = cr
     b["cross_check_report"] = f["cross_check_report"]
@@ -47,7 +81,9 @@ def main():
     for k, v in (f.get("metadata") or {}).items():
         seg.setdefault("metadata", {})[k] = v
 
-    tmp = bundle_file.with_suffix(".tmp")
+    # tmp 带 pid：固定名时两个进程（如 agent 超时重试）共用同一路径互相截断；
+    # `.tmp-<pid>` 也不匹配任何 `*.paper.json` glob，不会被误当 bundle 读入。
+    tmp = bundle_file.with_name(bundle_file.name + ".tmp-{}".format(os.getpid()))
     tmp.write_text(json.dumps(b, ensure_ascii=False, indent=2), "utf-8")
     tmp.replace(bundle_file)
 

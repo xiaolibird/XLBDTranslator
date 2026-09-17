@@ -17,7 +17,9 @@ from typing import Any, Optional
 
 from ..core.schema import Settings
 from ..core.exceptions import APIError, APIAuthenticationError, APITimeoutError
-from .engine import OpenAICompatibleTranslator, _reraise_if_provider_fatal
+from .engine import (OpenAICompatibleTranslator, _reraise_if_provider_fatal,
+                     _VISION_TRANSIENT_RETRIES)
+from ..utils.json_tools import looks_like_complete_json, strip_code_fences
 from .support import PromptManager
 from ..utils.logger import get_logger
 
@@ -128,7 +130,19 @@ class ClaudeAgentTranslator(OpenAICompatibleTranslator):
         result = envelope.get('result')
         if not isinstance(result, str) or not result.strip():
             raise APIError(f"claude CLI 返回空 result (subtype={envelope.get('subtype')})")
-        return result.strip()
+        result = result.strip()
+        # 正文完整性校验（对齐 scholar/llm_client._call_agent 2026-08-20 的同型修复）：
+        # CLI 截断的信封是干净的（is_error=false / 退出码 0），只有正文是半截，光看
+        # 信封一条都够不着；此前这里只查非空，半截 JSON 会被当成功交给
+        # _parse_json_response 的正则抢救、抢不出的段落直接 [Failed: Missing]，且因为
+        # 没抛异常 tenacity 不会重试。只对"长得像 JSON"的正文校验（现网调用方全部
+        # 期待 JSON，这道门只防未来的纯文本用法被误伤）；截断是随机的，抛可重试的
+        # APIError（classify_fatal 判 soft）交给 @retry / 回退链。
+        stripped = strip_code_fences(result)
+        if stripped.lstrip()[:1] in ('{', '[') and not looks_like_complete_json(stripped):
+            raise APIError(
+                "claude CLI 返回的 JSON 疑似被截断（{} 字符，结构未闭合）".format(len(stripped)))
+        return result
 
     def _chat_completions(self, system_instruction: str, user_content: Any) -> str:
         """与父类签名一致；长文本模式下 system_instruction 已合并进 user_content。"""
@@ -162,16 +176,29 @@ class ClaudeAgentTranslator(OpenAICompatibleTranslator):
             f"First, use the Read tool to view the image file at: {img_path}\n\n"
             f"{original_prompt}"
         )
-        try:
-            raw_text = self._run_cli(prompt, extra_args=['--allowedTools', 'Read'])
-            parsed = self._parse_json_response(
-                raw_text=raw_text,
-                is_dict_like=True,
-            )
-            if isinstance(parsed, dict) and 'translation' in parsed:
-                return str(parsed['translation'])
-            return "[Failed: Invalid JSON Response]"
-        except Exception as e:
-            _reraise_if_provider_fatal(e)
-            logger.error(f"❌ Claude Agent Vision 调用失败 for {img_path}: {e}")
-            return f"[Failed: {str(e)}]"
+        # 与父类 _call_vision_api 同款瞬态重试（此前覆写后丢了这层保护——claude-agent
+        # 常是回退链末位兜底，视觉段在"最后一道防线"上反而最脆弱）：hard/soft 的
+        # provider 级错误仍立即上抛给回退链，瞬态异常有限重试后才落 [Failed:]。
+        import time as _time
+        last_error: Optional[Exception] = None
+        for attempt in range(_VISION_TRANSIENT_RETRIES + 1):
+            try:
+                raw_text = self._run_cli(prompt, extra_args=['--allowedTools', 'Read'])
+                parsed = self._parse_json_response(
+                    raw_text=raw_text,
+                    is_dict_like=True,
+                )
+                if isinstance(parsed, dict) and 'translation' in parsed:
+                    return str(parsed['translation'])
+                return "[Failed: Invalid JSON Response]"
+            except Exception as e:
+                _reraise_if_provider_fatal(e)
+                last_error = e
+                if attempt < _VISION_TRANSIENT_RETRIES:
+                    wait_time = min(8, 2 ** (attempt + 1))
+                    logger.warning(
+                        f"⚠️ Claude Agent Vision 瞬态失败（尝试 {attempt + 1}/"
+                        f"{_VISION_TRANSIENT_RETRIES + 1}），{wait_time}s 后重试 {img_path}: {e}")
+                    _time.sleep(wait_time)
+        logger.error(f"❌ Claude Agent Vision 调用失败 for {img_path}: {last_error}")
+        return f"[Failed: {str(last_error)}]"

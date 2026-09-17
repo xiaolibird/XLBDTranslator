@@ -124,6 +124,11 @@ def check_gates(data: Dict[str, Any], *, quote_pass_min: float = QUOTE_PASS_MIN)
     if not report:
         return GateResult(False, "无 cross_check_report（status=final 系 agent 自报，未经亲读核验）")
     vc = report.get("verified_count") if isinstance(report, dict) else None
+    if isinstance(vc, bool) or (vc is not None and not isinstance(vc, int)):
+        # bool 是 int 子类：true 会以 True>=1 冒充「核验过 1 项」溜过下一行（压测抓到）；
+        # 字符串/浮点等其余非 int 显式值同拒（与 merge_final 的写入门对齐；生产书籍
+        # bundle 实查 19 处全是 int，收紧无存量风险）。None=legacy 缺失维持宽容。
+        return GateResult(False, "cross_check_report.verified_count 类型非法（{!r}），不是核验计数".format(vc))
     if isinstance(vc, int) and vc < 1:
         return GateResult(False, "cross_check_report 自报 verified_count=0（一项都没核验）")
     qv = data.get("quote_verify")
@@ -134,6 +139,11 @@ def check_gates(data: Dict[str, Any], *, quote_pass_min: float = QUOTE_PASS_MIN)
     if total and rate < quote_pass_min:
         return GateResult(False, "引文回验通过率 {:.0%} < {:.0%}（{} 条引句中 {} 条对不上原文）"
                           .format(rate, quote_pass_min, total, len(qv.get("flagged") or [])))
+    if not total:
+        # total=0（这一章一条可回验的逐字引句都没标）时第三道门形同虚设——「0 条全部
+        # 通过」与「95% 通过」在返回值上同形。不改判拒（数学/表格章确实可能没有逐字
+        # 引句，硬拒会把合法章挡在门外），但必须把这件事写在通过理由里让人看得见。
+        return GateResult(True, "⚠️ 引文回验 0 条参与（本章未标任何逐字引句，第三道门未实际生效）")
     return GateResult(True)
 
 

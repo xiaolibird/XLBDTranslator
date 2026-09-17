@@ -387,7 +387,13 @@ Begin generation:
         review_type: str
     ) -> str:
         """构建文献综述 prompt"""
-        papers_text = self._format_papers_for_prompt(papers[:30])
+        # 超过 30 篇时按优先级取 top-30（此前按传入顺序静默砍尾：调用方传 100 篇，
+        # 后 70 篇无声丢弃且无任何留痕，与 generate_thesis_introduction 走
+        # _select_top_papers 的做法不一致）。
+        if len(papers) > 30:
+            logger.info("  文献综述仅取优先级前 30/{} 篇进 prompt".format(len(papers)))
+            papers = sorted(papers, key=lambda p: p.priority_score, reverse=True)[:30]
+        papers_text = self._format_papers_for_prompt(papers)
         
         return """# Task: Generate {type} Literature Review
 

@@ -1008,8 +1008,23 @@ def update_index(notes_dir: Path, *, full: bool = False,
                     and (until is None or month[:len(until)] <= until))
         st = md_path.stat()
         prev = old_months.get(stem)
+        # sidecar/references 也是条目内容的来源（build_month_entries 三处输入），存在
+        # 合法且已有实例的「只写 sidecar 不动 md」路径（backfill_scholar_metadata 的
+        # apply_changes 明确如此设计）。只看 md 的 stat 会让那类写入静默沿用旧缓存
+        # 条目、新元数据在索引里消失到下次 --full。把两个派生文件的 (mtime,size) 一并
+        # 纳入判据：旧索引（无这两键）首轮全量重扫一次后收敛，代价是每 stem 多两次 stat。
+        def _stat_sig(p: Path):
+            try:
+                s = p.stat()
+                return [s.st_mtime, s.st_size]
+            except OSError:
+                return None
+        side_sig = _stat_sig(notes_dir / "{}.index.json".format(stem))
+        ref_sig = _stat_sig(notes_dir / "{}.references.json".format(stem))
         unchanged = (prev and prev.get("md_mtime") == st.st_mtime
-                     and prev.get("md_size") == st.st_size)
+                     and prev.get("md_size") == st.st_size
+                     and prev.get("sidecar_sig", "\x00miss") == side_sig
+                     and prev.get("ref_sig", "\x00miss") == ref_sig)
         force = full or (range_mode and in_range)   # 区间模式：区间内强制重扫
         if (not in_range and prev) or (unchanged and not force):
             # 沿用旧条目（区间外文件即使变化也不动，除非它根本不在旧索引里）
@@ -1024,6 +1039,7 @@ def update_index(notes_dir: Path, *, full: bool = False,
                 series=series)
             months_meta[stem] = {"month": month, "series": series,
                                  "md_mtime": st.st_mtime, "md_size": st.st_size,
+                                 "sidecar_sig": side_sig, "ref_sig": ref_sig,
                                  "papers": len(entries),
                                  "source": entries[0]["_source"] if entries else "empty"}
             reparsed += 1
@@ -1699,7 +1715,13 @@ def _rename_pages(topics_dir, pairs, out, *, apply: bool):
     for page in sorted(topics_dir.rglob("*.md")):
         try:
             text = page.read_text(encoding="utf-8")
-        except Exception:                                  # noqa: BLE001
+        except Exception as e:                             # noqa: BLE001
+            # 读失败 ≠ 不需要处理：这一页里指向已注销 citekey 的引用不会被改名，静默
+            # continue 会让「已就地改名 N 页」的回执看起来全部成功（sync_topics_to_vault
+            # 对同型场景已用 unresolved 列表追踪，这里此前漏了同款防线）。
+            out.setdefault("read_failed", []).append(str(page.relative_to(topics_dir)))
+            logger.warning("  ⚠️ 改名时读取失败，跳过（该页旧 citekey 未处理）：{}（{}）"
+                           .format(page.name, e))
             continue
         rel0 = str(page.relative_to(topics_dir))
         if generated_block_tampered(text):

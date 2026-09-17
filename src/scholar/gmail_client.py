@@ -105,6 +105,15 @@ class GmailClient:
                     "请从 Google Cloud Console 下载 OAuth 2.0 客户端凭据文件"
                 )
             
+            # run_local_server 要起本地回调服务器并打开浏览器授权，headless（launchd
+            # 周批）下会挂起等待或以难解的方式失败。refresh_token 被吊销/过期正是走到
+            # 这里的常见原因——非交互环境直接给出可操作的报错，而不是静默挂死。
+            import sys as _sys
+            if not _sys.stdin.isatty():
+                raise RuntimeError(
+                    "Gmail 凭据失效且当前为非交互环境，无法弹出浏览器重新授权。"
+                    "请在终端手动运行一次 digest（或任何会触发 Gmail 认证的命令）完成授权，"
+                    "token 将写回 {}".format(self.token_path))
             logger.info("🔐 开始 OAuth 2.0 授权流程...")
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(self.credentials_path),
@@ -398,25 +407,58 @@ class GmailClient:
             label_ids=label_ids if label_ids else None
         )
         
-        # 获取完整邮件内容
+        # 获取完整邮件内容。
+        # full 是 metadata 的超集（headers/labelIds/internalDate 全在），一次取回
+        # 同时喂元数据解析与正文提取。此前逐封 get 串行往返：周批几十封、按月/按年
+        # 回填几百封时总耗时线性放大（3 年回填曾靠外部 4 并行分片绕过的正是这里）。
+        # 改走 Gmail batch HTTP（一次往返打包 ≤25 个 get；messages.get 5 配额单位/封，
+        # 25 封=125 单位，距 250 单位/秒的用户限额留了一半余量）；batch 整体失败时
+        # 回退逐封拉取，单封失败仍只告警跳过、语义与串行版一致。
+        ids = [m['id'] for m in messages]
+        details_by_id: Dict[str, Any] = {}
+
+        def _cb(request_id, response, exception):
+            if exception is not None:
+                logger.warning("处理邮件 {} 时出错: {}".format(request_id, exception))
+                return
+            details_by_id[request_id] = response
+
+        try:
+            _BATCH = 25
+            for k in range(0, len(ids), _BATCH):
+                batch = self.service.new_batch_http_request()
+                for mid in ids[k:k + _BATCH]:
+                    batch.add(self.service.users().messages().get(
+                        userId='me', id=mid, format='full'),
+                        request_id=mid, callback=_cb)
+                batch.execute()
+        except Exception as e:
+            missing = [mid for mid in ids if mid not in details_by_id]
+            logger.warning("批量拉取失败（{}），对剩余 {} 封回退逐封拉取".format(e, len(missing)))
+            for mid in missing:
+                try:
+                    details_by_id[mid] = self.get_message(mid, format='full')
+                except Exception as e2:
+                    logger.warning("处理邮件 {} 时出错: {}".format(mid, e2))
+
         scholar_emails = []
-        for msg_info in messages:
+        for mid in ids:                      # 按 list_messages 的原始顺序组装
+            details = details_by_id.get(mid)
+            if details is None:
+                continue
             try:
-                # full 是 metadata 的超集（headers/labelIds/internalDate 全在），一次取回
-                # 同时喂元数据解析与正文提取——省掉每封邮件一次串行往返
-                details = self.get_message(msg_info['id'], format='full')
                 metadata = self.parse_email_metadata(details)
                 body = self.get_message_body(details)
-                
+
                 scholar_emails.append({
                     'message': details,
                     'metadata': metadata,
                     'body': body
                 })
                 logger.debug("  📧 {}".format(metadata.subject[:50]))
-                    
+
             except Exception as e:
-                logger.warning("处理邮件 {} 时出错: {}".format(msg_info['id'], e))
+                logger.warning("处理邮件 {} 时出错: {}".format(mid, e))
                 continue
         
         logger.info("找到 {} 封 Google Scholar 邮件".format(len(scholar_emails)))

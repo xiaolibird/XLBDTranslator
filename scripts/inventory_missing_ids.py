@@ -344,6 +344,8 @@ def main() -> int:
         print("续跑：上一份报告 {} 条，其中待重查 {} 条（缺 {}），原样结转 {} 条".format(
             len(prev_recs), len(redo),
             "/".join(sorted({x for v in redo.values() for x in v})) or "无", len(carried)))
+    if args.limit < 0:
+        ap.error("--limit 不能为负（0=不限）")   # 负数此前被静默当 0=全量跑，联网按日计费的脚本不能容这种笔误
     if args.limit > 0:
         targets = targets[:args.limit]
     print("无 DOI/arXiv/PMID 的 keeper：{} 篇{}".format(len(targets), "（--limit 生效）" if args.limit else ""))

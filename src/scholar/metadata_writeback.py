@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ._citekey_utils import csl_names, date_parts
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 HEADING_RE_TMPL = r"^## .*\[@{}\]\s*$"
 AUTHORS_LINE = "**作者**: "
@@ -110,21 +113,45 @@ def _match_sidecar(entry: Dict[str, Any], rows: List[Dict[str, Any]]) -> Optiona
     return cand[0] if len(cand) == 1 else None
 
 
+# _match_bundle 的目录级缓存：{目录: [(路径, doi小写, 归一化标题)]}。
+# realign 对同一 --month-prefix 范围逐条调用本函数，同月 manual 条目大概率落在同一目录
+# （实测单目录 126 份 bundle：无缓存时 126 条 × 126 份 = 1.6 万次 读文件+JSON 解析，
+# 有缓存只需 126 次）。缓存生命周期 = 进程（realign 是一次性 CLI）；同进程内若有写
+# bundle 的路径（_apply_bundle 只改既有文件的字段，不增删文件、不动 doi/title），
+# 键集合不变，缓存仍然有效。
+_BUNDLE_DIR_CACHE: Dict[str, List[Tuple[Path, str, str]]] = {}
+
+
+def _bundle_dir_rows(mdir: Path) -> List[Tuple[Path, str, str]]:
+    key = str(mdir)
+    rows = _BUNDLE_DIR_CACHE.get(key)
+    if rows is None:
+        rows = []
+        for bf in sorted(mdir.glob("*.paper.json")):
+            try:
+                meta = ((json.loads(bf.read_text(encoding="utf-8")).get("segment") or {})
+                        .get("metadata")) or {}
+            except Exception as e:
+                # 出声（缓存进程内永久生效，坏 bundle 会被静默剔除一整轮）：否则该篇
+                # 只显示「未匹配」，看不出根因是这份 bundle 本身坏了——与本批修过的
+                # _bbt_search_pick/_rename_pages 同型。
+                logger.debug("bundle 解析失败，跳过（{}）：{}: {}", bf.name, type(e).__name__, e)
+                continue
+            rows.append((bf, (meta.get("doi") or "").strip().lower(), _norm(meta.get("title"))))
+        _BUNDLE_DIR_CACHE[key] = rows
+    return rows
+
+
 def _match_bundle(entry: Dict[str, Any], notes_dir: Path) -> Optional[Path]:
     mdir = notes_dir / "manual" / (entry.get("month") or "")
     if not mdir.is_dir():
         return None
     doi = (entry.get("doi") or "").strip().lower()
     title = _norm(entry.get("title"))
-    for bf in sorted(mdir.glob("*.paper.json")):
-        try:
-            meta = ((json.loads(bf.read_text(encoding="utf-8")).get("segment") or {})
-                    .get("metadata")) or {}
-        except Exception:
-            continue
-        if doi and (meta.get("doi") or "").strip().lower() == doi:
+    for bf, b_doi, b_title in _bundle_dir_rows(mdir):
+        if doi and b_doi == doi:
             return bf
-        if not doi and title and _norm(meta.get("title")) == title:
+        if not doi and title and b_title == title:
             return bf
     return None
 

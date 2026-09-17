@@ -462,7 +462,7 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "doi": meta.doi or None,
         "arxiv_id": meta.arxiv_id or None,
         "title": meta.title or "",
-        "title_zh": seg.translated_title or None,
+        "title_zh": (seg.metadata.translated_title or seg.translated_title) or None,  # LLM 写的是 metadata 侧；seg 侧从未被赋值，此前 title_zh 恒 None、中文标题检索信号从未生效
         "authors": list(meta.authors or []),
         "year": year,
         "journal": meta.journal or None,

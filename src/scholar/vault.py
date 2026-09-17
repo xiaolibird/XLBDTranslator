@@ -1213,6 +1213,7 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
             "source_topics_mtime": max(topics_times) if topics_times else None,
             "counts": {k2: v for k2, v in report.items() if isinstance(v, int)},
             "conflicts": report["conflicts"], "slice_failures": slice_failures}
-    (vault_dir / META_JSON).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 原子写（与全库其余落盘一致）：sync_vault 的 vault_stamp 靠它判新鲜度，进程中途
+    # 被杀留下半截 JSON 虽有兜底（读坏→判陈旧→自愈重建），但没理由独留这一处裸写。
+    write_if_changed(vault_dir / META_JSON, json.dumps(meta, ensure_ascii=False, indent=2))
     return report

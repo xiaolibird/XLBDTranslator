@@ -27,6 +27,8 @@ from ..utils.logger import get_logger
 logger = get_logger(__name__)
 
 UNPAYWALL_API = "https://api.unpaywall.org/v2"
+# resolve_oa_pdf 的「email 未配置」进程级一次性告警标记（见该函数内注释）
+_WARNED_NO_EMAIL = False
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
@@ -111,6 +113,16 @@ def resolve_oa_pdf(
     # 1) arXiv 直链
     if meta.arxiv_id:
         return OAResult(oa_status="arxiv", pdf_url=arxiv_pdf_url(meta.arxiv_id), source="arxiv")
+
+    # email 缺失时主路 Unpaywall（下方 `if meta.doi and email:`）整块静默不执行，非 arXiv
+    # 篇目全部退化成 closed，而日志上与「真没有 OA」完全同形——这是配置问题不是数据事实，
+    # 必须出声。进程级只警一次：批量精读一篇一条会把告警面刷成噪音。
+    global _WARNED_NO_EMAIL
+    if meta.doi and not email and not _WARNED_NO_EMAIL:
+        _WARNED_NO_EMAIL = True
+        logger.warning("  ⚠️ 未配置 email（zotero_email/external_email 均空），Unpaywall 主路将被"
+                       "整体跳过，非 arXiv 篇目的 OA 解析会系统性退化为 closed——请在 "
+                       "config/scholar.env 配置邮箱（Unpaywall 礼貌参数，非密钥）")
 
     own_client = client is None
     c = client if client is not None else (ipv4_client(timeout=timeout)
@@ -581,20 +593,30 @@ _JATS_BLOCK = {"p", "title", "sec", "abstract", "caption", "list-item", "article
                "table-wrap", "tr", "td", "th"}
 
 
-def _jats_walk(el, parts, budget):
+def _jats_walk(el, parts, budget, _total=None):
+    """_total：单元素列表，实时累计 parts 的总长度。此前预算检查是每个子节点
+    `sum(len(p) for p in parts)` 全量重扫——总代价 O(节点数 × 已收集片段数)，
+    _JATS_RAW_BUDGET 抬到 2M 后长文章（数千片段）会平方级放大。改为随 append
+    同步累加，数值与逐次重算完全一致，输出逐字节不变。None（外部直调/旧签名）
+    时按当前 parts 初始化一次。"""
+    if _total is None:
+        _total = [sum(len(p) for p in parts)]
     tag = el.tag if isinstance(el.tag, str) else ""
     tag = tag.rsplit("}", 1)[-1]          # 去命名空间（EuropePMC 通常无 ns，防御性处理）
     if tag not in _JATS_SKIP:
         if el.text:
             parts.append(el.text)
+            _total[0] += len(el.text)
         for child in el:
-            if sum(len(p) for p in parts) > budget:
+            if _total[0] > budget:
                 break
-            _jats_walk(child, parts, budget)
+            _jats_walk(child, parts, budget, _total)
         if tag in _JATS_BLOCK:
             parts.append("\n")
+            _total[0] += 1
     if el.tail:                            # tail 属于父级文本流，跳过的标签也要保留
         parts.append(el.tail)
+        _total[0] += len(el.tail)
 
 
 # 只为「量出真长度」而设的 walk 预算：与 max_chars 解耦。

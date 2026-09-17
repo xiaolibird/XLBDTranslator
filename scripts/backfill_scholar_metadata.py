@@ -47,6 +47,7 @@ topics / qa / 账本 → `_archive/scholar_meta_<时间戳>/`。
 import argparse
 import json
 import re
+import os
 import sys
 import unicodedata
 from datetime import date, datetime
@@ -565,7 +566,7 @@ def _key_re(old: str) -> "re.Pattern":
 
 
 def _write_json_atomic(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(path.name + ".tmp-{}".format(os.getpid()))  # 带 pid 防并发互截
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(path)
 

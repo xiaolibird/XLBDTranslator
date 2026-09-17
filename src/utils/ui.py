@@ -86,7 +86,7 @@ def get_user_strategy(settings: Settings):
     # ==========================================
     # 1. 章节目录 (TOC) 配置 - 跳过，使用默认值
     # ==========================================
-    print("\n[1/4] 📚 Table of Contents (章节目录)")
+    print("\n[1/5] 📚 Table of Contents (章节目录)")
     
     if ext == '.pdf':
         if settings.document.custom_toc_path and settings.document.custom_toc_path.exists():
@@ -101,7 +101,7 @@ def get_user_strategy(settings: Settings):
     # 2. Vision 模式配置 (仅 PDF)
     # ==========================================
     # 对于非 PDF 文件，Vision 和 Cropping 步骤将被跳过，但 Retain Original Text 仍适用。
-    print("\n[2/4] 👁️  Vision Mode (视觉/图片模式)")
+    print("\n[2/5] 👁️  Vision Mode (视觉/图片模式)")
     if ext == '.pdf':    
         # 优先使用 .env 中的配置
         if settings.processing.use_vision_mode is not None:
@@ -130,7 +130,7 @@ def get_user_strategy(settings: Settings):
     # ==========================================
     # 3. 页面范围配置 (仅 PDF) - 跳过，使用默认值
     # ==========================================
-    print("\n[3/4] 📄 Page Range (页面范围)")
+    print("\n[3/5] 📄 Page Range (页面范围)")
 
     if ext == '.pdf':
         if settings.document.page_range:
@@ -144,7 +144,7 @@ def get_user_strategy(settings: Settings):
     # ==========================================
     # 4. 裁切/边距配置 (仅 PDF)
     # ==========================================
-    print("\n[4/4] ✂️  Image Cropping (Remove Headers/Footers)")
+    print("\n[4/5] ✂️  Image Cropping (Remove Headers/Footers)")
 
     if ext != '.pdf' or settings.processing.use_vision_mode is False:
         print("      Skipped (Vision mode disabled or non-PDF file).")

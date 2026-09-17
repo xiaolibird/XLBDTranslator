@@ -490,6 +490,11 @@ class LLMClient:
                         raise RuntimeError(
                             "Gemini 响应内容为空（finish_reason={}），"
                             "可能被安全过滤拦截或 max_output_tokens 不足".format(finish_reason))
+                    # 完整正文 → 降级连击清零（_reset_degraded 的不变量：「只有真正返回完整
+                    # 正文的路径才该调」——此前只有 claude-agent 分支守着这条，本分支漏掉；
+                    # 今天 partial 只在 claude-agent 路径产生所以无实际后果，但若将来给
+                    # HTTP 路径也挂 partial，漏掉这行会让成功调用打不断连击）。
+                    self._reset_degraded()
                     return response.text
 
                 # OpenAI 兼容
@@ -519,6 +524,7 @@ class LLMClient:
                     raise RuntimeError(
                         "OpenAI 兼容响应内容为空（finish_reason={}），"
                         "可能被内容过滤拦截或模型未生成有效输出".format(finish_reason))
+                self._reset_degraded()   # 同上：完整正文路径清零降级连击
                 return content
             except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
                     subprocess.TimeoutExpired) as e:

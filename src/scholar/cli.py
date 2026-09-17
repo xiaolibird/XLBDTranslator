@@ -55,7 +55,7 @@ def add_digest_arguments(parser):
 
     # LLM 参数
     parser.add_argument('--provider', type=str, default=None,
-                         choices=['gemini', 'deepseek', 'openai-compatible'],
+                         choices=['gemini', 'deepseek', 'ollama', 'claude-agent', 'openai-compatible'],
                          help='LLM 提供商（覆盖配置文件）')
     parser.add_argument('--model', type=str, default=None, help='LLM 模型名称（覆盖配置文件）')
 

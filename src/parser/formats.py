@@ -317,11 +317,28 @@ class PDFParser(BaseDocPipeline):
                 if img_path:
                     # yield (页码, 图片路径, 类型)
                     yield i, img_path, "image"
+                else:
+                    # 渲染失败 ≠ 空白页：此前连 content unit 都不 yield，该页在
+                    # structure_map/成品里无声消失，quality_report 也扫不到（它只扫
+                    # 已存在 segment 的失败标记）。与 EPUB 侧的占位段约定对齐，
+                    # 让失败在成品对应位置可见。
+                    # 下游影响：占位文本会随相邻正文进翻译管线（EPUB 侧是原文替换式渲染、
+                    # 占位不进成品；PDF 侧则会出现在成品对应位置——这正是目的）。方括号
+                    # 包裹的中文提示被 LLM 透传或译写后仍清晰可辨，且不匹配
+                    # contains_failed_marker 的失败标记集，不会误触发质检重译回路。
+                    yield i, (f"[PDF 第{i + 1}页渲染失败] 本页原文未能渲染为图片，"
+                              f"请检查源文件。"), "text"
             else:
                 # --- Text 模式 ---
                 text = self._extract_text(page, i)
-                # yield (页码, 文本内容, 类型)
-                yield i, text, "text"
+                if text is None:
+                    # 抽取异常（None）≠ 真空白页（""）：前者注入占位段可见化，
+                    # 后者维持跳过语义（run() 对空文本不建 segment）。
+                    yield i, (f"[PDF 第{i + 1}页解析失败] 本页原文未能提取，"
+                              f"请检查源文件。"), "text"
+                else:
+                    # yield (页码, 文本内容, 类型)
+                    yield i, text, "text"
 
     def _save_page_image(self, page, page_idx) -> str:
         """
@@ -359,7 +376,7 @@ class PDFParser(BaseDocPipeline):
             logger.error(f"Failed to render image for page {page_idx}: {e}")
             return ""
 
-    def _extract_text(self, page, page_idx) -> str:
+    def _extract_text(self, page, page_idx) -> Optional[str]:
         """
         提取页面文本，根据 settings 里的百分比参数进行裁切 (Clip)。
         """
@@ -372,8 +389,9 @@ class PDFParser(BaseDocPipeline):
             return text.strip()
 
         except Exception as e:
+            # None = 抽取失败（与空白页的 "" 区分开，调用方注入占位段）
             logger.error(f"Failed to extract text from page {page_idx}: {e}")
-            return ""
+            return None
 
     def _get_crop_rect(self, page: fitz.Page) -> fitz.Rect:
         """计算裁切矩形"""

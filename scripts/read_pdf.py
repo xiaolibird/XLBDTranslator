@@ -121,19 +121,25 @@ def cmd_ingest(args):
         proc.research_interests, getattr(args, "context", "") or "")
 
     outs, failed = [], []
-    for pdf_path in pdfs:
-        try:
-            r = ingest_pdf(
-                pdf_path, notes_dir, month, llm,
-                model=model, email=email,
-                research_interests=research_interests,
-                title_override=(args.title or "") if len(pdfs) == 1 else "",
-                index_path=notes_dir / INDEX_JSON,
-                force=args.force)
-            outs.append(r)
-        except Exception as e:
-            logger.error("❌ ingest 失败 {}: {}".format(pdf_path.name, e))
-            failed.append((pdf_path.name, str(e)))
+    try:
+        for pdf_path in pdfs:
+            try:
+                r = ingest_pdf(
+                    pdf_path, notes_dir, month, llm,
+                    model=model, email=email,
+                    research_interests=research_interests,
+                    title_override=(args.title or "") if len(pdfs) == 1 else "",
+                    index_path=notes_dir / INDEX_JSON,
+                    force=args.force)
+                outs.append(r)
+            except Exception as e:
+                logger.error("❌ ingest 失败 {}: {}".format(pdf_path.name, e))
+                failed.append((pdf_path.name, str(e)))
+    finally:
+        # LLMClient 契约：批量 ingest 完成后显式 close（防 fd 泄漏）。
+        # hasattr 守卫：测试桩会把 LLMClient monkeypatch 成 None/无 close 的对象。
+        if hasattr(llm, "close"):
+            llm.close()
 
     fresh = [r for r in outs if not r.get("skipped")]
     print("\n" + "=" * 66)
@@ -957,7 +963,7 @@ def cmd_finalize(args):
         return 1
     ccr = ccr or {}
     vc = ccr.get("verified_count")
-    if not isinstance(vc, int) or vc < 1:
+    if not isinstance(vc, int) or isinstance(vc, bool) or vc < 1:   # bool 是 int 子类，True 会冒充 1
         logger.error("❌ bundle 缺有效 cross_check_report（需 verified_count>=1，当前: {!r}）：\n"
                      "   亲读 PDF 交叉核验是归档硬前提，不可省。请 agent 完成核验并写回\n"
                      "   cross_check_report（含 verified_count/corrected/added）后再 finalize: {}"

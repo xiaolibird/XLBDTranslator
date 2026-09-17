@@ -352,6 +352,8 @@ class OpenAICompatibleTranslator(BaseTranslator):
             try:
                 final_glossary.update(self._extract_glossary_window(content_sample))
             except Exception as e:
+                # 同 Gemini 版：致命错误上抛给回退链，不许在术语抽取阶段吞掉 402/401
+                _reraise_if_provider_fatal(e)
                 logger.error(f"术语抽取窗口失败（跳过）: {e}")
         return final_glossary
 
@@ -446,12 +448,16 @@ class OpenAICompatibleTranslator(BaseTranslator):
                                 glossary: Optional[Dict[str, str]] = None) -> List[str]:
         results: List[str] = []
         current_context = context[-self.settings.processing.max_context_length:] if context else ""
+        # 同 Gemini 版：限速等待只服务下一次 vision 调用，判据是最后一个 image 段
+        _last_img = max((i for i, s0 in enumerate(segments)
+                         if s0.content_type == "image" and s0.image_path), default=-1)
 
-        for seg in segments:
+        for _i, seg in enumerate(segments):
             try:
                 if seg.content_type == "image" and seg.image_path:
                     translation = self._call_vision_api(seg.image_path, current_context, glossary)
-                    time.sleep(self.settings.processing.vision_rate_limit_delay)
+                    if _i != _last_img:           # 最后一个图片段之后不再空等限速窗口
+                        time.sleep(self.settings.processing.vision_rate_limit_delay)
                 else:
                     fallback = self._translate_text_batch([seg], current_context, glossary=glossary)
                     translation = fallback[0] if fallback else "[Fallback Failed]"

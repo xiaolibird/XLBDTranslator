@@ -29,7 +29,11 @@ logger = get_logger(__name__)
 # 文件名里的 PDF 页范围："Rubin_143_160.md" / "101_120.md" / "ch4_53_72.md"
 _FNAME_RANGE_RE = re.compile(r"(?:^|_)(\d{1,4})_(\d{1,4})(?=\.|$)")
 # 正文里的印刷页码引用："pp.143–160" / "p. 4" / "（pp. 8-12）"
-_PAGE_REF_RE = re.compile(r"pp?\.\s?(\d{1,4})(?:\s?[–—-]\s?(\d{1,4}))?")
+# (?<![A-Za-z0-9])：无左边界时 "Chap.4"/"App.12"（字母）与 "3p.27"（数字）的尾部会被
+# 当成页码误认；不用 \b——中文在 Python re 里是 \w，「见p.27」这类中文紧邻的
+# 真页码引用会被 \b 误杀（本文件处理的正是中文旧 digest）。
+# 污染 printed_start/printed_end 与 infer_offset 的众数投票（实测复现）。
+_PAGE_REF_RE = re.compile(r"(?<![A-Za-z0-9])pp?\.\s?(\d{1,4})(?:\s?[–—-]\s?(\d{1,4}))?")
 
 
 @dataclass

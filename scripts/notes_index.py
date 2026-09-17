@@ -82,7 +82,14 @@ def main():
                   "请手动跑 `PYTHONPATH=. python scripts/notes_embed.py` 后再引用。")
             rc = 1
         if not args.apply:
-            return rc          # dry-run：不顺手重建索引（fix_inline_citekeys 已 update_index 一次）
+            # dry-run：不顺手重建索引（fix_inline_citekeys 已 update_index 一次）。
+            # --fix-collisions 没有独立 dry-run（fix_citekey_collisions 一跑就落盘），
+            # 此前组合传参时它被静默跳过、连一行提示都没有——用户以为看到的是两项
+            # 检查的完整预览。出声说明，单独跑才执行。
+            if args.fix_collisions:
+                print("⏭ --fix-collisions 本次被跳过（它无 dry-run、一跑就落盘）："
+                      "请在确认上面的预览后单独运行 --fix-collisions")
+            return rc
     if args.fix_collisions:
         side = {}
         n = fix_citekey_collisions(notes_dir, side_out=side)

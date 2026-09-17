@@ -335,8 +335,12 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
         return []
 
     best: Dict[str, Evidence] = {}
-    for q in spec.queries:
-        vec = embed_client.embed([q])[0]
+    # 全部 query 一次批量 embed：EmbeddingClient.embed 本就吃列表（recheck_gaps/
+    # find_similar_questions 均如此用），逐条单发是每 query 一次 HTTP 往返——
+    # 8 页 × 4-5 query 的一轮全量要白付几十次串行往返。
+    queries = list(spec.queries)
+    vecs = embed_client.embed(queries) if queries else []
+    for q, vec in zip(queries, vecs):
         hits = store.search(vec, mask=mask, top_k=per_query_k)
         # per-query 相对判据：min_sim 是 floor（语义不变），强 query 按自身 top1 抬门槛，
         # 冷门 query 退回 floor（见 DEFAULT_RELATIVE_ALPHA 注释与标定表）。
@@ -1061,6 +1065,55 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
     return "\n".join(lines)
 
 
+def _json_safe(v, _depth: int = 0):
+    """把用户 frontmatter 里 yaml 解析出的任意嵌套结构变成 json.dumps 必然可序列化：
+    dict 键一律转 str（None 键保留为 None——JSON 原生支持），list/tuple 递归，
+    非 JSON 原生标量（date/Decimal 等）转 str 保值。只服务 _render_frontmatter 的
+    dict 分支，受管键从不产出这类结构。
+
+    _depth 上限 32：yaml.safe_load 对锚点别名（`a: &x {b: *x}`）会构造出**自引用**
+    结构，无界递归直接 RecursionError；超限降级 str(v)——Python 的 repr 对循环
+    结构是安全的（打印成 {...}），保住不炸。
+
+    键统一转成 **JSON 文本形态**（int 1 → "1"、True → "true"、None → "null"——与
+    json.dumps 对非 str 键的隐式转换逐字节一致，输出不变）：这样 date 键 vs 同形
+    字符串键、int 1 vs "1" 这类「Python 层不同、JSON 文本层同形」的碰撞在这里就能
+    数出来并告警，而不是静默丢失或推迟到下次 yaml 回读时被吞（第 2 轮对抗审计）。
+    碰撞仍是后写覆盖先写（有损，但此前是整个函数 TypeError 崩掉）；>512 字符的
+    嵌套键与顶层同策略跳过——flow-style 超长键同样触发 PyYAML 的 simple key
+    扫描上限、整页解析失败。"""
+    if _depth > 32:
+        return str(v)
+    if isinstance(v, dict):
+        out = {}
+        n_coll = n_long = 0
+        for k, x in v.items():
+            if isinstance(k, str):
+                jk = k
+            elif k is None or isinstance(k, (int, float, bool)):
+                jk = json.dumps(k)          # "1" / "1.5" / "true" / "null"
+            else:
+                jk = str(k)
+            if len(jk) > 512:
+                n_long += 1
+                continue
+            if jk in out:
+                n_coll += 1
+            out[jk] = _json_safe(x, _depth + 1)
+        if n_coll:
+            logger.warning("frontmatter 嵌套键净化后发生 {} 处同形碰撞（如日期键与同形字符串键"
+                           "并存），后写的覆盖先写的", n_coll)
+        if n_long:
+            logger.warning("frontmatter 嵌套键过长（>512 字符）{} 个，已跳过（超长键会让整页"
+                           "YAML 解析失败）", n_long)
+        return out
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x, _depth + 1) for x in v]
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
+
+
 def _render_frontmatter(items: Dict[str, Any]) -> str:
     """把有序字典渲染成 YAML frontmatter 文本（`---` 包裹）。
 
@@ -1079,6 +1132,14 @@ def _render_frontmatter(items: Dict[str, Any]) -> str:
     lines = ["---"]
     for k, v in items.items():
         ks = str(k)
+        if len(ks) > 512:
+            # PyYAML 对 block mapping 的 simple key 有约 1024 字符的扫描器硬限制
+            # （加引号也算 simple key，同样受限）：写出去必然让 split_frontmatter
+            # 解析失败、整页永久卡 conflict——正是本函数 docstring 点名要防的后果。
+            # 这样的键只可能来自极端病态的用户 frontmatter，保真无路可走，跳过+出声。
+            logger.warning("frontmatter 键过长（{} 字符 > 512），YAML 简单键无法安全序列化，"
+                           "已跳过该键（值一并丢弃）", len(ks))
+            continue
         key = ks if (_SAFE_KEY.match(ks) and ks.lower() not in _YAML_WORDS) else _y(ks)
         if isinstance(v, list):
             lines.append("{}:".format(key))
@@ -1086,7 +1147,13 @@ def _render_frontmatter(items: Dict[str, Any]) -> str:
         elif isinstance(v, dict):
             # 受管键从不产出 dict；只有用户手写的嵌套 YAML 才可能走到这里。
             # json.dumps 的转义集合是 YAML 双引号标量/流式对象的子集，天然合法。
-            lines.append("{}: {}".format(key, json.dumps(v, ensure_ascii=False)))
+            # _json_safe：yaml.safe_load 会把用户手写的裸日期解析成 datetime.date——
+            # 出现在**值**位直接 TypeError（json.dumps default= 可救），出现在**键**位
+            # （`custom:\n  2024-01-01: 备注`）default= 救不了（skipkeys 只丢不转）。
+            # 两侧都递归转 str 保值不炸；炸点原在昂贵的 LLM 合成**之后**（build_topic/
+            # write_qa_page 都不兜这层），ask_notes 直接裸栈崩到顶。与 vault.py 那层
+            # try/except 互补。
+            lines.append("{}: {}".format(key, json.dumps(_json_safe(v), ensure_ascii=False)))
         else:
             lines.append("{}: {}".format(key, _y(v)))
     lines.append("---")
@@ -1247,8 +1314,20 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
                 per_paper_cap: int = DEFAULT_PER_PAPER_CAP,
                 bucket_bonus: float = DEFAULT_BUCKET_BONUS,
                 model: Optional[str] = None, dry_run: bool = False) -> TopicResult:
-    """一个 topic 的完整链路：召回 → 合成 → 校验 → 合并 → 落盘。"""
+    """一个 topic 的完整链路：冲突预检 → 召回 → 合成 → 校验 → 合并 → 落盘。"""
     path = topics_dir / "{}.md".format(spec.slug)
+    # 冲突**预检**（与 merge_topic_page 的三条判据逐字对齐）：哨兵缺失/批注区缺失/
+    # 生成块被手改的页，合成结果注定被丢弃——此前冲突检测只在 LLM 调用（实测一页
+    # 3-4 分钟）**之后**，而冲突页不落盘、generated_at 冻结，30 天日历兜底与 P2 路由
+    # 会反复把它排进队列，每次都白烧一整次检索+合成直到用户手动解决。预检把这段
+    # 浪费降到毫秒级；LLM 调用期间才发生的手改仍由落盘前的 fresh 重读兜住（W1/X1）。
+    existing0, _fm0, prev_page = read_existing(path)
+    if existing0 is not None:
+        _fmx, body0 = split_frontmatter(existing0)
+        if _fmx is None or extract_user_zone(body0) is None or generated_block_tampered(body0):
+            return TopicResult(slug=spec.slug, status="conflict", path=path,
+                               error="哨兵缺失/生成块被手改，未覆盖（请把批注移到「我的批注」下）"
+                                     "——合成前预检拦下，未消耗 LLM 调用")
     evidences = retrieve_evidence(spec, store, embed_client, min_sim=min_sim,
                                   per_paper_cap=per_paper_cap, bucket_bonus=bucket_bonus)
     if not evidences:
@@ -1257,9 +1336,8 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
     attach_titles(evidences, index)
     n_papers = len({e.citekey for e in evidences})
 
-    # 只取 prev_page 喂 prompt；这份快照的 text/frontmatter 不用来做最终合并——
+    # prev_page 来自上面的预检快照，只喂 prompt；text/frontmatter 不用来做最终合并——
     # LLM 调用后落盘前会在下面重读一次最新版（X1/W1），用那份而不是这里的旧快照。
-    _, _, prev_page = read_existing(path)
     prompt = build_prompt(spec, evidences, template, research_interests, prev_page)
     if dry_run:
         return TopicResult(slug=spec.slug, status="skipped", path=path,

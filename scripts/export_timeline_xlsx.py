@@ -114,7 +114,7 @@ _STYLES = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 
 def write_xlsx(path: Path, sheets: List[Dict[str, Any]]) -> None:
     """sheets: [{name, rows, widths, autofilter}]，原子写（tmp + replace）。"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(path.name + ".tmp-{}".format(os.getpid()))  # 带 pid 防并发互截
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml",
                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'

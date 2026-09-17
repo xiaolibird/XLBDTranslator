@@ -369,6 +369,7 @@ class ScholarWorkflow:
         try:
             # 延迟导入放进 try：httpx 缺失（ModuleNotFoundError）也只跳过、不中断 digest
             from .academic_search import fetch_external_papers
+            fetch_errors: list = []
             candidates = fetch_external_papers(
                 arxiv_query=getattr(proc, 'arxiv_query', ''),
                 pubmed_query=getattr(proc, 'pubmed_query', ''),
@@ -377,9 +378,17 @@ class ScholarWorkflow:
                 start_segment_id=start_id,
                 email=getattr(proc, 'external_email', ''),
                 date_range=self.date_range,
+                errors=fetch_errors,
             )
+            if fetch_errors:
+                # 单源失败在 fetch_external_papers 内只 warning——无人值守（launchd）下
+                # 「检索式坏了/接口持续故障 → 长期 0 篇」与「这周真没新论文」不可区分，
+                # 必须 notify，与 Step 4.5/Step 5 的告警纪律一致（失败不影响 digest 继续）。
+                notify("Scholar digest", "外部检索部分失败：{}（digest 继续，仅缺该源）".format(
+                    "；".join("{} {}".format(s, m[:120]) for s, m in fetch_errors)))
         except Exception as e:
             logger.warning("  ⚠️ 外部检索整体失败（跳过）: {}".format(e))
+            notify("Scholar digest", "外部检索整体失败（digest 继续，无外部源）：{}".format(str(e)[:200]))
             return
 
         blacklist = proc.blacklist
@@ -1165,6 +1174,10 @@ class ScholarWorkflow:
             seg.priority_reason = "src:{:.1f} fld:{:.1f} rec:{:.1f} typ:{:.1f} cite:{:.1f}".format(
                 source_score, field_score, recency_score, type_score, citation_score
             )
+            # 权威存放在 metadata 侧：三处读方（notes.py 分层行 / cli Top5 / to_markdown）
+            # 读的都是 meta.priority_reason，此前规则路径只写 seg 侧，展示层恒为 "N/A"
+            # ——理由明明算出来了却丢了。seg 侧保留镜像（旧序列化数据兼容）。
+            seg.metadata.priority_reason = seg.priority_reason
 
         # 方法学审稿加成（THREAT/MUST_ENGAGE 置顶）统一在 _sort_by_priority 中应用，
         # 这样规则路径与 LLM 覆盖路径（_parse_llm_response 会覆盖 priority_score）
@@ -1311,7 +1324,11 @@ class ScholarWorkflow:
                 bonus, bonus_reason = self._filter_priority_bonus(seg)
                 if bonus:
                     seg.priority_score += bonus
-                    seg.priority_reason = (seg.priority_reason or "") + " " + bonus_reason
+                    seg.priority_reason = ((seg.priority_reason or "") + " " + bonus_reason).strip()
+                    # 同上：加成理由也要进 metadata 侧，否则 LLM 路径的加成说明同样
+                    # 不会出现在任何展示层
+                    seg.metadata.priority_reason = (
+                        (seg.metadata.priority_reason or "") + " " + bonus_reason).strip()
             self._priority_bonus_applied = True
 
         self.segments.sort(key=lambda x: x.priority_score, reverse=True)

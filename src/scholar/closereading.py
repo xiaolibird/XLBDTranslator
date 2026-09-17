@@ -937,6 +937,10 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
                     oa = None
                 oa_map[id(seg)] = oa
             has_ft = [s for s in cand if oa_map.get(id(s)) and oa_map[id(s)].pdf_url]
+            # 成员判断按对象身份（id）而不是 `in` 列表：PaperSegment 是 pydantic 模型，
+            # `in` 走全字段深比较——候选 candidate_factor*top_n 篇时是 O(n²) 次含摘要
+            # 全文的深比较，且两个字段恰好全等的不同对象会被误判为同一篇。
+            has_ft_ids = {id(s) for s in has_ft}
             # 无 OA PDF 的再问一次 Europe PMC——否则 Elsevier/MDPI/OUP 这批（PDF 被反爬挡死、
             # 但 EPMC 有全文）会被择优逻辑系统性判成"拿不到全文"而让位给摘要降级篇。
             # 结果走 fulltext._PMCID_CACHE：route_epmc_render 已经问过的 DOI 这里不重复触网；
@@ -944,17 +948,18 @@ def close_read_segments(segments, research_interests: str, llm, top_n: int = 5,
             import time as _time
             _sleep = _time.sleep
             for seg in cand:
-                if seg in has_ft:
+                if id(seg) in has_ft_ids:
                     continue
                 if route_delay > 0:
                     _sleep(route_delay)
                 try:
                     if europepmc_pmcid(doi=seg.metadata.doi, pmid=seg.metadata.pmid, client=xc):
                         has_ft.append(seg)
+                        has_ft_ids.add(id(seg))
                 except Exception:
                     pass
         has_ft = sorted(has_ft, key=lambda s: s.priority_score, reverse=True)
-        no_ft = [s for s in cand if s not in has_ft]
+        no_ft = [s for s in cand if id(s) not in has_ft_ids]
         chosen = (has_ft[:n] + no_ft)[:n]  # 先全文可得（已按优先级），不足补高优先级降级
         chosen = sorted(chosen, key=lambda s: s.priority_score, reverse=True)
         logger.info("  精读择优：候选 {} 篇，其中全文可得 {} 篇 → 选 {} 篇".format(

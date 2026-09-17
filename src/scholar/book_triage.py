@@ -187,8 +187,15 @@ def triage_chapter(ch: Chapter, manifest: BookManifest, pages: Sequence[str],
 def triage_book(manifest: BookManifest, pages: Sequence[str], specs, llm,
                 interests: str, model: Optional[str] = None,
                 only: Optional[Sequence[int]] = None,
-                max_workers: int = 4) -> Dict[int, ChapterTriage]:
-    """对全书逐章分诊（并发）。返回 {章号: ChapterTriage}。"""
+                max_workers: int = 4,
+                on_result=None) -> Dict[int, ChapterTriage]:
+    """对全书逐章分诊（并发）。返回 {章号: ChapterTriage}。
+
+    on_result：可选回调 `f(out_so_far)`，每完成一章调一次——调用方用它做增量落盘。
+    没有它时，几十章的分诊（几十次 LLM 调用）只有整批返回后才写盘，中途 Ctrl-C /
+    被杀 = 已花钱调完的全部结果作废、重跑从第 1 章开始（cmd_read 逐章落盘，唯独
+    这条路径此前是全批量末尾一次写）。回调抛错只告警不中断分诊本身。
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     chapters = [c for c in manifest.chapter_objs()
@@ -197,15 +204,34 @@ def triage_book(manifest: BookManifest, pages: Sequence[str], specs, llm,
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(triage_chapter, c, manifest, pages, specs, llm, interests, model): c
                 for c in chapters}
-        for fut in as_completed(futs):
-            c = futs[fut]
-            try:
-                res = fut.result()
-            except Exception as exc:              # noqa: BLE001
-                res = ChapterTriage(number=c.number, title=c.title, error=str(exc)[:200])
-            out[res.number] = res
-            logger.info("  分诊 ch{:>2} max={} {}".format(
-                res.number, res.max_score, res.title[:48]))
+        try:
+            for fut in as_completed(futs):
+                c = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as exc:              # noqa: BLE001
+                    res = ChapterTriage(number=c.number, title=c.title, error=str(exc)[:200])
+                out[res.number] = res
+                logger.info("  分诊 ch{:>2} max={} {}".format(
+                    res.number, res.max_score, res.title[:48]))
+                if on_result is not None:
+                    try:
+                        on_result(out)
+                    except Exception as exc:          # noqa: BLE001
+                        logger.warning("  ⚠️ 分诊增量落盘失败（继续分诊）：{}".format(exc))
+        except KeyboardInterrupt:
+            # 已完成的章在 out 里且已通过 on_result 落盘；未开始的取消。
+            # **正在跑的线程无法被打断**（Python 线程语义），with 退出时会等它们自然
+            # 跑完（每个 LLM 调用可达数分钟）——必须说清楚，否则用户以为卡死而
+            # kill -9，反而丢掉这几章的收尾（第 1 轮对抗审计 CONFIRMED：cancel 对
+            # 已开跑的 future 是空操作，"放弃等待"的旧措辞与事实不符）。
+            for f in futs:
+                f.cancel()
+            running = sum(1 for f in futs if f.running())
+            logger.warning("  🛑 分诊被中断：已完成 {}/{} 章（增量已落盘）；仍有 {} 个进行中的"
+                           " LLM 调用需自然收尾（每个可达数分钟），正在等待——请勿强杀"
+                           .format(len(out), len(chapters), running))
+            raise
     return out
 
 

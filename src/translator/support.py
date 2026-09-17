@@ -317,8 +317,14 @@ class CachePersistenceManager:
         current_time = time.time()
         buffer_seconds = 600  # 10分钟缓冲时间
         
+        # 快照遍历 + pop(默认值)：异步线程池 TTL 到期瞬间多个在飞请求会并发走进
+        # 本方法与 remove_invalid_cache，共享的 cache_metadata 上 check-then-del
+        # 会二次 KeyError / 迭代中 dict 改变 RuntimeError——engine_gemini 对姊妹结构
+        # cache_refs 的同型竞态已按"原子 pop"修过（P1），这里补齐同款。不加锁：
+        # get_or_create_system_cache 持 _cache_creation_lock（非重入）时会调进来，
+        # 套锁必死锁；元数据是自愈的顾问状态，崩溃自由即足够。
         expired_keys = []
-        for cache_key, cache_info in self.cache_metadata["system_instruction"].items():
+        for cache_key, cache_info in list(self.cache_metadata["system_instruction"].items()):
             expiry_time = cache_info.get('expiry_time', 0)
             
             if cache_info.get('content_hash') == content_hash:
@@ -334,7 +340,7 @@ class CachePersistenceManager:
         # 清理过期记录
         if expired_keys:
             for key in expired_keys:
-                del self.cache_metadata["system_instruction"][key]
+                self.cache_metadata["system_instruction"].pop(key, None)
             self._save_metadata()
             logger.info(f"🗑️  已删除 {len(expired_keys)} 个过期缓存记录")
         
@@ -351,14 +357,18 @@ class CachePersistenceManager:
         """
         removed = False
         for cache_type in ["system_instruction", "glossary", "context"]:
+            # 快照 + 原子 pop：并发降级（TTL 到期时多个在飞请求同判缓存失效）下，
+            # 先收集后 del 的两步在第二个线程上必 KeyError，且炸点在"无缓存重发"
+            # 之前——原始错误被 KeyError 顶替、优雅降级也不执行（见 get_system_cache
+            # 处的同款注释；engine_gemini P1 修过 cache_refs 的同型竞态）。
             keys_to_remove = [
-                k for k, v in self.cache_metadata[cache_type].items()
+                k for k, v in list(self.cache_metadata[cache_type].items())
                 if v.get('cache_name') == cache_name
             ]
             for key in keys_to_remove:
-                del self.cache_metadata[cache_type][key]
-                removed = True
-                logger.info(f"🗑️  已删除失效缓存记录: {key} ({cache_type})")
+                if self.cache_metadata[cache_type].pop(key, None) is not None:
+                    removed = True
+                    logger.info(f"🗑️  已删除失效缓存记录: {key} ({cache_type})")
         
         if removed:
             self._save_metadata()
@@ -541,8 +551,11 @@ class PromptManager:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 return f.read()
-        except FileNotFoundError:
-            logger.warning(f"⚠️ Prompt template not found: {path}, using fallback")
+        except (OSError, UnicodeDecodeError) as e:
+            # 不止 FileNotFoundError：权限问题/误存成非 UTF-8 编码同样该走兜底而不是
+            # 让翻译器初始化带着一条与 prompt 无关的裸栈崩掉（异常自身不说明是哪个
+            # 模板文件出的问题）。FileNotFoundError 是 OSError 子类，语义不变。
+            logger.warning(f"⚠️ Prompt template unreadable: {path} ({type(e).__name__}: {e}), using fallback")
             # 中性兜底指令：不带花括号占位符（模板从不做 .format()，占位符会以
             # 字面量进 prompt 并与 user message 里的真实输入自相矛盾）
             return (

@@ -25,6 +25,39 @@ logger = get_logger(__name__)
 _ATOM_NS = "{http://www.w3.org/2005/Atom}"
 _ARXIV_NS = "{http://arxiv.org/schemas/atom}"
 
+# 检索请求的瞬态重试参数：arXiv/NCBI 最常见的瞬态故障是 503（高峰期）、429 与超时。
+# fulltext.polite_get 只退避 403/429 且绑定宿主熔断（语义是「补抓候选」），检索路径
+# 每周 cron 一撞 503 就整源失败、又被 workflow 外层 except 吞成一句 warning——
+# 这里补一层轻量重试（2s→6s 两次等待，最多 3 次尝试），5xx/429/超时之外原样返回。
+_TRANSIENT_CODES = frozenset({429, 500, 502, 503, 504})
+_RETRY_ATTEMPTS = 3
+_RETRY_FIRST_DELAY = 2.0
+_RETRY_BACKOFF = 3.0
+
+
+def _get_retry(client: httpx.Client, url: str, params: Optional[Dict[str, Any]] = None,
+               *, attempts: int = _RETRY_ATTEMPTS, sleep=time.sleep) -> httpx.Response:
+    """GET + 瞬态退避重试。429/5xx/超时/连接错误重试到用尽，其余响应原样返回
+    （raise_for_status 仍由调用方负责，保持既有异常形状）。sleep 可注入（测试免等）。"""
+    attempts = max(1, attempts)
+    for i in range(attempts):
+        try:
+            r = client.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if i >= attempts - 1:
+                raise
+            logger.warning("  检索请求瞬态失败（{}），退避重试 {}/{}: {}".format(
+                type(e).__name__, i + 1, attempts - 1, url.split("?")[0]))
+            sleep(_RETRY_FIRST_DELAY * (_RETRY_BACKOFF ** i))
+            continue
+        if r.status_code in _TRANSIENT_CODES and i < attempts - 1:
+            logger.warning("  检索请求 HTTP {}，退避重试 {}/{}: {}".format(
+                r.status_code, i + 1, attempts - 1, url.split("?")[0]))
+            sleep(_RETRY_FIRST_DELAY * (_RETRY_BACKOFF ** i))
+            continue
+        return r
+    return r  # 理论不可达（循环内必 return/raise），给类型检查一个出口
+
 
 def _generate_paper_id(title: str, authors: Optional[List[str]] = None) -> str:
     """与 ScholarEmailParser.generate_paper_id 一致的 ID 生成（title + 前3作者的 md5）。"""
@@ -72,6 +105,12 @@ class AcademicSearchClient:
         date_range 指定 [start,end] 时把 submittedDate 过滤进检索式并翻页（历史月份在结果深处，
         不能只取首页）；否则沿用 days 客户端裁剪。异常向上抛，由调用方决定容错。
         """
+        if max_results <= 0:
+            # page=0 时下一行 `max_results // page` 直接 ZeroDivisionError，且会被
+            # workflow 外层 except 吞成一句不指名根因的 warning、整段外部检索静默失效。
+            # 本仓库 gmail_client 用的恰是「0=不限」惯例，这里明确拒绝该语义防误用。
+            logger.warning("arXiv 检索 max_results={} 非法（须 ≥1），返回空".format(max_results))
+            return []
         q = query
         if date_range:
             s, e = date_range
@@ -88,7 +127,7 @@ class AcademicSearchClient:
                 "search_query": q, "start": start, "max_results": page,
                 "sortBy": "submittedDate", "sortOrder": "descending",
             }
-            resp = self._client.get(self.ARXIV_API, params=params)
+            resp = _get_retry(self._client, self.ARXIV_API, params=params)
             resp.raise_for_status()
             batch = self.parse_arxiv(resp.text)
             if not batch:
@@ -156,6 +195,9 @@ class AcademicSearchClient:
 
         date_range 指定 [start,end] 时用 mindate/maxdate+datetype=pdat（历史区间）；否则沿用 reldate。
         """
+        if max_results <= 0:
+            logger.warning("PubMed 检索 max_results={} 非法（须 ≥1），返回空".format(max_results))
+            return []
         esearch_params = {
             "db": "pubmed",
             "term": query,
@@ -175,7 +217,7 @@ class AcademicSearchClient:
             esearch_params["reldate"] = days
             esearch_params["datetype"] = "pdat"
 
-        resp = self._client.get(f"{self.EUTILS}/esearch.fcgi", params=esearch_params)
+        resp = _get_retry(self._client, f"{self.EUTILS}/esearch.fcgi", params=esearch_params)
         resp.raise_for_status()
         try:
             ids = resp.json().get("esearchresult", {}).get("idlist", [])
@@ -199,7 +241,7 @@ class AcademicSearchClient:
             }
             if self.email:
                 efetch_params["email"] = self.email
-            resp2 = self._client.get(f"{self.EUTILS}/efetch.fcgi", params=efetch_params)
+            resp2 = _get_retry(self._client, f"{self.EUTILS}/efetch.fcgi", params=efetch_params)
             resp2.raise_for_status()
             items.extend(self.parse_pubmed(resp2.text))
         return items
@@ -331,7 +373,7 @@ def fetch_arxiv_by_id(arxiv_id: str, client: httpx.Client, timeout: float = 20.0
     if not aid:
         return None
     aid = re.sub(r"v\d+$", "", aid)  # 去掉版本后缀取最新
-    resp = client.get(AcademicSearchClient.ARXIV_API, params={"id_list": aid})
+    resp = _get_retry(client, AcademicSearchClient.ARXIV_API, params={"id_list": aid})
     resp.raise_for_status()
     items = AcademicSearchClient.parse_arxiv(resp.text)
     return items[0] if items else None
@@ -367,7 +409,7 @@ def fetch_pubmed_by_id(doi: str = "", pmid: str = "", *, client: httpx.Client,
                   "retmax": 1, "tool": tool}
         if email:
             params["email"] = email
-        resp = client.get("{}/esearch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
+        resp = _get_retry(client, "{}/esearch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
         resp.raise_for_status()
         ids = (resp.json().get("esearchresult") or {}).get("idlist") or []
         if not ids:
@@ -377,7 +419,7 @@ def fetch_pubmed_by_id(doi: str = "", pmid: str = "", *, client: httpx.Client,
     params = {"db": "pubmed", "id": pid, "retmode": "xml", "tool": tool}
     if email:
         params["email"] = email
-    resp = client.get("{}/efetch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
+    resp = _get_retry(client, "{}/efetch.fcgi".format(AcademicSearchClient.EUTILS), params=params)
     resp.raise_for_status()
     items = AcademicSearchClient.parse_pubmed(resp.text)
     return items[0] if items else None
@@ -419,11 +461,15 @@ def fetch_external_papers(
     email: str = "",
     timeout: float = 20.0,
     date_range: Optional[Tuple[date, date]] = None,
+    errors: Optional[List[Tuple[str, str]]] = None,
 ) -> List[PaperSegment]:
     """抓取 arXiv + PubMed，返回 PaperSegment 列表（segment_id 从 start_segment_id 连续分配）。
 
     date_range 指定 [start,end] 时按历史区间检索（回填用）；否则用相对 days。
     单源失败只 warning 跳过，不影响另一源与整体流程（cron 无人值守）。
+    errors：可选出参，收集 (源名, 失败原因)。无人值守下「检索式写错/接口挂了导致 0 篇」
+    与「这周真没有新论文」在返回值上同形，调用方靠它区分并 notify（本模块是纯客户端，
+    不直接依赖 utils.notify 的 UI 层）。
     """
     segments: List[PaperSegment] = []
     next_id = start_segment_id
@@ -439,6 +485,8 @@ def fetch_external_papers(
                     next_id += 1
             except Exception as e:
                 logger.warning("  ⚠️ arXiv 检索失败（跳过）: {}".format(e))
+                if errors is not None:
+                    errors.append(("arxiv", "{}: {}".format(type(e).__name__, str(e)[:200])))
 
         if pubmed_query:
             try:
@@ -450,5 +498,7 @@ def fetch_external_papers(
                     next_id += 1
             except Exception as e:
                 logger.warning("  ⚠️ PubMed 检索失败（跳过）: {}".format(e))
+                if errors is not None:
+                    errors.append(("pubmed", "{}: {}".format(type(e).__name__, str(e)[:200])))
 
     return segments

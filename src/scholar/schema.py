@@ -91,8 +91,9 @@ class PaperMetadata(BaseModel):
 
     # 分类信息
     field: PaperField = Field(default=PaperField.OTHER, description="论文领域")
-    keywords: List[str] = Field(default_factory=list, description="关键词列表")
-    
+    # （keywords 只声明一处，见下方「LLM处理结果」段——此前这里重复声明过一次，
+    #  class body 后者覆盖前者，留着只会误导人去改一个不生效的 description）
+
     # 来源追踪
     source_email_id: Optional[str] = Field(None, description="来源邮件ID")
     email_received_at: Optional[datetime] = Field(None, description="邮件接收时间")

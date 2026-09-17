@@ -558,6 +558,10 @@ class GeminiTranslator(BaseTranslator):
             try:
                 final_glossary.update(self._extract_glossary_window(content_sample))
             except Exception as e:
+                # provider 级致命错误（402 欠费/401 认证）必须上抛让回退链感知——
+                # 全文件其余外层 except 都有这行，唯独这里此前漏掉：欠费发生在术语
+                # 抽取阶段时被吞成 warning，方法"成功"返回还会清零 soft-failure 计数。
+                _reraise_if_provider_fatal(e)
                 logger.error(f"   - ❌ 术语抽取窗口 {idx} 失败（跳过）: {e}")
 
         if final_glossary:
@@ -675,10 +679,16 @@ class GeminiTranslator(BaseTranslator):
         )
         try:
             raw_text = response.candidates[0].content.parts[0].text
-        except Exception:
-            # If the response was blocked/malformed, return failed markers for this batch
-            logger.error("❌ Text Translation response invalid or blocked; marking batch as failed")
-            return ["[Failed: Blocked or invalid response]" for _ in segments]
+        except Exception as e:
+            # 走过 _generate_content 的三道校验仍取不出正文（如 thinking 模型烧光
+            # 输出预算时 parts 为空列表）。此前这里直接 return 整批 [Failed:]——
+            # tenacity 看到的是「函数正常返回」不重试，FallbackTranslator 也感知不到
+            # provider 异常；成因若是系统性的，整本书后续批次会无声连环判死而运行
+            # 以"成功"退出。改抛 _ResponseValidationError：软错误进 @retry 本地重试，
+            # 耗尽后 reraise 给回退链换 provider——与 OpenAI 路径的行为对齐。
+            raise _ResponseValidationError(
+                "Text Translation response has no readable text part "
+                "(candidates/parts malformed)", context={"response": repr(response)[:300]}) from e
         
         # 解析响应，传递期望的 ID 列表以便检测缺失的翻译
         input_ids = [s.segment_id for s in segments]
@@ -712,8 +722,12 @@ class GeminiTranslator(BaseTranslator):
         """视觉批量翻译（串行处理）"""
         results = []
         current_context = context[-self.settings.processing.max_context_length:] if context else ""
+        # 限速等待只服务「下一次 vision 调用」：最后一个 image 段之后（哪怕后面还有
+        # 文本降级段）不再空等（第 1 轮对抗审计：判批尾会在 [img, img, text] 形态下多等一次）
+        _last_img = max((i for i, s0 in enumerate(segments)
+                         if s0.content_type == "image" and s0.image_path), default=-1)
 
-        for seg in segments:
+        for _i, seg in enumerate(segments):
             try:
                 if seg.content_type == "image" and seg.image_path:
                     translation = self._call_vision_api(
@@ -721,7 +735,8 @@ class GeminiTranslator(BaseTranslator):
                         current_context,
                         glossary
                     )
-                    time.sleep(self.settings.processing.vision_rate_limit_delay)
+                    if _i != _last_img:           # 最后一个图片段之后不再空等限速窗口
+                        time.sleep(self.settings.processing.vision_rate_limit_delay)
                 else:
                     # 降级处理文本
                     fallback_result = self._translate_text_batch([seg], current_context, glossary)

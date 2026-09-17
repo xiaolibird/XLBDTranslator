@@ -277,10 +277,18 @@ class AsyncGeminiTranslator(BaseAsyncTranslator):
         img_path: str,
         context: str,
         semaphore: asyncio.Semaphore,
-        retry_count: int = 2,
+        retry_count: int = 0,
         glossary: Optional[Dict[str, str]] = None
     ) -> str:
-        """异步调用视觉 API，使用信号量限制并发，支持重试"""
+        """异步调用视觉 API，使用信号量限制并发。
+
+        retry_count 缺省 0：`base._call_vision_api` 内部已有
+        `_VISION_TRANSIENT_RETRIES=2`（3 次尝试 + 指数退避）的完整重试，此前外层再
+        默认包 2 次（对失败标记/异常各自重试）会嵌套放大成最坏 3×3=9 次真实 API
+        调用，且两层各打一遍"尝试 X/3"日志、排查时相互冒充——同步路径与
+        OpenAI-compatible 异步路径都是单层 3 次。保留循环机制（失败标记检测/
+        provider 级错误立即上抛），只把外层预算归零对齐单层语义；调用方仍可显式
+        传 retry_count 恢复外层重试。"""
 
         async with semaphore:  # 限制并发数
             # 获取当前事件循环（安全方式）

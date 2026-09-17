@@ -187,6 +187,11 @@ def build_digest_docx(segments: List[PaperSegment], citekeys: Dict[str, Optional
                                  "DOI: {}".format(it["DOI"]) if it.get("DOI") else ""] if x]
             _apply_font(doc.add_paragraph().add_run(". ".join(parts)), size=9.5, cjk=cjk_font)
 
-    doc.save(str(out_path))
+    # 原子写（tmp+replace，tmp 带 pid 防并发互踩）：python-docx 直接向目标写 zip 流，
+    # 进程中途被杀会拿半截 docx 顶掉上一次的完好产物——全库其余落盘都是原子的。
+    import os as _os
+    tmp = out_path.with_name(out_path.name + ".tmp-{}".format(_os.getpid()))
+    doc.save(str(tmp))
+    _os.replace(tmp, out_path)
     logger.info("  📄 样式化 docx → {}".format(out_path))
     return out_path

@@ -368,7 +368,13 @@ def main() -> int:
                 T.record_topic_failure(topics_dir, spec.slug)
             elif r.status in ("new", "merged"):
                 T.record_topic_success(topics_dir, spec.slug)
-            streak = streak + 1 if r.status == "failed" else 0
+            # conflict 对连败计数保持**中性**：预检短路后它根本没打 LLM，既不证明
+            # provider 恢复（不能清零——否则交替出现的 conflict 会把真实的链耗尽
+            # 连败打断），也不是 provider 故障（不能累加）。
+            if r.status == "failed":
+                streak += 1
+            elif r.status != "conflict":
+                streak = 0
             print("  " + _fmt(r))
     finally:
         embed_client.close()

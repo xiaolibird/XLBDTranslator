@@ -1392,6 +1392,16 @@ class TranslationWorkflow:
                     # 处理结果（线程安全）
                     batch_success = 0
                     with lock:
+                        if batch_results is not None and len(batch_results) != len(batch):
+                            # 与同步路径（_run_sync_batches）同款防线：engine 返回条数与
+                            # 批大小不一致时 zip 静默截断，多出的段 translated_text 不变、
+                            # 不进 completed/failed 任一 checkpoint 分支，潜伏到渲染阶段
+                            # 才以空白译文暴露。此前这条检查只打到同步路径，而异步是
+                            # 多数预设的默认值——先落日志留痕。
+                            logger.warning(
+                                f"⚠️ 异步批次 engine 返回 {len(batch_results)} 条结果，"
+                                f"与批大小 {len(batch)} 不一致，多出的段将被 zip 静默丢弃"
+                            )
                         for seg, trans in zip(batch, batch_results):
                             # 与同步路径同源判定：手写 startswith/endswith 会漏检
                             # "[...翻译被截断]"，把截断段记成功后 checkpoint 就不再重译

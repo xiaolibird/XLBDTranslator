@@ -323,7 +323,12 @@ class ZoteroConnectorClient:
             if r.status_code != 200:
                 return None
             results = r.json().get("result", []) or []
-        except Exception:
+        except Exception as e:
+            # 出声（debug 级防刷屏）：静默 None 会让「citekey 解析 0/N」看不出是
+            # BBT 插件挂了、连接被重置还是响应格式变了——同类里 ping/save_items
+            # 的异常分支都有日志，唯独这里此前是裸吞。
+            logger.debug("BBT item.search 失败（term={}）: {}: {}",
+                         term[:60], type(e).__name__, e)
             return None
         return pick_citekey(results, norm_doi, title)
 

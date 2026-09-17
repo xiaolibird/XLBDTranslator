@@ -283,46 +283,87 @@ def _seg_from_norm(item: Dict[str, Any], sid: int, source: str,
                         metadata=meta, status=DigestStatus.PENDING)
 
 
-def segments_from_identifiers(ids: Sequence[str], email: str = "") -> List[PaperSegment]:
+def segments_from_identifiers(ids: Sequence[str], email: str = "",
+                              max_workers: int = 4) -> List[PaperSegment]:
     """DOI / arXiv id / 裸标题 → PaperSegment。解析不出的条目跳过并告警，不中断整批。
 
     Crossref 基本不给摘要，所以这条路进来的论文摘要多为空——筛选凭标题判，
     真正的内容在后面的全文精读里补。
+
+    4-worker 分片并行（同 enrich_segments/resolve_citekeys 的模板）：journal_screen
+    勾选批一次几十上百个标识符、每个 1-2 次网络往返，纯串行要等分钟级。每个 worker
+    持独立 client、只解析自己分片；结果按原始下标回填，输出顺序与 segment_id
+    语义（enumerate 下标）与串行版逐条一致。
     """
     from .crossref import crossref_by_doi, crossref_lookup
     from .academic_search import fetch_arxiv_by_id
     from .fulltext import ipv4_client
 
-    segs: List[PaperSegment] = []
-    with ipv4_client(timeout=30) as xc:
-        for i, raw in enumerate(ids, 1):
-            s = raw.strip()
-            am = ARXIV_RE.match(s) or ARXIV_RE.match(
-                s.rsplit("/", 1)[-1] if "arxiv.org" in s.lower() else "")
-            try:
-                if am:
-                    it = fetch_arxiv_by_id(am.group(1), xc)
-                    if it:
-                        seg = _seg_from_norm(it, i, "arxiv", it.get("abstract", ""))
-                        seg.metadata.arxiv_id = am.group(1)
-                        segs.append(seg)
-                        continue
-                dm = DOI_RE.search(s)
-                if dm:
-                    it = crossref_by_doi(dm.group(1), email=email, client=xc)
-                    if it:
-                        segs.append(_seg_from_norm(it, i, "crossref"))
-                        continue
-                if not am and not dm:                       # 当成标题模糊检索
-                    it = crossref_lookup(s, email=email, client=xc)
-                    if it:
-                        segs.append(_seg_from_norm(it, i, "crossref"))
-                        continue
-            except Exception as e:
-                logger.warning("  ⚠️ 解析失败 [{}]: {}".format(s, e))
-                continue
-            logger.warning("  ⚠️ 查不到元数据，跳过：{}".format(s))
-    return segs
+    id_list = list(ids)
+    if not id_list:
+        return []
+
+    def _resolve_one(i: int, raw: str, xc) -> Optional[PaperSegment]:
+        s = raw.strip()
+        am = ARXIV_RE.match(s) or ARXIV_RE.match(
+            s.rsplit("/", 1)[-1] if "arxiv.org" in s.lower() else "")
+        try:
+            if am:
+                it = fetch_arxiv_by_id(am.group(1), xc)
+                if it:
+                    seg = _seg_from_norm(it, i, "arxiv", it.get("abstract", ""))
+                    seg.metadata.arxiv_id = am.group(1)
+                    return seg
+            dm = DOI_RE.search(s)
+            if dm:
+                it = crossref_by_doi(dm.group(1), email=email, client=xc)
+                if it:
+                    return _seg_from_norm(it, i, "crossref")
+            if not am and not dm:                       # 当成标题模糊检索
+                it = crossref_lookup(s, email=email, client=xc)
+                if it:
+                    return _seg_from_norm(it, i, "crossref")
+        except Exception as e:
+            logger.warning("  ⚠️ 解析失败 [{}]: {}".format(s, e))
+            return None
+        logger.warning("  ⚠️ 查不到元数据，跳过：{}".format(s))
+        return None
+
+    results: dict = {}
+    n_workers = max(1, min(max_workers, len(id_list)))
+    shards = [id_list[k::n_workers] for k in range(n_workers)]
+    offsets = [list(range(k + 1, len(id_list) + 1, n_workers)) for k in range(n_workers)]
+
+    def _run_shard(pairs) -> dict:
+        out = {}
+        try:
+            with ipv4_client(timeout=30) as xc:
+                for i, raw in pairs:
+                    out[i] = _resolve_one(i, raw, xc)
+        except Exception as e:
+            # 逐条异常已在 _resolve_one 内消化；能到这里的只有 client 构造/关闭这类
+            # 分片级故障。此前它会经 f.result() 穿透出去，把**其余分片已完成的结果
+            # 一并作废**（第 1 轮对抗审计 CONFIRMED）——降为「该分片剩余条目记未解析
+            # + 告警」，与串行版「解析不出的条目跳过并告警」同一语义。
+            logger.warning("  ⚠️ 解析分片中断（{}: {}），该分片剩余 {} 条记为未解析"
+                           .format(type(e).__name__, str(e)[:120], len(pairs) - len(out)))
+            for i, _raw in pairs:
+                out.setdefault(i, None)
+        return out
+
+    if n_workers == 1:
+        # 单 worker 也必须走 _run_shard 的隔离（第 2 轮对抗审计 CONFIRMED：此前
+        # 单条目输入/显式 max_workers=1 走的是无防护裸循环，client 构造失败会把
+        # 「解析不出的条目跳过并告警，不中断整批」的承诺整个炸穿）。
+        results.update(_run_shard(list(zip(offsets[0], shards[0]))))
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_run_shard, list(zip(offsets[k], shards[k])))
+                    for k in range(n_workers)]
+            for f in futs:
+                results.update(f.result())
+    return [results[i] for i in sorted(results) if results[i] is not None]
 
 
 def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,

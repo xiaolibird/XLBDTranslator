@@ -132,7 +132,9 @@ def parse_page(path: Path) -> Page:
 
         if zone == "claims":
             if ln.startswith("## ") or ln.startswith("### "):
-                section = ln.lstrip("# ").strip()
+                # 只剥标题前缀：lstrip("# ") 是字符集剥离，标题正文以 #/空格开头
+                # （如「## #1 关键问题」）会被过度裁剪成「1 关键问题」。
+                section = re.sub(r"^#+\s*", "", ln).strip()
             elif ln.startswith("- ") and _CITE_RE.search(ln):
                 page.claims.append(Claim(text=ln[2:].strip(),
                                          citekeys=_CITE_RE.findall(ln),

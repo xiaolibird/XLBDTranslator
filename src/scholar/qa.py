@@ -202,7 +202,8 @@ def _legacy_digest(norm: str) -> str:
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
 
 
-def qa_slug(question: str, explicit: Optional[str] = None, *, qa_dir=None) -> str:
+def qa_slug(question: str, explicit: Optional[str] = None, *, qa_dir=None,
+            pages=None) -> str:
     """问题 -> 稳定 slug。给了 `explicit` 就用它（仍要过合法性检查）。
 
     ## digest 口径迁移（2026-08-17）
@@ -283,7 +284,9 @@ def qa_slug(question: str, explicit: Optional[str] = None, *, qa_dir=None) -> st
     #
     # 按身份扫一遍则两种情形一起覆盖，规则也更简单：**一个身份一页**。
     # 代价是读 N 份 frontmatter，几十上百页的量级可以忽略，且只在给了 qa_dir 时才走。
-    for page in list_qa_pages(d):
+    # pages：可选预载列表（audit_qa_pages 每页都要问一次本函数，逐次全目录重扫会在
+    # 「多页同时脱轨」——恰是口径迁移后最需要 --verify 快的时刻——退化成 O(N²)）。
+    for page in (pages if pages is not None else list_qa_pages(d)):
         if page.question and question_key(page.question) == question_key(norm):
             if page.slug != slug:
                 logger.info("qa 页 {} 与本问题身份相同（文件名按旧 digest 口径起的），"
@@ -1652,6 +1655,10 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
                 flatten_linebreaks((h.get("text") or "").strip())
                 for h in (p.get("highlights") or []) if isinstance(h, dict))
     out: List[QAAudit] = []
+    # 预载一次目录给 qa_slug 的身份回退扫描用：不预载时，每一页脱轨都会触发一次
+    # list_qa_pages 全目录重扫——「多页同时脱轨」（口径迁移后跑 --verify 的场景，
+    # 正是最需要它快的时刻）退化成 O(N²)。
+    _pages_cache = list_qa_pages(Path(qa_dir))
     for path in sorted(Path(qa_dir).glob("*.md")):
         if not is_qa_page_file(path):
             continue
@@ -1678,7 +1685,7 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
         # 脱轨的那种——多半是手打 `--slug` 起的名字，重问时不带 `--slug` 就会分叉。
         if a.question:
             try:
-                want = qa_slug(a.question, qa_dir=qa_dir)
+                want = qa_slug(a.question, qa_dir=qa_dir, pages=_pages_cache)
             except TopicError:
                 want = ""
             if want and want != a.slug:

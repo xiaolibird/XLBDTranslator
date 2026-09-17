@@ -94,10 +94,19 @@ def _creators_to_authors(creators: List[Dict[str, Any]]) -> List[str]:
     return authors
 
 
+# 英文月名 → 月份。文档一直声称支持 "Feb 2026"，实现此前只挑数字 token、英文月名被
+# 静默吃成 1 月——错值被精度体系遮蔽（反推不出数字月 → 判 year 精度 → 展示层截到年），
+# 但对象里的 .month 终究是错的，绕过精度直接读就翻车。表与 academic_search._MONTHS 同源。
+_MONTH_NAME_RE = re.compile(
+    r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\b")
+_MONTH_BY_NAME = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                  "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
 def _parse_date(date_str: str) -> Optional[date]:
     """从 Zotero 的 date 字段解析日期，容忍多种格式：
-    "2026-02-01" / "2026-02" / "2026" / "7/2026"（月/年）/ "Feb 2026" 等。
-    策略：取 4 位年份，再从其余数字里挑一个 1-12 当月份；解析不出月/日就用 1。"""
+    "2026-02-01" / "2026-02" / "2026" / "7/2026"（月/年）/ "Feb 2026" / "March 15, 2026"。
+    策略：取 4 位年份；月份先从其余数字里挑 1-12，挑不到再认英文月名；日恒用 1。"""
     s = (date_str or "").strip()
     if not s:
         return None
@@ -106,13 +115,19 @@ def _parse_date(date_str: str) -> Optional[date]:
         return None
     year = int(ym.group(0))
     month = 1
+    found = False
     for tok in re.findall(r"\d+", s):
         if tok == ym.group(0):
             continue
         v = int(tok)
         if 1 <= v <= 12:
             month = v
+            found = True
             break
+    if not found:
+        nm = _MONTH_NAME_RE.search(s)
+        if nm:
+            month = _MONTH_BY_NAME[nm.group(1).lower()]
     try:
         return date(year, month, 1)
     except Exception:
@@ -144,10 +159,14 @@ def apply_item_to_meta(meta: PaperMetadata, item: Dict[str, Any]) -> bool:
     if d and not meta.publication_date:
         meta.publication_date = d
         # _parse_date 的日恒为 1、月解析不出时也退到 1，所以真实精度只能从原串倒推：
-        # 原串里除年之外还挑得出 1-12 的数 → 月精度，否则只有年。签名不动（有测试钉死）。
+        # 原串里除年之外挑得出 1-12 的数，**或有英文月名**（与 _parse_date 的月名分支
+        # 同判据，两处必须一致，否则「Feb 2026」解析出真月份却被精度截回年）→ 月精度，
+        # 否则只有年。签名不动（有测试钉死）。
         import re as _re
         toks = [t for t in _re.findall(r"\d+", raw_date or "") if t != str(d.year)]
-        meta.date_precision = "month" if any(1 <= int(t) <= 12 for t in toks) else "year"
+        has_month = (any(1 <= int(t) <= 12 for t in toks)
+                     or bool(_MONTH_NAME_RE.search(raw_date or "")))
+        meta.date_precision = "month" if has_month else "year"
     return True
 
 
