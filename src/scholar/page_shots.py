@@ -113,6 +113,14 @@ class PageMap:
     how: str = "pdf-order"       # label / header / pdf-order
     labels: Optional[Dict[int, int]] = None   # 印刷页 → PDF 页序(1 起)，来自 PDF 页标签
 
+    def to_printed(self, pdf_index: int) -> int:
+        """PDF 页序(1 起) → 印刷页（札记与引用定位符用的口径）。"""
+        if self.labels:
+            for printed, idx in self.labels.items():
+                if idx == pdf_index:
+                    return printed
+        return pdf_index + self.offset
+
     def to_pdf(self, printed: int) -> Optional[int]:
         """印刷页 → PDF 页序(1 起)；落不到本 PDF 内返回 None。"""
         if self.labels and printed in self.labels:
@@ -592,3 +600,176 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
         out["_map"] = {"how": pm.how, "offset": pm.offset, "n_pages": pm.n_pages}
         out["_missing"] = missing
     return out
+
+
+# ---------------------------------------------------------------------------
+# 句 → 原文出处段落（2026-09-20：用户要的是「每一句都有对应正文位置的截图」，不只是图表）
+# ---------------------------------------------------------------------------
+# 证据句是中文转述、原文是英文，无法靠文本搜索定位。做法：把 PDF 正文切成行级滑动窗口，
+# 用多语种向量（bge-m3）跨语言匹配；句中数字在窗口里出现是强加分；札记标了页码的只在
+# 那一页找。够自信才配图——配错出处比不配更糟，它会让人对着错的原文去核。
+
+PASSAGE_DPI = 150
+WIN_LINES, WIN_STRIDE = 6, 3
+PASSAGE_MIN_SCORE = 0.62   # 0.60–0.62 一档实测出现过「相关但不是出处」的弱匹配（shi2025 缺失率设置→Table 2 表注）
+_REF_HEAD = re.compile(r"^\s*(References|REFERENCES|Bibliography|参考文献)\s*$")
+_NUM = re.compile(r"\d+(?:\.\d+)?")
+# 这些分节是 agent 自己的话，原文里没有出处
+NO_SOURCE_SECTIONS = ("对我研究的联想", "交叉核验记录", "逐节通读要点", "版本差异")
+
+
+def passage_windows(doc) -> List[dict]:
+    """正文的行级滑动窗口：[{page(1起), rect, text}]。References 之后、页眉页脚不要。"""
+    import fitz
+    out: List[dict] = []
+    for pi in range(doc.page_count):
+        page = doc[pi]
+        h = page.rect.height
+        stop = False
+        for blk in page.get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            lines = []
+            for ln in blk.get("lines", []):
+                txt = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
+                r = fitz.Rect(ln["bbox"])
+                if not txt or r.y1 < h * 0.06 or r.y0 > h * 0.945:
+                    continue
+                if _REF_HEAD.match(txt):
+                    stop = True
+                    break
+                lines.append((r, txt))
+            if stop:
+                break
+            if not lines:
+                continue
+            n = len(lines)
+            starts = [0] if n <= WIN_LINES + 2 else list(range(0, n - WIN_LINES + 1, WIN_STRIDE))
+            if starts[-1] + WIN_LINES < n and n > WIN_LINES + 2:
+                starts.append(n - WIN_LINES)
+            for s0 in starts:
+                seg = lines if n <= WIN_LINES + 2 else lines[s0:s0 + WIN_LINES]
+                text = re.sub(r"(\w)- (\w)", r"\1\2", " ".join(t for _, t in seg))
+                if len(text) < 60:
+                    continue
+                rect = fitz.Rect(seg[0][0])
+                for r, _ in seg[1:]:
+                    rect |= r
+                out.append({"page": pi + 1, "rect": tuple(rect), "text": text, "blk": (pi, blk.get("number", 0)), "pos": s0})
+        if stop:
+            break
+    return out
+
+
+def _nums(text: str) -> set:
+    return {x.rstrip("0").rstrip(".") if "." in x else x for x in _NUM.findall(text.replace(",", ""))} - {"1", "2", "3", "0"}
+
+
+def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMap] = None,
+                    windows: Optional[List[dict]] = None, win_vecs=None) -> List[Optional[dict]]:
+    """为每句找原文出处。返回与 sentences 等长的列表：{page, rect, score} 或 None。
+
+    sentences: [{"text", "page"(札记页码，可无), "section"}]；embed: texts -> (n,d) ndarray。
+    """
+    import numpy as np
+    import fitz
+    wins = windows if windows is not None else passage_windows(doc)
+    res: List[Optional[dict]] = [None] * len(sentences)
+    todo = [i for i, s in enumerate(sentences)
+            if not any((s.get("section") or "").startswith(k) for k in NO_SOURCE_SECTIONS) and (s.get("text") or "").strip()]
+    if not wins or not todo:
+        return res
+    W = win_vecs if win_vecs is not None else embed([w["text"] for w in wins])
+    Q = embed([sentences[i]["text"] for i in todo])
+    W = W / (np.linalg.norm(W, axis=1, keepdims=True) + 1e-9)
+    Q = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9)
+    sim = Q @ W.T
+    wnums = [_nums(w["text"]) for w in wins]
+    wpage = np.array([w["page"] for w in wins])
+    for qi, si in enumerate(todo):
+        s = sentences[si]
+        sc = sim[qi].copy()
+        hint = s.get("page")
+        if not hint:                               # 句子正文里自带的页码提示：「（§5.7, p.14）」
+            m = re.search(r"(?<![A-Za-z])pp?\.\s*(\d{1,4}(?:\s*[-–]\s*\d{1,4})?)", s.get("text") or "")
+            hint = m.group(1) if m else None
+        want = [page_map.to_pdf(p) for p in parse_pages(hint)] if page_map else []
+        want = [w for w in want if w]
+        if want:                                   # 札记标了页码：只在那一页（含区间）里找
+            sc[~np.isin(wpage, want)] = -1.0
+        qn = _nums(s["text"])
+        if qn:
+            sc = sc + np.array([min(0.12, 0.04 * len(qn & wn)) for wn in wnums])
+        b = int(np.argmax(sc))
+        if sc[b] < PASSAGE_MIN_SCORE:
+            continue
+        rect = fitz.Rect(wins[b]["rect"])
+        for nb in (b - 1, b + 1):                  # 出处常跨窗口：相邻窗口也够像就并进来
+            if 0 <= nb < len(wins) and wins[nb]["blk"] == wins[b]["blk"] and sc[nb] >= sc[b] - 0.04:
+                rect |= fitz.Rect(wins[nb]["rect"])
+        res[si] = {"page": wins[b]["page"], "rect": tuple(rect), "score": round(float(sc[b]), 3)}
+    return res
+
+
+def render_passage(doc, pdf_index: int, rect, out: Path, dpi: int = PASSAGE_DPI) -> Path:
+    import fitz
+    page = doc[pdf_index - 1]
+    clip = (fitz.Rect(rect) + (-10, -1.5, 10, 1.5)) & page.rect   # 纵向留白再大就会露出邻行的半行字
+    _save(page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=clip, alpha=False), out)
+    return out
+
+
+PASSAGE_VERSION = "2"
+
+
+def sentence_key(text: str) -> str:
+    import hashlib
+    return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:10]
+
+
+def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_root: Path, embed,
+                       force: bool = False) -> Dict[str, dict]:
+    """逐句原文出处截图。返回 {句子键: {"rel", "printed", "score"}}（没把握的句子不在其中）。
+
+    结果缓存在 `<citekey>/passages.json`，键 = PDF 指纹 + 算法版本 + 句子内容哈希：finalize 是
+    整月重建，不缓存的话每入库一篇新论文，当月所有旧论文都要重新算一遍向量（126 篇的月份
+    要十几分钟）。只有**新句子**才触发向量计算；PDF 换了或算法升版则整篇重算。
+    """
+    import json
+    import fitz
+    pdf_path = Path(pdf_path)
+    safe = shot_name(citekey, 1).split("/")[0]
+    cdir = out_root / safe
+    cfile = cdir / "passages.json"
+    st = pdf_path.stat()
+    fp = [st.st_size, st.st_mtime_ns]
+    cache = {}
+    if cfile.exists() and not force:
+        try:
+            cache = json.loads(cfile.read_text("utf-8"))
+        except Exception:
+            cache = {}
+    if cache.get("pdf_fp") != fp or cache.get("v") != PASSAGE_VERSION:
+        cache = {"pdf_fp": fp, "v": PASSAGE_VERSION, "items": {}}
+        if cdir.is_dir():
+            for old in cdir.glob("q_*.jpg"):
+                old.unlink()
+    items = cache["items"]
+    keyed = [(sentence_key(x.get("text")), x) for x in sentences]
+    new = [(k, x) for k, x in keyed if k not in items]
+    if new:
+        with fitz.open(str(pdf_path)) as doc:
+            pm = build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
+            found = locate_passages(doc, [x for _, x in new], embed, pm)
+            for (k, _), r in zip(new, found):
+                if r is None:
+                    items[k] = None
+                    continue
+                rel = "{}/q_{}.jpg".format(safe, k)
+                render_passage(doc, r["page"], r["rect"], out_root / rel)
+                items[k] = {"rel": rel, "printed": pm.to_printed(r["page"]), "score": r["score"]}
+        cdir.mkdir(parents=True, exist_ok=True)
+        tmp = cfile.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        tmp.replace(cfile)
+    return {k: items[k] for k, _ in keyed if items.get(k) and (out_root / items[k]["rel"]).is_file()}

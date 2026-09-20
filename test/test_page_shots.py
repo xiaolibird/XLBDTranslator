@@ -403,3 +403,107 @@ def test_wraparound_prose_beside_figure_is_not_pulled_in(tmp_path):
     with fitz.open(str(pdf)) as d:
         r, how = PS.find_figure_bbox(d[0], "Fig. 1")
     assert how == "caption+graphics" and r.x0 > 250
+
+
+# ---------------- 逐句原文出处 ----------------
+
+def _fake_embed(texts):
+    """确定性假向量：按关键词打到不同维度，既不连网络也能区分段落。"""
+    import numpy as np
+    keys = ["sexual", "性功能", "satellite", "卫星", "skip", "跳答"]
+    pair = {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2}
+    out = np.full((len(texts), 4), 0.01)
+    for i, t in enumerate(texts):
+        for k, w in enumerate(keys):
+            if w in t:
+                out[i, pair[k]] += 1.0
+        out[i, 3] += 0.05
+    return out
+
+
+def _three_paragraph_pdf(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    paras = {100: "In a hypothetical study on sexual health, men might be reluctant to answer a question on loss of sexual function, so missingness is informative.",
+             300: "Data obtained from remote sensing equipment via satellite may be missing observations at certain times due to transient satellite malfunction.",
+             500: "A skip pattern occurs when a set of responses are only obtained if the response to an earlier question is Yes, leading to a skip."}
+    for y, t in paras.items():
+        pg.insert_textbox(fitz.Rect(60, y, 520, y + 120), t, fontsize=10)
+    pg.insert_text((60, 700), "References", fontsize=11)
+    pg.insert_textbox(fitz.Rect(60, 715, 520, 800), "1. Someone, A. A paper about sexual health surveys and satellite skip patterns. J. X 1, 1-2 (2020).", fontsize=9)
+    pg.insert_text((500, 830), "19", fontsize=9)
+    p0 = doc.new_page(0)                                   # 前面再垫一页：页码偏移至少两页一致才会被采信
+    p0.insert_textbox(fitz.Rect(60, 100, 520, 200), "Title page with an abstract that is unrelated to any of the evidence sentences below.", fontsize=10)
+    p0.insert_text((500, 830), "18", fontsize=9)
+    return _save(doc, tmp_path, "src.pdf")
+
+
+def test_each_sentence_gets_its_own_source_passage_and_own_words_are_skipped(tmp_path):
+    pdf = _three_paragraph_pdf(tmp_path)
+    sents = [{"text": "缺失本身可作信息：男性更不愿回答性功能问题。", "page": None, "section": "结果与效应量"},
+             {"text": "批次失败：卫星瞬时故障导致某些时刻观测缺失。", "page": None, "section": "方法与数据"},
+             {"text": "这与我的研究直接相关（性功能的例子可引）。", "page": None, "section": "对我研究的联想"}]
+    out = tmp_path / "shots"
+    got = PS.passages_for_paper(pdf, "mitra2023Learning", sents, out, _fake_embed)
+    k0, k1, k2 = (PS.sentence_key(s["text"]) for s in sents)
+    assert set(got) == {k0, k1}                      # 「对我研究的联想」是 agent 自己的话，原文里没有出处
+    with fitz.open(str(pdf)) as d:
+        wins = PS.passage_windows(d)
+        assert not any("Someone, A." in w["text"] for w in wins)          # References 之后不作候选
+        r = PS.locate_passages(d, sents[:2], _fake_embed)
+    assert r[0]["rect"][1] < 250 < 290 < r[1]["rect"][1] < 450            # 各自落在自己的那一段
+    assert (out / got[k0]["rel"]).stat().st_size > 800
+
+
+def test_passage_cache_only_embeds_new_sentences(tmp_path):
+    pdf = _three_paragraph_pdf(tmp_path)
+    calls = []
+
+    def counting(texts):
+        calls.append(len(texts))
+        return _fake_embed(texts)
+    s1 = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量"}]
+    out = tmp_path / "shots"
+    PS.passages_for_paper(pdf, "k", s1, out, counting)
+    n = len(calls)
+    PS.passages_for_paper(pdf, "k", s1, out, counting)
+    assert len(calls) == n                           # 句子没变：一次向量都不算
+    PS.passages_for_paper(pdf, "k", s1 + [{"text": "跳答模式造成大块缺失。", "section": "方法与数据"}], out, counting)
+    assert len(calls) > n and calls[-1] == 1         # 只为新增的那一句算查询向量
+
+
+def test_write_notes_puts_source_crop_right_under_the_sentence(tmp_path):
+    from src.scholar.notes import write_notes
+    from src.scholar.notes_index import parse_note_md
+    from src.scholar.schema import PaperSegment, PaperMetadata, CloseReading
+    pdf = _three_paragraph_pdf(tmp_path)
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        {"heading": "结果与效应量", "sentences": [{"text": "男性更不愿回答性功能问题。", "tag": "可引用证据", "page": "19"},
+                                         {"text": "卫星瞬时故障导致观测缺失。", "tag": "可引用证据", "page": "19"}]}])
+    seg = PaperSegment(segment_id=1, paper_id="p1", close_reading=cr,
+                       metadata=PaperMetadata(paper_id="p1", title="T", authors=["A B"], doi="10.1/t"))
+    out = tmp_path / "notes"
+    out.mkdir()
+    res = write_notes([seg], {"p1": "mitra2023Learning"}, out_dir=out, filename="n", index_series="manual",
+                      pdf_paths={"p1": str(pdf)}, embed_fn=_fake_embed)
+    lines = Path(res["note_path"]).read_text("utf-8").splitlines()
+    i = next(n for n, l in enumerate(lines) if "男性更不愿回答" in l)
+    assert lines[i + 1].startswith("  ![原文出处 p.19](assets/shots/mitra2023Learning/q_")
+    assert sum(l.startswith("  ![原文出处") for l in lines) == 2
+    assert len(parse_note_md(Path(res["note_path"]))[0]["highlights"]) == 2       # 截图行不是证据句
+
+
+def test_page_hint_inside_sentence_text_restricts_the_search(tmp_path):
+    """shi2025：句子没有 page 字段，但正文写着「（§5.7, p.14）」——那就只在那一页找。"""
+    doc = fitz.open()
+    for i in range(3):
+        pg = doc.new_page()
+        pg.insert_textbox(fitz.Rect(60, 100, 520, 220),
+                          "Missing data rate range settings are described here with satellite examples on page {}. "
+                          "The remaining words pad this paragraph so that it is long enough to be a window.".format(13 + i), fontsize=10)
+        pg.insert_text((500, 830), str(13 + i), fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, [14])
+        r = PS.locate_passages(d, [{"text": "缺失率三档设置，卫星例子（§5.7, p.14）", "section": "实验方法"}], _fake_embed, pm)
+    assert r[0] and r[0]["page"] == 2

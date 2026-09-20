@@ -151,10 +151,13 @@ def _shot_lines_after(text: str, shots: Optional[Dict[str, Any]], shown: set) ->
     """
     if not shots:
         return []
-    from .page_shots import labels_in, norm_label
+    from .page_shots import labels_in, norm_label, sentence_key
     by_label = {norm_label(v["label"]): (rel, v) for rel, v in shots.items()
                 if isinstance(v, dict) and v.get("kind") == "figure"}
     out = []
+    hit = (shots.get("_passages") or {}).get(sentence_key(text))
+    if hit:                                   # 这句话在原文里的出处段落（连文字一起裁下来）
+        out.append("  ![原文出处 p.{}]({}/{})".format(hit["printed"], _SHOT_DIR, hit["rel"]))
     for lab in labels_in(text):
         key = norm_label(lab)
         if key in by_label and key not in shown:
@@ -371,7 +374,7 @@ def build_csl_item(meta: PaperMetadata, citekey: str) -> Dict[str, Any]:
         page_range=getattr(meta, "page_range", None), issued=issued)
 
 
-def _make_shots(segments, citekeys, pdf_paths, out_dir) -> Dict[str, Dict[str, Any]]:
+def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[str, Dict[str, Any]]:
     """为给了本地 PDF 的论文生成原文截图，返回 paper_id -> 截图清单。
 
     逐篇 best-effort：截图是派生物，PDF 坏了/加密了/PyMuPDF 没装都只告警，绝不拦归档。
@@ -385,6 +388,7 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir) -> Dict[str, Dict[str, A
         logger.warning("  ⚠️ 原文截图不可用（{}），本轮跳过".format(e))
         return out
     root = Path(out_dir) / _SHOT_DIR
+    n_pass = 0
     for seg in segments:
         ck, pdf = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
         cr = seg.close_reading
@@ -396,9 +400,19 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir) -> Dict[str, Dict[str, A
             out[seg.paper_id] = page_shots.shots_for_paper(Path(pdf), ck, hl, root)
         except Exception as e:                               # noqa: BLE001
             logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
+            continue
+        if embed_fn is not None:
+            sents = [{"text": st.text, "page": getattr(st, "page", None), "section": sec.heading}
+                     for sec in cr.sections for st in sec.sentences]
+            try:
+                out[seg.paper_id]["_passages"] = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn)
+                n_pass += len(out[seg.paper_id]["_passages"])
+            except Exception as e:                           # noqa: BLE001 —— 多为 Ollama 没起
+                logger.warning("  ⚠️ 逐句出处定位失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
+                embed_fn = None                              # 向量服务不可用：本轮后面的论文不再逐篇重试
     n = sum(1 for m in out.values() for v in m.values() if isinstance(v, dict) and v.get("kind"))
     if n:
-        logger.info("  🖼 原文截图 {} 篇 / {} 张 → {}".format(len(out), n, root))
+        logger.info("  🖼 原文截图 {} 篇 / {} 张 · 逐句出处 {} 句 → {}".format(len(out), n, n_pass, root))
     return out
 
 
@@ -418,12 +432,16 @@ def write_notes(
     explicit_citekey_source: str = "zotero",
     existing_key_owners: Optional[Dict[str, str]] = None,
     pdf_paths: Optional[Dict[str, str]] = None,
+    embed_fn=None,
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
     pdf_paths: paper_id -> 本地 PDF 路径。给了就在 citekey 定稿之后、渲染之前为每篇生成
         原文截图（证据页码对应的整页 + 证据句提到的图/表），落 `<out_dir>/assets/shots/<citekey>/`，
-        md 与 docx 里都会带上。必须在这里做而不是事后补：finalize 是整月重建，而截图目录名
+        md 与 docx 里都会带上。再给了 embed_fn（texts -> ndarray，多语种向量）就为**每一句**
+        证据定位它在原文里的出处段落并裁图，紧跟在那句下面；没给就只出整页与图表。
+        向量函数由调用方注入而不在这里自建：测试不许连网络，Ollama 没起也不该拦归档。
+        必须在这里做而不是事后补：finalize 是整月重建，而截图目录名
         用的 citekey 要到本函数内部才定下来——事后补意味着每篇新论文都要重建两遍。
 
     Args:
@@ -501,7 +519,7 @@ def write_notes(
     # （backfill/ingest 都看它 exists()），放最后落 = 事务提交标记：中断后要么整月旧态完整、
     # 要么配套先到位而 md 未落，重跑都能完整恢复。
     from .notes_index import _atomic_write
-    shots = _make_shots(segments, citekeys, pdf_paths, out_dir)
+    shots = _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn)
     md_content = build_digest_note(segments, citekeys, title=digest_title, instruction=instruction,
                                    shots=shots)
 
