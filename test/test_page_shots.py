@@ -507,3 +507,17 @@ def test_page_hint_inside_sentence_text_restricts_the_search(tmp_path):
         pm = PS.build_page_map(d, [14])
         r = PS.locate_passages(d, [{"text": "缺失率三档设置，卫星例子（§5.7, p.14）", "section": "实验方法"}], _fake_embed, pm)
     assert r[0] and r[0]["page"] == 2
+
+
+def test_two_pdfs_under_one_citekey_do_not_wipe_each_other(tmp_path):
+    """同一篇在两个月份桶里各读过一次、PDF 是两份文件：后一次不许删掉前一次的截图。"""
+    a = _three_paragraph_pdf(tmp_path)
+    b = tmp_path / "copy.pdf"
+    b.write_bytes(a.read_bytes() + b"\n% another download\n")
+    s = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量"}]
+    out = tmp_path / "shots"
+    ra = PS.passages_for_paper(a, "umPropagate", s, out, _fake_embed)
+    rb = PS.passages_for_paper(b, "umPropagate", s, out, _fake_embed)
+    (rel_a,), (rel_b,) = [v["rel"] for v in ra.values()], [v["rel"] for v in rb.values()]
+    assert rel_a != rel_b and (out / rel_a).is_file() and (out / rel_b).is_file()
+    assert PS.passages_for_paper(a, "umPropagate", s, out, _fake_embed) == ra          # 前一次的缓存仍然有效

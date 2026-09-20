@@ -719,7 +719,7 @@ def render_passage(doc, pdf_index: int, rect, out: Path, dpi: int = PASSAGE_DPI)
     return out
 
 
-PASSAGE_VERSION = "2"
+PASSAGE_VERSION = "3"
 
 
 def sentence_key(text: str) -> str:
@@ -740,9 +740,14 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
     pdf_path = Path(pdf_path)
     safe = shot_name(citekey, 1).split("/")[0]
     cdir = out_root / safe
-    cfile = cdir / "passages.json"
     st = pdf_path.stat()
     fp = [st.st_size, st.st_mtime_ns]
+    # 缓存与截图文件名都带 PDF 指纹：同一 citekey 可能对应两份 PDF（同一篇在两个月份桶里各读过
+    # 一次）。按 citekey 共用一份缓存时，后重建的月份会因「指纹变了」清空目录，把先重建那个月
+    # 的截图删掉——2026-09-20 全量实测 4 篇、209 个坏链。
+    import hashlib
+    tag = hashlib.sha1("{}:{}".format(*fp).encode()).hexdigest()[:6]
+    cfile = cdir / "passages.{}.json".format(tag)
     cache = {}
     if cfile.exists() and not force:
         try:
@@ -752,7 +757,7 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
     if cache.get("pdf_fp") != fp or cache.get("v") != PASSAGE_VERSION:
         cache = {"pdf_fp": fp, "v": PASSAGE_VERSION, "items": {}}
         if cdir.is_dir():
-            for old in cdir.glob("q_*.jpg"):
+            for old in cdir.glob("q_{}_*.jpg".format(tag)):
                 old.unlink()
     items = cache["items"]
     keyed = [(sentence_key(x.get("text")), x) for x in sentences]
@@ -765,7 +770,7 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
                 if r is None:
                     items[k] = None
                     continue
-                rel = "{}/q_{}.jpg".format(safe, k)
+                rel = "{}/q_{}_{}.jpg".format(safe, tag, k)
                 render_passage(doc, r["page"], r["rect"], out_root / rel)
                 items[k] = {"rel": rel, "printed": pm.to_printed(r["page"]), "score": r["score"]}
         cdir.mkdir(parents=True, exist_ok=True)
