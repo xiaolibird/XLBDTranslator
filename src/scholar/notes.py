@@ -143,8 +143,61 @@ def _yaml_list(items: List[str]) -> str:
     return "[" + ", ".join(json.dumps(i, ensure_ascii=False) for i in items) + "]"
 
 
+def _shot_lines_after(text: str, shots: Optional[Dict[str, Any]], shown: set) -> List[str]:
+    """一句证据后面要跟的图表截图行（每张图只在**第一次被提到**时出现一次）。
+
+    行首两个空格 = 挂在上一条列表项之下；它不以 `- 〔` 开头，notes_index 的 TAG_LINE_RE
+    不会把它当成证据句（截图是派生物，不进 highlights）。
+    """
+    if not shots:
+        return []
+    from .page_shots import labels_in, norm_label
+    by_label = {norm_label(v["label"]): (rel, v) for rel, v in shots.items()
+                if isinstance(v, dict) and v.get("kind") == "figure"}
+    out = []
+    for lab in labels_in(text):
+        key = norm_label(lab)
+        if key in by_label and key not in shown:
+            shown.add(key)
+            rel, v = by_label[key]
+            note = "（札记写作 {}，按图注宽松匹配，请核对）".format(lab) if "lenient" in (v.get("how") or "") else ""
+            out.append("  ![{} · 原文截图{}]({}/{})".format(v["label"], note, _SHOT_DIR, rel))
+    return out
+
+
+def _shot_pages_block(shots: Optional[Dict[str, Any]]) -> List[str]:
+    """节末的「原文页面」：整页截图以链接给出（内嵌会让月度 md/docx 膨胀到不可用）。"""
+    if not shots:
+        return []
+    pages = sorted(((v.get("printed") or v.get("pdf_page") or 0, rel, v) for rel, v in shots.items()
+                    if isinstance(v, dict) and v.get("kind") == "page"), key=lambda t: t[0])
+    if not pages:
+        return []
+    links = []
+    for _, rel, v in pages:
+        if v.get("how") == "figure-fallback":
+            name = "{}所在页".format("/".join(v.get("labels") or []))
+        else:
+            name = "p.{}".format(v["printed"])
+        links.append("[{}]({}/{})".format(name, _SHOT_DIR, rel))
+    m = shots.get("_map") or {}
+    how = {"label": "页码为原文印刷页（PDF 自带页标签）", "header": "页码为原文印刷页（由页眉/页脚推得，PDF 第 1 页 = p.{}）"
+           .format((m.get("offset") or 0) + 1), "pdf-order": "页码为 PDF 页序"}.get(m.get("how"), "")
+    out = ["**【原文页面】**", "", "{}：{}".format(how or "原文页面", " · ".join(links))]
+    miss = shots.get("_missing") or []
+    if miss:
+        out.append("")
+        out.append("> 未能截到：{}（页码落不到本 PDF 内，或全文找不到该图注）".format("、".join(miss)))
+    out.append("")
+    return out
+
+
+_SHOT_DIR = "assets/shots"
+
+
 def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[int] = None,
-                   level: int = 2, tier: str = "") -> List[str]:
+                   level: int = 2, tier: str = "",
+                   shots: Optional[Dict[str, Any]] = None) -> List[str]:
     """渲染单篇论文的 markdown 段落（不含 YAML front matter）。
 
     level=1 用于单篇文档的一级标题；level=2 用于聚合文档里每篇一节。
@@ -208,11 +261,14 @@ def _paper_section(seg: PaperSegment, citekey: Optional[str], index: Optional[in
         label = "全文精读" if cr.from_full_text else "精读（仅摘要降级）"
         src = " · 来源 `{}`".format(cr.source) if cr.source else ""
         body.extend(["", "{} {}{}".format(sub, label, src), ""])
+        shown: set = set()
         for sec in cr.sections:
             body.append("**【{}】**".format(sec.heading))
             for st in sec.sentences:
                 body.append(render_tag_line(st.tag, st.text, getattr(st, "page", None)))
+                body.extend(_shot_lines_after(st.text, shots, shown))
             body.append("")
+        body.extend(_shot_pages_block(shots))
     elif seg.summary:
         # 无精读时退回摘要级 AI 归纳
         body.extend(["", "{} AI 归纳".format(sub), "", seg.summary])
@@ -253,7 +309,8 @@ def build_note(seg: PaperSegment, citekey: Optional[str], instruction: str = "")
 
 
 def build_digest_note(segments: List[PaperSegment], citekeys: Dict[str, Optional[str]],
-                      title: str = "Scholar Digest", instruction: str = "") -> str:
+                      title: str = "Scholar Digest", instruction: str = "",
+                      shots: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
     """把一个时间窗的所有论文聚合成一篇 pandoc-ready 札记。
 
     按优先级降序排列；顶部「优先级速览」表分级着色（🔴高/🟠中/🟢低）；每篇一节，末尾统一参考文献。
@@ -287,7 +344,7 @@ def build_digest_note(segments: List[PaperSegment], citekeys: Dict[str, Optional
     # 逐篇（同一排序）
     for i, seg in enumerate(ordered):
         lines.extend(_paper_section(seg, citekeys.get(seg.paper_id), index=i + 1, level=2,
-                                    tier=tiers[i]))
+                                    tier=tiers[i], shots=(shots or {}).get(seg.paper_id)))
         lines.append("---")
         lines.append("")
 
@@ -314,6 +371,37 @@ def build_csl_item(meta: PaperMetadata, citekey: str) -> Dict[str, Any]:
         page_range=getattr(meta, "page_range", None), issued=issued)
 
 
+def _make_shots(segments, citekeys, pdf_paths, out_dir) -> Dict[str, Dict[str, Any]]:
+    """为给了本地 PDF 的论文生成原文截图，返回 paper_id -> 截图清单。
+
+    逐篇 best-effort：截图是派生物，PDF 坏了/加密了/PyMuPDF 没装都只告警，绝不拦归档。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not pdf_paths:
+        return out
+    try:
+        from . import page_shots
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("  ⚠️ 原文截图不可用（{}），本轮跳过".format(e))
+        return out
+    root = Path(out_dir) / _SHOT_DIR
+    for seg in segments:
+        ck, pdf = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
+        cr = seg.close_reading
+        if not (ck and pdf and cr and cr.sections and Path(pdf).is_file()):
+            continue
+        hl = [{"text": st.text, "page": getattr(st, "page", None)}
+              for sec in cr.sections for st in sec.sentences]
+        try:
+            out[seg.paper_id] = page_shots.shots_for_paper(Path(pdf), ck, hl, root)
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
+    n = sum(1 for m in out.values() for v in m.values() if isinstance(v, dict) and v.get("kind"))
+    if n:
+        logger.info("  🖼 原文截图 {} 篇 / {} 张 → {}".format(len(out), n, root))
+    return out
+
+
 def write_notes(
     segments: List[PaperSegment],
     citekeys: Dict[str, Optional[str]],
@@ -329,8 +417,14 @@ def write_notes(
     existing_citekeys: Optional[set] = None,
     explicit_citekey_source: str = "zotero",
     existing_key_owners: Optional[Dict[str, str]] = None,
+    pdf_paths: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
+
+    pdf_paths: paper_id -> 本地 PDF 路径。给了就在 citekey 定稿之后、渲染之前为每篇生成
+        原文截图（证据页码对应的整页 + 证据句提到的图/表），落 `<out_dir>/assets/shots/<citekey>/`，
+        md 与 docx 里都会带上。必须在这里做而不是事后补：finalize 是整月重建，而截图目录名
+        用的 citekey 要到本函数内部才定下来——事后补意味着每篇新论文都要重建两遍。
 
     Args:
         segments: 入选论文（同一时间窗）
@@ -407,7 +501,9 @@ def write_notes(
     # （backfill/ingest 都看它 exists()），放最后落 = 事务提交标记：中断后要么整月旧态完整、
     # 要么配套先到位而 md 未落，重跑都能完整恢复。
     from .notes_index import _atomic_write
-    md_content = build_digest_note(segments, citekeys, title=digest_title, instruction=instruction)
+    shots = _make_shots(segments, citekeys, pdf_paths, out_dir)
+    md_content = build_digest_note(segments, citekeys, title=digest_title, instruction=instruction,
+                                   shots=shots)
 
     # 每篇札记配套独立的 references.json（按文件名区分），避免按月回填时互相覆盖
     ref_path = out_dir / "{}.references.json".format(slug)
@@ -473,7 +569,8 @@ def write_notes(
             from .docx_builder import build_digest_docx
             docx_path = out_dir / "{}.docx".format(_slug(filename, 80) or "scholar_digest")
             build_digest_docx(segments, citekeys, docx_path, title=digest_title,
-                              csl_items=csl_items, cjk_font=cjk_font, instruction=instruction)
+                              csl_items=csl_items, cjk_font=cjk_font, instruction=instruction,
+                              shots=shots, assets_root=out_dir / _SHOT_DIR)
             result["docx_path"] = str(docx_path)
         except Exception as e:
             logger.warning("  ⚠️ 生成样式化 docx 失败: {}".format(e))

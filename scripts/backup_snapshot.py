@@ -87,7 +87,10 @@ CONSISTENCY_RETRIES = 3
 EXCLUDE_PATTERNS = ("embeddings.sqlite3*", "_archive", "_archive/*",
                     ".backfill_deepread_backup", ".backfill_deepread_backup/*",
                     ".digest_overwrite_backup", ".digest_overwrite_backup/*",
-                    ".pytest_cache", ".pytest_cache/*")
+                    ".pytest_cache", ".pytest_cache/*",
+                    # 原文截图（2026-09-20）：由 PDF + 札记页码确定性重建（regen 即可），全库 GB 级；
+                    # 收进来的话 8 周档 + 24 月档各带一份。与 embeddings.sqlite3 同一口径：可重建的不收。
+                    "assets/shots", "assets/shots/*")
 
 
 def _excluded(rel: str) -> bool:

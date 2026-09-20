@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt, RGBColor, Inches
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -74,10 +74,42 @@ def _set_col_widths(table, widths_inches: List[float]):
                 cell.width = Inches(widths_inches[i])
 
 
+def _figure_shots_for(text: str, shots: Dict, shown: set):
+    """这句证据第一次提到的图表 → [(标签, 相对路径)]；与 notes._shot_lines_after 同一口径。"""
+    if not shots:
+        return []
+    from .page_shots import labels_in, norm_label
+    by_label = {norm_label(v["label"]): (rel, v) for rel, v in shots.items()
+                if isinstance(v, dict) and v.get("kind") == "figure"}
+    out = []
+    for lab in labels_in(text):
+        key = norm_label(lab)
+        if key in by_label and key not in shown:
+            shown.add(key)
+            out.append((by_label[key][1]["label"], by_label[key][0]))
+    return out
+
+
+def _add_shot(doc, assets_root, rel: str, label: str, cjk_font: str = "") -> None:
+    """插一张原文截图 + 图题。图片缺失/损坏只跳过——docx 是人读副本，不能因一张图整份生成失败。"""
+    try:
+        path = Path(assets_root) / rel
+        if not path.is_file():
+            return
+        doc.add_picture(str(path), width=Inches(6.0))
+        doc.paragraphs[-1].alignment = 1                       # 居中
+        cp = doc.add_paragraph()
+        cp.alignment = 1
+        _apply_font(cp.add_run("{} · 原文截图".format(label)), size=9, color=_META_GRAY, cjk=cjk_font)
+    except Exception:                                          # noqa: BLE001
+        return
+
+
 def build_digest_docx(segments: List[PaperSegment], citekeys: Dict[str, Optional[str]],
                       out_path: Path, title: str = "Scholar Digest",
                       csl_items: Optional[List[Dict[str, Any]]] = None,
-                      cjk_font: str = "", instruction: str = "") -> Path:
+                      cjk_font: str = "", instruction: str = "",
+                      shots: Optional[Dict[str, Dict]] = None, assets_root=None) -> Path:
     """生成样式化 digest docx。按优先级降序；速览表单元格着色；精读句级三色着色。"""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,13 +186,20 @@ def build_digest_docx(segments: List[PaperSegment], citekeys: Dict[str, Optional
             # 全文精读（句级三色）
             label = "全文精读" if cr.from_full_text else "精读（仅摘要）"
             _apply_font(doc.add_paragraph().add_run(label), size=10.5, bold=True, cjk=cjk_font)
+            my_shots = (shots or {}).get(seg.paper_id) or {}
+            shown: set = set()
             for sec in cr.sections:
                 sp = doc.add_paragraph()
                 _apply_font(sp.add_run("【{}】".format(sec.heading)), size=10, bold=True, cjk=cjk_font)
                 bp = doc.add_paragraph()
+                pending = []
                 for st in sec.sentences:
                     run = bp.add_run(st.text + " ")
                     _apply_font(run, size=10.5, color=_TAG_COLOR.get(st.tag), cjk=cjk_font)
+                    pending.extend(_figure_shots_for(st.text, my_shots, shown))
+                # 图表截图放在本节文字之后：docx 里一节是一个段落，图插不进句子中间
+                for label, rel in pending:
+                    _add_shot(doc, assets_root, rel, label, cjk_font)
         else:
             # 无精读 → 摘要 + AI 总结
             _apply_font(doc.add_paragraph().add_run("摘要"), size=10.5, bold=True, cjk=cjk_font)

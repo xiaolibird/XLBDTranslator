@@ -1,0 +1,594 @@
+# -*- coding: utf-8 -*-
+"""原文截图：把句级证据的页码锚渲染成 PDF 页面图，并按图注裁出论文的图/表。
+
+为什么要有：句级证据是 agent 的**中文转述**，不是原文摘抄——「转述有没有失真」无法靠文本比对
+回验（topics 防线保证 citekey 与原句存在，不保证转述准确，见 scholar-notes skill 的实测反例）。
+截图把证据直接挂回原文版面：核数字、看表格、看图，一眼到位；也绕开文本抽取的双栏串行与
+表格行列串位（脚本草稿系统性偏差的来源之一）。
+
+三个不平凡的点：
+  1. **页码口径**：札记里的页码可能是期刊印刷页（Mitra 2023 标的是 13–23，PDF 只有 11 页），
+     也可能就是 PDF 页序。`PageMap` 先读 PDF 自带的页标签，再从页眉/页脚的数字推偏移，
+     都不成才按 PDF 页序解释；超界返回 None，绝不「就近凑一页」。
+  2. **图表裁剪**：按图注（Fig. N / Figure N / Table N / Box N）定位，图取图注上方的
+     图形区，表取图注下方直到下一段正文。版面千奇百怪，所以**拿不准就退回整页**，
+     并在返回值里标 `how`，调用方据此决定要不要提示「此为整页」。
+  3. **幂等与体积**：文件名由 (citekey, 页, 标签) 决定论推出；已存在且不旧于 PDF 就跳过。
+     JPEG 而非 PNG——论文页面是照片级连续色调 + 文字，120dpi JPEG q82 约 150–250KB，
+     PNG 要 3–5 倍；全库数千页时差的是 GB 级。
+"""
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+PAGE_DPI = 120
+CROP_DPI = 170          # 图表裁剪区域小，给高一点的分辨率才看得清坐标轴与表内数字
+JPEG_QUALITY = 82
+ASSET_DIR = "assets/shots"
+# 裁剪算法一变就 +1：每篇目录下的 `.v` 记着生成它的版本，不一致则整篇强制重渲染。
+# 没有它的话，改了算法重跑也只会命中旧缓存——错图永远留在库里。
+SHOT_VERSION = "5"
+
+_KINDS = {"fig": "Fig.", "table": "Table", "box": "Box", "algorithm": "Algorithm"}
+_QUAL = r"(Extended\s+Data|Supplementary|Supplemental|Supp\.?|Suppl\.?|Appendix|扩展数据|补充材料|补充|附)?"
+# 证据句里的标签：英文 Fig./Figure/Table/Box/Algorithm + 中文 图/表/算法；编号可带 S/A 前缀（附录表）
+_LABEL_RE = re.compile(
+    _QUAL + r"\s*(Fig(?:ure|\.)?|Table|Box|Algorithm|图|(?<![代列发报图])表|算法)\s*\.?\s*([SA]?\.?\d+)"
+    # 「算法 9 种」「表 3 个」是数量不是编号
+    r"(?!\d|\s*(?:种|个|项|类|次|篇|条|张|组|步|层|倍|年|天|月|名|例|家|位|维|折|%|％))",
+    re.I)
+# 版面上的图注：必须在块首；编号后面要么是标点/竖线/换行，要么直接接首字母大写的标题词。
+# 「Table 2 presents the F1…」「Tables 2 and 3 summarize…」是正文，不是图注（实测会被误配）。
+_CAPTION_RE = re.compile(
+    r"^\s*" + _QUAL + r"\s*(Fig(?:ure|\.)?|Table|Box|Algorithm)\s*\.?\s*([SA]?\.?\d+)[a-h]?"
+    r"(?P<tail>[^\n]{0,24})", re.I)
+_PROSE_TAIL = re.compile(
+    r"^\s*(?:,|and\b|&|to\b|through\b|presents?\b|shows?\b|displays?\b|summari[sz]es?\b|reports?\b|"
+    r"lists?\b|gives?\b|illustrates?\b|depicts?\b|compares?\b|provides?\b|contains?\b|"
+    r"demonstrates?\b|indicates?\b|is\b|are\b|in\b|we\b|the\b|of\b|for\b|also\b)")
+# ↑ 刻意**区分大小写**：正文里编号后接的是小写词（"Table 2 presents"），而不少投稿版/预印本的
+#   图注是「Figure 1 The flowchart of…」——编号后无标点、直接接首字母大写的标题词。
+
+
+def _norm(qual: str, kind: str, num: str) -> Tuple[str, str, str]:
+    k = kind.lower()
+    k = ("fig" if k.startswith("fig") or k == "图" else
+         "table" if k in ("table", "表") else
+         "algorithm" if k in ("algorithm", "算法") else "box")
+    q = re.sub(r"\s+", " ", (qual or "").lower())
+    q = ("ext" if q in ("extended data", "扩展数据") else
+         "supp" if q.rstrip(".") in ("supplementary", "supplemental", "supp", "suppl", "appendix",
+                                      "补充材料", "补充", "附") else "")
+    n = num.upper().replace(".", "")
+    if not q and n[:1] in ("S", "A"):
+        q = "supp"                       # Table S3 / Table A6 本身就是附录编号
+    return q, k, n
+
+
+def norm_label(label: str) -> Optional[Tuple[str, str, str]]:
+    """'Fig. 2a' / '图2' / 'Extended Data Fig 1' / 'Table A6' → (限定, 类别, 编号)；认不出返回 None。"""
+    m = _LABEL_RE.search(label or "")
+    return _norm(m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def label_text(key: Tuple[str, str, str]) -> str:
+    q, k, n = key
+    return "{}{} {}".format({"ext": "Extended Data ", "supp": "Supplementary ", "": ""}[q], _KINDS[k], n)
+
+
+def labels_in(text: str) -> List[str]:
+    """从一句证据里抽出它提到的图表标签（去重保序），统一成英文规范写法。"""
+    out, seen = [], set()
+    for m in _LABEL_RE.finditer(text or ""):
+        key = _norm(m.group(1), m.group(2), m.group(3))
+        if key[2].lstrip("SA") in ("", "0"):
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(label_text(key))
+    return out
+
+
+def parse_pages(page: Optional[str]) -> List[int]:
+    """'16' → [16]；'15-16' / '17–18' → [15,16] / [17,18]；'p.7' → [7]；区间上限 6 页防误写。"""
+    if page is None:
+        return []
+    nums = [int(x) for x in re.findall(r"\d+", str(page))]
+    if not nums:
+        return []
+    if len(nums) >= 2 and nums[0] < nums[1] <= nums[0] + 6 and re.search(r"\d\s*[-–—~至]\s*\d", str(page)):
+        return list(range(nums[0], nums[1] + 1))
+    return nums[:1] if len(nums) == 1 else sorted(set(nums))[:6]
+
+
+# ---------------------------------------------------------------------------
+# 页码口径
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PageMap:
+    n_pages: int
+    offset: int = 0              # 印刷页 = PDF 页序(1 起) + offset
+    how: str = "pdf-order"       # label / header / pdf-order
+    labels: Optional[Dict[int, int]] = None   # 印刷页 → PDF 页序(1 起)，来自 PDF 页标签
+
+    def to_pdf(self, printed: int) -> Optional[int]:
+        """印刷页 → PDF 页序(1 起)；落不到本 PDF 内返回 None。"""
+        if self.labels and printed in self.labels:
+            return self.labels[printed]
+        idx = printed - self.offset
+        return idx if 1 <= idx <= self.n_pages else None
+
+
+def _edge_numbers(page) -> List[int]:
+    """页眉/页脚区域里的独立整数（候选印刷页码）。"""
+    h = page.rect.height
+    out = []
+    for x0, y0, x1, y1, txt, *_ in page.get_text("blocks"):
+        if y1 < h * 0.09 or y0 > h * 0.91:
+            for tok in re.findall(r"(?<![\d.\-/])\d{1,4}(?![\d.\-/])", txt):
+                out.append(int(tok))
+    return out
+
+
+def build_page_map(doc, wanted: Optional[List[int]] = None) -> PageMap:
+    """推断这份 PDF 的页码口径。`wanted` 是札记里出现过的页码，用来判断要不要找偏移。"""
+    n = doc.page_count
+    # 1) PDF 自带页标签（出版商 PDF 常有；arXiv 基本没有）
+    labels = {}
+    try:
+        for i in range(n):
+            lab = doc[i].get_label()
+            if lab and lab.isdigit():
+                labels.setdefault(int(lab), i + 1)
+    except Exception:
+        labels = {}
+    if labels and any(k != v for k, v in labels.items()):
+        return PageMap(n, 0, "label", labels)
+    # 2) 札记页码都落在 PDF 页序内 → 先不急着找偏移；但若页眉页脚强烈指向某个偏移，仍以它为准
+    votes: Dict[int, int] = {}
+    for i in range(n):
+        for num in set(_edge_numbers(doc[i])):
+            off = num - (i + 1)
+            if off >= 0:
+                votes[off] = votes.get(off, 0) + 1
+    best = max(votes.items(), key=lambda kv: (kv[1], -kv[0])) if votes else (0, 0)
+    need = max(2, (n + 1) // 2)             # 过半页面一致才采信，挡住「每页都印着年份 2023」
+    if best[0] > 0 and best[1] >= need:
+        return PageMap(n, best[0], "header")
+    if wanted and max(wanted) > n and best[0] > 0 and best[1] >= 2:
+        return PageMap(n, best[0], "header")   # 札记页码明显超界时放宽门槛
+    return PageMap(n, 0, "pdf-order")
+
+
+# ---------------------------------------------------------------------------
+# 渲染
+# ---------------------------------------------------------------------------
+
+def _save(pix, out: Path) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp.jpg")
+    pix.save(str(tmp), jpg_quality=JPEG_QUALITY)
+    tmp.replace(out)
+
+
+def render_page(doc, pdf_index: int, out: Path, dpi: int = PAGE_DPI) -> Path:
+    import fitz
+    page = doc[pdf_index - 1]
+    _save(page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False), out)
+    return out
+
+
+def _captions(page) -> List[Tuple[Tuple[str, str, str], "object"]]:
+    """本页全部**真**图注：[(标签键, Rect)]。"""
+    import fitz
+    out = []
+    for b in page.get_text("blocks"):
+        if len(b) > 6 and b[6] != 0:          # 图像块
+            continue
+        txt = b[4] or ""
+        if re.match(r"^\s*(Tables|Figures|Figs)\b", txt):
+            continue
+        m = _CAPTION_RE.match(txt)
+        if not m or _PROSE_TAIL.match(m.group("tail") or ""):
+            continue
+        out.append((_norm(m.group(1), m.group(2), m.group(3)), fitz.Rect(b[:4])))
+    return out
+
+
+def _caption_blocks(page, key, lenient: bool = False):
+    """本页上与标签键匹配的图注块。
+
+    严格：Extended Data 必须两边一致（Nature 论文里 Table 1 与 Extended Data Table 1 是两张表）。
+    lenient：忽略限定词——札记常把「Extended Data Table 1」简写成「Table 1」，全文找不到
+    严格匹配时才用（见 find_label_page），且回执会标 how='…(lenient)' 提醒人核对。
+    """
+    q, k, n = key
+    return [r for (cq, ck, cn), r in _captions(page)
+            if ck == k and cn == n and (lenient or cq == q or "ext" not in (cq, q))]
+
+
+def _text_blocks(page):
+    return [(__import__("fitz").Rect(b[:4]), b[4] or "") for b in page.get_text("blocks")
+            if not (len(b) > 6 and b[6] != 0)]
+
+
+def _full_caption(page, cap):
+    """图注常被拆成多个文本块（换行/分栏）。把紧邻其下、左缘对齐的续行并进来。"""
+    import fitz
+    reg = fitz.Rect(cap)
+    rest = sorted([r for r, _ in _text_blocks(page) if r.y0 >= cap.y1 - 2 and r != cap], key=lambda r: r.y0)
+    for r in rest:
+        if r.y0 - reg.y1 > 5 or abs(r.x0 - cap.x0) > 8 or r.width > cap.width * 1.3:
+            break
+        reg |= r
+    return reg
+
+
+def _is_prose(rect, text: str, col_width: float) -> bool:
+    """成段正文：够宽、多行、以字母为主且有句读。表格单元格/坐标轴标注都不满足。"""
+    t = (text or "").strip()
+    if len(t) < 160 or rect.width < col_width * 0.6 or t.count("\n") < 2:
+        return False
+    letters = sum(ch.isalpha() or ch.isspace() for ch in t) / max(len(t), 1)
+    return letters > 0.8 and len(re.findall(r"[.;,] ", t)) >= 3
+
+
+def _stop_before(region, cap, page, others, below: bool):
+    """区域向下（或向上）延伸时，遇到别的图注或成段正文就截止。"""
+    import fitz
+    reg = fitz.Rect(region)
+    walls = list(others) + [r for r, t in _text_blocks(page) if r != cap and _is_prose(r, t, reg.width)]
+    for w in walls:
+        if _x_overlap(w, reg) <= 0:
+            continue
+        if below and w.y0 >= cap.y1 and w.y0 < reg.y1:
+            reg.y1 = min(reg.y1, w.y0 - 2)
+        if (not below) and w.y1 <= cap.y0 and w.y1 > reg.y0:
+            reg.y0 = max(reg.y0, w.y1 + 2)
+    return reg
+
+
+def _widen(region, cap, page, others):
+    """检测到的区域常比实际版面窄一圈（宽表右侧几列、图左缘的子图标号、紧贴表顶的表头行）。
+
+    只并入**紧贴**区域（间隙 < 10pt，小于常见栏间距）且**纵向完全落在区域内**的文字块与线条——
+    相邻栏的正文段落通常比图表高、不会完全落在区域纵向范围内，因而不会被拉进来；成段正文与
+    别的图注一律不并。纵向只向「远离图注」的一侧补一行以内（表头行/末行）。
+    """
+    import fitz
+    reg = fitz.Rect(region)
+    items = [(r, t) for r, t in _text_blocks(page)]
+    items += [(fitz.Rect(d["rect"]), "") for d in page.get_drawings()]
+    for _ in range(3):                                   # 并入后边界变了，再看一轮
+        grew = False
+        for r, t in items:
+            if r.get_area() > page.rect.get_area() * 0.5 or any(r == o for o in others) or r == cap:
+                continue
+            if t and _is_prose(r, t, reg.width):
+                continue
+            inside_y = r.y0 >= reg.y0 - 2 and r.y1 <= reg.y1 + 2
+            touch_x = (0 <= reg.x0 - r.x1 < 10) or (0 <= r.x0 - reg.x1 < 10) or \
+                      (_x_overlap(r, reg) > 0 and (r.x0 < reg.x0 - 1 or r.x1 > reg.x1 + 1))
+            if inside_y and touch_x and r.width < page.rect.width * 0.95:
+                new = reg | r
+                if new != reg:
+                    reg, grew = new, True
+        if not grew:
+            break
+    cap_below = cap.y0 >= region.y0 + region.height * 0.5
+    for r, t in items:                                   # 远离图注一侧：紧贴的一行（≤ 16pt 高）
+        if t and not _is_prose(r, t, reg.width) and r.height <= 16 and _x_overlap(r, reg) > r.width * 0.5 \
+                and not any(r == o or r.intersects(o) for o in others) and not _CAPTION_RE.match(t):
+            if cap_below and 0 <= reg.y0 - r.y1 < 6:
+                reg.y0 = r.y0
+            if (not cap_below) and 0 <= r.y0 - reg.y1 < 6:
+                reg.y1 = r.y1
+    return reg
+
+
+def _x_overlap(a, b) -> float:
+    return max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+
+
+def _detect_tables(page, **kw):
+    import fitz
+    try:
+        found = page.find_tables(**kw).tables
+    except Exception:
+        return []
+    area = page.rect.get_area()
+    out = []
+    for t in found:
+        r = fitz.Rect(t.bbox)
+        if t.row_count >= 2 and t.col_count >= 2 and r.get_area() < area * 0.8:
+            out.append(r)
+    return out
+
+
+def _match_tables(caps, tables):
+    """把表注配给表格。先整页推断口径（表注在上/在下），再按间距贪心配对。
+
+    口径必须整页一致地推：Scientific Reports 的表注在表**下方**，逐个取最近会把
+    「Table 1 的表注」配给紧随其后的 Table 2 的表（2026-09-20 实测 che2018 p.8）。
+    """
+    best = {}
+    for orient in ("cap_above", "cap_below"):
+        pairs = []
+        for ci, c in enumerate(caps):
+            for ti, t in enumerate(tables):
+                gap = (t.y0 - c.y1) if orient == "cap_above" else (c.y0 - t.y1)
+                if -6 <= gap <= 70 and _x_overlap(c, t) > min(c.width, t.width) * 0.3:
+                    pairs.append((gap, ci, ti))
+        used_c, used_t, got, cost = set(), set(), {}, 0.0
+        for gap, ci, ti in sorted(pairs):
+            if ci in used_c or ti in used_t:
+                continue
+            used_c.add(ci); used_t.add(ti); got[ci] = ti; cost += max(gap, 0)
+        if (len(got), -cost) > (len(best.get("m", {})), -best.get("cost", 1e9)) or not best:
+            best = {"m": got, "cost": cost, "orient": orient}
+    return best.get("m", {}), best.get("orient", "cap_above")
+
+
+def _rule_table(page, cap, other_caps):
+    """三线表兜底：表注旁一组等宽的长横线，首尾之间就是表。"""
+    import fitz
+    rules = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.height < 2.5 and r.width > max(80, cap.width * 0.5):
+            rules.append(r)
+    if not rules:
+        return None
+    for below in (True, False):
+        near = sorted([r for r in rules if (r.y0 >= cap.y1 - 3 if below else r.y1 <= cap.y0 + 3)],
+                      key=lambda r: r.y0 if below else -r.y0)
+        if not near or abs((near[0].y0 - cap.y1) if below else (cap.y0 - near[0].y1)) > 40:
+            continue
+        first = near[0]
+        group = [r for r in near if abs(r.x0 - first.x0) < 15 and abs(r.x1 - first.x1) < 15]
+        for oc in other_caps:                       # 别越过下一个图注
+            group = [r for r in group if (r.y0 < oc.y0 if below and oc.y0 > cap.y1 else True)
+                     and (r.y1 > oc.y1 if (not below) and oc.y1 < cap.y0 else True)]
+        if len(group) >= 2:
+            reg = fitz.Rect(group[0])
+            for r in group[1:]:
+                reg |= r
+            return reg
+    return None
+
+
+def find_figure_bbox(page, label: str):
+    """按图注定位图/表/Box/算法的版面区域。返回 (fitz.Rect | None, how)。
+
+    how: 'caption+graphics' 图注 + 图形区 / 'caption+table' 图注 + 检测到的表 /
+         'caption+rules' 三线表兜底 / 'box' 有底色的整框 / 'not-found'。
+    拿不准就返回 (None, 'not-found')，调用方退回整页——错裁比不裁危险，它会让人核错对象。
+    """
+    import fitz
+    key = norm_label(label)
+    if not key:
+        return None, "not-found"
+    caps_all = _captions(page)
+    mine = _caption_blocks(page, key)
+    lenient = False
+    if not mine:
+        mine, lenient = _caption_blocks(page, key, lenient=True), True
+    if not mine:
+        return None, "not-found"
+    cap0 = mine[0]
+    kind = key[1]
+    pr = page.rect
+    others = [r for _, r in caps_all if r != cap0]
+    cap = _full_caption(page, cap0) if kind != "box" else cap0
+    for o in others:                              # 续行不许并过下一个图注
+        if o.y0 >= cap0.y1 and o.y0 < cap.y1:
+            cap.y1 = o.y0 - 2
+    gfx = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.width > 4 and r.height > 4 and r.get_area() < pr.get_area() * 0.9:
+            gfx.append(r)
+    for img in page.get_images(full=True):
+        try:
+            gfx.extend(fitz.Rect(r) for r in page.get_image_rects(img[0]))
+        except Exception:
+            pass
+    blocks = [fitz.Rect(b[:4]) for b in page.get_text("blocks") if not (len(b) > 6 and b[6] != 0)]
+
+    if kind == "table":
+        tcaps = [r for (q, k, n), r in caps_all if k == "table"]
+        region, how = None, "not-found"
+        for kw in ({}, {"horizontal_strategy": "lines", "vertical_strategy": "text"}):
+            tabs = _detect_tables(page, **kw)
+            if not tabs:
+                continue
+            m, _ = _match_tables(tcaps, tabs)
+            ci = tcaps.index(cap0)
+            if ci in m:
+                region, how = fitz.Rect(tabs[m[ci]]) | cap, "caption+table"
+                break
+        if region is None:
+            rt = _rule_table(page, cap, others)
+            if rt is None:
+                return None, "not-found"
+            region, how = rt | cap, "caption+rules"
+        below = region.y1 > cap.y1 + 4
+        region = _stop_before(region, cap, page, others, below=below) | cap
+        if region.height < cap.height + 30:       # 只裁到表注本身（无线表没检出）→ 交给整页兜底
+            return None, "not-found"
+        # 有表线的表，底边（表注在下时是顶边）以**最外一条表线**为准：检测到的表格区域常多带一行
+        # 紧随其后的小节标题（太短，不算成段正文，_stop_before 挡不住；serrano2026 p.7 实测）。
+        hr = [fitz.Rect(d["rect"]) for d in page.get_drawings()]
+        # 不能用 r.intersects：画线命令画出的表线高度为 0，fitz 视空矩形与任何东西都不相交
+        hr = [r for r in hr if r.height < 2.5 and r.width > region.width * 0.35
+              and _x_overlap(r, region) > 0 and region.y0 - 2 <= r.y0 and r.y1 <= region.y1 + 2]
+        if len(hr) >= 2:
+            if below and region.y1 - max(r.y1 for r in hr) > 10:
+                region.y1 = max(r.y1 for r in hr) + 4
+            if (not below) and min(r.y0 for r in hr) - region.y0 > 10:
+                region.y0 = min(r.y0 for r in hr) - 4
+        for t in blocks:                          # 表脚注：紧贴表底的小字块
+            if 0 <= t.y0 - region.y1 < 10 and _x_overlap(t, region) > t.width * 0.6 and t.height < 60 \
+                    and not any(t == o for o in others):
+                region |= t
+    elif kind in ("fig", "algorithm"):
+        def grow(side_above: bool):
+            pool = ([r for r in gfx if r.y1 <= cap.y0 + 6] if side_above else
+                    [r for r in gfx if r.y0 >= cap.y1 - 6])
+            # 同栏或跨栏的图形才算；页眉装饰线之类与图注不相干的不要
+            pool = [r for r in pool if _x_overlap(r, cap) > 0 or r.width > pr.width * 0.5]
+            pool.sort(key=(lambda r: -r.y1) if side_above else (lambda r: r.y0))
+            if not pool:
+                return None
+            edge = pool[0].y1 if side_above else pool[0].y0
+            if abs((cap.y0 - edge) if side_above else (edge - cap.y1)) > 60:
+                return None                        # 离图注太远，多半不是它的图
+            reg = fitz.Rect(pool[0])
+            for r in pool[1:]:
+                gap = (reg.y0 - r.y1) if side_above else (r.y0 - reg.y1)
+                if gap < 40:
+                    reg |= r
+            for oc in others:                      # 不越过别的图注
+                if side_above and oc.y1 <= cap.y0 and oc.y1 > reg.y0 and _x_overlap(oc, reg) > 0:
+                    reg.y0 = oc.y1 + 2
+                if (not side_above) and oc.y0 >= cap.y1 and oc.y0 < reg.y1 and _x_overlap(oc, reg) > 0:
+                    reg.y1 = oc.y0 - 2
+            return reg
+        region = grow(True) or grow(False)         # 多数期刊图注在图下；JMIR 等在图上
+        if region is None:
+            return None, "not-found"
+        for t, txt in _text_blocks(page):          # 坐标轴/图例等图内文字
+            # 文字环绕排版时，旁边那栏正文会与图形区相交——成段正文不是图的一部分（cornelis2026 Fig.1）
+            if t.intersects(region) and t.height < region.height and not any(t == o for o in others) \
+                    and not _is_prose(t, txt, region.width) and t != cap0:
+                region |= t
+        region |= cap
+        how = "caption+graphics"
+    else:                                          # Box：标题块所在的有底色矩形
+        holders = [r for r in gfx if r.contains(cap0) and r.get_area() > cap0.get_area() * 4]
+        if not holders:
+            return None, "not-found"
+        region = min(holders, key=lambda r: r.get_area())
+        how = "box"
+    if kind != "box":
+        region = _widen(region, cap, page, others)
+    region = (region + (-8, -8, 8, 8)) & pr
+    for o in others:                               # 8pt 留白不许压进紧随其后的下一个图注
+        if _x_overlap(o, region) > 0 and o.y0 >= cap.y1 and region.y0 < o.y0 < region.y1:
+            region.y1 = o.y0 - 1
+    if region.get_area() < pr.get_area() * 0.02 or region.height < 36:
+        return None, "not-found"
+    return region, how + ("(lenient)" if lenient else "")
+
+
+def render_figure(doc, pdf_index: int, label: str, out: Path, dpi: int = CROP_DPI):
+    """裁出图/表；定位失败返回 (None, 'not-found')，不落盘。"""
+    import fitz
+    page = doc[pdf_index - 1]
+    rect, how = find_figure_bbox(page, label)
+    if rect is None:
+        return None, how
+    _save(page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False), out)
+    return out, how
+
+
+def find_label_page(doc, label: str, hint: Optional[int] = None) -> Optional[int]:
+    """图注在哪一页（PDF 页序，1 起）。先看 hint 页及其前后一页——图常被排到引用它的下一页。"""
+    n = norm_label(label)
+    if not n:
+        return None
+    order = list(range(1, doc.page_count + 1))
+    if hint:
+        order.sort(key=lambda i: (abs(i - hint), i))
+    for lenient in (False, True):
+        for i in order:
+            if _caption_blocks(doc[i - 1], n, lenient):
+                return i
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 面向调用方：一篇论文要哪些截图
+# ---------------------------------------------------------------------------
+
+def shot_name(citekey: str, printed: int, label: str = "") -> str:
+    safe = re.sub(r"[^\w.-]+", "_", citekey, flags=re.U)
+    if label:
+        q, k, num = norm_label(label)
+        return "{}/{}{}{}.jpg".format(safe, q, k, num)
+    return "{}/p{:04d}.jpg".format(safe, printed)
+
+
+def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_root: Path,
+                    force: bool = False) -> Dict[str, dict]:
+    """渲染一篇论文被证据引用到的全部页面与图表。
+
+    返回 {相对路径: {"kind": page|figure, "printed": 16, "pdf_page": 4, "label": "Fig. 2", "how": ...}}；
+    另有键 "_map" 记页码口径、"_missing" 记落不到 PDF 内的页码/找不到的图表（供回执如实上报）。
+    """
+    import fitz
+    pdf_path = Path(pdf_path)
+    out: Dict[str, dict] = {}
+    missing: List[str] = []
+    wanted_pages: List[int] = []
+    wanted_labels: List[Tuple[str, Optional[int]]] = []
+    for h in highlights:
+        pages = parse_pages(h.get("page") or h.get("pages"))
+        wanted_pages.extend(pages)
+        for lab in labels_in(h.get("text") or ""):
+            wanted_labels.append((lab, pages[0] if pages else None))
+    if not wanted_pages and not wanted_labels:
+        return {"_map": {"how": "none"}, "_missing": []}
+    vfile = out_root / shot_name(citekey, 1).split("/")[0] / ".v"
+    if not force and (not vfile.exists() or vfile.read_text().strip() != SHOT_VERSION):
+        force = True
+        if vfile.parent.is_dir():                 # 旧版本的图整目录清掉，免得留下不再被引用的错图
+            for old in vfile.parent.glob("*.jpg"):
+                old.unlink()
+    with fitz.open(str(pdf_path)) as doc:
+        pm = build_page_map(doc, wanted_pages)
+        stale_before = pdf_path.stat().st_mtime
+        for printed in sorted(set(wanted_pages)):
+            idx = pm.to_pdf(printed)
+            if idx is None:
+                missing.append("p.{}".format(printed))
+                continue
+            rel = shot_name(citekey, printed)
+            dst = out_root / rel
+            if force or not dst.exists() or dst.stat().st_mtime < stale_before:
+                render_page(doc, idx, dst)
+            out[rel] = {"kind": "page", "printed": printed, "pdf_page": idx}
+        seen = set()
+        for lab, printed in wanted_labels:
+            key = norm_label(lab)
+            if key in seen:
+                continue
+            seen.add(key)
+            hint = pm.to_pdf(printed) if printed else None
+            idx = find_label_page(doc, lab, hint)
+            if idx is None:
+                missing.append(lab)
+                continue
+            rel = shot_name(citekey, 0, lab)
+            dst = out_root / rel
+            if force or not dst.exists() or dst.stat().st_mtime < stale_before:
+                got, how = render_figure(doc, idx, lab, dst)
+            else:
+                got, how = dst, "cached"
+            if got is None:
+                # 图注找到了但区域拿不准：退回图注所在的整页，宁可大也不裁错
+                rel = "{}/pdf{:04d}.jpg".format(rel.split("/")[0], idx)
+                dst = out_root / rel
+                if force or not dst.exists() or dst.stat().st_mtime < stale_before:
+                    render_page(doc, idx, dst)
+                out.setdefault(rel, {"kind": "page", "pdf_page": idx, "how": "figure-fallback", "labels": []})
+                out[rel].setdefault("labels", []).append(lab)
+                continue
+            out[rel] = {"kind": "figure", "label": lab, "pdf_page": idx, "how": how}
+        vfile.parent.mkdir(parents=True, exist_ok=True)
+        vfile.write_text(SHOT_VERSION)
+        out["_map"] = {"how": pm.how, "offset": pm.offset, "n_pages": pm.n_pages}
+        out["_missing"] = missing
+    return out

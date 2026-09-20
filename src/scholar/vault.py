@@ -11,7 +11,9 @@ frontmatter 走按键合并而非文本 diff（Obsidian 的 Properties UI 会重
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -1000,6 +1002,44 @@ PYTHONPATH=. python scripts/build_vault.py --vault-dir <这个目录>
 """
 
 
+SHOT_DIR = "assets/shots"            # 与 notes._SHOT_DIR 同值；月度 md 里的原文截图相对路径
+_SHOT_LINK = re.compile(r"\]\(" + re.escape(SHOT_DIR) + r"/([^)/]+)/([^)]+)\)")
+
+
+def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: bool = False
+                 ) -> Tuple[List[str], int]:
+    """把正文里引用到的原文截图镜像进 vault，并把链接改写成相对 `01-文献/` 的路径。
+
+    为什么要改写：per-paper 笔记的「原文精读」是从月度 md **原样切**出来的，那里的图片路径
+    `assets/shots/<citekey>/x.jpg` 是相对札记库根的；到了 vault 的 `01-文献/` 下就是坏链。
+    镜像优先用硬链接（vault 与札记库同盘时零额外空间——全库截图是 GB 级），不同盘/不支持
+    再退回复制。只搬**被引用到的**文件；源文件缺失就原样留着链接，不猜、不报错。
+    """
+    n = 0
+
+    def _one(m):
+        nonlocal n
+        ck, name = m.group(1), m.group(2)
+        src = notes_dir / SHOT_DIR / ck / name
+        dst = vault_dir / SHOT_DIR / ck / name
+        if src.is_file() and not dry_run:
+            try:
+                if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if dst.exists():
+                        dst.unlink()
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copy2(src, dst)
+                    n += 1
+            except OSError:
+                pass
+        return "](../{}/{}/{})".format(SHOT_DIR, ck, name)
+
+    return [_SHOT_LINK.sub(_one, ln) if SHOT_DIR in ln else ln for ln in body], n
+
+
 def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
                 include_maybe: bool = False, include_abstract_only: bool = False,
                 k: int = 5, dry_run: bool = False,
@@ -1025,8 +1065,10 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
     for e in entries:
         fname = safe_filename(e["citekey"], used_lower)
         path = vault_dir / PAPERS_DIR / "{}.md".format(fname)
-        gen = render_generated_block(e, bodies.get(e["citekey"]) or [],
-                                     neighbors.get(e["citekey"]) or [], one_lines)
+        body_e, n_shots = mirror_shots(bodies.get(e["citekey"]) or [], notes_dir, vault_dir,
+                                       dry_run=dry_run)
+        report["shots_mirrored"] = report.get("shots_mirrored", 0) + n_shots
+        gen = render_generated_block(e, body_e, neighbors.get(e["citekey"]) or [], one_lines)
         files.append((path, gen, e))
 
     # citekey -> 实际落盘的文件名（含撞名时的 X-2 后缀）。概念页同步器据此把

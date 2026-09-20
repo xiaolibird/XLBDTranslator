@@ -114,11 +114,35 @@ def git(vault_dir, *argv):
                           capture_output=True, text=True, check=False)
 
 
+SHOTS_IGNORE = "assets/shots/"
+
+
+def ensure_shots_ignored(vault_dir) -> bool:
+    """原文截图是可再生的派生物（全库 GB 级），绝不进 vault 的 git 历史。
+
+    `.gitignore` 缺这一行就补上，并把**已被跟踪**的截图从索引移除（`git rm --cached`，磁盘文件
+    保留）。2026-09-20 实测：截图功能上线当天，launchd 的自动同步用 `git add -A` 把试点的
+    234 张图提交了进去。返回是否动过 `.gitignore`。不改写历史——那是用户的仓库。
+    """
+    gi = vault_dir / ".gitignore"
+    lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    changed = False
+    if SHOTS_IGNORE not in [ln.strip() for ln in lines]:
+        lines.append(SHOTS_IGNORE)
+        gi.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        changed = True
+    if git(vault_dir, "ls-files", "--", SHOTS_IGNORE).stdout.strip():
+        git(vault_dir, "rm", "-r", "--cached", "--quiet", "--", SHOTS_IGNORE)
+        log("已把 vault 里被跟踪的原文截图移出 git 索引（文件保留）")
+    return changed
+
+
 def commit_vault(vault_dir, counts, conflicts, stamp):
     """vault 侧提交。不是 repo 就跳过；没有改动就不留空提交。"""
     if not (vault_dir / ".git").exists():
         log("vault 未 git init，跳过提交（建议 git init 以便回滚）")
         return 0
+    ensure_shots_ignored(vault_dir)
     if git(vault_dir, "rev-parse", "--verify", "HEAD").returncode != 0:
         log("vault git 库还没有任何提交，跳过自动提交（先手工 commit 一次建基线）")
         return 0

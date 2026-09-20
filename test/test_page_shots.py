@@ -1,0 +1,405 @@
+# -*- coding: utf-8 -*-
+"""原文截图（src/scholar/page_shots.py）。
+
+每条用例都对应 2026-09-20 在真实论文上**亲眼看图**抓到的一个错，数字回执上全都看不出来：
+  · Mitra 2023 札记标的是期刊页 13–23，PDF 只有 11 页——拿页码当下标会全错；
+  · Scientific Reports 的表注在表**下方**：逐个取最近，Table 1 的表注会配到 Table 2 的表，
+    还一路吞进 Discussion 正文（che2018 p.8）；
+  · 正文里以「Table 2 presents…」开头的段落被当成表注（shi2025 p.10）；
+  · 三线表没有竖线，默认表格检测检不出，间距启发式又把长表从分组横线处截断；
+  · 「定位失败，见所在整页」——却没真的渲染整页。
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+fitz = pytest.importorskip("fitz")
+from src.scholar import page_shots as PS  # noqa: E402
+
+
+# ---------------- 合成 PDF 的小工具 ----------------
+
+def _grid(page, x0, y0, rows, cols, cw=70, rh=16, text="0.71"):
+    for r in range(rows + 1):
+        page.draw_line((x0, y0 + r * rh), (x0 + cols * cw, y0 + r * rh))
+    for c in range(cols + 1):
+        page.draw_line((x0 + c * cw, y0), (x0 + c * cw, y0 + rows * rh))
+    for r in range(rows):
+        for c in range(cols):
+            page.insert_text((x0 + c * cw + 6, y0 + r * rh + 12), "{}{}".format(text, r * cols + c), fontsize=8)
+    return fitz.Rect(x0, y0, x0 + cols * cw, y0 + rows * rh)
+
+
+def _prose(page, y, first="Discussion of the results follows here with many words.", n=5):
+    for i in range(n):
+        page.insert_text((60, y + i * 13),
+                         (first if i == 0 else "More running prose text that belongs to the body of the paper."),
+                         fontsize=10)
+
+
+def _save(doc, tmp_path, name="p.pdf"):
+    p = tmp_path / name
+    doc.save(str(p))
+    doc.close()
+    return p
+
+
+# ---------------- 标签与页码解析 ----------------
+
+def test_labels_cover_chinese_appendix_and_extended_data():
+    got = PS.labels_in("主结果（表1、Table 2）与消融（Table A6，Supplementary Table S3），"
+                       "见图3 与 Extended Data Fig 1；Algorithm 2 给出流程")
+    assert got == ["Table 1", "Table 2", "Supplementary Table A6", "Supplementary Table S3",
+                   "Fig. 3", "Extended Data Fig. 1", "Algorithm 2"]
+
+
+def test_labels_ignore_words_that_merely_contain_biao_or_zero():
+    assert PS.labels_in("本文代表1种思路，列表2项，发表3篇；算法0 不存在") == []
+
+
+def test_parse_pages_single_range_and_garbage():
+    assert PS.parse_pages("16") == [16]
+    assert PS.parse_pages("15-16") == [15, 16]
+    assert PS.parse_pages("17–18") == [17, 18]
+    assert PS.parse_pages(None) == [] and PS.parse_pages("附录") == []
+    assert PS.parse_pages("3-400") == [3, 400]          # 不是区间（跨度离谱）→ 不展开成 398 页
+
+
+# ---------------- 页码口径 ----------------
+
+def test_page_map_infers_journal_offset_from_footer(tmp_path):
+    doc = fitz.open()
+    for i in range(6):
+        pg = doc.new_page()
+        pg.insert_text((60, 300), "body text")
+        pg.insert_text((500, 820), str(155 + i), fontsize=9)                 # 页脚印刷页码
+        pg.insert_text((60, 820), "J Am Med Inform Assoc 2021", fontsize=9)  # 每页都有的年份不该赢
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, wanted=[156])
+    assert (pm.how, pm.offset) == ("header", 154)
+    assert pm.to_pdf(156) == 2
+    assert pm.to_pdf(12) is None and pm.to_pdf(999) is None                  # 超界绝不就近凑一页
+
+
+def test_page_map_defaults_to_pdf_order_without_evidence(tmp_path):
+    doc = fitz.open()
+    for _ in range(4):
+        doc.new_page().insert_text((60, 300), "arXiv style page without printed numbers")
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, wanted=[3])
+    assert pm.how == "pdf-order" and pm.to_pdf(3) == 3 and pm.to_pdf(5) is None
+
+
+# ---------------- 表格 ----------------
+
+def _two_tables_captions_below(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    t1 = _grid(pg, 60, 60, 6, 5, text="1.")
+    pg.insert_text((60, t1.y1 + 18), "Table 1. Mortality prediction AUC (mean and std).", fontsize=10)
+    t2 = _grid(pg, 60, t1.y1 + 50, 4, 3, text="2.")
+    pg.insert_text((60, t2.y1 + 18), "Table 2. Multi-task prediction AUC.", fontsize=10)
+    _prose(pg, t2.y1 + 60)
+    return _save(doc, tmp_path), t1, t2
+
+
+def test_caption_below_table_pairs_with_its_own_table(tmp_path):
+    pdf, t1, t2 = _two_tables_captions_below(tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r1, how1 = PS.find_figure_bbox(d[0], "Table 1")
+        r2, _ = PS.find_figure_bbox(d[0], "Table 2")
+    assert how1 == "caption+table"
+    assert r1.contains(t1) and not r1.intersects(t2 + (0, 6, 0, 0))          # 没抓到 Table 2 的表
+    assert r2.contains(t2) and r2.y1 < t2.y1 + 60                            # 没吞进后面的正文
+
+
+def test_body_paragraph_starting_with_table_is_not_a_caption(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 60), "Table 2", fontsize=10)
+    pg.insert_text((60, 74), "Structure learning results of F1.", fontsize=10)
+    t = _grid(pg, 60, 90, 5, 4)
+    pg.insert_text((60, 400), "Table 2 presents the F1 value for six networks and we discuss it.", fontsize=10)
+    pg.insert_text((60, 440), "Tables 2 and 3 summarize the F1 and SHD results.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        caps = PS._captions(d[0])
+        r, how = PS.find_figure_bbox(d[0], "Table 2")
+    assert len(caps) == 1 and caps[0][1].y0 < 80
+    assert how == "caption+table" and r.contains(t) and r.y1 < 390
+
+
+def test_three_line_table_is_found_whole_via_rules(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 60), "Table 3", fontsize=10)
+    pg.insert_text((60, 74), "SHD on benchmark datasets.", fontsize=10)
+    ys = [84, 100, 170, 240, 310]                                            # 顶线/表头线/分组线…/底线
+    for y in ys:
+        pg.draw_line((60, y), (500, y))
+    for y in range(96, 306, 14):
+        for c in range(6):
+            pg.insert_text((66 + c * 72, y + 10), "0.{}".format(30 + c), fontsize=8)
+    _prose(pg, 360)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Table 3")
+    assert how in ("caption+table", "caption+rules")
+    assert r.y0 <= 60 and r.y1 >= 308 and r.y1 < 355                         # 到底线为止，不在分组线处截断
+
+
+# ---------------- 图 ----------------
+
+def test_figure_crop_has_graphics_and_caption_but_not_next_section(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    box = fitz.Rect(80, 80, 480, 300)
+    pg.draw_rect(box, fill=(0.9, 0.5, 0.5))
+    pg.insert_text((90, 100), "a", fontsize=10)
+    pg.insert_text((80, 322), "Fig. 2 | Examples of structured missingness.", fontsize=9)
+    _prose(pg, 380, first="For data that are MNAR, complete case analysis may introduce bias.")
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "图2")                            # 中文标签也能配
+    assert how == "caption+graphics"
+    assert r.contains(box) and r.y1 >= 322 and r.y1 < 375
+
+
+# ---------------- 面向调用方 ----------------
+
+def test_shots_for_paper_names_fallback_and_idempotence(tmp_path):
+    doc = fitz.open()
+    for i in range(3):
+        pg = doc.new_page()
+        pg.insert_text((500, 820), str(13 + i), fontsize=9)
+        pg.insert_text((60, 120), "Body of page {}".format(i + 1))
+    pg = doc[1]
+    pg.insert_text((60, 300), "Fig. 1 | A caption whose graphic we never drew.", fontsize=9)  # 有图注、无图形
+    pdf = _save(doc, tmp_path)
+    out = tmp_path / "shots"
+    hl = [{"text": "高维下更难发现（Fig. 1）", "pages": "14"},
+          {"text": "落不到本 PDF 内的页码", "pages": "99"},
+          {"text": "提到一张不存在的表 Table 9", "pages": None}]
+    r = PS.shots_for_paper(pdf, "mitra2023Learning", hl, out)
+    assert r["_map"]["how"] == "header" and r["_map"]["offset"] == 12
+    assert r["mitra2023Learning/p0014.jpg"] == {"kind": "page", "printed": 14, "pdf_page": 2}
+    fb = r["mitra2023Learning/pdf0002.jpg"]                                  # 裁不准 → 真的渲染了整页
+    assert fb["how"] == "figure-fallback" and fb["labels"] == ["Fig. 1"]
+    assert (out / "mitra2023Learning/pdf0002.jpg").stat().st_size > 1000
+    assert sorted(r["_missing"]) == ["Table 9", "p.99"]                      # 缺什么如实上报
+    before = {p: p.stat().st_mtime_ns for p in out.rglob("*.jpg")}
+    PS.shots_for_paper(pdf, "mitra2023Learning", hl, out)
+    assert before == {p: p.stat().st_mtime_ns for p in out.rglob("*.jpg")}   # 幂等：不重渲染
+
+
+def test_extended_data_label_is_strict_first_then_lenient(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    t = _grid(pg, 60, 90, 4, 4)
+    pg.insert_text((60, 70), "Extended Data Table 1 | Hyperparameter search spaces.", fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        assert PS.find_label_page(d, "Table 1") == 1                         # 全文无严格匹配 → 宽松命中
+        r, how = PS.find_figure_bbox(d[0], "Table 1")
+    assert r.contains(t) and how.endswith("(lenient)")                       # 且回执标明是宽松配的
+
+
+# ---------------- 接进 md / docx 渲染链 ----------------
+
+def _segment_with_figure(tmp_path):
+    from src.scholar.schema import PaperSegment, PaperMetadata, CloseReading
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.draw_rect(fitz.Rect(80, 80, 480, 300), fill=(0.9, 0.5, 0.5))
+    pg.insert_text((80, 322), "Fig. 2 | Examples of structured missingness.", fontsize=9)
+    pg.insert_text((500, 820), "16", fontsize=9)
+    doc.new_page().insert_text((500, 820), "17", fontsize=9)
+    pdf = _save(doc, tmp_path, "mitra.pdf")
+    cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+        {"heading": "图表与补充材料要点", "sentences": [
+            {"text": "Fig. 2a：85 岁以下全部检查，单调模式。", "tag": "可引用证据", "page": "16"},
+            {"text": "Fig. 2c 为 MNAR，结构不可观测。", "tag": "可引用证据", "page": "16"}]},
+        {"heading": "局限与可质疑点", "sentences": [
+            {"text": "正文与图2 的图注有张力。", "tag": "可反驳观点", "page": "17"}]}])
+    meta = PaperMetadata(paper_id="pid1", title="Learning from data with structured missingness",
+                         authors=["Robin Mitra"], doi="10.1038/s42256-022-00596-z")
+    seg = PaperSegment(segment_id=1, paper_id="pid1", metadata=meta, close_reading=cr)
+    return seg, pdf
+
+
+def test_write_notes_embeds_each_figure_once_and_parser_is_unaffected(tmp_path):
+    from src.scholar.notes import write_notes
+    from src.scholar.notes_index import parse_note_md
+    seg, pdf = _segment_with_figure(tmp_path)
+    out = tmp_path / "notes"
+    out.mkdir()
+    res = write_notes([seg], {"pid1": "mitra2023Learning"}, out_dir=out, filename="科研札记_T_手动精读",
+                      emit_docx=True, index_series="manual", pdf_paths={"pid1": str(pdf)})
+    md = Path(res["note_path"]).read_text("utf-8")
+    assert md.count("![Fig. 2 · 原文截图](assets/shots/mitra2023Learning/fig2.jpg)") == 1   # 三句提到，只嵌一次
+    first = md.index("Fig. 2a：85 岁以下")
+    assert first < md.index("![Fig. 2") < md.index("Fig. 2c 为 MNAR")                        # 紧跟第一次提到它的那句
+    assert "[p.16](assets/shots/mitra2023Learning/p0016.jpg)" in md and "p0017.jpg" in md
+    assert all((out / m).is_file() for m in
+               ("assets/shots/mitra2023Learning/fig2.jpg", "assets/shots/mitra2023Learning/p0016.jpg"))
+    entry = parse_note_md(Path(res["note_path"]))[0]
+    assert len(entry["highlights"]) == 3                       # 图片行/原文页面节都不是证据句
+    assert {h.get("pages") for h in entry["highlights"]} == {"16", "17"}
+    from docx import Document
+    d = Document(res["docx_path"])
+    assert len(d.inline_shapes) == 1 and any("Fig. 2 · 原文截图" in p.text for p in d.paragraphs)
+
+
+def test_write_notes_without_pdf_is_byte_identical_to_before(tmp_path):
+    """没给 pdf_paths（自动月度链路、旧调用方）→ md 里不许多出任何一行。"""
+    from src.scholar.notes import write_notes
+    seg, pdf = _segment_with_figure(tmp_path)
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    ra = write_notes([seg], {"pid1": "k"}, out_dir=a, filename="n", index_series="manual")
+    rb = write_notes([seg], {"pid1": "k"}, out_dir=b, filename="n", index_series="manual",
+                     pdf_paths={"pid1": str(tmp_path / "missing.pdf")})                      # PDF 不在 → 同样不动
+    ma, mb = (Path(r["note_path"]).read_text("utf-8") for r in (ra, rb))
+    assert "原文截图" not in ma and "原文页面" not in ma
+    strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("generated"))
+    assert strip(ma) == strip(mb) and not (b / "assets").exists()
+
+
+# ---------------- vault 镜像 ----------------
+
+def test_vault_mirrors_referenced_shots_and_rewrites_links(tmp_path):
+    from src.scholar import vault as V
+    notes, vault = tmp_path / "notes", tmp_path / "vault"
+    src = notes / V.SHOT_DIR / "mitra2023Learning"
+    src.mkdir(parents=True)
+    (src / "fig2.jpg").write_bytes(b"jpg")
+    (src / "unused.jpg").write_bytes(b"x")
+    body = ["- 〔可引用证据〕Fig. 2a ……〔p.16〕",
+            "  ![Fig. 2 · 原文截图](assets/shots/mitra2023Learning/fig2.jpg)",
+            "页：[p.16](assets/shots/mitra2023Learning/p0016.jpg)"]          # 源文件缺失的那张
+    out, n = V.mirror_shots(body, notes, vault)
+    assert out[1] == "  ![Fig. 2 · 原文截图](../assets/shots/mitra2023Learning/fig2.jpg)"
+    assert out[2].endswith("(../assets/shots/mitra2023Learning/p0016.jpg)") and out[0] == body[0]
+    dst = vault / V.SHOT_DIR / "mitra2023Learning"
+    assert n == 1 and (dst / "fig2.jpg").read_bytes() == b"jpg"
+    assert not (dst / "unused.jpg").exists() and not (dst / "p0016.jpg").exists()      # 只搬被引用且存在的
+    assert V.mirror_shots(body, notes, vault)[1] == 0                                  # 幂等
+    assert V.mirror_shots(body, notes, tmp_path / "v2", dry_run=True)[1] == 0 and not (tmp_path / "v2").exists()
+
+
+def test_caption_without_punctuation_followed_by_capitalised_title_word(tmp_path):
+    """投稿版 PDF：「Figure 1 The flowchart of …」是图注；「Figure 1 the flowchart shows」是正文。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.draw_rect(fitz.Rect(80, 80, 480, 300), fill=(0.5, 0.7, 0.9))
+    pg.insert_text((80, 322), "Figure 1 The flowchart of genetic sequencing strategy", fontsize=9)
+    pg.insert_text((80, 500), "Figure 1 the flowchart shows how individuals were enrolled.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        caps = PS._captions(d[0])
+        r, how = PS.find_figure_bbox(d[0], "Fig. 1")
+    assert len(caps) == 1 and caps[0][1].y0 < 330
+    assert how == "caption+graphics" and r.y1 < 480
+
+
+def test_labels_supp_abbreviation_and_chinese_quantities():
+    assert PS.labels_in("未发生肾衰者被删除（Supp Fig 20）；软件包见 Supp. Table 9") == \
+        ["Supplementary Fig. 20", "Supplementary Table 9"]
+    assert PS.labels_in("比较了算法 9 种：逻辑回归、XGBoost……；共表 3 个、图 2 张") == []
+    assert PS.labels_in("见表 3 与图2a") == ["Table 3", "Fig. 2"]
+
+
+def test_table_crop_stops_at_next_caption_and_short_heading(tmp_path):
+    """serrano2026 p.7：Table 3 之后紧跟一行小节标题、一段正文和 Table 4，都不许裁进来。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 60), "Table 3. Percentage degradation in MAE.", fontsize=10)
+    for y in (72, 90, 200):
+        pg.draw_line((60, y), (500, y))
+    for y in range(96, 196, 14):
+        for c in range(5):
+            pg.insert_text((66 + c * 86, y + 8), "-5{}.{}*".format(c, y % 7), fontsize=8)
+    pg.insert_text((60, 226), "RQ1: Impact of Graph-Aware Mechanisms.", fontsize=10)
+    _prose(pg, 244, first="Across configurations, graph-aware missingness markedly increases difficulty, and so on.", n=6)
+    pg.insert_text((60, 360), "Table 4. Percentage Summary of Statistical Outcomes.", fontsize=10)
+    t4 = _grid(pg, 60, 372, 3, 4)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Table 3")
+    assert how.startswith("caption+")
+    assert r.y0 <= 56 and 198 <= r.y1 < 216 and not r.intersects(t4)
+
+
+def test_caption_only_region_falls_back_instead_of_returning_a_sliver(tmp_path):
+    """he2024 p.8：无线表检不出时，别把一条孤零零的表注当成「这张表」。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    for y in range(80, 160, 14):
+        pg.insert_text((60, y), "NPHA   66.35   65.48   66.35   65.73", fontsize=8)      # 无表线的表体，在表注上方
+    pg.insert_text((60, 180), "Table 3: Imputation accuracy w.r.t. different confidence levels.", fontsize=10)
+    _prose(pg, 230)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Table 3")
+    assert r is None or r.height > 60          # 要么老实失败（交给整页兜底），要么真带上了表体
+
+
+def test_multi_block_caption_is_kept_whole_and_version_bump_rerenders(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.draw_rect(fitz.Rect(80, 80, 480, 300), fill=(0.5, 0.8, 0.8))
+    pg.insert_text((80, 322), "Figure 6: Distribution of each patient's longest continuous", fontsize=9)
+    pg.insert_text((80, 337), "stretch without a 4-month gap between visits.", fontsize=9)      # 续行是另一个文本块
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, _ = PS.find_figure_bbox(d[0], "Fig. 6")
+    assert r.y1 >= 337
+    out = tmp_path / "s"
+    PS.shots_for_paper(pdf, "k", [{"text": "Fig. 6"}], out)
+    f = out / "k/fig6.jpg"
+    (out / "k/.v").write_text("0")                                   # 假装是旧算法出的图
+    (out / "k/stale_wrong_crop.jpg").write_bytes(b"x")
+    m0 = f.stat().st_mtime_ns
+    PS.shots_for_paper(pdf, "k", [{"text": "Fig. 6"}], out)
+    assert f.stat().st_mtime_ns > m0 and not (out / "k/stale_wrong_crop.jpg").exists()
+    assert (out / "k/.v").read_text() == PS.SHOT_VERSION
+
+
+def test_region_is_widened_to_touching_columns_but_not_to_the_next_text_column(tmp_path):
+    """lin2004 Table 3：检测到的表比实际窄，右侧几列被切；但不许把相邻栏的正文拉进来。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 60), "Table 3. Estimates of AUCs", fontsize=10)
+    t = _grid(pg, 60, 72, 4, 3)                                   # 检得出的部分：x 60–270
+    for r in range(4):
+        pg.insert_text((276, 72 + r * 16 + 12), "[1.89, 7.25]", fontsize=8)   # 紧贴其右、没有表线的一列
+    for i in range(12):                                           # 相邻栏的正文，远高于表
+        pg.insert_text((360, 60 + i * 13), "Neighbouring column prose that must stay out.", fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, _ = PS.find_figure_bbox(d[0], "Table 3")
+    assert r.x1 >= 320 and r.x1 < 360 and r.contains(t)
+
+
+def test_wraparound_prose_beside_figure_is_not_pulled_in(tmp_path):
+    """cornelis2026 Fig.1：文字环绕排版，左栏正文与图形区纵向重叠，但不是图的一部分。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.draw_rect(fitz.Rect(300, 80, 540, 300), fill=(0.5, 0.3, 0.8))
+    pg.insert_text((300, 322), "Figure 1: Existing graph benchmarks operate in the n >> p regime.", fontsize=9)
+    pg.insert_textbox(fitz.Rect(60, 80, 290, 300),
+                      "On the other hand, existing GNN inductive benchmarks, ranging from the recent one, "
+                      "to established ones like OGB, and others, predominantly operate in the opposite regime. "
+                      "As quantified in the figure, which visualizes major datasets, the landscape is defined. "
+                      "Consequently, while these benchmarks have driven progress, they fail to reflect it.",
+                      fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Fig. 1")
+    assert how == "caption+graphics" and r.x0 > 250
