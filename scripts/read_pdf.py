@@ -309,6 +309,49 @@ def _sync_topics_best_effort(notes_dir: Path, note_md: str) -> None:
                           notify_title="Scholar 手动精读", subject="精读已正常归档")
 
 
+def _home_pdfs_best_effort(notes_dir: Path, month: str, reading_dir: str = "") -> None:
+    """finalize 收尾：把本月 pdf_path 还在 Reading 之外的 PDF 搬进 Reading 并回填。
+
+    为什么放在 finalize 而不是 ingest：目标文件名是 `<citekey>.pdf`（locate_pdf 第 0 级按它
+    精确命中），而 citekey 要到 finalize 写 md 时才生成。为什么必须有这一步：ingest 只把
+    PDF 的绝对路径写进 bundle、不管文件在哪——2026-09-20 盘点 333 篇手动精读，31 篇的 PDF
+    躺在 Downloads / 会话临时目录里，其中 4 篇已随目录清理丢失、pdf_path 成了死链。
+
+    best-effort：归档（md/索引/向量库）此时已完成，这里任何失败都只告警、不改退出码。
+    索引不存 pdf_path，所以搬完不需要再重建。已在 Reading 下的 PDF 不碰。
+    """
+    try:
+        import os
+        from src.scholar.paths import repo_path
+        # 只对真实札记库动手（同 sync_vault 导出时间线 xlsx 的口径）：finalize 会被测试拿临时
+        # notes 目录跑，不设防的话测试用的 PDF 会被搬进用户真实的 Reading 目录。
+        # SCHOLAR_READING_ROOT 是测试把归档根指到临时目录的显式开关，设了才放行。
+        if (repo_path(notes_dir).resolve() != repo_path("output/scholar_notes").resolve()
+                and not os.environ.get("SCHOLAR_READING_ROOT")):
+            return
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "relink_manual_pdfs", Path(__file__).resolve().parent / "relink_manual_pdfs.py")
+        rl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rl)
+        try:
+            plan = rl.build_plan(month, None, notes_dir, 0, home=True, reading_dir=reading_dir)
+        except rl.PlanError as e:
+            print("   ⚠️ PDF 未归位（{}）；稍后手动跑：PYTHONPATH=. python scripts/relink_manual_pdfs.py "
+                  "--month {} --home --apply".format(e, month))
+            return
+        dead = [p for p in plan if p.get("dead")]
+        if plan and len(dead) < len(plan):
+            rl.apply_plan(plan)
+        for q in plan:
+            if not q.get("dead"):
+                print("   📁 PDF 已归位: {} → {}".format(q["src"].name, q["dst"]))
+        for q in dead:
+            print("   ⚠️ pdf_path 是死链（文件已不在）: {} ← {}".format(q["citekey"], q["src"]))
+    except Exception as e:   # noqa: BLE001 —— 收尾步骤绝不能把一次成功的归档变成失败
+        print("   ⚠️ PDF 归位步骤异常（不影响归档）: {}: {}".format(type(e).__name__, e))
+
+
 def _reuse_citekeys(notes_dir: Path, month: str, segments) -> dict:
     """按 dedup_key 沿用上一轮 sidecar 里的 citekey，返回 {paper_id: citekey|None}。
 
@@ -529,6 +572,23 @@ def _bundle_inventory(mdir: Path, suffix: str) -> dict:
     return out
 
 
+def _bundle_pdf_paths(mdir: Path) -> dict:
+    """{paper_id: pdf_path}，供 write_notes 生成原文截图。读不出的 bundle 直接略过——
+    它们在 _collect_month_segments 里已经按 broken 处理并上报，这里不重复告警。"""
+    from src.scholar.pdf_ingest import BUNDLE_SUFFIX, load_bundle
+    out = {}
+    for bf in sorted(Path(mdir).glob("*" + BUNDLE_SUFFIX)):
+        try:
+            d = load_bundle(bf)
+            seg = (d.get("segment") or {})
+            pid = seg.get("paper_id") or d.get("paper_id")
+            if pid and d.get("pdf_path"):
+                out[pid] = d["pdf_path"]
+        except Exception:                                    # noqa: BLE001
+            continue
+    return out
+
+
 def _collect_month_segments(mdir: Path, suffix: str):
     """扫当月 bundle → `(segments, skipped, broken, consumed)`。
 
@@ -629,7 +689,7 @@ def _stale_inventory_detail(consumed: dict, disk: dict) -> str:
 
 
 def _rebuild_month(notes_dir: Path, month: str, settings,
-                   allow_removals: bool = False) -> dict:
+                   allow_removals: bool = False, sync_topics: bool = True) -> dict:
     """从当月全部 final bundle 重建手动精读四件套 + 刷索引。
 
     allow_removals：跳过「净删除止损闸」。默认 False——整月重建是**整篇重写**，一份
@@ -760,7 +820,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
 
             citekeys = _reuse_citekeys(notes_dir, month, segments)
             res = write_notes(
-                segments, citekeys, out_dir=notes_dir,
+                segments, citekeys, out_dir=notes_dir, pdf_paths=_bundle_pdf_paths(mdir),
                 instruction=proc.notes_instruction,
                 digest_title="科研札记 · {}（手动深度精读）".format(month),
                 filename="科研札记_{}_手动精读".format(month),
@@ -857,7 +917,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
             out["sync_skipped"] = True
         else:
             _sync_embedding_best_effort(notes_dir, idx, settings)
-            if out.get("md"):
+            if out.get("md") and sync_topics:
                 _sync_topics_best_effort(notes_dir, out["md"])   # W6：接入 P2，见函数文档
     return out
 
@@ -992,6 +1052,8 @@ def cmd_finalize(args):
     r = _rebuild_month(notes_dir, month, settings,
                        allow_removals=getattr(args, "allow_removals", False))
     _report_final(r, notes_dir)
+    if not (r.get("refused") or getattr(args, "no_home", False)):
+        _home_pdfs_best_effort(notes_dir, month, getattr(args, "reading_dir", "") or "")
     # 在 _rebuild_month 里「拒收」等价于「从已归档的 md 里删掉」：整月 md 被重写、索引重建、
     # 向量库同步，一篇已核验论文当场蒸发。绿回执 + exit 0 会让自动权限模式的 agent 直接
     # 往下走（同 audit_citekeys_vs_pmlr 的论证），所以这里必须非 0。
@@ -1005,7 +1067,8 @@ def cmd_regen(args):
     notes_dir = Path(settings.processing.notes_dir)
     month = args.month or _cur_month()
     r = _rebuild_month(notes_dir, month, settings,
-                       allow_removals=getattr(args, "allow_removals", False))
+                       allow_removals=getattr(args, "allow_removals", False),
+                       sync_topics=not getattr(args, "no_topics", False))
     _report_final(r, notes_dir)
     # sidecar 写失败也退非 0：手动精读的 sidecar 是 _reuse_citekeys 的锚，丢了下一轮 regen 会把键全顶回
     return 1 if (r.get("broken_bundles") or r.get("refused") or r.get("concurrent")
@@ -1121,6 +1184,10 @@ def main():
     p_fin.add_argument("bundle", help="已 final 的 bundle.json 路径")
     p_fin.add_argument("--allow-removals", action="store_true",
                        help="允许本轮重建净删除已归档论文（默认拒绝：一份 bundle 被拒收就等于把那篇从 md/索引/书目/向量库一起删掉）")
+    p_fin.add_argument("--reading-dir", default="",
+                       help="PDF 归位的 Reading 子目录名（如 2026-09-20-SM源头）；缺省按桶名/精读日期推")
+    p_fin.add_argument("--no-home", action="store_true",
+                       help="不把 PDF 搬进 ~/Desktop/Lab/Reading（默认 finalize 收尾会搬并回填 pdf_path）")
     p_fin.set_defaults(func=cmd_finalize)
 
     p_reg = sub.add_parser("regen", help="按现有 final bundle 重建某月（不新增论文）")
@@ -1128,6 +1195,8 @@ def main():
                        help="月份桶 YYYY-MM[-DD][-批次名]（默认当月）")
     p_reg.add_argument("--allow-removals", action="store_true",
                        help="允许本轮重建净删除已归档论文（默认拒绝：一份 bundle 被拒收就等于把那篇从 md/索引/书目/向量库一起删掉）")
+    p_reg.add_argument("--no-topics", action="store_true",
+                       help="不触发概念页路由/重合成（证据句没变、只为刷新截图或版式而重建时用；省 LLM 调用）")
     p_reg.set_defaults(func=cmd_regen)
 
     args = ap.parse_args()

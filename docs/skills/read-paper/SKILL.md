@@ -100,6 +100,16 @@ for p in ps:
 - 再打开 bundle 的 `close_reading_script`，**逐条比对**：每个数字、效应量、样本量、方法主张都回到 PDF 原文核验；
 - 分歧一律**以你从 PDF 亲证的为准**；脚本有而你漏的，抽查属实才保留；脚本编造/串页的，删。
 
+🖼 **核对数字、表格、图时，看原文版面截图，别只信抽取出来的文本**（2026-09-20 起）：
+```bash
+PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/shot_pdf.py <pdf 路径> --pages 8 10-11 --labels "Table 2" 图3
+```
+它打印每张图的路径，用 **Read 工具打开看**。文本抽取在双栏论文上会左右栏交错、表格会行列串位——
+脚本草稿引错数字多半出在这里；图上的数字就是原文的数字。逐格复算一张结果表（如「作者称 84%，
+复算 75%」那种核验）直接对着表格截图数，比对着抽取文本数可靠得多。标签中英文都认
+（`Table 2`/`表2`/`Extended Data Fig 1`/`Table A6`/`Supp Fig 20`）；页码按札记口径自动判别
+（期刊印刷页或 PDF 页序）。回执里 `← 裁不准，已退回整页` / `← 按图注宽松匹配` 要留意。
+
 ### 4. 写回 bundle（终稿）
 把合并终稿写进 bundle 的这两个字段，并把 `status` 改为 `"final"`：
 - `close_reading_final`：严格 `CloseReading` JSON —— `{"from_full_text": true, "source": "manual-pdf", "sections": [{"heading": "研究问题", "sentences": [{"text": "…", "tag": null}]}, …]}`。
@@ -159,6 +169,29 @@ PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scri
 ```
 它从当月**全部 final bundle** 重建手动精读四件套并刷新索引（同月可多篇追加、幂等）。
 交叉核验报告会自动渲染为精读末节「交叉核验记录」。
+
+📁 **finalize 收尾会把 PDF 归位**（2026-09-20 起）：本月 `pdf_path` 还在 `~/Desktop/Lab/Reading/` 之外的
+PDF（Downloads、会话临时目录……）会被**移动**到 `Reading/<目录>/<citekey>.pdf` 并回填 `pdf_path`，
+回执里每篇打一行 `📁 PDF 已归位`。为什么：ingest 只记路径、不管文件在哪——盘点时 333 篇里有
+31 篇散在 Reading 之外，4 篇已随目录清理丢失成了死链。目标目录规则：
+- `finalize --reading-dir 2026-09-20-SM源头`：显式指定（**一批论文有共同主题时用这个**，目录名 = `日期-主题`）；
+- 不指定时：桶名带日期（`--month 2026-09-11-异配图GNN`）就用桶名；纯月份桶用精读当天建纯日期目录。
+- 已在 Reading 下的 PDF **不挪、不改名**（那是用户手工摆好的）；`⚠️ pdf_path 是死链` 表示文件已经不在了，要重新下载。
+- 不想搬加 `--no-home`；事后补跑：`PYTHONPATH=. python scripts/relink_manual_pdfs.py --month <月> --home [--reading-dir <名>] --apply`（不加 `--apply` 是 dry-run）。
+- **agent 自己下载来读的 PDF 别放会话临时目录**——会话一结束就没了。直接下到 `Reading/<日期-主题>/` 再 ingest。
+- 书籍系列（`read-book`）不走这一步：书的路径同时写在 `books/<书>/book.manifest.json` **和各章 json** 里，要手动一起改。
+
+🖼 **finalize 会自动生成原文截图并嵌进 md 与 docx**（2026-09-20 起）：证据句的页码 → 整页截图
+（节末「【原文页面】」给链接，不内嵌，免得月度 md/docx 膨胀）；证据句提到的图/表 → 按图注裁剪，
+**紧跟在第一次提到它的那句下面**内嵌（每张只嵌一次）。落 `output/scholar_notes/assets/shots/<citekey>/`。
+所以**写精读时把图表标签写进句子**（「Table 2 显示……」「Fig. 2c：……」）、**句级 `page` 尽量标**——
+这两样决定了哪些图会出现在札记里。要点：
+- 裁不准的**不会乱裁**，退回图注所在整页；全文找不到图注的（补充材料里的 Supp Fig、投稿版 PDF 把
+  图注集中列在文末「Figure legends」而图单独排版）在节末 `> 未能截到：…` 如实列出。
+- 截图是派生物：不进 highlights、不进向量库、不进 git（vault 已 ignore）、不进 iCloud 备份；
+  丢了重跑 `regen --month <月> --no-topics` 即可重建（`--no-topics` = 证据句没变，别触发概念页重合成）。
+- vault 同步会把被引用的截图硬链接进 `~/Documents/ScholarVault/assets/shots/` 并改写链接。
+- 目前只覆盖**手动精读**系列（有 bundle 的 `pdf_path`）；自动月度/周札记与书籍系列还没接。
 
 ⚠️ **finalize 会在动库之前先止损**：整月重建是**整篇重写**，一份 bundle 被拒收就等于把那篇
 已归档论文从 md/references/sidecar/索引/书目/向量库里一起删掉。所以如果本轮重建会**净删除**
