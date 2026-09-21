@@ -1108,6 +1108,44 @@ def render_passage(doc, pdf_index: int, rect, out: Path, dpi: int = PASSAGE_DPI)
 PASSAGE_VERSION = "5"
 
 
+_SHOT_SUBDIR = "assets/shots"        # 与 notes._SHOT_DIR / vault.SHOT_DIR 同值
+
+
+def crop_index(assets_root: Path) -> Dict[Tuple[str, str], str]:
+    """(citekey 目录名, 句键) -> 相对 assets_root 的逐句出处图路径。
+
+    给概念页/问答页的证据表用：那两处的证据句就是精读里的句子，图早就渲染好了，按句键查表就能
+    挂上链接——不必也不该再渲染一遍。只收磁盘上真在的文件。
+    """
+    import json
+    out: Dict[Tuple[str, str], str] = {}
+    root = Path(assets_root)
+    if not root.is_dir():
+        return out
+    for cache in sorted(root.glob("*/passages.*.json")):
+        ck = cache.parent.name
+        try:
+            items = (json.loads(cache.read_text("utf-8")) or {}).get("items") or {}
+        except Exception:                                    # noqa: BLE001
+            continue
+        for key, v in items.items():
+            if v and (root / v["rel"]).is_file():
+                out.setdefault((ck, key), v["rel"])
+    return out
+
+
+def crop_for(crops: Dict[Tuple[str, str], str], citekey: str, text: str) -> Optional[str]:
+    """按 citekey + 句子原文查它的出处图。证据表里的句子做过换行归一化，两种写法都试。"""
+    if not (crops and citekey and text):
+        return None
+    safe = re.sub(r"[^\w.-]+", "_", citekey, flags=re.U)
+    for t in (text, text.replace("\n", " ")):
+        rel = crops.get((safe, sentence_key(t)))
+        if rel:
+            return rel
+    return None
+
+
 def sentence_key(text: str) -> str:
     import hashlib
     return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:10]

@@ -2565,3 +2565,42 @@ def test_refresh_child_passes_its_pid_to_the_child(monkeypatch, tmp_path):
     env = seen.get("env") or {}
     assert env.get(T.TOPICS_PARENT_PID_ENV) == str(_os.getpid()), \
         "子进程环境里必须带父进程 pid，父死联动才装得上"
+
+
+def test_evidence_row_links_the_existing_source_crop(tmp_path):
+    """概念页/问答页的证据句就是精读里的句子，出处图早渲染好了——只挂链接，不重复渲染。"""
+    import json
+    from src.scholar import page_shots as PS
+    from src.scholar.vault import mirror_shots_only
+    notes = tmp_path / "notes"
+    ck, sent = "little2020rubin", "一般情形被 Meng（1995）称为 uncongeniality。"
+    d = notes / PS._SHOT_SUBDIR / ck
+    d.mkdir(parents=True)
+    rel = "{}/q_abc123_{}.jpg".format(ck, PS.sentence_key(sent))
+    (notes / PS._SHOT_SUBDIR / rel).write_bytes(b"jpeg")
+    (d / "passages.abc123.json").write_text(json.dumps(
+        {"items": {PS.sentence_key(sent): {"rel": rel, "printed": 244, "raw": 0.86}}}), encoding="utf-8")
+    crops = PS.crop_index(notes / PS._SHOT_SUBDIR)
+    assert PS.crop_for(crops, ck, sent) == rel
+    assert PS.crop_for(crops, ck, "别的句子") is None
+    assert PS.crop_for(crops, "someoneelse2020X", sent) is None      # 同一句子、不同论文：不许串
+
+    ev = T.Evidence(ref="E1", citekey=ck, text=sent, role="citable", section="研究问题",
+                    note_file="n.md", note_line=3, score=0.8)
+    syn = {"summary": "S", "sections": [{"heading": "H", "claims": [{"text": "C", "refs": ["E1"]}]}],
+           "disputes": [], "gaps": []}
+    spec = T.TopicSpec(slug="s", title="T", question="Q", queries=["q"])
+    block = T.render_generated_block(spec, syn, [ev], crops=crops)
+    assert "[原文截图](../assets/shots/{})".format(rel) in block
+    # 问答页深一层：链接前缀是 ../../，与 vault 的 02-主题/问答/ 恰好对上
+    from src.scholar import qa as Q
+    qa_block = Q.render_qa_block("问题", {"answer": "A", "gaps": [], "caveats": [],
+                                          "points": [{"text": "C", "refs": ["E1"], "citekeys": [ck]}]},
+                                 [ev], crops=crops)
+    assert "[原文截图](../../assets/shots/{})".format(rel) in qa_block
+    # vault 侧只搬文件、不动链接（两边相对层级一致）
+    vault = tmp_path / "vault"
+    (vault / "02-主题").mkdir(parents=True)
+    assert mirror_shots_only(block, notes, vault) == 1
+    assert (vault / PS._SHOT_SUBDIR / rel).is_file()
+    assert mirror_shots_only(block, notes, vault) == 0                # 幂等

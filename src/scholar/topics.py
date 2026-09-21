@@ -47,7 +47,9 @@ from ..utils.logger import get_logger
 from .grounding import build_pool, check_numbers
 from .notes_index import write_if_changed
 from .thresholds import TOPICS_MIN_SIM, TOPICS_RELATIVE_ALPHA
+from . import page_shots
 from .vault import (
+    mirror_shots_only,
     ROLE_LABEL, extract_user_zone, generated_block_tampered, split_frontmatter,
     _gen_hash, GEN_END, _SAFE_KEY, _YAML_WORDS, _y,
 )
@@ -1070,7 +1072,9 @@ def _cite_str(refs: Sequence[str], ev_map: Dict[str, Evidence]) -> str:
 
 
 def render_generated_block(spec: TopicSpec, synthesis: dict,
-                           evidences: Sequence[Evidence]) -> str:
+                           evidences: Sequence[Evidence],
+                           crops: Optional[Dict[Tuple[str, str], str]] = None,
+                           crop_prefix: str = "../") -> str:
     """哨兵之间的正文：总述 → 小节论断 → 分歧 → 缺口 → 证据表。
 
     证据表列出全部召回证据（含未被引用的），并标注哪些没被用上。
@@ -1143,6 +1147,9 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
             loc += " · p.{}".format(e.pages)
         elif e.chapter:
             loc += " · {}".format(e.chapter)
+        rel = page_shots.crop_for(crops or {}, e.citekey, e.text or "")
+        if rel:      # 证据句在精读里已经渲染过出处图，这里只挂链接，不重复渲染
+            loc += " · [原文截图]({}{}/{})".format(crop_prefix, page_shots._SHOT_SUBDIR, rel)
         lines.append("- {} **{}** `[@{}]` {}{}".format(
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
@@ -1451,7 +1458,9 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
                            error="校验后没有任何有效论断（丢弃 {} 条，非法编号 {} 个）".format(
                                report.dropped_claims, report.invalid_refs))
 
-    gen_block = render_generated_block(spec, synthesis, evidences)
+    gen_block = render_generated_block(spec, synthesis, evidences,
+                                       crops=page_shots.crop_index(
+                                           Path(topics_dir).parent / page_shots._SHOT_SUBDIR))
     n_disputes = len(synthesis["disputes"])
     # W1（lost update）：synthesize_topic 实测一页要 3-4 分钟，用户完全可能在这期间在
     # Obsidian 里编辑「我的批注」区，也可能在 Properties 面板加一个自定义 frontmatter
@@ -2179,6 +2188,9 @@ def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, 
         seen.add(slug)
         dst = out_dir / "{}.md".format(slug)
         gen_v = to_wiki_links(gen, filenames)
+        if not dry_run:                       # 证据表里的出处图要搬进 vault（相对层级两边一致，链接不动）
+            report["shots_mirrored"] = report.get("shots_mirrored", 0) + mirror_shots_only(
+                gen_v, notes_dir, vault_dir)
         fm_v = dict(fm)
         fm_v["cssclasses"] = fm.get("cssclasses") or (
             ["lint-report"] if is_lint else ["topic-page"])

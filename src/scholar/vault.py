@@ -1006,6 +1006,39 @@ SHOT_DIR = "assets/shots"            # 与 notes._SHOT_DIR 同值；月度 md �
 _SHOT_LINK = re.compile(r"\]\(" + re.escape(SHOT_DIR) + r"/([^)/]+)/([^)]+)\)")
 
 
+_ANY_SHOT_LINK = re.compile(r"\]\((?:\.\./)*" + re.escape(SHOT_DIR) + r"/([^)/]+)/([^)]+)\)")
+
+
+def mirror_shots_only(text: str, notes_dir: Path, vault_dir: Path, *,
+                      referenced: Optional[Set[Tuple[str, str]]] = None) -> int:
+    """把正文里引用到的截图硬链接进 vault，**链接原样不动**。
+
+    概念页/问答页用：`topics/x.md` → `vault/02-主题/x.md`、`topics/qa/x.md` → `vault/02-主题/问答/x.md`
+    两边相对 `assets/shots/` 的层级**恰好一致**（`../` 与 `../../`），所以只需搬文件、不需要改写路径。
+    per-paper 笔记那条路走 `mirror_shots`（要把相对札记库根的路径改写成相对 `01-文献/`）。
+    """
+    n = 0
+    for ck, name in _ANY_SHOT_LINK.findall(text or ""):
+        if referenced is not None:
+            referenced.add((ck, name))
+        src, dst = notes_dir / SHOT_DIR / ck / name, vault_dir / SHOT_DIR / ck / name
+        if not src.is_file():
+            continue
+        try:
+            if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    dst.unlink()
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    shutil.copy2(src, dst)
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
 def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: bool = False,
                  referenced: Optional[Set[Tuple[str, str]]] = None) -> Tuple[List[str], int]:
     """把正文里引用到的原文截图镜像进 vault，并把链接改写成相对 `01-文献/` 的路径。

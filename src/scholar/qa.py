@@ -68,6 +68,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from ..utils.logger import get_logger
 from .embeddings import EmbeddingError
 from .notes_index import write_if_changed
+from . import page_shots
 from .topics import (
     DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, DEFAULT_USER_ZONE, GEN_BEGIN,
     GEN_END, TOPICS_DIRNAME, TopicError, TopicSpec, ValidationReport, _CITE_RE,
@@ -769,7 +770,9 @@ def _gap_hit_lines(hits: Sequence["GapHit"]) -> List[str]:
 def render_qa_block(question: str, qa: dict, evidences, *,
                     related_topics: Sequence[str] = (),
                     nearby_papers: Sequence[str] = (),
-                    titles: Optional[Dict[str, str]] = None) -> str:
+                    titles: Optional[Dict[str, str]] = None,
+                    crops: Optional[Dict[Tuple[str, str], str]] = None,
+                    crop_prefix: str = "../../") -> str:
     """哨兵之间的正文：问题 → 相关概念页 → 直接回答 → 论断 → 注意事项 → 没覆盖到的 → 证据表。
 
     「本次召回没覆盖到的」（gaps）**排在证据表之前而不是文末**：它是这一页最容易被
@@ -848,6 +851,9 @@ def render_qa_block(question: str, qa: dict, evidences, *,
             loc += " · p.{}".format(e.pages)
         elif getattr(e, "chapter", None):
             loc += " · {}".format(e.chapter)
+        rel = page_shots.crop_for(crops or {}, e.citekey, getattr(e, "text", "") or "")
+        if rel:      # 与 topics.render_generated_block 同型：只挂链接，不重复渲染
+            loc += " · [原文截图]({}{}/{})".format(crop_prefix, page_shots._SHOT_SUBDIR, rel)
         L.append("- {} **{}** `[@{}]` {}{}".format(
             mark, e.ref, e.citekey, " · ".join(m for m in meta if m), loc))
         if e.title:
@@ -1699,8 +1705,9 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
     if prev_q and question_key(prev_q) != question_key(question):
         return path, "taken"
     gen_block = render_qa_block(question, qa, evidences, related_topics=related_topics,
-                                titles=titles,
-                                nearby_papers=nearby_papers)
+                                titles=titles, nearby_papers=nearby_papers,
+                                crops=page_shots.crop_index(
+                                    qa_dir.parent.parent / page_shots._SHOT_SUBDIR))
     fm = build_qa_frontmatter(question, slug, qa, evidences, report,
                               now.isoformat(timespec="seconds"), preserved=fresh_fm,
                               extra_queries=extra_queries, roles=roles, min_sim=min_sim,
@@ -1799,6 +1806,10 @@ def sync_qa_to_vault(notes_dir, vault_dir, filenames: Dict[str, str], *,
         slug = str(fm["qa"])
         fm_v = dict(fm)
         fm_v["cssclasses"] = fm.get("cssclasses") or ["qa-page"]
+        if not dry_run:                       # 同 sync_topics_to_vault：搬文件、不改链接
+            from .vault import mirror_shots_only
+            report["shots_mirrored"] = report.get("shots_mirrored", 0) + mirror_shots_only(
+                gen, notes_dir, vault_dir)
         content, status = merge_qa_page(
             _render_frontmatter(fm_v), to_wiki_links(gen, filenames),
             (out_dir / "{}.md".format(slug)).read_text(encoding="utf-8")
