@@ -217,3 +217,38 @@ def test_finalize_hook_homes_and_never_raises(tmp_path, roots, capsys):
     (notes / RL.INDEX_JSON).unlink()                 # 索引没了：只告警，不抛
     M._home_pdfs_best_effort(notes, "2026-09-20-SM源头")
     assert "不影响归档" in capsys.readouterr().out
+
+
+def test_dead_link_does_not_silently_repoint_to_a_different_pdf_with_the_same_name(tmp_path, roots):
+    """F9-C：死链 + 目标位恰好有个同 citekey 的**别的** PDF（同一篇的另一版本），此前被当成
+    「上次搬完没回填」而把 bundle 静默改指过去。"""
+    import fitz
+    reading, downloads = roots
+    d = reading / "2026-09-05-t"
+    d.mkdir()
+    doc = fitz.open()
+    for _ in range(9):                                      # 目标位那份 9 页
+        doc.new_page()
+    doc.save(str(d / "k2020Dup.pdf")); doc.close()
+    notes, bdir = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/d", "Paper D", "k2020Dup", downloads / "gone.pdf")])
+    b = json.loads((bdir / "e1.paper.json").read_text("utf-8"))
+    b["n_pages"] = 3                                        # bundle 记的是 3 页 → 对不上
+    (bdir / "e1.paper.json").write_text(json.dumps(b, ensure_ascii=False, indent=2), "utf-8")
+    plan = RL.build_plan("2026-09-05-t", None, notes, 0, home=True)
+    assert plan[0].get("dead") and not plan[0]["backfill_only"]
+    RL.apply_plan(plan)
+    assert json.loads((bdir / "e1.paper.json").read_text("utf-8"))["pdf_path"].endswith("gone.pdf")
+
+
+def test_half_finished_move_self_heals_even_when_the_bucket_dir_would_be_recomputed(tmp_path, roots):
+    """F9-D：纯月份桶的目标目录按 bundle mtime 推；bundle 被别的流程重写过之后，重跑推出来的是
+    当天的目录，而 PDF 躺在当初那个日期目录里——此前自愈失效、判成死链。"""
+    reading, downloads = roots
+    old_dir = reading / "2026-09-18"
+    old_dir.mkdir()
+    (old_dir / "k2020Moved.pdf").write_bytes(b"pdf")
+    notes, bdir = _mk(tmp_path, "2026-09", [("e1", "10.1/m", "Paper M", "k2020Moved", downloads / "gone.pdf")])
+    plan = RL.build_plan("2026-09", None, notes, 0, home=True)
+    assert plan[0]["backfill_only"] and plan[0]["dst"] == old_dir / "k2020Moved.pdf"
+    RL.apply_plan(plan)
+    assert json.loads((bdir / "e1.paper.json").read_text("utf-8"))["pdf_path"].endswith("2026-09-18/k2020Moved.pdf")

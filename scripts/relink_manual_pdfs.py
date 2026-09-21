@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+from typing import Optional
 import shutil
 import sys
 from datetime import date
@@ -69,6 +70,25 @@ def _same_file_content(a: Path, b: Path) -> bool:
                 m.update(chunk)
         return m.digest()
     return h(a) == h(b)
+
+
+def _plausible_same_paper(bundle: dict, dst: Path) -> bool:
+    """目标位那份 PDF 像不像 bundle 记的这一篇：有 `n_pages` 就比页数，没有就只能放行。"""
+    want = bundle.get("n_pages")
+    if not want:
+        return True
+    try:
+        import fitz
+        with fitz.open(str(dst)) as d:
+            return d.page_count == int(want)
+    except Exception:                                # noqa: BLE001 —— 读不出就别拦，交给人看
+        return True
+
+
+def _find_homed(citekey: str) -> Optional[Path]:
+    """已经按 `<citekey>.pdf` 归位到 Reading 下某个目录的那一份（半完成自愈用）。"""
+    hits = sorted(reading_root().glob("*/{}.pdf".format(citekey)))
+    return hits[0] if len(hits) == 1 else None
 
 
 _DATED_BUCKET = re.compile(r"^\d{4}-\d{2}-\d{2}(-.+)?$")
@@ -180,6 +200,18 @@ def build_plan(month, pdf_dir, notes_dir, expect, home=False, reading_dir=""):
         # 视为 mv 已完成，本次跳过 mv 只补写 pdf_path，让「重跑自愈」真正成立而非整体 abort。
         p["backfill_only"] = (not p["already"] and bool(p["src"].name)
                               and not p["src"].is_file() and p["dst"].is_file())
+        if p["backfill_only"] and not _plausible_same_paper(p["data"], p["dst"]):
+            # F9-C：死链 + 目标位恰好有个同 citekey 的**别的** PDF（同一篇的另一版本），此前会被
+            # 当成「上次搬完没回填」而把 bundle 静默改指过去。页数对不上就不认，留成死链让人来看。
+            p["backfill_only"] = False
+            p["dead"] = True
+            continue
+        if not p["backfill_only"] and not p["already"] and bool(p["src"].name) and not p["src"].is_file():
+            # F9-D：纯月份桶的目标目录按 bundle mtime 推，bundle 一旦被别的流程重写过，重跑时
+            # 推出来的是当天的目录、而 PDF 躺在当初那个日期目录里，自愈失效、判成死链。
+            found = _find_homed(p["citekey"])
+            if found:
+                p["dst"], p["backfill_only"] = found, True
         if p["already"] or p["backfill_only"]:
             continue
         if not p["src"].is_file():

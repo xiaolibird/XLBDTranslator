@@ -1008,3 +1008,20 @@ def test_garbled_text_layer_is_reported_not_silently_zero(tmp_path, caplog):
     ok_pdf = _save(ok, tmp_path, "ok.pdf")
     with fitz.open(str(ok_pdf)) as d:
         assert not PS.text_looks_garbled(d) and PS.passage_windows(d)
+
+
+def test_source_pages_heading_does_not_masquerade_as_a_close_reading_section(tmp_path):
+    """F12：`**【原文页面】**` 正是 notes_index._CR_SECTION_RE 认的精读分节标题格式，会被当成一个
+    新分节（ingest 的 md 还原路径据此多还原出一个空节）。"""
+    from src.scholar.notes import write_notes
+    from src.scholar.notes_index import parse_note_md, _CR_SECTION_RE
+    seg, pdf = _segment_with_figure(tmp_path)
+    out = tmp_path / "notes"
+    out.mkdir()
+    res = write_notes([seg], {seg.paper_id: "k2020Fig"}, out_dir=out, filename="n", index_series="manual",
+                      pdf_paths={seg.paper_id: str(pdf)})
+    lines = Path(res["note_path"]).read_text("utf-8").splitlines()
+    assert any(l.strip() == "**原文页面**" for l in lines)
+    assert not any(_CR_SECTION_RE.match(l.strip()) and "原文页面" in l for l in lines)
+    secs = {h.get("section") for h in parse_note_md(Path(res["note_path"]))[0]["highlights"]}
+    assert "原文页面" not in secs and None not in secs

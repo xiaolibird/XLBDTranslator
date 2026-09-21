@@ -177,9 +177,13 @@ def _shot_pages_block(shots: Optional[Dict[str, Any]]) -> List[str]:
     if not pages:
         return []
     links = []
+    m0 = shots.get("_map") or {}
     for _, rel, v in pages:
         if v.get("how") == "figure-fallback":
             name = "{}所在页".format("/".join(v.get("labels") or []))
+        elif m0.get("how") == "label" and v.get("printed") == v.get("pdf_page"):
+            # 罗马页码页在 PDF 页标签里不是数字，to_printed 回退成了页序——别以「印刷页」名义显示（F13）
+            name = "PDF 第 {} 页".format(v["pdf_page"])
         else:
             name = "p.{}".format(v["printed"])
         links.append("[{}]({}/{})".format(name, _SHOT_DIR, rel))
@@ -187,7 +191,9 @@ def _shot_pages_block(shots: Optional[Dict[str, Any]]) -> List[str]:
     how = {"label": "页码为原文印刷页（PDF 自带页标签）", "header": "页码为原文印刷页（由页眉/页脚推得，PDF 第 1 页 = p.{}）"
            .format((m.get("offset") or 0) + 1), "pdf-order": "页码为 PDF 页序",
            "pdf-order(header-ignored)": "页码为 PDF 页序（页眉印的是期刊页码，札记标的不是）"}.get(m.get("how"), "")
-    out = ["**【原文页面】**", "", "{}：{}".format(how or "原文页面", " · ".join(links))]
+    # 标题**不能**写成 `**【原文页面】**`：那正是 notes_index._CR_SECTION_RE 认的精读分节标题格式，
+    # 会被当成一个新分节（ingest 的 md 还原路径据此多还原出一个空节）。用不同的写法避开（F12）。
+    out = ["**原文页面**", "", "{}：{}".format(how or "原文页面", " · ".join(links))]
     miss = shots.get("_missing") or []
     if miss:
         out.append("")
