@@ -22,6 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from ..utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 PAGE_DPI = 120
 CROP_DPI = 170          # 图表裁剪区域小，给高一点的分辨率才看得清坐标轴与表内数字
 JPEG_QUALITY = 82
@@ -822,6 +826,61 @@ def _page_blocks(page):
     return out
 
 
+_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+_COMMON_EN = frozenset("the of and to in a is that for with we are on as this by be an it from at which or "
+                       "not data model missing our results were was has have can may such been".split())
+
+
+def text_looks_garbled(doc, pages: int = 4) -> bool:
+    """文本层是不是坏的（ToUnicode 表缺失/错位，抽出来整篇是移位过的乱码）。
+
+    真库实例：MohanPearlJASA2019MissingDataGraphs.pdf 抽出来是 `Ehftqd 6'"( onqsq"xr` —— 每个字母
+    往前移了一位（`Figure 6 portrays`）。这种 PDF 的窗口全是乱码，跨语言向量自然谁也匹配不上
+    （实测最高余弦 0.46–0.52，全在阈值下），**已经是失败安全的**；这里只把它从静默变成一行告警，
+    顺便省掉给一整篇乱码算向量的开销。
+    不做自动纠偏：移位不是均匀的（连字与标点另有映射），猜错会产出自信的错图。换一份 PDF 才是解。
+    """
+    txt = "".join(doc[i].get_text()[:3000] for i in range(1, min(pages, doc.page_count)))
+    words = [w.lower() for w in _LATIN_WORD.findall(txt)]
+    if len(words) < 150:                       # 中文论文/图多的论文拉丁词本来就少，不判
+        return False
+    return sum(1 for w in words if w in _COMMON_EN) / len(words) < 0.05
+
+
+def _lines_from_words(page, y_tol: float = 3.0, col_gap_ratio: float = 0.12):
+    """块结构废了的时候，直接按词的坐标重建行。
+
+    真库实例：kwaf284.pdf（AJE 投稿版）14 页却有 6,990 个文本块、3,569 个词——每个词甚至每个
+    字都是一个独立块，`_merge_fragments` 的成对合并够不着，整篇只切出 12 个窗口、被窗口池守卫
+    整篇跳过。这里按 y 聚行、按横向大间隙切栏，重建出可用的行。
+    """
+    import fitz
+    words = [w for w in page.get_text("words") if (w[4] or "").strip()]
+    if not words:
+        return []
+    gap = page.rect.width * col_gap_ratio
+    rows: Dict[int, List] = {}
+    for w in words:
+        rows.setdefault(int(round(w[1] / y_tol)), []).append(w)
+    frags = []                                  # 同一 y 上被大间隙分开的两段属于不同栏
+    for _, ws in sorted(rows.items()):
+        ws.sort(key=lambda w: w[0])
+        cur = [ws[0]]
+        for w in ws[1:]:
+            if w[0] - cur[-1][2] > gap:
+                frags.append(cur); cur = [w]
+            else:
+                cur.append(w)
+        frags.append(cur)
+    out = []
+    for fr in frags:
+        r = fitz.Rect(fr[0][0], min(w[1] for w in fr), fr[-1][2], max(w[3] for w in fr))
+        out.append((r, " ".join(w[4] for w in fr), r.height))
+    # 按栏（x 中点分桶）再按 y 排，保证同栏的行在列表里相邻——窗口是按列表顺序切的
+    out.sort(key=lambda t: (round(((t[0].x0 + t[0].x1) / 2) / max(gap, 1)), t[0].y0))
+    return out
+
+
 def _merge_fragments(blocks):
     """逐行成块的 PDF（每行一个文本块）把相邻的碎块并回段落。
 
@@ -847,9 +906,30 @@ def passage_windows(doc) -> List[dict]:
     """正文（含附录）的行级滑动窗口：[{page(1起), rect, text, blk, pos}]。参考文献条目、页眉页脚不要。"""
     import fitz
     out: List[dict] = []
+    if text_looks_garbled(doc):
+        logger.warning("  ⚠️ PDF 文本层是乱码（ToUnicode 表坏了），本篇不做逐句出处定位；换一份 PDF 才是解")
+        return out
+    out = _windows_from(doc, from_words=False)
+    # 按**结果**决定要不要回退到按词重建行，而不是按块数这类结构代理指标：块结构看着碎、但
+    # `_merge_fragments` 能并回来的 PDF（双栏中文综述）走词路径反而会把左右栏交错在一起。
+    # 判据就是后面 locate_passages 用的那条窗口池退化线。
+    pages = len({w["page"] for w in out}) or doc.page_count
+    if len(out) < 3 * pages and doc.page_count >= 4:
+        alt = _windows_from(doc, from_words=True)
+        if len(alt) > len(out):
+            return alt
+    return out
+
+
+def _windows_from(doc, from_words: bool) -> List[dict]:
+    import fitz
+    out: List[dict] = []
     in_refs, ref_size, seen_refs = False, 0.0, False
     for pi in range(doc.page_count):
-        for blk in _merge_fragments(_page_blocks(doc[pi])):
+        page = doc[pi]
+        blocks = ([{"lines": _lines_from_words(page), "number": 0}] if from_words
+                  else _merge_fragments(_page_blocks(page)))
+        for blk in blocks:
             lines = []
             for r, txt, size in blk["lines"]:
                 if _REF_HEAD.match(txt):

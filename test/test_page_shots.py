@@ -937,3 +937,73 @@ def test_number_bonus_cannot_lift_an_unrelated_window_over_the_line(tmp_path):
             assert PS.locate_passages(d, sent, embed)[0] is not None
         finally:
             PS.PASSAGE_MIN_RAW = keep
+
+
+def test_lines_are_rebuilt_from_words_when_the_block_structure_is_useless(tmp_path):
+    """kwaf284（AJE 投稿版）14 页有 6,990 个文本块、3,569 个词——每个词一个块，`_merge_fragments`
+    的成对合并够不着，整篇只切出 12 个窗口、被窗口池守卫整篇跳过。MuPDF 自己生成的 PDF 会把同
+    一行的词并回一个块，造不出那种结构，所以直接单测按词重建行这一步。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    for row in range(6):
+        x = 50
+        for w in "Consider an analysis adjusted for".split():
+            pg.insert_text((x, 100 + row * 14), w, fontsize=9); x += len(w) * 5 + 4
+        x = 380                                                # 另一栏：与左栏的空隙远大于 12% 页宽
+        for w in "In our hypothetical example receiving".split():
+            pg.insert_text((x, 100 + row * 14), w, fontsize=9); x += len(w) * 5 + 4
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        lines = PS._lines_from_words(d[0])
+    texts = [t for _, t, _ in lines]
+    assert texts.count("Consider an analysis adjusted for") == 6
+    assert texts.count("In our hypothetical example receiving") == 6
+    assert not any("adjusted" in t and "hypothetical" in t for t in texts)      # 两栏不许并进同一行
+    assert texts[:6] == ["Consider an analysis adjusted for"] * 6              # 同栏的行在列表里相邻
+
+
+def test_window_pool_falls_back_to_words_only_when_the_block_path_is_degenerate(tmp_path, monkeypatch):
+    """回退判据看**结果**（窗口池够不够），不看块数这类结构代理指标：块结构看着碎但能并回来的
+    双栏中文综述走词路径反而会把左右栏交错在一起（吴博综述实测 216 → 1041 个交错窗口）。"""
+    doc = fitz.open()
+    for _ in range(5):                                         # 守卫只对 ≥4 页的 PDF 生效
+        pg = doc.new_page()
+        for k, y in enumerate((100, 300, 500)):                # 每页 3 段 → 块路径每页 3 个窗口，不算退化
+            pg.insert_textbox(fitz.Rect(60, y, 520, y + 160),
+                              "Paragraph {} about data obtained from remote sensing equipment via satellite that "
+                              "may be missing observations at certain times due to malfunction. ".format(k) * 2, fontsize=10)
+    pdf = _save(doc, tmp_path, "five.pdf")
+    with fitz.open(str(pdf)) as d:
+        seen = []
+        real = PS._windows_from
+        monkeypatch.setattr(PS, "_windows_from", lambda doc, from_words: (seen.append(from_words), real(doc, from_words))[1])
+        assert PS.passage_windows(d) and seen == [False]        # 块路径够用：根本不去碰词路径
+        seen.clear()
+        monkeypatch.setattr(PS, "_page_blocks", lambda page: [])   # 块路径颗粒无收
+        assert PS.passage_windows(d) and seen == [False, True]     # 回退到词路径并拿到窗口
+
+
+def test_garbled_text_layer_is_reported_not_silently_zero(tmp_path, caplog):
+    """MohanPearlJASA2019：ToUnicode 表坏了，抽出来是 `Ehftqd 6'"( onqsq"xr`（每个字母移了一位）。
+    向量匹配自然全在阈值下（失败安全），但要让人看见原因，而不是静默零命中。不做自动纠偏——
+    移位不均匀，猜错会产出自信的错图。"""
+    doc = fitz.open()
+    for _ in range(5):
+        pg = doc.new_page()
+        pg.insert_textbox(fitz.Rect(60, 100, 520, 700),
+                          ("Ehftqd 6 onqsq xr mnsgdq dw lokd ne hcdmshﬀ akd ptdqx ats hm sghr b rd sgd qdbnudq "
+                           "ahkhsx ne sgd hcdmshﬀ akd ptdqx hr mns fr q msddc ax sgd sgdnqdl bnmrhcdqdc gdqd. ") * 6,
+                          fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        assert PS.text_looks_garbled(d)
+        assert PS.passage_windows(d) == []
+    ok = fitz.open()
+    for _ in range(5):
+        ok.new_page().insert_textbox(fitz.Rect(60, 100, 520, 700),
+                                     ("Figure 6 portrays another example of an identifiable query, but in this case the "
+                                      "recoverability of the identifiable query is not guaranteed by the theorem here. ") * 6,
+                                     fontsize=9)
+    ok_pdf = _save(ok, tmp_path, "ok.pdf")
+    with fitz.open(str(ok_pdf)) as d:
+        assert not PS.text_looks_garbled(d) and PS.passage_windows(d)
