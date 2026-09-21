@@ -59,6 +59,35 @@ def test_download_pdf_non_200_returns_none(tmp_path):
     assert cr.download_pdf("http://x/y.pdf", tmp_path / "a.pdf", client=client) is None
 
 
+def test_arxiv_export_url_rewrites_only_main_site_pdf_links():
+    assert cr._arxiv_export_url("https://arxiv.org/pdf/2302.05049.pdf") == "https://export.arxiv.org/pdf/2302.05049"
+    assert cr._arxiv_export_url("http://arxiv.org/pdf/2109.01876v2") == "https://export.arxiv.org/pdf/2109.01876v2"
+    assert cr._arxiv_export_url("https://arxiv.org/pdf/math/0501001v1.pdf") == "https://export.arxiv.org/pdf/math/0501001v1"
+    assert cr._arxiv_export_url("https://export.arxiv.org/pdf/2302.05049") is None      # 已是镜像：不再绕
+    assert cr._arxiv_export_url("https://europepmc.org/articles/PMC1?pdf=render") is None
+
+
+@pytest.mark.parametrize("validate", [False, True])
+def test_download_pdf_falls_back_to_export_mirror_when_arxiv_penalises(tmp_path, validate, monkeypatch):
+    """主站 CDN 罚 406 时换 export 镜像再下一次；非 arXiv 的 406 不重试。"""
+    import src.scholar.fulltext as FT
+    monkeypatch.setattr(FT, "validate_pdf_bytes", lambda data: (True, ""))
+    seen = []
+
+    def handler(r):
+        seen.append(str(r.url))
+        if r.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=b"%PDF-1.7\n...body...")
+        return httpx.Response(406)
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = cr.download_pdf("https://arxiv.org/pdf/2302.05049.pdf", tmp_path / "a.pdf", client=client, validate=validate)
+    assert p is not None and p.read_bytes().startswith(b"%PDF")
+    assert seen[-1] == "https://export.arxiv.org/pdf/2302.05049"
+    seen.clear()
+    assert cr.download_pdf("https://x.org/y.pdf", tmp_path / "b.pdf", client=client, validate=validate) is None
+    assert len(seen) == 1
+
+
 # ---------------- pdf_to_text 单页上限 ----------------
 
 def _three_page_pdf(tmp_path):

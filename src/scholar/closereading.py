@@ -35,6 +35,15 @@ AUTO_MAX_CHARS = 40000
 AUTO_PAGE_MAX_CHARS = 20000
 
 
+_ARXIV_PDF_RE = re.compile(r"^https?://(?:www\.)?arxiv\.org/pdf/([^?#]+?)(?:\.pdf)?(?:[?#].*)?$", re.I)
+
+
+def _arxiv_export_url(url: str) -> Optional[str]:
+    """arxiv.org/pdf/<id>[.pdf] → export.arxiv.org/pdf/<id>；非 arXiv 主站 PDF 链接返回 None。"""
+    m = _ARXIV_PDF_RE.match(url or "")
+    return "https://export.arxiv.org/pdf/{}".format(m.group(1)) if m else None
+
+
 def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
                  max_bytes: int = 40_000_000, *, validate: bool = False) -> Optional[Path]:
     """下载 PDF 到 dest。非 200 / 非 PDF / 超限 / 异常 → None（不抛出）。
@@ -55,6 +64,12 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
             r = polite_get(c, url, follow_redirects=True, headers=PDF_ACCEPT_HEADERS)
         else:
             r = c.get(url)
+        alt = _arxiv_export_url(url) if r.status_code in (403, 406, 429) else None
+        if alt:
+            # 主站 CDN 按 IP+TLS 指纹罚 406（见 fulltext.tls_context），罚期内 export 镜像照常可用
+            # （2026-09-22 实测同一时刻主站 406、export 200）。只回退一次，仍受 _arxiv_throttle 节流。
+            logger.info("  ↪ arXiv 主站返回 {}，改走 export 镜像".format(r.status_code))
+            r = c.get(alt)
         if r.status_code != 200:
             logger.warning("  ⚠️ 下载 PDF 返回 {}: {}".format(r.status_code, url[:60]))
             return None

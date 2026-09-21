@@ -433,6 +433,18 @@ def test_cmd_run_wires_the_streak_and_gate_helpers():
     assert "if counts_toward_streak(\"abstract_only\", expand, None):" in src
 
 
+def test_cmd_run_attaches_shots_per_paper_not_at_batch_end():
+    """截图须在每篇写盘、落账本之后立刻补。2026-09-22 实测：放在批尾时，连挂 3 篇触发熔断
+    `return 1` 直接跳过了批尾，第 1 篇成功改写的精读既没配图、旧截图行也没清。"""
+    import inspect
+    src = inspect.getsource(bd.cmd_run)
+    ledger_i = src.index("_save_ledger_or_shout(notes_dir, led, expand, ck, bdir)")
+    shots_i = src.index("_attach_shots_best_effort(")
+    assert ledger_i < shots_i < src.index("save_ledger(notes_dir, led, expand)\n    except"), \
+        "补截图必须在逐篇成功分支里、账本落盘之后（它读账本里的 pdf），不能挪到批尾"
+    assert src.count("_attach_shots_best_effort(") == 1
+
+
 def test_abstract_level_never_overwrites_an_existing_fulltext_reading():
     """第 2 轮审计（MAJOR）：`abstract_only` 闸此前只对 `--expand` 生效。补深度批的目标集本就限定
     `has_full_text_reading=True`——全文这次抓不到、退化成摘要级时，只要新产出的带 tag 句子数不比

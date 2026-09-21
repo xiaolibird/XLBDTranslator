@@ -811,8 +811,12 @@ def _save_ledger_or_shout(notes_dir: Path, led: dict, expand: bool, ck: str, bdi
         return False
 
 
-def _attach_shots_best_effort(notes_dir: Path, settings, led: dict, touched: dict) -> None:
+def _attach_shots_best_effort(notes_dir: Path, settings, led: dict, touched: dict,
+                              cache: Optional[dict] = None) -> None:
     """给本轮改写过精读节的 md 补原文截图（逐句出处 + 整页 + 图表）。best-effort：失败只告警。
+
+    每篇写盘后立刻调用（不等整批收尾）：熔断中止、被 kill 都不会留下没图或旧图残留的篇目。
+    cache 在同一批内复用向量函数，只探活一次。
 
     文本手术只替换到最后一句证据，上一轮插在句后的截图行与「原文页面」块会残留——这里对本轮
     改写过的论文一律先清后插（找不到 PDF 的也清，旧图对不上新句子）；同一份 md 里没改写的论文
@@ -821,7 +825,10 @@ def _attach_shots_best_effort(notes_dir: Path, settings, led: dict, touched: dic
     try:
         from src.scholar.notes import attach_shots_to_md
         from src.scholar.embeddings import passage_embed_fn
-        embed = passage_embed_fn(settings.llm)
+        cache = {} if cache is None else cache
+        if "embed" not in cache:
+            cache["embed"] = passage_embed_fn(settings.llm)
+        embed = cache["embed"]
         done = led.get("done") or {}
         pdf_for = lambda ck: (done.get(ck) or {}).get("pdf")        # noqa: E731
         n = 0
@@ -831,7 +838,7 @@ def _attach_shots_best_effort(notes_dir: Path, settings, led: dict, touched: dic
                 continue
             rep = attach_shots_to_md(md, pdf_for, notes_dir, embed_fn=embed, strip_if_no_shots=set(cks))
             n += rep["passages"]
-        print("   🖼 原文截图：{} 份札记 · 逐句出处 {} 句".format(len(touched), n), flush=True)
+        print("   🖼 原文截图：逐句出处 {} 句".format(n), flush=True)
     except Exception as e:                                          # noqa: BLE001
         print("   ⚠️ 原文截图失败（不影响本轮精读写回）：{}: {}".format(type(e).__name__, e), flush=True)
 
@@ -897,7 +904,7 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         return 2
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     ok = fail = 0
-    touched: Dict[str, set] = {}          # 本轮改写过精读节的 md → citekey，收尾补原文截图
+    shot_cache: dict = {}   # 同批复用截图用的向量函数          # 本轮改写过精读节的 md → citekey，收尾补原文截图
     streak = 0          # 连续失败计数——限流/欠费是通路级故障，见下方熔断
 
     for n, entry in enumerate(targets, start=1):
@@ -1076,10 +1083,10 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
                            "note_file": entry.get("note_file"), "backup": bdir.name,
                            # 这篇深读用的 PDF：原文截图靠它（attach_shots 优先读这一项）
                            "pdf": str(Path(used_pdf).resolve()) if Path(used_pdf).is_file() else None}
-        touched.setdefault(entry.get("note_file"), set()).add(ck)
         ok += 1
         streak = 0
         _save_ledger_or_shout(notes_dir, led, expand, ck, bdir)
+        _attach_shots_best_effort(notes_dir, settings, led, {entry.get("note_file"): {ck}}, shot_cache)
 
     try:
         save_ledger(notes_dir, led, expand)
@@ -1087,8 +1094,6 @@ def cmd_run(args, settings, notes_dir: Path, index: dict) -> int:
         logger.error("⛔ 收尾写账本失败（{}）：本轮成功 {} 篇的进度可能没落盘，"
                      "下一轮会重跑它们。请修好磁盘/权限后重跑。", e, ok)
         return 1
-    if touched and args.apply:
-        _attach_shots_best_effort(notes_dir, settings, led, touched)
     print("\n完成：成功 {} / 失败 {}{}".format(
         ok, fail, "" if args.apply else "（干跑，未写盘）"))
     if ok and args.apply:
