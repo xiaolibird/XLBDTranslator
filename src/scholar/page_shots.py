@@ -771,7 +771,9 @@ PASSAGE_APPX_PENALTY = 0.03  # 附录常把正文的话再说一遍：分数接�
 # 阈值为什么不往上抬（2026-09-21 对抗审核 A，49 对逐张看图）：纯余弦 0.62–0.66 这一带 11 对准、
 # 12 对不准，完全分不开。不准的那些几乎都是**真出处当时够不着**（在附录里、被页码锁在错页），
 # 够得着之后真出处的余弦高出一大截（0.78/0.80/0.78）。所以修的是候选池与约束，不是阈值。
-_REF_HEAD = re.compile(r"^\s*(References?|REFERENCES?|Bibliography|BIBLIOGRAPHY|Literature Cited|参考文献)\s*$")
+# 只认复数：回归表里的参照组单元格就叫「Reference」，放宽成单数会把它当成参考文献标题，后半篇
+# 正文一个窗口都切不出来（liang2026 BMJ，p.7–12 全空，句子被配到第 1 页的标题框上——看图才发现）。
+_REF_HEAD = re.compile(r"^\s*(References|REFERENCES|Bibliography|BIBLIOGRAPHY|Literature Cited|参考文献)\s*$")
 # References 之后不是全文终点：附录里的补充表、消融、完整超参恰恰是证据句最爱引的地方（对抗审核 A：
 # 全库 116 份 PDF 在 References 之后还有 ≥8 页，出处在附录的句子要么漏配、要么被配到正文里的相似物）。
 _APPX_HEAD = re.compile(

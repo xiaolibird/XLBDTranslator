@@ -901,3 +901,16 @@ def test_wordy_table_row_between_the_rules_is_not_a_prose_wall(tmp_path):
     with fitz.open(str(pdf)) as d:
         r, how = PS.find_figure_bbox(d[0], "Table 1")
     assert how == "caption+rules" and r.y0 <= 91 and r.y1 >= 218
+
+
+def test_reference_category_cell_in_a_table_is_not_the_references_heading(tmp_path):
+    """回归表里的参照组单元格「Reference」不是参考文献标题——当成标题的话后半篇正文全部丢掉。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 80), "Never smoker", fontsize=9)
+    pg.insert_text((300, 80), "Reference", fontsize=9)
+    pg.insert_textbox(fitz.Rect(60, 200, 520, 300), "Data obtained from remote sensing equipment via satellite may be missing "
+                      "observations at certain times due to transient satellite malfunction after the table.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        assert any("satellite" in w["text"] for w in PS.passage_windows(d))
