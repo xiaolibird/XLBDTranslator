@@ -32,7 +32,7 @@ JPEG_QUALITY = 82
 ASSET_DIR = "assets/shots"
 # 裁剪算法一变就 +1：每篇目录下的 `.v` 记着生成它的版本，不一致则整篇强制重渲染。
 # 没有它的话，改了算法重跑也只会命中旧缓存——错图永远留在库里。
-SHOT_VERSION = "6"
+SHOT_VERSION = "7"
 
 _KINDS = {"fig": "Fig.", "table": "Table", "box": "Box", "algorithm": "Algorithm"}
 _QUAL = r"(Extended\s+Data|Supplementary|Supplemental|Supp\.?|Suppl\.?|Appendix|扩展数据|补充材料|补充|附)?"
@@ -60,8 +60,17 @@ _PROSE_TAIL = re.compile(
 _LOWER_TAIL = re.compile(r"^\s+(?!continued\b|cont\b)[a-z]{2,}\b")
 
 
+# 编号后紧跟右括号或「(a) 小写词」也是正文引用：「(Tables 1 and Appendix Table 9) using…」
+# 「Figure 3(a) shows a graphical model…」——被当成图注时，定位会停在引用它的那一页，真图注所在页
+# 反而找不到（2026-09-22 抽样 349 个失败里亲眼看到两例）。
+_PAREN_TAIL = re.compile(r"^(?:\s*\)|\s*\([a-z]\)\s+[a-z]{2,})")
+
+
+_SUBCAP = re.compile(r"^\s*\(?[a-h]\)\s")
+
+
 def _is_prose_mention(kind: str, tail: str) -> bool:
-    if _PROSE_TAIL.match(tail or ""):
+    if _PROSE_TAIL.match(tail or "") or _PAREN_TAIL.match(tail or ""):
         return True
     return not kind.lower().startswith("algorithm") and bool(_LOWER_TAIL.match(tail or ""))
 
@@ -441,6 +450,42 @@ def _rule_table(page, cap, other_caps):
     return None
 
 
+def _hrules(page, min_w: float = 80):
+    """页上的长横线（booktabs 表线 / 算法框线）。高度可以是 0（画线命令），所以只看宽高，不做求并。"""
+    import fitz
+    out = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.height < 2.5 and r.width > min_w:
+            out.append(r)
+    return out
+
+
+def _algorithm_region(page, cap, others):
+    """算法框：LaTeX 的 algorithm / algorithm2e「ruled」样式是三条等宽横线——顶线、标题下的中线、底线，
+    伪代码夹在中线与底线之间。按线定界，不靠「找图形」：伪代码是纯文字，此前一律被当成图去找图形区，
+    68 个算法框全部退回整页（2026-09-22 诊断）。没有这组线（编号列表式的伪代码）返回 None，交给原逻辑。
+    """
+    import fitz
+    rules = [r for r in _hrules(page, 60) if _x_overlap(r, cap) > min(r.width, cap.width) * 0.5]
+    mid = [r for r in rules if -3 <= r.y0 - cap.y1 <= 14]
+    if not mid:
+        return None
+    m = min(mid, key=lambda r: r.y0)
+    same = [r for r in rules if abs(r.x0 - m.x0) < 15 and abs(r.x1 - m.x1) < 15]
+    top = [r for r in same if -3 <= cap.y0 - r.y1 <= 14]
+    below = sorted([r for r in same if r.y0 > m.y1 + 12], key=lambda r: r.y0)
+    for oc in others:                                  # 底线不许越过下一个图注
+        below = [r for r in below if not (oc.y0 > m.y1 and r.y0 > oc.y0)]
+    if not below:
+        return None
+    bot = below[0]
+    y0 = min(r.y0 for r in top) if top else cap.y0
+    # 横向要同时盖住标题：有的排版标题比框线向左伸出（chauhan2024 的标题从 x=57 起、框线从 118 起，
+    # 只按框线裁会把「Algorithm 1」切掉半截）
+    return fitz.Rect(min(m.x0, bot.x0, cap.x0), y0 - 1, max(m.x1, bot.x1, cap.x1), bot.y1 + 1)
+
+
 def find_figure_bbox(page, label: str):
     """按图注定位图/表/Box/算法的版面区域。返回 (fitz.Rect | None, how)。
 
@@ -481,24 +526,39 @@ def find_figure_bbox(page, label: str):
 
     if kind == "table":
         tcaps = [r for (q, k, n), r in caps_all if k == "table"]
-        region, how, ruled = None, "not-found", None
+        region, how, ruled, flip = None, "not-found", None, None
         for kw in ({}, {"horizontal_strategy": "lines", "vertical_strategy": "text"}):
             tabs = _detect_tables(page, **kw)
             if not tabs:
                 continue
-            m, _ = _match_tables(tcaps, tabs)
+            m, orient = _match_tables(tcaps, tabs)
             ci = tcaps.index(cap0)
             if ci in m:
                 region, how = fitz.Rect(tabs[m[ci]]) | cap, "caption+table"
                 break
+            # 整页口径配不上这一个：同一页上「表注在上」与「表注在下」的表可以混排（heile26a p.8：
+            # 左栏表注在下、右栏表注在上）。只在**没被整页配对占用**的表里按反方向找，整页口径照旧优先。
+            used = set(m.values())
+            alt = []
+            for ti, t in enumerate(tabs):
+                if ti in used:
+                    continue
+                gap = (cap0.y0 - t.y1) if orient == "cap_above" else (t.y0 - cap0.y1)
+                if -6 <= gap <= 40 and _x_overlap(cap0, t) > min(cap0.width, t.width) * 0.5:
+                    alt.append((gap, ti))
+            if alt and flip is None:
+                flip = fitz.Rect(tabs[min(alt)[1]]) | cap
             # （试过、撤掉了）检出的表框把表注自己也包进去时，拿表注把框切成两截、取大的那截当表：
             # 真库 102 个这类失败能救回 29 个，但抽 9 张亲眼看有 4 张是错的——会把表注包进去的框本身
             # 就是过度检出（连带下面整张折线图、横排表旁的整页正文）。错裁比不裁危险，继续退回整页。
         if region is None:
             rt = _rule_table(page, cap, others)
-            if rt is None:
+            if rt is not None:
+                region, how, ruled = rt | cap, "caption+rules", rt
+            elif flip is not None:                 # 前两条都不中，才用反方向配上的那张表
+                region, how = flip, "caption+table(flip)"
+            else:
                 return None, "not-found"
-            region, how, ruled = rt | cap, "caption+rules", rt
         below = region.y1 > cap.y1 + 4
         region = _stop_before(region, cap, page, others, below=below, protect=ruled) | cap
         if region.height < cap.height + 30:       # 只裁到表注本身（无线表没检出）→ 交给整页兜底
@@ -518,6 +578,10 @@ def find_figure_bbox(page, label: str):
             if 0 <= t.y0 - region.y1 < 10 and _x_overlap(t, region) > t.width * 0.6 and t.height < 60 \
                     and not any(t == o for o in others):
                 region |= t
+    elif kind == "algorithm" and _algorithm_region(page, cap0, others) is not None:
+        region, how = _algorithm_region(page, cap0, others), "algorithm-rules"
+        if region.height < 36:
+            return None, "not-found"
     elif kind in ("fig", "algorithm"):
         def grow(side_above: bool):
             pool = ([r for r in gfx if r.y1 <= cap.y0 + 6] if side_above else
@@ -528,8 +592,16 @@ def find_figure_bbox(page, label: str):
             if not pool:
                 return None
             edge = pool[0].y1 if side_above else pool[0].y0
-            if abs((cap.y0 - edge) if side_above else (edge - cap.y1)) > 60:
-                return None                        # 离图注太远，多半不是它的图
+            dist = abs((cap.y0 - edge) if side_above else (edge - cap.y1))
+            if dist > 60:
+                # 离图注太远，多半不是它的图——除非隔在中间的全是子图小标题「(a) … (b) …」
+                # （MoE-Health Fig. 3、CANDOR Fig. 5：子图各带一段说明，总图注在最下面）
+                lo, hi = (edge, cap.y0) if side_above else (cap.y1, edge)
+                between = [t for r_, t in _text_blocks(page)
+                           if r_.y0 >= lo - 2 and r_.y1 <= hi + 2 and _x_overlap(r_, cap) > 0 and r_ != cap0]
+                if not (dist <= 180 and between and all(_SUBCAP.match(t) for t in between)):
+                    return None
+                relaxed.append(True)
             reg = fitz.Rect(pool[0])
             for r in pool[1:]:
                 gap = (reg.y0 - r.y1) if side_above else (r.y0 - reg.y1)
@@ -541,7 +613,34 @@ def find_figure_bbox(page, label: str):
                 if (not side_above) and oc.y0 >= cap.y1 and oc.y0 < reg.y1 and _x_overlap(oc, reg) > 0:
                     reg.y1 = oc.y0 - 2
             return reg
-        region = grow(True) or grow(False)         # 多数期刊图注在图下；JMIR 等在图上
+        relaxed: List[bool] = []
+
+        def side():
+            # 侧栏图注（npj / bioRxiv 常见）：图在图注左边或右边、纵向与图注重叠
+            def beside(r):
+                return (_x_overlap(r, cap) <= 0 and (0 <= r.x0 - cap.x1 < 40 or 0 <= cap.x0 - r.x1 < 40)
+                        and min(r.y1, cap.y1) - max(r.y0, cap.y0) > min(r.height, cap.height) * 0.5)
+            pool = [r for r in gfx if r.width > 20 and r.height > 20 and beside(r)]
+            if not pool:
+                return None
+            reg = fitz.Rect(max(pool, key=lambda r: r.get_area()))
+            on_right = reg.x0 >= cap.x1 - 1
+            for _ in range(4):
+                for r in gfx:
+                    if (r.x0 >= cap.x1 - 1) == on_right and r.intersects(reg + (-40, -40, 40, 40)) \
+                            and _x_overlap(r, cap) <= 0:
+                        reg |= r
+            # 这片图形若紧挨着别的图注，它是别的图（双栏页里另一栏的图）
+            for oc in others:
+                if _x_overlap(oc, reg) > oc.width * 0.5 and (0 <= oc.y0 - reg.y1 < 60 or 0 <= reg.y0 - oc.y1 < 60):
+                    return None
+            return reg
+
+        region, how = grow(True) or grow(False), "caption+graphics"   # 多数期刊图注在图下；JMIR 等在图上
+        if region is not None and relaxed:
+            how = "caption+graphics(subcap)"
+        if region is None:
+            region, how = side(), "caption+graphics(side)"                # npj / bioRxiv 侧栏图注
         if region is None:
             return None, "not-found"
         for t, txt in _text_blocks(page):          # 坐标轴/图例等图内文字
@@ -550,14 +649,15 @@ def find_figure_bbox(page, label: str):
                     and not _is_prose(t, txt, region.width) and t != cap0:
                 region |= t
         region |= cap
-        how = "caption+graphics"
     else:                                          # Box：标题块所在的有底色矩形
         holders = [r for r in gfx if r.contains(cap0) and r.get_area() > cap0.get_area() * 4]
         if not holders:
             return None, "not-found"
         region = min(holders, key=lambda r: r.get_area())
         how = "box"
-    if kind != "box":
+    # 算法框的四边已由框线定死；子图放宽/侧栏两条路径是 2026-09-22 新加的，外扩在双栏页上会连锁
+    # 吞进另一栏（mandyam26a Fig. 5 把右栏正文整栏截了进来）——这三种都不外扩。
+    if kind != "box" and not how.startswith("algorithm") and "(" not in how:
         region = _widen(region, cap, page, others)
     region = (region + (-8, -8, 8, 8)) & pr
     for o in others:                               # 8pt 留白不许压进紧随其后的下一个图注
@@ -568,15 +668,111 @@ def find_figure_bbox(page, label: str):
     return region, how + ("(lenient)" if lenient else "")
 
 
+def _big_gfx(page, frac: float = 0.03):
+    import fitz
+    pr = page.rect
+    out = []
+    for d in page.get_drawings():
+        r = fitz.Rect(d["rect"])
+        if r.get_area() > pr.get_area() * frac and r.get_area() < pr.get_area() * 0.95:
+            out.append(r)
+    for img in page.get_images(full=True):
+        try:
+            out.extend(fitz.Rect(r) for r in page.get_image_rects(img[0])
+                       if fitz.Rect(r).get_area() > pr.get_area() * frac)
+        except Exception:
+            pass
+    return out
+
+
+def find_figure_cross_page(doc, pdf_index: int, label: str):
+    """图与图注被排在相邻两页：图注在页首、图在上一页（npj 常见整页图 + 下页图注），或图注在页尾、
+    图在下一页。返回 (邻页页序, 图区域, 图注区域) 或 None。
+
+    只在同页定位失败后才调用。三道闸，缺一不认：①图注这一页、图注靠邻页那一侧**没有**大图形；
+    ②邻页的大图形合计占页面 ≥ 20%；③邻页这片图形旁边**没有**别的图注（否则它是别的图）。
+    """
+    import fitz
+    key = norm_label(label)
+    if not key or key[1] != "fig":
+        return None
+    # 扫描件整篇不做：每页都是一张整页图，「邻页的大图形」永远成立（1975 年打字稿报告抽 13 张错 5 张）
+    full = 0
+    for i in range(doc.page_count):
+        pg_ = doc[i]
+        if any(r.get_area() > pg_.rect.get_area() * 0.7 for r in _big_gfx(pg_, 0.5)):
+            full += 1
+    if full >= max(3, doc.page_count * 0.6):
+        return None
+    page = doc[pdf_index - 1]
+    # 跨页是新路径，限定词必须完全一致：Supplementary Fig. 3 不许配给正文 Fig. 3
+    mine = [r for (cq, ck, cn), r in _captions(page) if (cq, ck, cn) == key]
+    if not mine:
+        return None
+    cap = _full_caption(page, mine[0])
+    H = page.rect.height
+    at_top, at_bottom = cap.y0 < H * 0.3, cap.y1 > H * 0.7
+    here = _big_gfx(page)
+    for nb, cond in ((pdf_index - 1, at_top), (pdf_index + 1, at_bottom)):
+        if not cond or not (1 <= nb <= doc.page_count):
+            continue
+        near = [r for r in here if (r.y1 <= cap.y0 if nb < pdf_index else r.y0 >= cap.y1)]
+        if near:                                   # 图注这一页、朝邻页那一侧就有图：不是跨页
+            continue
+        npg = doc[nb - 1]
+        big = _big_gfx(npg)
+        if not big:
+            continue
+        reg = fitz.Rect(big[0])
+        for r in big[1:]:
+            reg |= r
+        if reg.get_area() < npg.rect.get_area() * 0.2:
+            continue
+        # 邻页上只要有任何图注/表注，它的图就归那个图注——真正的跨页图，那一页只有图、没有图注
+        # （npj 整页图 + 下页图注；Nature 投稿版整页图）。只查「紧挨着」不够：bioRxiv 上一页的图注
+        # 常与图隔着一段，照样被错拼过来（2026-09-22 抽 9 张错 2 张）。
+        if any(k in ("fig", "table") for (_, k, _), _r in _captions(npg)):
+            continue
+        # 那片「大图形」里有成段正文 = 扫描页（整页是一张图，OCR 文字层铺满）：不是图
+        # （老式打字稿报告每页都是整页扫描图，抽 9 张错 3 张）。
+        if sum(1 for t, txt in _text_blocks(npg) if t.intersects(reg) and _is_prose(t, txt, reg.width * 0.5)) >= 2:
+            continue
+        for t, txt in _text_blocks(npg):           # 图内文字（坐标轴、图例）
+            if t.intersects(reg) and not _is_prose(t, txt, reg.width):
+                reg |= t
+        return nb, (reg + (-6, -6, 6, 6)) & npg.rect, (cap + (-6, -6, 6, 6)) & page.rect
+    return None
+
+
 def render_figure(doc, pdf_index: int, label: str, out: Path, dpi: int = CROP_DPI):
-    """裁出图/表；定位失败返回 (None, 'not-found')，不落盘。"""
+    """裁出图/表；定位失败返回 (None, 'not-found')，不落盘。图与图注跨页时把两块竖向拼成一张。"""
     import fitz
     page = doc[pdf_index - 1]
     rect, how = find_figure_bbox(page, label)
-    if rect is None:
+    if rect is not None:
+        _save(page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False), out)
+        return out, how
+    xp = find_figure_cross_page(doc, pdf_index, label)
+    if xp is None:
         return None, how
-    _save(page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False), out)
-    return out, how
+    nb, freg, creg = xp
+    from PIL import Image
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    ims = []
+    for pg, clip in ((doc[nb - 1], freg), (page, creg)):
+        pix = pg.get_pixmap(matrix=mat, clip=clip, alpha=False)
+        ims.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+    W = max(im.width for im in ims)
+    canvas = Image.new("RGB", (W, sum(im.height for im in ims) + 12), "white")
+    y = 0
+    for im in ims:                                 # 图在上、图注在下，与版面阅读顺序一致
+        canvas.paste(im, ((W - im.width) // 2, y))
+        y += im.height + 12
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp.jpg")
+    canvas.save(str(tmp), quality=JPEG_QUALITY)
+    tmp.replace(out)
+    return out, "cross-page"
 
 
 def find_label_page(doc, label: str, hint: Optional[int] = None) -> Optional[int]:

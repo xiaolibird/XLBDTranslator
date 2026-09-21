@@ -1042,3 +1042,82 @@ def test_publisher_cover_page_gives_a_negative_offset(tmp_path):
         assert (pm.how, pm.offset) == ("header", -1) and pm.to_pdf(2) == 3 and pm.to_printed(11) == 10
         pm2 = PS.build_page_map(d, [2, 11])        # 11 = PDF 总页数：印刷页到不了，只能是按 PDF 页序记的
         assert pm2.how == "pdf-order(header-ignored)" and pm2.to_pdf(11) == 11
+
+
+# ---------------- 2026-09-22：退回整页的四类（各对应一个亲眼看到的错） ----------------
+
+def test_algorithm_box_is_bounded_by_its_three_rules_and_keeps_a_protruding_title(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((57, 96), "Algorithm 1 COntinuous Patient state PERceiver", fontsize=9)   # 标题比框线向左伸出
+    for y in (84, 104, 250):                                                                   # 顶线 / 中线 / 底线
+        pg.draw_line((118, y), (477, y))
+    for i in range(8):
+        pg.insert_text((125, 120 + i * 15), "{}: x <- update(x)".format(i + 1), fontsize=9)
+    _prose(pg, 300)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Algorithm 1")
+    assert how == "algorithm-rules"
+    assert r.x0 <= 57 and r.x1 >= 477 and r.y0 <= 84 and 250 <= r.y1 < 290
+
+
+def test_side_caption_figure(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_textbox(fitz.Rect(60, 100, 200, 300), "Figure 1. Mechanisms of missing data. Two general paradigms.", fontsize=9)
+    img = fitz.Rect(210, 100, 540, 330)
+    pg.draw_rect(img, fill=(0.3, 0.5, 0.8))
+    _prose(pg, 420)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Fig. 1")
+    assert how == "caption+graphics(side)" and r.contains(img) and r.x0 <= 62 and r.y1 < 410
+
+
+def test_prose_mentions_with_parentheses_are_not_captions(tmp_path):
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((60, 100), "Figure 3(a) shows a graphical model created by an expert.", fontsize=10)
+    pg.insert_text((60, 130), "Table 9) using Comprehensiveness and sufficiency metrics.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        assert PS._captions(d[0]) == []
+
+
+def _figure_then_caption_pages(tmp_path, neighbour_caption=False, scanned=False):
+    doc = fitz.open()
+    for _ in range(3 if not scanned else 5):
+        doc.new_page()
+    fig = doc[0]
+    fig.draw_rect(fitz.Rect(60, 60, 540, 700), fill=(0.8, 0.3, 0.3))       # 整页图，没有图注
+    if neighbour_caption:
+        fig.insert_text((60, 730), "Figure 1. A different figure that owns this graphic.", fontsize=9)
+    if scanned:                                                             # 每页都是整页扫描图
+        for i in range(5):
+            doc[i].draw_rect(fitz.Rect(20, 20, 575, 820), fill=(0.95, 0.95, 0.9))
+    cap = doc[1]
+    cap.insert_text((60, 80), "Figure 2 | Overview of the framework and the cohort.", fontsize=9)
+    _prose(cap, 200)
+    return _save(doc, tmp_path)
+
+
+def test_cross_page_figure_is_stitched_only_when_the_neighbour_page_is_uncaptioned(tmp_path):
+    ok = _figure_then_caption_pages(tmp_path)
+    with fitz.open(str(ok)) as d:
+        x = PS.find_figure_cross_page(d, 2, "Fig. 2")
+        out, how = PS.render_figure(d, 2, "Fig. 2", tmp_path / "x.jpg")
+    assert x and x[0] == 1 and how == "cross-page" and out.stat().st_size > 1000
+    owned = _figure_then_caption_pages(tmp_path / "o" if (tmp_path / "o").mkdir() is None else tmp_path, neighbour_caption=True)
+    with fitz.open(str(owned)) as d:
+        assert PS.find_figure_cross_page(d, 2, "Fig. 2") is None           # 邻页有图注：那张图归别人
+    (tmp_path / "s").mkdir()
+    scan = _figure_then_caption_pages(tmp_path / "s", scanned=True)
+    with fitz.open(str(scan)) as d:
+        assert PS.find_figure_cross_page(d, 2, "Fig. 2") is None           # 扫描件整篇不做
+
+
+def test_cross_page_requires_exact_qualifier(tmp_path):
+    p = _figure_then_caption_pages(tmp_path)
+    with fitz.open(str(p)) as d:
+        assert PS.find_figure_cross_page(d, 2, "Supplementary Fig. 2") is None
