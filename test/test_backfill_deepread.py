@@ -752,3 +752,14 @@ def test_version_gate_is_not_fooled_by_float_three(tmp_path):
     finally:
         _lg.remove(hid)
     assert "schema v" in "\n".join(lines), "3.0 不是 int 3，必须当版本不明报出来"
+
+
+def test_segment_paper_id_is_the_real_id_not_the_run_sequence():
+    """closereading 把抓到的 PDF 落在 scholar_pdfs/<paper_id[:16]>.pdf。此前 paper_id 用本轮序号，
+    每轮都写成 1.pdf、2.pdf… 互相覆盖，事后找不回这篇用的是哪份 PDF，原文截图无从谈起。"""
+    from src.scholar.academic_search import _generate_paper_id
+    e = {"citekey": "k2020X", "title": "A Title About Missing Data", "authors": ["Ann Lee", "Bo Li"]}
+    s1, s2 = bd.segment_from_entry(e, 1), bd.segment_from_entry(e, 7)
+    want = _generate_paper_id(e["title"], e["authors"])
+    assert s1.paper_id == s2.paper_id == s1.metadata.paper_id == want
+    assert s1.segment_id == 1 and s2.segment_id == 7          # 序号仍在 segment_id 上

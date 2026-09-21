@@ -205,3 +205,21 @@ class EmbeddingClient:
         if last_exc:
             raise EmbeddingError("Ollama embedding 请求失败：{}".format(last_exc)) from last_exc
         raise EmbeddingError("Ollama embedding 请求失败：未知原因")
+
+
+def passage_embed_fn(llm_settings):
+    """逐句原文出处定位用的向量函数（bge-m3 是多语种的，中文证据句可直接匹配英文原文）。
+
+    探活失败返回 None——调用方据此整体跳过「逐句出处」那一步、归档照常；下次重建靠缓存只补没算过的
+    句子。手动精读、书籍、自动札记三条链路共用这一个入口（此前 read_pdf / book_digest 各抄了一份）。
+    """
+    if llm_settings is None:
+        return None
+    try:
+        client = EmbeddingClient(base_url=resolve_embedding_base_url(llm_settings),
+                                 model=llm_settings.embedding_model)
+        client.probe()
+        return client.embed
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("  ⚠️ 向量服务不可用（{}），本轮不做逐句出处截图".format(str(e)[:100]))
+        return None

@@ -232,7 +232,7 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args,
         full_text = sum(1 for s in fresh if s.close_reading and s.close_reading.from_full_text)
 
     # existing_ckeys 已在 main() 中从 literature_index.json 一次性计算，避免 41 个月重复 IO
-    from src.scholar.notes import write_notes
+    from src.scholar.notes import write_notes, auto_shot_kwargs
     res = write_notes(
         fresh, citekeys, out_dir=Path(proc.notes_dir),
         instruction=proc.notes_instruction,
@@ -241,7 +241,8 @@ def run_month(y, m, settings, seen: set, existing_ckeys: set, args,
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True, existing_citekeys=existing_ckeys,   # headless：无 Zotero key 时用人读临时键，避免 MISSING-KEY
         # 同一论文（同 dedup_key）的既有条目占着基键时继承它，不加后缀（notes.write_notes 说明）
-        existing_key_owners=existing_owners)
+        existing_key_owners=existing_owners,
+        **auto_shot_kwargs(fresh, settings.llm))         # 精读时落盘的 PDF → 原文截图
     seen |= month_keys           # 落盘成功，本月键此刻才算真正「已收录」
 
     hit_ck = sum(1 for v in citekeys.values() if v)

@@ -1704,7 +1704,7 @@ __PAPERS_JSON__
             return None
         try:
             from .zotero_sync import sync_segments_to_zotero
-            from .notes import write_notes, note_file_paths, backup_note_files
+            from .notes import write_notes, note_file_paths, backup_note_files, auto_shot_kwargs
         except Exception as e:
             logger.warning("  ⚠️ Zotero 模块导入失败，跳过: {}".format(e))
             return None
@@ -1785,6 +1785,7 @@ __PAPERS_JSON__
             filename=note_fname,
             emit_docx=proc.notes_emit_docx,
             cjk_font=proc.notes_docx_cjk_font,
+            **auto_shot_kwargs(self.segments, self.settings.llm),   # 精读时落盘的 PDF → 原文截图
         )
         if summary.get("sidecar_ok") is False:
             # 与另外三条入库链路同一口径：量尺永久不可恢复（md 不存那三个字段），

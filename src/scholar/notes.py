@@ -13,6 +13,7 @@ pandoc-ready 科研札记生成。
   pandoc note.md --citeproc --bibliography=note.references.json --csl=nature.csl -o note.docx
 """
 import json
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -396,59 +397,77 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
         return out
     root = Path(out_dir) / _SHOT_DIR
     n_pass = 0
-    fails_in_a_row = 0
+    state = {"embed_fn": embed_fn, "fails_in_a_row": 0}
     for seg in segments:
-        ck, spec = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
-        # 值可以是路径字符串，也可以是 {"path", "offset"(印刷页 = PDF 页序 + offset), "ranges"[(a,b)…]}
-        # ——书籍链路用后者：整本 600 页只切精读过的那几章，页码口径直接取 manifest 的权威偏移。
-        spec = {"path": spec} if isinstance(spec, str) else (spec or {})
-        pdf, ranges = spec.get("path"), spec.get("ranges")
-        pmap = None
-        if spec.get("offset") is not None and pdf and Path(pdf).is_file():
-            import fitz
-            with fitz.open(str(pdf)) as _d:
-                pmap = page_shots.PageMap(_d.page_count, int(spec["offset"]), "manifest")
+        ck = citekeys.get(seg.paper_id)
         cr = seg.close_reading
-        if not (ck and pdf and cr and cr.sections):
-            continue
-        if not Path(pdf).is_file():                          # 死链：此前无声跳过，md 里这篇的图全部消失
-            logger.warning("  ⚠️ {} 的 pdf_path 不存在，本轮无原文截图: {}".format(ck, pdf))
-            continue
-        hl = [{"text": st.text, "page": getattr(st, "page", None)}
-              for sec in cr.sections for st in sec.sentences]
-        try:
-            out[seg.paper_id] = page_shots.shots_for_paper(Path(pdf), ck, hl, root, page_map=pmap)
-        except Exception as e:                               # noqa: BLE001
-            logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
+        if not (ck and cr and cr.sections):
             continue
         sents = [{"text": st.text, "page": getattr(st, "page", None), "section": sec.heading}
                  for sec in cr.sections for st in sec.sentences]
-        got = None
-        if embed_fn is not None:
-            try:
-                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn,
-                                                    page_map=pmap, ranges=ranges)
-                fails_in_a_row = 0
-            except Exception as e:                           # noqa: BLE001
-                logger.warning("  ⚠️ 逐句出处定位失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
-                # 只有**连续**两篇失败才认定是向量服务挂了、后面不再重试：单篇的确定性错误
-                # （窗口超长被 4xx、这份 PDF 渲染异常）此前会让本轮后面所有论文都没有出处图。
-                fails_in_a_row += 1
-                if fails_in_a_row >= 2:
-                    logger.warning("  ⚠️ 连续 {} 篇失败，判定向量服务不可用：本轮余下论文只读缓存".format(fails_in_a_row))
-                    embed_fn = None
-        if got is None:                                      # 没有向量服务 / 这一篇失败：已算过的图照出
-            try:
-                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, None,
-                                                    page_map=pmap, ranges=ranges)
-            except Exception as e:                           # noqa: BLE001
-                logger.warning("  ⚠️ 读逐句出处缓存失败 {}: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
-                got = {}
-        out[seg.paper_id]["_passages"] = got
-        n_pass += len(got)
+        got = shots_for_one(ck, pdf_paths.get(seg.paper_id), sents, root, state)
+        if got is not None:
+            out[seg.paper_id] = got
+            n_pass += len(got.get("_passages") or {})
     n = sum(1 for m in out.values() for v in m.values() if isinstance(v, dict) and v.get("kind"))
     if n:
         logger.info("  🖼 原文截图 {} 篇 / {} 张 · 逐句出处 {} 句 → {}".format(len(out), n, n_pass, root))
+    return out
+
+
+def shots_for_one(ck: str, spec, sents: List[Dict[str, Any]], root: Path,
+                  state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """单篇论文的原文截图清单（整页 + 图表 + 逐句出处 `_passages`）。没有可用 PDF 返回 None。
+
+    `write_notes` 与「给已归档 md 补截图」（`attach_shots_to_md`）共用这一个函数，
+    **不许**另写第二套：两套出图逻辑一旦口径漂移，同一篇论文在不同札记里会配出不同的图。
+
+    spec：路径字符串，或 {"path", "offset"(印刷页 = PDF 页序 + offset), "ranges"[(a,b)…]}
+    ——书籍链路用后者：整本 600 页只切精读过的那几章，页码口径直接取 manifest 的权威偏移。
+    sents：[{"text", "page", "section"}]，即精读里的每一句（带分节标题，供「无出处分节」判断）。
+    state：跨篇共享的 {"embed_fn", "fails_in_a_row"}——连续两篇定位失败就判定向量服务挂了，
+    余下论文只读缓存（单篇的确定性错误不该让后面所有论文都没有出处图）。
+    """
+    from . import page_shots
+    spec = {"path": spec} if isinstance(spec, str) else (spec or {})
+    pdf, ranges = spec.get("path"), spec.get("ranges")
+    if not pdf:
+        return None
+    if not Path(pdf).is_file():                              # 死链：此前无声跳过，md 里这篇的图全部消失
+        logger.warning("  ⚠️ {} 的 pdf_path 不存在，本轮无原文截图: {}".format(ck, pdf))
+        return None
+    pmap = None
+    if spec.get("offset") is not None:
+        import fitz
+        with fitz.open(str(pdf)) as _d:
+            pmap = page_shots.PageMap(_d.page_count, int(spec["offset"]), "manifest")
+    hl = [{"text": s["text"], "page": s.get("page")} for s in sents]
+    try:
+        out = page_shots.shots_for_paper(Path(pdf), ck, hl, root, page_map=pmap)
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
+        return None
+    got = None
+    if state.get("embed_fn") is not None:
+        try:
+            got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, state["embed_fn"],
+                                                page_map=pmap, ranges=ranges)
+            state["fails_in_a_row"] = 0
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("  ⚠️ 逐句出处定位失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
+            state["fails_in_a_row"] = state.get("fails_in_a_row", 0) + 1
+            if state["fails_in_a_row"] >= 2:
+                logger.warning("  ⚠️ 连续 {} 篇失败，判定向量服务不可用：本轮余下论文只读缓存"
+                               .format(state["fails_in_a_row"]))
+                state["embed_fn"] = None
+    if got is None:                                          # 没有向量服务 / 这一篇失败：已算过的图照出
+        try:
+            got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, None,
+                                                page_map=pmap, ranges=ranges)
+        except Exception as e:                               # noqa: BLE001
+            logger.warning("  ⚠️ 读逐句出处缓存失败 {}: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
+            got = {}
+    out["_passages"] = got
     return out
 
 
@@ -634,3 +653,157 @@ def write_notes(
             logger.warning("  ⚠️ 生成样式化 docx 失败: {}".format(e))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 给已归档的 md 补原文截图（自动月度/周札记：digest JSON 不存精读分节，证据句只在 md 里）
+# ---------------------------------------------------------------------------
+
+_SHOT_LINE_RE = re.compile(r"^  !\[.*\]\(" + re.escape(_SHOT_DIR) + r"/")
+_PAGES_HEAD = "**原文页面**"
+_ANCHOR_TAIL = re.compile(r"\s*〔p\.([0-9][0-9\-–,\s]*)〕\s*$")
+
+
+def _strip_shot_lines(region: List[str]) -> List[str]:
+    """去掉 region 里上一轮插进来的截图行与「原文页面」块（别的行一字不动）。"""
+    out: List[str] = []
+    i = 0
+    while i < len(region):
+        ln = region[i]
+        if _SHOT_LINE_RE.match(ln):
+            i += 1
+            continue
+        if ln.strip() == _PAGES_HEAD:
+            # 块的形状见 _shot_pages_block：标题 / 空行 / 链接行 /（空行 / > 未能截到）/ 空行
+            j = i + 1
+            while j < len(region) and (not region[j].strip()
+                                       or "(" + _SHOT_DIR + "/" in region[j]
+                                       or region[j].startswith("> 未能截到")):
+                j += 1
+            # 块尾那一个空行归块所有，其余空行（区段收尾的）留给调用方按原样保留
+            k = j
+            while k > i + 1 and not region[k - 1].strip():
+                k -= 1
+            i = k + 1 if k < j else j
+            continue
+        out.append(ln)
+        i += 1
+    return out
+
+
+def _evidence_of(line: str):
+    """md 里一条证据句 → (text, page)。不是证据句返回 None。与 render_tag_line 严格互逆。"""
+    from ._citekey_utils import TAG_LINE_RE
+    m = TAG_LINE_RE.match(line)
+    if m:
+        return m.group(2), m.group(3)
+    if line.startswith("- ") and not line.startswith("- 〔"):
+        body = line[2:]
+        a = _ANCHOR_TAIL.search(body)
+        return (body[:a.start()] if a else body).rstrip(), (a.group(1) if a else None)
+    return None
+
+
+def attach_shots_to_md(md_path: Path, pdf_for, out_dir: Path, embed_fn=None,
+                       apply: bool = True, strip_if_no_shots=None) -> Dict[str, Any]:
+    """给一份已归档的札记 md 补原文截图，返回 {"papers", "shot_papers", "passages", "changed"}。
+
+    pdf_for(citekey) -> None | 路径 | {"path","offset","ranges"}。出图用 shots_for_one、插图用
+    _shot_lines_after / _shot_pages_block——都是 write_notes 用的那一套，这里只负责「在已有 md 里
+    找到每一句、把图片行插回它下面」。**幂等**：先清掉上一轮插的截图行与「原文页面」块再插，
+    重跑结果不变；证据句、分节标题、其余行一字不动（notes_index 不认图片行为证据句）。
+
+    strip_if_no_shots：citekey 集合。这些论文的精读节刚被文本手术整节换过（backfill_deepread），
+    上一轮的截图行对应的是**旧句子**——这轮出不了图时也要清掉，不能让旧图挂在新句子下面。
+    其余论文出不了图时原样保留（PDF 暂时找不到不该抹掉已插好的图）。
+    """
+    from .notes_index import _SECTION_RE, _CLOSEREAD_RE, _CR_SECTION_RE
+    md_path = Path(md_path)
+    lines = md_path.read_text(encoding="utf-8").split("\n")
+    heads = [i for i, ln in enumerate(lines) if _SECTION_RE.match(ln)]
+    root = Path(out_dir) / _SHOT_DIR
+    state = {"embed_fn": embed_fn, "fails_in_a_row": 0}
+    rep = {"papers": 0, "shot_papers": 0, "passages": 0, "changed": False}
+    out: List[str] = []
+    cur = 0
+    for n, h in enumerate(heads):
+        end = heads[n + 1] if n + 1 < len(heads) else len(lines)
+        for k in range(h + 1, end):                           # 最后一篇之后是「# 参考文献」
+            if lines[k].startswith("# "):
+                end = k
+                break
+        ck = _SECTION_RE.match(lines[h]).group(4)
+        cr = next((k for k in range(h + 1, end) if _CLOSEREAD_RE.match(lines[k])), None)
+        if cr is None:
+            continue
+        stop = next((k for k in range(cr + 1, end)
+                     if lines[k].startswith("#") or lines[k].strip() == "---"), end)
+        region = _strip_shot_lines(lines[cr + 1:stop])
+        rep["papers"] += 1
+        sents, sec = [], ""
+        for ln in region:
+            m = _CR_SECTION_RE.match(ln)
+            if m:
+                sec = m.group(1).strip()
+                continue
+            ev = _evidence_of(ln)
+            if ev and ev[0]:
+                sents.append({"text": ev[0], "page": ev[1], "section": sec})
+        shots = shots_for_one(ck, pdf_for(ck), sents, root, state) if sents else None
+        new_region: List[str] = []
+        if shots:
+            rep["shot_papers"] += 1
+            rep["passages"] += len(shots.get("_passages") or {})
+            shown: set = set()
+            for ln in region:
+                new_region.append(ln)
+                ev = _evidence_of(ln)
+                if ev and ev[0]:
+                    new_region.extend(_shot_lines_after(ev[0], shots, shown))
+            block = _shot_pages_block(shots)
+            if block:
+                t = len(new_region)
+                while t > 0 and not new_region[t - 1].strip():
+                    t -= 1
+                trail = len(new_region) - t
+                new_region = new_region[:t] + [""] + block + [""] * max(0, trail - 1)
+        elif strip_if_no_shots and ck in strip_if_no_shots:
+            new_region = region                              # 精读刚换过：旧图对不上新句子，清掉
+        else:
+            # 这一篇这轮出不了图（PDF 找不到/坏了）：原样保留，**不**清掉上一轮已插好的截图行
+            new_region = lines[cr + 1:stop]
+        out.extend(lines[cur:cr + 1])
+        out.extend(new_region)
+        cur = stop
+    out.extend(lines[cur:])
+    text = "\n".join(out)
+    if text != "\n".join(lines):
+        rep["changed"] = True
+        if apply:
+            from .notes_index import _atomic_write
+            _atomic_write(md_path, text)
+    return rep
+
+
+def auto_shot_kwargs(segments, llm_settings, scratch_dir: str = "output/scholar_pdfs") -> Dict[str, Any]:
+    """自动链路（周度入库 / 月度回填 / digest / CLI）调 write_notes 时补传的截图参数。
+
+    自动链路精读时 closereading 会把抓到的 PDF 落在 `<scratch_dir>/<paper_id 前 16 位>.pdf`
+    （closereading.close_read_segment），此前这份 PDF 只用来抽文本、从没交给 write_notes，
+    所以自动札记一张原文截图都没有。有精读、PDF 也在的论文才给；一篇都没有就返回 {}
+    （连向量服务都不探活）。向量服务不可用时 embed_fn=None：整页与图表照出，逐句出处跳过。
+    """
+    from .paths import repo_path
+    d = repo_path(scratch_dir)
+    paths: Dict[str, str] = {}
+    for s in segments:
+        cr = getattr(s, "close_reading", None)
+        if not (cr and cr.sections and s.paper_id):
+            continue
+        p = d / "{}.pdf".format(s.paper_id[:16])
+        if p.is_file():
+            paths[s.paper_id] = str(p)
+    if not paths:
+        return {}
+    from .embeddings import passage_embed_fn
+    return {"pdf_paths": paths, "embed_fn": passage_embed_fn(llm_settings)}

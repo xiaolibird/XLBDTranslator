@@ -588,7 +588,7 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
 
     citekeys = resolve_citekeys(segs, proc.zotero_base_url)
 
-    from .notes import write_notes
+    from .notes import write_notes, auto_shot_kwargs
     from .notes_index import INDEX_JSON, existing_citekeys, existing_citekey_owners
     notes_out_dir = Path(proc.notes_dir)
     note_filename = "科研札记_{}_全文精读".format(label)
@@ -671,7 +671,8 @@ def run_ingest(segs: Sequence[PaperSegment], settings: ScholarSettings, label: s
         filename=note_filename,
         emit_docx=proc.notes_emit_docx, cjk_font=proc.notes_docx_cjk_font,
         fallback_citekeys=True, existing_citekeys=existing_ckeys,
-        existing_key_owners=existing_owners)
+        existing_key_owners=existing_owners,
+        **auto_shot_kwargs(segs, settings.llm))          # 精读时落盘的 PDF → 原文截图
 
     hit_ck = sum(1 for v in citekeys.values() if v)
     logger.info("  ✅ {} → {} 篇 | citekey {}/{} | 全文精读 {} | 增强 CR{}/AX{}/TS{}".format(

@@ -314,7 +314,7 @@ def run_zotero_sync(args, settings):
     """
     from src.scholar.schema import DigestOutput
     from src.scholar.zotero_sync import sync_segments_to_zotero
-    from src.scholar.notes import write_notes
+    from src.scholar.notes import write_notes, auto_shot_kwargs
 
     proc = settings.processing
     if args.base_url:
@@ -384,6 +384,7 @@ def run_zotero_sync(args, settings):
         filename=input_path.stem,
         emit_docx=proc.notes_emit_docx,
         cjk_font=proc.notes_docx_cjk_font,
+        **auto_shot_kwargs(segments, settings.llm),     # 精读时落盘的 PDF → 原文截图
     )
 
     saved = sum(1 for r in results.values() if r.saved)

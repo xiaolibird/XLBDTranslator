@@ -585,20 +585,9 @@ def _is_topic_bucket(month: str) -> bool:
 
 
 def _passage_embed_fn(settings):
-    """逐句出处定位用的向量函数（bge-m3 是多语种的，中文证据句可直接匹配英文原文）。
-
-    探活失败返回 None——那一步整体跳过，归档照常；下次 regen 会靠缓存只补没算过的句子。
-    """
-    try:
-        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
-        client = EmbeddingClient(base_url=resolve_embedding_base_url(settings.llm),
-                                 model=settings.llm.embedding_model)
-        client.probe()
-        return client.embed
-    except Exception as e:                                   # noqa: BLE001
-        logger.warning("  ⚠️ 向量服务不可用（{}），本轮不做逐句出处截图".format(str(e)[:100]))
-        return None
-
+    """逐句出处定位用的向量函数——收敛在 embeddings.passage_embed_fn（三条链路共用）。"""
+    from src.scholar.embeddings import passage_embed_fn
+    return passage_embed_fn(getattr(settings, "llm", None))
 
 def _bundle_pdf_paths(mdir: Path) -> dict:
     """{paper_id: pdf_path}，供 write_notes 生成原文截图。读不出的 bundle 直接略过——
