@@ -698,36 +698,103 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
 
 PASSAGE_DPI = 150
 WIN_LINES, WIN_STRIDE = 6, 3
-PASSAGE_MIN_SCORE = 0.62   # 0.60–0.62 一档实测出现过「相关但不是出处」的弱匹配（shi2025 缺失率设置→Table 2 表注）
-_REF_HEAD = re.compile(r"^\s*(References|REFERENCES|Bibliography|参考文献)\s*$")
+PASSAGE_MIN_SCORE = 0.62   # 余弦 + **本文少见的**数字命中加分 ≥ 这个值才配图
+PASSAGE_VETO_RAW = 0.70    # 句子带 ≥3 个小数而窗口命中不到 2 个：多半落在了图注/方法段上，纯余弦要到这里才信
+PASSAGE_OFFPAGE_RAW = 0.68 # 札记标了页码却要到 ±1 页之外去找：页码多半没错，换页的门槛要高
+PASSAGE_APPX_PENALTY = 0.03  # 附录常把正文的话再说一遍：分数接近时优先正文
+# 阈值为什么不往上抬（2026-09-21 对抗审核 A，49 对逐张看图）：纯余弦 0.62–0.66 这一带 11 对准、
+# 12 对不准，完全分不开。不准的那些几乎都是**真出处当时够不着**（在附录里、被页码锁在错页），
+# 够得着之后真出处的余弦高出一大截（0.78/0.80/0.78）。所以修的是候选池与约束，不是阈值。
+_REF_HEAD = re.compile(r"^\s*(References?|REFERENCES?|Bibliography|BIBLIOGRAPHY|Literature Cited|参考文献)\s*$")
+# References 之后不是全文终点：附录里的补充表、消融、完整超参恰恰是证据句最爱引的地方（对抗审核 A：
+# 全库 116 份 PDF 在 References 之后还有 ≥8 页，出处在附录的句子要么漏配、要么被配到正文里的相似物）。
+_APPX_HEAD = re.compile(
+    r"^\s*(Appendix|Appendices|APPENDIX|APPENDICES|Supplementa(?:ry|l)\b|SUPPLEMENTA(?:RY|L)\b|"
+    r"Supporting Information|Extended Data|Methods\s*$|METHODS\s*$|附录|补充材料|[A-Z](?:\.\d+)*\.?\s+[A-Z][A-Za-z])")
+_YEAR = re.compile(r"\b(?:19|20)\d\d\b")
 _NUM = re.compile(r"\d+(?:\.\d+)?")
-# 这些分节是 agent 自己的话，原文里没有出处
+# 这些分节是 agent 自己的话，原文里没有出处。按**关键词**而不是固定节名匹配：精读里常有
+# 「对本论文攻防的意义」「净影响」这类自定义标题（对抗审核 A：startswith 四个固定节名漏掉约 54 对）。
 NO_SOURCE_SECTIONS = ("对我研究的联想", "交叉核验记录", "逐节通读要点", "版本差异")
+_NO_SOURCE_KEYS = ("联想", "攻防", "净影响", "净意义", "启示", "对我", "对本论文", "对本课题", "交叉核验记录",
+                   "逐节通读", "版本差异", "读后", "我的")
+# 句首规则只收「肯定没有出处」的：质疑句不在其列——它的事实前提多半就在原文里（审核样本 #18）。
+_NO_SOURCE_LEAD = re.compile(r"^\s*(?:\*\*)?(?:【?原文未报告】?|本次精读|此前草稿|脚本草稿|草稿称)")
+# 句子里当标签/定位符用的数字不是内容：「Table 2」「式 3」「p.14」「第4页」「§5.7」
+_LABEL_NUM = re.compile(r"(?i)(?:tables?|figs?\.?|figures?|eqs?\.?|equations?|sections?|sec\.|appendix|algorithm|box|"
+                        r"theorem|lemma|supp\w*|图|表|式|节|附录|算法|定理|引理|§|pp?\.|第)\s*[A-Z]?\.?\d+(?:[.\-–]\d+)*\s*[页节章]?")
+
+
+def _cjk_len(text: str) -> int:
+    """有效长度：一个汉字顶 2.5 个拉丁字符。最小窗口长度是按英文标定的，中文一行只有 25–40 字，
+    逐行成块的中文 PDF 此前整行整行被丢（吴博综述 34 页只切出 9 个窗口）。"""
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return len(text) + int(cjk * 1.5)
+
+
+def _page_blocks(page):
+    """一页的文本块：[{"lines": [(Rect, text, size)], "number": n}]，页眉页脚已去。"""
+    import fitz
+    h = page.rect.height
+    out = []
+    for blk in page.get_text("dict").get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        lines = []
+        for ln in blk.get("lines", []):
+            spans = ln.get("spans", [])
+            txt = "".join(sp.get("text", "") for sp in spans).strip()
+            r = fitz.Rect(ln["bbox"])
+            if not txt or r.y1 < h * 0.06 or r.y0 > h * 0.945:
+                continue
+            lines.append((r, txt, max((sp.get("size", 0) for sp in spans), default=0)))
+        if lines:
+            out.append({"lines": lines, "number": blk.get("number", 0)})
+    return out
+
+
+def _merge_fragments(blocks):
+    """逐行成块的 PDF（每行一个文本块）把相邻的碎块并回段落。
+
+    只在**至少一方 ≤2 行**时才并，正常分段的 PDF 不受影响；判据是同栏（横向重叠过半）且行距
+    不超过 0.7 个行高。不并的话这类 PDF 要么切不出窗口（mathur2026 全篇 12 个窗口），要么截出来
+    只有一行字、没法拿来核对内容（对抗审核 A：16 份 PDF 单行窗口占比过半）。
+    """
+    out = []
+    for b in blocks:
+        if out:
+            a = out[-1]
+            ra, rb = a["lines"][-1][0], b["lines"][0][0]
+            lh = max(ra.height, 1.0)
+            same_col = _x_overlap(ra, rb) >= 0.5 * min(ra.width, rb.width)
+            if (len(a["lines"]) <= 2 or len(b["lines"]) <= 2) and same_col and -1 <= rb.y0 - ra.y1 <= 0.7 * lh:
+                a["lines"].extend(b["lines"])
+                continue
+        out.append({"lines": list(b["lines"]), "number": b["number"]})
+    return out
 
 
 def passage_windows(doc) -> List[dict]:
-    """正文的行级滑动窗口：[{page(1起), rect, text}]。References 之后、页眉页脚不要。"""
+    """正文（含附录）的行级滑动窗口：[{page(1起), rect, text, blk, pos}]。参考文献条目、页眉页脚不要。"""
     import fitz
     out: List[dict] = []
+    in_refs, ref_size, seen_refs = False, 0.0, False
     for pi in range(doc.page_count):
-        page = doc[pi]
-        h = page.rect.height
-        stop = False
-        for blk in page.get_text("dict").get("blocks", []):
-            if blk.get("type") != 0:
-                continue
+        for blk in _merge_fragments(_page_blocks(doc[pi])):
             lines = []
-            for ln in blk.get("lines", []):
-                txt = "".join(sp.get("text", "") for sp in ln.get("spans", [])).strip()
-                r = fitz.Rect(ln["bbox"])
-                if not txt or r.y1 < h * 0.06 or r.y0 > h * 0.945:
-                    continue
+            for r, txt, size in blk["lines"]:
                 if _REF_HEAD.match(txt):
-                    stop = True
-                    break
+                    in_refs, ref_size, seen_refs = True, size, True
+                    lines = []
+                    continue
+                if in_refs:
+                    # 附录标题：够短、字号不小于 References 标题、没有年份和逗号（参考文献条目三样都占）
+                    if (_APPX_HEAD.match(txt) and len(txt) <= 70 and size >= ref_size - 0.6
+                            and not _YEAR.search(txt) and "," not in txt):
+                        in_refs = False
+                    else:
+                        continue
                 lines.append((r, txt))
-            if stop:
-                break
             if not lines:
                 continue
             n = len(lines)
@@ -737,14 +804,13 @@ def passage_windows(doc) -> List[dict]:
             for s0 in starts:
                 seg = lines if n <= WIN_LINES + 2 else lines[s0:s0 + WIN_LINES]
                 text = re.sub(r"(\w)- (\w)", r"\1\2", " ".join(t for _, t in seg))
-                if len(text) < 60:
+                if _cjk_len(text) < 60:
                     continue
                 rect = fitz.Rect(seg[0][0])
                 for r, _ in seg[1:]:
                     rect |= r
-                out.append({"page": pi + 1, "rect": tuple(rect), "text": text, "blk": (pi, blk.get("number", 0)), "pos": s0})
-        if stop:
-            break
+                out.append({"page": pi + 1, "rect": tuple(rect), "text": text, "blk": (pi, blk["number"]),
+                            "pos": s0, "appx": seen_refs})
     return out
 
 
@@ -752,19 +818,35 @@ def _nums(text: str) -> set:
     return {x.rstrip("0").rstrip(".") if "." in x else x for x in _NUM.findall(text.replace(",", ""))} - {"1", "2", "3", "0"}
 
 
+def _content_nums(text: str) -> set:
+    """句子里的**内容**数字：先把「Table 2 / 式 3 / p.14 / 第4页」这类标签里的数字拿掉。"""
+    return _nums(_LABEL_NUM.sub(" ", text or ""))
+
+
+def has_no_source(sentence: dict) -> bool:
+    sec = sentence.get("section") or ""
+    return (any(sec.startswith(k) for k in NO_SOURCE_SECTIONS) or any(k in sec for k in _NO_SOURCE_KEYS)
+            or bool(_NO_SOURCE_LEAD.match(sentence.get("text") or "")))
+
+
 def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMap] = None,
                     windows: Optional[List[dict]] = None, win_vecs=None) -> List[Optional[dict]]:
-    """为每句找原文出处。返回与 sentences 等长的列表：{page, rect, score} 或 None。
+    """为每句找原文出处。返回与 sentences 等长的列表：{page, rect, score, raw, how} 或 None。
 
     sentences: [{"text", "page"(札记页码，可无), "section"}]；embed: texts -> (n,d) ndarray。
+    score = 原始余弦 raw + 数字命中加分，只用于排序与展示；**过不过线看 raw**（v4，2026-09-21）：
+    此前阈值卡在加分之后，「300/500/1000/0.5」这类满篇都是的数字能把余弦 0.64 的图注抬到 0.76。
     """
     import numpy as np
     import fitz
     wins = windows if windows is not None else passage_windows(doc)
     res: List[Optional[dict]] = [None] * len(sentences)
-    todo = [i for i, s in enumerate(sentences)
-            if not any((s.get("section") or "").startswith(k) for k in NO_SOURCE_SECTIONS) and (s.get("text") or "").strip()]
+    todo = [i for i, s in enumerate(sentences) if not has_no_source(s) and (s.get("text") or "").strip()]
     if not wins or not todo:
+        return res
+    # 窗口池退化（扫描件、每页被拆成上千个零碎文本块）：出处多半不在池里，硬配只会配错
+    n_text_pages = len({w["page"] for w in wins})
+    if len(wins) < 3 * max(n_text_pages, 1) and doc.page_count >= 4:
         return res
     W = win_vecs if win_vecs is not None else embed([w["text"] for w in wins])
     Q = embed([sentences[i]["text"] for i in todo])
@@ -772,29 +854,75 @@ def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMa
     Q = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9)
     sim = Q @ W.T
     wnums = [_nums(w["text"]) for w in wins]
+    df: Dict[str, int] = {}
+    for wn in wnums:
+        for x in wn:
+            df[x] = df.get(x, 0) + 1
+    rare_cap = max(8, len(wins) // 40)             # 滑窗有重叠：同一处数字会落进相邻几个窗口
     wpage = np.array([w["page"] for w in wins])
+    appx = np.array([PASSAGE_APPX_PENALTY if w.get("appx") else 0.0 for w in wins])
+    picks: Dict[int, Tuple[int, float, float, str, int]] = {}
     for qi, si in enumerate(todo):
         s = sentences[si]
-        sc = sim[qi].copy()
+        raw = sim[qi]
+        qn = _content_nums(s["text"])
+        qdec = {x for x in qn if "." in x}
+        rare_hits = np.array([sum(1 for x in (qn & wn) if len(x) >= 2 and df.get(x, 0) <= rare_cap) for wn in wnums])
+        # 「300/500/1000/0.5」这类满篇都是的数字此前每个 +0.04，能把余弦 0.64 的图注抬到 0.76
+        bonus = np.array([min(0.12, 0.04 * r + 0.01 * (len(qn & wn) - r)) for r, wn in zip(rare_hits, wnums)]) \
+            if qn else np.zeros(len(wins))
+        rank = raw + bonus - appx
+        vetoed = np.array([len(qdec & wn) < 2 for wn in wnums]) if len(qdec) >= 3 else np.zeros(len(wins), bool)
+        accept = np.where(vetoed, raw >= PASSAGE_VETO_RAW, raw + bonus >= PASSAGE_MIN_SCORE)
+
+        def best(mask, extra=None) -> Optional[int]:
+            m = mask & accept if extra is None else mask & accept & extra
+            return int(np.argmax(np.where(m, rank, -9.0))) if m.any() else None
+
         hint = s.get("page")
-        if not hint:                               # 句子正文里自带的页码提示：「（§5.7, p.14）」
-            m = re.search(r"(?<![A-Za-z])pp?\.\s*(\d{1,4}(?:\s*[-–]\s*\d{1,4})?)", s.get("text") or "")
-            hint = m.group(1) if m else None
+        if not hint:                               # 句子正文里自带的页码提示：「（§5.7, p.14）」「第4页」
+            m = re.search(r"(?<![A-Za-z])pp?\.\s*(\d{1,4}(?:\s*[-–]\s*\d{1,4})?)|第\s*(\d{1,4})\s*页", s.get("text") or "")
+            hint = (m.group(1) or m.group(2)) if m else None
         want = [page_map.to_pdf(p) for p in parse_pages(hint)] if page_map else []
         want = [w for w in want if w]
-        if want:                                   # 札记标了页码：只在那一页（含区间）里找
-            sc[~np.isin(wpage, want)] = -1.0
-        qn = _nums(s["text"])
-        if qn:
-            sc = sc + np.array([min(0.12, 0.04 * len(qn & wn)) for wn in wnums])
-        b = int(np.argmax(sc))
-        if sc[b] < PASSAGE_MIN_SCORE:
+        chosen = None
+        if want:
+            # 页码是强提示但不是铁律：札记页码差一页、印刷页与 PDF 页错位都常见。此前锁死在那一页，
+            # 只能在错页里挑个最像的（审核样本：yan2024 真出处 p.9、提示 8；niu2025 p.4、提示 5）。
+            # 同页能过线就留在同页；后一档要**明显**更好（+0.06）才换页，±1 页之外还要余弦够硬。
+            on = np.isin(wpage, want)
+            near = np.isin(wpage, [p + d for p in want for d in (-1, 0, 1)])
+            far_ok = (raw >= PASSAGE_OFFPAGE_RAW) | (rare_hits >= 2)
+            for b, how in ((best(on), "page"), (best(near), "page±1"), (best(~near, far_ok), "off-page")):
+                if b is not None and (chosen is None or rank[b] > rank[chosen[0]] + 0.06):
+                    chosen = (b, how)
+        else:
+            b = best(np.ones(len(wins), bool))
+            if b is not None:
+                chosen = (b, "global")
+        if chosen is None:
             continue
+        b, how = chosen
+        picks[si] = (b, float(raw[b]), float(rank[b]), how, int(rare_hits[b]))
+    # 多句挤到同一个窗口：多半是一张图注/一段总述把讲表内数字的句子全吸了过去（对抗审核 A：
+    # ceriscioli2026 十句 SHD 结果全配到同一张表注上，分数 0.63–0.82）。有少见数字命中的留下，
+    # 其余只留余弦最高的两句。
+    by_win: Dict[int, List[int]] = {}
+    for si, (b, *_rest) in picks.items():
+        by_win.setdefault(b, []).append(si)
+    for b, sis in by_win.items():
+        if len(sis) >= 4:
+            weak = sorted((si for si in sis if picks[si][4] < 1), key=lambda si: -picks[si][1])
+            for si in weak[2:]:
+                picks.pop(si)
+    qpos = {si: qi for qi, si in enumerate(todo)}
+    for si, (b, raw_b, rank_b, how, _hits) in picks.items():
         rect = fitz.Rect(wins[b]["rect"])
         for nb in (b - 1, b + 1):                  # 出处常跨窗口：相邻窗口也够像就并进来
-            if 0 <= nb < len(wins) and wins[nb]["blk"] == wins[b]["blk"] and sc[nb] >= sc[b] - 0.04:
+            if 0 <= nb < len(wins) and wins[nb]["blk"] == wins[b]["blk"] and sim[qpos[si]][nb] >= raw_b - 0.04:
                 rect |= fitz.Rect(wins[nb]["rect"])
-        res[si] = {"page": wins[b]["page"], "rect": tuple(rect), "score": round(float(sc[b]), 3)}
+        res[si] = {"page": wins[b]["page"], "rect": tuple(rect), "score": round(rank_b, 3),
+                   "raw": round(raw_b, 3), "how": how}
     return res
 
 
@@ -806,7 +934,7 @@ def render_passage(doc, pdf_index: int, rect, out: Path, dpi: int = PASSAGE_DPI)
     return out
 
 
-PASSAGE_VERSION = "3"
+PASSAGE_VERSION = "4"
 
 
 def sentence_key(text: str) -> str:
@@ -841,30 +969,42 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
             cache = json.loads(cfile.read_text("utf-8"))
         except Exception:
             cache = {}
-    if cache.get("pdf_fp") != fp or cache.get("v") != PASSAGE_VERSION:
-        cache = {"pdf_fp": fp, "v": PASSAGE_VERSION, "items": {}}
+    # 换 embedding 模型后分数不可比，正负缓存都得作废（此前缓存头不记模型名，换了也照用旧结果）。
+    # 只读缓存模式（embed=None）不知道模型，沿用缓存里记的。
+    if embed is None:
+        # 只读缓存模式绝不作废缓存、绝不删图：向量服务没起时，旧算法算出的图也比整篇没图强，
+        # 等服务起来的下一轮再按新版本重算。
+        items = cache.get("items") or {}
+        return {k: items[k] for k in (sentence_key(x.get("text")) for x in sentences)
+                if items.get(k) and (out_root / items[k]["rel"]).is_file()}
+    model = str(getattr(getattr(embed, "__self__", None), "model", "") or "")
+    if cache.get("pdf_fp") != fp or cache.get("v") != PASSAGE_VERSION or cache.get("model", "") != model:
+        cache = {"pdf_fp": fp, "v": PASSAGE_VERSION, "model": model, "items": {}, "hints": {}}
         if cdir.is_dir():
             for old in cdir.glob("q_{}_*.jpg".format(tag)):
                 old.unlink()
     items = cache["items"]
+    hints = cache.setdefault("hints", {})
     keyed = [(sentence_key(x.get("text")), x) for x in sentences]
     # 命中过但图不在了（被误删、assets 目录被清过）也算新句：缓存只记「算过」，图才是产物，
     # 不重算的话这一句的出处图永远回不来。负缓存（None）不受影响。
+    # 页码锚改了也算新句：句子文字没变、只订正了 page 时，旧的命中（或旧的「没找到」）不该沿用。
     new = [(k, x) for k, x in keyed
-           if k not in items or (items[k] and not (out_root / items[k]["rel"]).is_file())]
-    if embed is None:                                  # 向量服务不可用：只读缓存，算过的图照出，新句留给下一轮
-        new = []
+           if k not in items or (items[k] and not (out_root / items[k]["rel"]).is_file())
+           or hints.get(k, "") != str(x.get("page") or "")]
     if new:
         with fitz.open(str(pdf_path)) as doc:
             pm = build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
             found = locate_passages(doc, [x for _, x in new], embed, pm)
-            for (k, _), r in zip(new, found):
+            for (k, x), r in zip(new, found):
+                hints[k] = str(x.get("page") or "")
                 if r is None:
                     items[k] = None
                     continue
                 rel = "{}/q_{}_{}.jpg".format(safe, tag, k)
                 render_passage(doc, r["page"], r["rect"], out_root / rel)
-                items[k] = {"rel": rel, "printed": pm.to_printed(r["page"]), "score": r["score"]}
+                items[k] = {"rel": rel, "printed": pm.to_printed(r["page"]), "score": r["score"],
+                            "raw": r.get("raw"), "how": r.get("how")}
         cdir.mkdir(parents=True, exist_ok=True)
         tmp = cfile.with_suffix(".tmp")
         tmp.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")

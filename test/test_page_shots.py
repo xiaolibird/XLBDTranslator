@@ -681,3 +681,122 @@ def test_sentence_starting_with_a_figure_number_is_not_a_caption(tmp_path):
         assert PS.find_label_page(d, "Fig. 9", hint=1) == 2
         kinds = {k[1] + k[2] for k, _ in PS._captions(d[1])}
     assert {"fig9", "algorithm1", "table1"} <= kinds
+
+
+# ---------------- 逐句出处 v4：2026-09-21 对抗审核 A 的七类结构性缺陷 ----------------
+
+def test_appendix_after_references_is_searchable_but_reference_entries_are_not(tmp_path):
+    """References 之后不是全文终点：附录里的消融/补充表恰恰是证据句最爱引的地方。此前一遇到
+    References 就彻底停止，出处在附录的句子要么漏配、要么被配到正文里的相似物。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_textbox(fitz.Rect(60, 80, 520, 170), "Data obtained from remote sensing equipment via satellite may be missing "
+                      "observations at certain times due to transient satellite malfunction in the main text.", fontsize=10)
+    pg.insert_text((60, 200), "References", fontsize=12)
+    pg.insert_textbox(fitz.Rect(60, 215, 520, 290), "[1] Someone, A. A paper about sexual health surveys and loss of sexual "
+                      "function among men, with a long enough title to form a window. J. X 1, 1-2 (2020).", fontsize=9)
+    pg.insert_text((60, 320), "A Additional results", fontsize=12)
+    pg.insert_textbox(fitz.Rect(60, 335, 520, 430), "In the appendix study on sexual health, men were reluctant to answer a "
+                      "question on loss of sexual function, so the missingness is informative there as well.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        wins = PS.passage_windows(d)
+        r = PS.locate_passages(d, [{"text": "附录：男性更不愿回答性功能问题。", "section": "结果与效应量"}], _fake_embed)
+    assert not any("Someone, A." in w["text"] for w in wins)
+    assert any(w["appx"] and "appendix study" in w["text"] for w in wins)
+    assert r[0] and r[0]["rect"][1] > 300                                # 落在附录那一段（含其标题行），不是 215–290 的参考文献条目
+
+
+def test_page_hint_is_soft_a_one_page_slip_still_finds_the_source(tmp_path):
+    """札记页码差一页很常见。此前页码是铁律：锁在错页里挑个最像的（yan2024 真出处 p.9、提示 8）。"""
+    doc = fitz.open()
+    texts = {13: "A skip pattern occurs when a set of responses are only obtained if the response to an earlier question is Yes.",
+             14: "Another skip pattern paragraph that talks about a skip in the questionnaire and nothing else at all here.",
+             15: "Data obtained via satellite may be missing observations at certain times due to transient satellite malfunction."}
+    for n, t in texts.items():
+        pg = doc.new_page()
+        pg.insert_textbox(fitz.Rect(60, 100, 520, 220), t, fontsize=10)
+        pg.insert_text((500, 830), str(n), fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, [14])
+        r = PS.locate_passages(d, [{"text": "卫星瞬时故障导致观测缺失。", "page": "14", "section": "方法与数据"},
+                                   {"text": "跳答模式造成大块缺失。", "page": "14", "section": "方法与数据"}], _fake_embed, pm)
+    assert r[0]["page"] == 3 and r[0]["how"] == "page±1"
+    assert r[1]["page"] == 2 and r[1]["how"] == "page"                  # 同页能过线就留在同页
+
+
+def test_sentence_full_of_decimals_is_not_pinned_to_a_caption_that_has_none_of_them(tmp_path):
+    """讲表内数字的句子此前常落到图注/表注上，满篇都是的数字（300/500/1000）还给它加分。现在：
+    句子带 ≥3 个小数而窗口命中不到 2 个 → 要纯余弦 ≥0.70 才信；本文少见的数字命中才加分。"""
+    import numpy as np
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_textbox(fitz.Rect(60, 80, 520, 150), "FIGURE 2 Empirical power CAPTION for n = 300, 500 and 1000 under the "
+                      "alternative, with nominal levels as described in the main text of the simulation study.", fontsize=10)
+    pg.insert_textbox(fitz.Rect(60, 300, 520, 370), "TABLEROW n = 300 rejection rates 0.012 0.048 0.097 0.151 at the nominal "
+                      "levels reported for the first simulation scenario of the study in this table.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+
+    def embed(texts):                                   # 图注的余弦 0.65，表格行只有 0.58
+        out = []
+        for t in texts:
+            c = 0.65 if "CAPTION" in t else 0.58 if "TABLEROW" in t else 1.0
+            out.append([c, (1 - c * c) ** 0.5, 0.0])
+        return np.array(out)
+    with fitz.open(str(pdf)) as d:
+        r = PS.locate_passages(d, [{"text": "第一类错误：n=300 时分别为 0.012、0.048、0.097、0.151。", "section": "结果与效应量"}], embed)
+    assert r[0] and r[0]["rect"][1] > 250 and r[0]["raw"] < 0.62 <= r[0]["score"]
+
+
+def test_pdf_with_one_text_block_per_line_is_windowed_as_paragraphs():
+    """逐行成块的 PDF：此前要么切不出窗口（mathur2026 全篇 12 个），要么截出来只有一行字没法核对。
+    （MuPDF 会把自己生成的相邻行并成一块，造不出这种 PDF，所以直接喂碎块。）"""
+    def blk(n, y, x0=60, x1=300, lines=1):
+        return {"number": n, "lines": [(fitz.Rect(x0, y + i * 12, x1, y + i * 12 + 11), "line {} of block {}".format(i, n), 10.0)
+                                       for i in range(lines)]}
+    frag = [blk(i, 100 + i * 13) for i in range(6)]                       # 六个单行块，行距 2pt
+    merged = PS._merge_fragments(frag)
+    assert len(merged) == 1 and len(merged[0]["lines"]) == 6
+    far = [blk(0, 100), blk(1, 140)]                                      # 隔了一个段落间距：不并
+    assert len(PS._merge_fragments(far)) == 2
+    other_col = [blk(0, 100), blk(1, 113, x0=320, x1=560)]                # 另一栏：不并
+    assert len(PS._merge_fragments(other_col)) == 2
+    normal = [blk(0, 100, lines=5), blk(1, 162, lines=5)]                 # 正常分段的 PDF 不受影响
+    assert len(PS._merge_fragments(normal)) == 2
+
+
+def test_no_source_is_decided_by_keywords_not_by_four_fixed_headings():
+    assert PS.has_no_source({"section": "对本论文攻防的意义", "text": "这一条可以直接拿来反驳审稿人。"})
+    assert PS.has_no_source({"section": "净影响", "text": "总体对我们有利。"})
+    assert PS.has_no_source({"section": "实验方法", "text": "【原文未报告】随机种子、GPU 型号。"})
+    assert not PS.has_no_source({"section": "局限与可质疑点", "text": "我的质疑九：每个标签独立挑选编码器。"})   # 事实前提在原文里
+    assert not PS.has_no_source({"section": "结果与效应量", "text": "AUC 为 0.87。"})
+    assert PS._cjk_len("谱分解图卷积模型与空间图卷积模型的核心思想汇总如下表所示") >= 60 > len("谱分解图卷积模型与空间图卷积模型的核心思想汇总如下表所示")
+
+
+def test_passage_cache_invalidation_page_hint_model_and_offline_never_deletes(tmp_path, monkeypatch):
+    pdf = _three_paragraph_pdf(tmp_path)
+    out = tmp_path / "shots"
+    calls = []
+
+    class Client:
+        def __init__(self, model):
+            self.model = model
+
+        def embed(self, texts):
+            calls.append((self.model, len(texts)))
+            return _fake_embed(texts)
+    s = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量"}]
+    got = PS.passages_for_paper(pdf, "k", s, out, Client("bge-m3").embed)
+    n = len(calls)
+    PS.passages_for_paper(pdf, "k", s, out, Client("bge-m3").embed)
+    assert len(calls) == n                                               # 同模型同句同页码：全走缓存
+    PS.passages_for_paper(pdf, "k", [dict(s[0], page="19")], out, Client("bge-m3").embed)
+    assert len(calls) > n                                                # 只订正了页码锚：重算这一句
+    n = len(calls)
+    PS.passages_for_paper(pdf, "k", [dict(s[0], page="19")], out, Client("other-model").embed)
+    assert len(calls) > n and calls[-1][0] == "other-model"             # 换了向量模型：整篇作废重算
+    monkeypatch.setattr(PS, "PASSAGE_VERSION", "999")                    # 算法升版了，但向量服务没起
+    offline = PS.passages_for_paper(pdf, "k", [dict(s[0], page="19")], out, None)
+    assert len(offline) == 1 and all((out / v["rel"]).is_file() for v in offline.values())   # 旧图照出，一张不删
