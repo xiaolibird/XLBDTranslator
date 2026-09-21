@@ -1025,3 +1025,20 @@ def test_source_pages_heading_does_not_masquerade_as_a_close_reading_section(tmp
     assert not any(_CR_SECTION_RE.match(l.strip()) and "原文页面" in l for l in lines)
     secs = {h.get("section") for h in parse_note_md(Path(res["note_path"]))[0]["highlights"]}
     assert "原文页面" not in secs and None not in secs
+
+
+def test_publisher_cover_page_gives_a_negative_offset(tmp_path):
+    """Taylor & Francis 下载的 PDF 第 1 页是一张封面，印刷页 = PDF 页序 - 1。此前只认非负偏移，
+    这种 PDF 被当成「PDF 页序」，札记按印刷页标的页码整篇差一页（mohan2021 JASA 版实测）。"""
+    doc = fitz.open()
+    doc.new_page().insert_text((60, 100), "Full Terms & Conditions of access and use", fontsize=10)   # 封面，无页码
+    for printed in range(1, 11):
+        pg = doc.new_page()
+        pg.insert_text((60, 100), "article body text on printed page {}".format(printed), fontsize=10)
+        pg.insert_text((500, 830), str(printed), fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, [2, 7])
+        assert (pm.how, pm.offset) == ("header", -1) and pm.to_pdf(2) == 3 and pm.to_printed(11) == 10
+        pm2 = PS.build_page_map(d, [2, 11])        # 11 = PDF 总页数：印刷页到不了，只能是按 PDF 页序记的
+        assert pm2.how == "pdf-order(header-ignored)" and pm2.to_pdf(11) == 11

@@ -208,10 +208,18 @@ def build_page_map(doc, wanted: Optional[List[int]] = None) -> PageMap:
     for i in range(n):
         for num in set(_edge_numbers(doc[i])):
             off = num - (i + 1)
-            if off >= 0:
+            # 负偏移只收 -1..-3：出版商下载时在正文前加的封面/条款页（Taylor & Francis 的 PDF 第 1 页
+            # 是一张封面，印刷页 = PDF 页序 - 1）。此前只认 >= 0，这种 PDF 被当成「PDF 页序」，整篇差一页。
+            if off >= -3:
                 votes[off] = votes.get(off, 0) + 1
-    best = max(votes.items(), key=lambda kv: (kv[1], -kv[0])) if votes else (0, 0)
+    best = max(votes.items(), key=lambda kv: (kv[1], -abs(kv[0]))) if votes else (0, 0)
     need = max(2, (n + 1) // 2)             # 过半页面一致才采信，挡住「每页都印着年份 2023」
+    if best[0] < 0 and best[1] >= need:
+        # 封面页的对称判据（与下面 F6 同理）：札记里出现了等于 PDF 总页数的页码——印刷页到不了那么大
+        # （最后一页的印刷页是 n + offset），只能是按 PDF 页序记的。
+        if wanted and max(wanted) > n + best[0]:
+            return PageMap(n, 0, "pdf-order(header-ignored)")
+        return PageMap(n, best[0], "header")
     if best[0] > 0 and best[1] >= need:
         # 页眉说这份 PDF 印的是 2467–2476 页，札记却标着 1–9：那是 agent 用 Read 工具按 **PDF 页序**
         # 记的页码。只要札记页码全在 PDF 页序内、且有一个低于首个印刷页（印刷页不可能有它），就按

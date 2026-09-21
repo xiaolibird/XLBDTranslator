@@ -132,12 +132,12 @@ class ProcessingSettings(BaseModel):
         "",
         description="NCBI E-utilities 礼貌参数用的联系邮箱（可选，无需密钥）"
     )
+    # 2026-09-21 放宽：原式是「缺失机制词 AND 临床场景词 AND 方法词」三重 AND，在 arXiv 全部历史里
+    # 只命中 1 篇（仅前两组 AND 也只有 25 篇、近 5 周 0 篇），这一路从来没有过产出。只保留缺失机制词：
+    # 近 5 周 14 篇、约每周 3 篇，远低于 external_max_results 上限；领域噪声交给 filter-v3 裁决剔除。
     arxiv_query: str = Field(
         "(all:MNAR OR all:\"missing not at random\" OR all:\"informative missingness\" "
-        "OR all:\"missingness mechanism\") AND (all:EHR OR all:\"electronic health record\" "
-        "OR all:ICU OR all:\"clinical prediction\") AND (all:\"causal discovery\" "
-        "OR all:transportability OR all:\"distribution shift\" OR all:\"external validation\" "
-        "OR all:attention OR all:\"graph neural network\")",
+        "OR all:\"missingness mechanism\")",
         description="arXiv 检索式（Atom API 语法，字段前缀 all:/abs:）"
     )
     pubmed_query: str = Field(

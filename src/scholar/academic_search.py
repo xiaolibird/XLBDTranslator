@@ -17,6 +17,7 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+from .fulltext import ipv4_client
 from .schema import PaperMetadata, PaperSegment, PaperField, DigestStatus
 from ..utils.logger import get_logger
 
@@ -33,6 +34,9 @@ _TRANSIENT_CODES = frozenset({429, 500, 502, 503, 504})
 _RETRY_ATTEMPTS = 3
 _RETRY_FIRST_DELAY = 2.0
 _RETRY_BACKOFF = 3.0
+# arXiv API 使用条款要求连续请求间隔 ≥3 秒。此前翻页只等 0.5 秒；周度 digest 在 2026-08-24、
+# 09-14 两次撞 429（未证实就是这个原因，但先按条款来）。
+_ARXIV_PAGE_DELAY = 3.0
 
 
 def _get_retry(client: httpx.Client, url: str, params: Optional[Dict[str, Any]] = None,
@@ -76,12 +80,11 @@ class AcademicSearchClient:
     def __init__(self, timeout: float = 20.0, email: str = "", tool: str = "xlbd-scholar-digest"):
         self.email = email
         self.tool = tool
-        # 强制 IPv4：本机代理/fake-ip（198.18.x.x）叠加 IPv6 黑洞会让 arXiv/PubMed 静默超时。
-        self._client = httpx.Client(
+        # 复用 ipv4_client：强制 IPv4（代理 fake-ip 叠加 IPv6 黑洞会静默超时）、跟随 301，
+        # 以及进程级 arXiv 节流（超限会被 CDN 按 IP+TLS 指纹罚 406，见 fulltext._arxiv_throttle）。
+        self._client = ipv4_client(
             timeout=timeout,
             headers={"User-Agent": f"{tool} (https://github.com/xiaolibird/XLBDTranslator)"},
-            transport=httpx.HTTPTransport(local_address="0.0.0.0"),
-            follow_redirects=True,  # arXiv/NCBI http→https 301 需跟随，否则拿到空响应
         )
 
     def close(self):
@@ -136,7 +139,7 @@ class AcademicSearchClient:
             if len(batch) < page:
                 break
             start += page
-            time.sleep(0.5)  # arXiv 礼貌限速
+            time.sleep(_ARXIV_PAGE_DELAY)  # arXiv 条款：请求间隔 ≥3 秒
         if pages_fetched >= max_pages:
             logger.warning("arXiv 检索触及最大页数上限 %d（已取 %d 条），可能未取完", max_pages, len(items))
         items = items[:max_results]

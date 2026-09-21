@@ -15,7 +15,11 @@ J Clin Med/Eur Heart J 全挂），但同一批论文的 OA 全文在 Europe PMC
 只返回 URL 与 OA 状态，实际下载交给 Zotero（连接器 attachments 让 Zotero 自己抓），
 或上层显式下载。HTTP 与解析分离，便于 mock 测试。
 """
+import os
 import re
+import ssl
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -32,17 +36,75 @@ _WARNED_NO_EMAIL = False
 EUROPEPMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
+def tls_context() -> ssl.SSLContext:
+    """httpx 用的 SSL 上下文：信任库语义与 httpx 默认一致，另开启 TLS 1.3 post_handshake_auth。
+
+    开 PHA 让 ClientHello 与标准库 http.client/urllib 一致。**它不是 arXiv 406 的根治**——
+    2026-09-21 先观察到「不开 PHA 恒 406、开了恒 200」，当晚高频请求后翻转为「开 PHA 恒 406、
+    不开反而通过」。最能解释两组现象的是：arXiv 的 CDN（Fastly）按「IP + TLS 指纹」分桶限流，
+    超限的桶罚一段时间的 406（x-cache 只有两层 MISS、不回源），重压下连 TLS 握手都被掐断。
+    换指纹只是换了个桶；真正的防线是 _arxiv_throttle 的请求间隔。PHA 对其它站点无副作用。
+
+    复现陷阱：Fastly 会缓存成功响应，命中缓存时拦截规则不生效（中层 x-cache 为 HIT）。
+    排查必须用从未请求过的 URL 或缓存击穿参数，并控制探测频率，否则会把自己送进罚期。
+    """
+    make = getattr(httpx, "create_ssl_context", None)  # 0.28 起公开；沿用它才能保持 SSL_CERT_FILE 等语义
+    if make is not None:
+        ctx = make()
+    else:  # httpx < 0.28：按其默认规则手工复刻（环境变量优先，否则 certifi）
+        import certifi
+        if os.environ.get("SSL_CERT_FILE"):
+            ctx = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+        elif os.environ.get("SSL_CERT_DIR"):
+            ctx = ssl.create_default_context(capath=os.environ["SSL_CERT_DIR"])
+        else:
+            ctx = ssl.create_default_context(cafile=certifi.where())
+    if ctx.post_handshake_auth is not None:  # 与 http.client._create_https_context 同一判据
+        ctx.post_handshake_auth = True
+    return ctx
+
+
+# arXiv 条款要求请求间隔 ≥3 秒。2026-09-21 实测：入库补全逐篇连发 12 次 arXiv 请求（加上
+# translation-server 同时解析同一批编号）后，同一 IP 随即被 CDN 罚 406，全文精读的 PDF 下载全灭。
+_ARXIV_MIN_INTERVAL = 3.0
+_arxiv_lock = threading.Lock()
+_arxiv_last = [0.0]   # 进程内最近一次 arXiv 请求的 time.monotonic()
+
+
+def _is_arxiv_host(host: str) -> bool:
+    host = (host or "").lower()
+    return host == "arxiv.org" or host.endswith(".arxiv.org")
+
+
+def _arxiv_throttle(request: httpx.Request) -> None:
+    """httpx 请求钩子：同一进程内发往 *.arxiv.org 的请求两两间隔 ≥_ARXIV_MIN_INTERVAL。
+
+    持锁睡眠是有意的——入库补全按分片多线程并发，必须全进程串行排队，按客户端各自计时拦不住。
+    重定向产生的后续请求同样经过钩子。非 arXiv 主机零开销直接放行。
+    """
+    if not _is_arxiv_host(request.url.host):
+        return
+    with _arxiv_lock:
+        wait = _arxiv_last[0] + _ARXIV_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _arxiv_last[0] = time.monotonic()
+
+
 def ipv4_client(timeout: float = 15.0, headers: Optional[Dict[str, str]] = None) -> httpx.Client:
     """构造强制 IPv4 的 httpx.Client。
 
     本机若有代理/fake-ip（Clash/Surge 等把域名解析到 198.18.x.x）叠加 IPv6 黑洞，
     默认连接会对 crossref/arxiv/unpaywall 超时（而 `curl -4` 正常）。绑定 IPv4 源地址规避。
+    另挂 _arxiv_throttle：进程内所有 arXiv 请求按条款节流（超限会被 CDN 罚 406/429，见 tls_context）。
+    访问 arXiv 的客户端一律走这里，别自己 httpx.Client(...)。
     """
     return httpx.Client(
         timeout=timeout,
         headers=headers or {"User-Agent": "xlbd-scholar-digest"},
-        transport=httpx.HTTPTransport(local_address="0.0.0.0"),
+        transport=httpx.HTTPTransport(local_address="0.0.0.0", verify=tls_context()),
         follow_redirects=True,  # arXiv/NCBI 等 http→https 会 301，默认不跟随会拿到空响应
+        event_hooks={"request": [_arxiv_throttle]},
     )
 
 
