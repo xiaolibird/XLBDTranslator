@@ -800,3 +800,68 @@ def test_passage_cache_invalidation_page_hint_model_and_offline_never_deletes(tm
     monkeypatch.setattr(PS, "PASSAGE_VERSION", "999")                    # 算法升版了，但向量服务没起
     offline = PS.passages_for_paper(pdf, "k", [dict(s[0], page="19")], out, None)
     assert len(offline) == 1 and all((out / v["rel"]).is_file() for v in offline.values())   # 旧图照出，一张不删
+
+
+def test_docx_embeds_figure_shots_only_when_asked_and_md_always_does(tmp_path):
+    """月度 docx 不内嵌截图（2026-08 一份 85 MB，把周备份从 56 MB 撑到 310 MB）；专题桶照旧内嵌。"""
+    import zipfile
+    from src.scholar.notes import write_notes
+    seg, pdf = _segment_with_figure(tmp_path)
+    sizes = {}
+    for flag in (True, False):
+        out = tmp_path / ("on" if flag else "off")
+        out.mkdir()
+        res = write_notes([seg], {seg.paper_id: "k2020Fig"}, out_dir=out, filename="n", index_series="manual",
+                          pdf_paths={seg.paper_id: str(pdf)}, emit_docx=True, docx_shots=flag)
+        with zipfile.ZipFile(res["docx_path"]) as z:
+            sizes[flag] = sum(1 for n in z.namelist() if n.startswith("word/media/"))
+        assert "assets/shots/k2020Fig/" in Path(res["note_path"]).read_text("utf-8")      # md 两种情况都带图
+    assert sizes[True] >= 1 and sizes[False] == 0
+
+
+def test_topic_bucket_rule():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("read_pdf_cli", Path(__file__).resolve().parents[1] / "scripts" / "read_pdf.py")
+    rp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rp)
+    assert rp._is_topic_bucket("2026-09-20-SM源头") and rp._is_topic_bucket("2026-07-17")
+    assert not rp._is_topic_bucket("2026-09") and not rp._is_topic_bucket("")
+
+
+def test_header_offset_is_ignored_when_notes_were_clearly_written_in_pdf_page_order(tmp_path):
+    """对抗审核 F6：页眉印着 13–42，札记按 PDF 页序标了 3/14/20。此前 3→落空、14→第 2 页、20→第 8 页。"""
+    doc = fitz.open()
+    for i in range(30):
+        pg = doc.new_page()
+        pg.insert_text((60, 100), "body text page {}".format(i + 1), fontsize=10)
+        pg.insert_text((500, 830), str(13 + i), fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        pm = PS.build_page_map(d, [3, 14, 20])
+        assert pm.how.startswith("pdf-order") and [pm.to_pdf(p) for p in (3, 14, 20)] == [3, 14, 20]
+        pm2 = PS.build_page_map(d, [14, 20, 41])                       # 41 > 30 页：只能是印刷页
+        assert pm2.how == "header" and pm2.to_pdf(14) == 2
+        pm3 = PS.build_page_map(d, [14, 20])                           # 两种口径都说得通：信页眉（原行为）
+        assert pm3.how == "header"
+
+
+def test_files_of_a_pdf_fingerprint_that_no_longer_exists_are_reaped_but_a_living_second_pdf_is_not(tmp_path):
+    """对抗审核 F8：PDF 重新下载后指纹变了，旧标记名下的缓存与图此前永远没人删。"""
+    import os
+    a = _three_paragraph_pdf(tmp_path)
+    b = tmp_path / "other_month_copy.pdf"
+    b.write_bytes(a.read_bytes() + b"\n% another download\n")
+    s = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量", "page": "19"}]
+    out = tmp_path / "shots"
+    for pdf in (a, b):
+        PS.shots_for_paper(pdf, "k", s, out)
+        PS.passages_for_paper(pdf, "k", s, out, _fake_embed)
+    before = sorted(p.name for p in (out / "k").iterdir())
+    tag_b = PS.pdf_tag(b)[1]
+    PS.passages_for_paper(a, "k", s, out, _fake_embed)
+    assert sorted(p.name for p in (out / "k").iterdir()) == before       # 两份都活着：谁也不动谁
+    os.utime(b, ns=(1, 1))                                               # b 被「重新下载」：指纹变了
+    PS.shots_for_paper(a, "k", s, out)
+    left = [p.name for p in (out / "k").iterdir() if tag_b in p.name]
+    assert left == []                                                    # 旧标记名下的 q 图、缓存、整页图全部回收
+    assert (out / "k/p0019.jpg").is_file()                               # a 的裸名图不受影响

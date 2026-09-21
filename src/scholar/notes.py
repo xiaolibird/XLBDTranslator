@@ -185,7 +185,8 @@ def _shot_pages_block(shots: Optional[Dict[str, Any]]) -> List[str]:
         links.append("[{}]({}/{})".format(name, _SHOT_DIR, rel))
     m = shots.get("_map") or {}
     how = {"label": "页码为原文印刷页（PDF 自带页标签）", "header": "页码为原文印刷页（由页眉/页脚推得，PDF 第 1 页 = p.{}）"
-           .format((m.get("offset") or 0) + 1), "pdf-order": "页码为 PDF 页序"}.get(m.get("how"), "")
+           .format((m.get("offset") or 0) + 1), "pdf-order": "页码为 PDF 页序",
+           "pdf-order(header-ignored)": "页码为 PDF 页序（页眉印的是期刊页码，札记标的不是）"}.get(m.get("how"), "")
     out = ["**【原文页面】**", "", "{}：{}".format(how or "原文页面", " · ".join(links))]
     miss = shots.get("_missing") or []
     if miss:
@@ -451,6 +452,7 @@ def write_notes(
     existing_key_owners: Optional[Dict[str, str]] = None,
     pdf_paths: Optional[Dict[str, str]] = None,
     embed_fn=None,
+    docx_shots: bool = True,
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
@@ -461,6 +463,8 @@ def write_notes(
         向量函数由调用方注入而不在这里自建：测试不许连网络，Ollama 没起也不该拦归档。
         必须在这里做而不是事后补：finalize 是整月重建，而截图目录名
         用的 citekey 要到本函数内部才定下来——事后补意味着每篇新论文都要重建两遍。
+    docx_shots: docx 里要不要内嵌图表截图（md 不受影响）。月度 docx 是不断累积的大文件，内嵌后
+        2026-08 一份就 85 MB，周备份从 56 MB 涨到 310 MB——调用方只对篇数有限的专题桶打开。
 
     Args:
         segments: 入选论文（同一时间窗）
@@ -606,7 +610,7 @@ def write_notes(
             docx_path = out_dir / "{}.docx".format(_slug(filename, 80) or "scholar_digest")
             build_digest_docx(segments, citekeys, docx_path, title=digest_title,
                               csl_items=csl_items, cjk_font=cjk_font, instruction=instruction,
-                              shots=shots, assets_root=out_dir / _SHOT_DIR)
+                              shots=shots if docx_shots else None, assets_root=out_dir / _SHOT_DIR)
             result["docx_path"] = str(docx_path)
         except Exception as e:
             logger.warning("  ⚠️ 生成样式化 docx 失败: {}".format(e))

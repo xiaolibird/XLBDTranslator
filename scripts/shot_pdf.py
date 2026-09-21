@@ -81,7 +81,8 @@ def main():
     m, miss = got.pop("_map", {}), got.pop("_missing", [])
     print("PDF: {}\n页码口径: {}{}".format(
         pdf, {"label": "原文印刷页（PDF 页标签）", "header": "原文印刷页（页眉/页脚推得）",
-              "pdf-order": "PDF 页序", "none": "—"}.get(m.get("how"), m.get("how")),
+              "pdf-order": "PDF 页序", "none": "—",
+              "pdf-order(header-ignored)": "PDF 页序（页眉印的是期刊页码，但给的页码低于首个印刷页）"}.get(m.get("how"), m.get("how")),
         "，PDF 第 1 页 = p.{}".format(m["offset"] + 1) if m.get("offset") else ""))
     for rel, v in sorted(got.items()):
         what = (v.get("label") or "p.{}".format(v.get("printed") or v.get("pdf_page")))

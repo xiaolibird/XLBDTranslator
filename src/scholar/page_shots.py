@@ -209,6 +209,12 @@ def build_page_map(doc, wanted: Optional[List[int]] = None) -> PageMap:
     best = max(votes.items(), key=lambda kv: (kv[1], -kv[0])) if votes else (0, 0)
     need = max(2, (n + 1) // 2)             # 过半页面一致才采信，挡住「每页都印着年份 2023」
     if best[0] > 0 and best[1] >= need:
+        # 页眉说这份 PDF 印的是 2467–2476 页，札记却标着 1–9：那是 agent 用 Read 工具按 **PDF 页序**
+        # 记的页码。只要札记页码全在 PDF 页序内、且有一个低于首个印刷页（印刷页不可能有它），就按
+        # PDF 页序解释。此前 header 口径没有这条回退：要么全部落空（真库一篇 10 页 PDF，9 个页码
+        # 全进「未能截到」），偏移小时更糟——自信地映到错页（对抗审核 F6）。
+        if wanted and max(wanted) <= n and min(wanted) < 1 + best[0]:
+            return PageMap(n, 0, "pdf-order(header-ignored)")
         return PageMap(n, best[0], "header")
     if wanted and max(wanted) > n and best[0] > 0 and best[1] >= 2:
         return PageMap(n, best[0], "header")   # 札记页码明显超界时放宽门槛
@@ -588,6 +594,52 @@ def pdf_tag(pdf_path: Path) -> Tuple[List[int], str]:
 _TAGGED = re.compile(r"_[0-9a-f]{6}\.jpg$")
 
 
+def _reap_stale_tags(cdir: Path, mytag: str, pdf_path: Path) -> None:
+    """登记「这个标记是哪份 PDF 的」，顺手回收已经没有主的标记名下的文件。
+
+    指纹 = size + mtime：PDF 被重新下载、或搬到时间戳粒度更粗的盘上，标记就变了。缓存文件名本身
+    带标记，清理又只认当前标记——旧标记的 `passages.<旧>.json`、`q_<旧>_*.jpg`、`*_<旧>.jpg`
+    永远没人删（对抗审核 F8）。判「没有主」要保守：登记过的那份 PDF 不在了，或者它现在的指纹
+    已经不是这个标记；没登记过的标记一律不碰（可能是另一个月份桶里还活着的那份 PDF）。
+    """
+    import json
+    f = cdir / "tags.json"
+    try:
+        reg = json.loads(f.read_text("utf-8")) if f.exists() else {}
+    except Exception:
+        reg = {}
+    changed = reg.get(mytag) != str(pdf_path)
+    reg[mytag] = str(pdf_path)
+    for tag, path in list(reg.items()):
+        if tag == mytag:
+            continue
+        try:
+            alive = Path(path).is_file() and pdf_tag(Path(path))[1] == tag
+        except OSError:
+            alive = False
+        if alive:
+            continue
+        for old in list(cdir.glob("q_{}_*.jpg".format(tag))) + list(cdir.glob("*_{}.jpg".format(tag))) + \
+                [cdir / "passages.{}.json".format(tag), cdir / ".v_{}".format(tag)]:
+            if old.is_file():
+                old.unlink()
+        owner = cdir / ".pdf"
+        if owner.is_file() and owner.read_text().strip() == tag:        # 裸名的主没了：裸名图一并收走，让位
+            for old in cdir.glob("*.jpg"):
+                if not old.name.startswith("q_") and not _TAGGED.search(old.name):
+                    old.unlink()
+            for meta in (owner, cdir / ".v"):
+                if meta.is_file():
+                    meta.unlink()
+        reg.pop(tag)
+        changed = True
+    if changed:
+        cdir.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(reg, ensure_ascii=False), "utf-8")
+        tmp.replace(f)
+
+
 def _owner_tag(cdir: Path, tag: str) -> str:
     """这个 citekey 目录里不带后缀的文件名（p0016.jpg / fig2.jpg）归哪份 PDF 所有。
 
@@ -630,6 +682,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
         return {"_map": {"how": "none"}, "_missing": []}
     cdir = out_root / shot_name(citekey, 1).split("/")[0]
     _, mytag = pdf_tag(pdf_path)
+    _reap_stale_tags(cdir, mytag, pdf_path)
     tag = "" if _owner_tag(cdir, mytag) == mytag else mytag       # 裸名归第一份 PDF，另一份带后缀
     vfile = cdir / (".v_" + tag if tag else ".v")
     if not force and (not vfile.exists() or vfile.read_text().strip() != SHOT_VERSION):
@@ -959,6 +1012,8 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
     safe = shot_name(citekey, 1).split("/")[0]
     cdir = out_root / safe
     fp, tag = pdf_tag(pdf_path)
+    if embed is not None:
+        _reap_stale_tags(cdir, tag, pdf_path)
     # 缓存与截图文件名都带 PDF 指纹：同一 citekey 可能对应两份 PDF（同一篇在两个月份桶里各读过
     # 一次）。按 citekey 共用一份缓存时，后重建的月份会因「指纹变了」清空目录，把先重建那个月
     # 的截图删掉——2026-09-20 全量实测 4 篇、209 个坏链。

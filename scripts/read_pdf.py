@@ -577,6 +577,13 @@ def _bundle_inventory(mdir: Path, suffix: str) -> dict:
     return out
 
 
+def _is_topic_bucket(month: str) -> bool:
+    """专题桶（`YYYY-MM-DD[-主题]`：一次读一批、篇数有限）才在 docx 里内嵌图表截图；纯月份桶
+    （`YYYY-MM`）是全年不断累积的大文件，只在 md 里带图。用户 2026-09-20 拍板。"""
+    import re
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}(-.+)?$", month or ""))
+
+
 def _passage_embed_fn(settings):
     """逐句出处定位用的向量函数（bge-m3 是多语种的，中文证据句可直接匹配英文原文）。
 
@@ -843,6 +850,7 @@ def _rebuild_month(notes_dir: Path, month: str, settings,
             res = write_notes(
                 segments, citekeys, out_dir=notes_dir, pdf_paths=_bundle_pdf_paths(mdir),
                 embed_fn=_passage_embed_fn(settings),
+                docx_shots=_is_topic_bucket(month),
                 instruction=proc.notes_instruction,
                 digest_title="科研札记 · {}（手动深度精读）".format(month),
                 filename="科研札记_{}_手动精读".format(month),
