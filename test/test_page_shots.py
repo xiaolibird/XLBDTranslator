@@ -914,3 +914,26 @@ def test_reference_category_cell_in_a_table_is_not_the_references_heading(tmp_pa
     pdf = _save(doc, tmp_path)
     with fitz.open(str(pdf)) as d:
         assert any("satellite" in w["text"] for w in PS.passage_windows(d))
+
+
+def test_number_bonus_cannot_lift_an_unrelated_window_over_the_line(tmp_path):
+    """rossiUnreasonable：「缺失率 0.00、0.10…0.99」被配到 Label Propagation 的超参网格
+    [0.1,…,0.95,0.99] 上——数字全中、内容无关（raw=0.539）。纯余弦有绝对下限。"""
+    import numpy as np
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_textbox(fitz.Rect(60, 80, 520, 170), "GRIDSEARCH Label Propagation. We use the label propagation implementation "
+                      "provided in the library. Since the method is sensitive to alpha, we perform a gridsearch over the "
+                      "following values: 0.1, 0.2, 0.3, 0.4, 0.5, 0.9, 0.95, 0.99 for each dataset separately.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+
+    def embed(texts):                                   # 唯一的窗口余弦 0.54：相关但不是出处
+        return np.array([[0.54, 0.84, 0.0] if "GRIDSEARCH" in t else [1.0, 0.0, 0.0] for t in texts])
+    sent = [{"text": "图3 和图6 沿横轴报告缺失率 0.1、0.2、0.3、0.4、0.5、0.9、0.95、0.99 下的准确率。", "section": "实验方法"}]
+    with fitz.open(str(pdf)) as d:
+        assert PS.locate_passages(d, sent, embed)[0] is None
+        PS.PASSAGE_MIN_RAW, keep = 0.50, PS.PASSAGE_MIN_RAW      # 放开下限就会配上——证明拦住它的正是这条线
+        try:
+            assert PS.locate_passages(d, sent, embed)[0] is not None
+        finally:
+            PS.PASSAGE_MIN_RAW = keep

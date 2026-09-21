@@ -765,6 +765,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
 PASSAGE_DPI = 150
 WIN_LINES, WIN_STRIDE = 6, 3
 PASSAGE_MIN_SCORE = 0.62   # 余弦 + **本文少见的**数字命中加分 ≥ 这个值才配图
+PASSAGE_MIN_RAW = 0.55     # 纯余弦的绝对下限：加分再多也不能把它抬过线
 PASSAGE_VETO_RAW = 0.70    # 句子带 ≥3 个小数而窗口命中不到 2 个：多半落在了图注/方法段上，纯余弦要到这里才信
 PASSAGE_OFFPAGE_RAW = 0.68 # 札记标了页码却要到 ±1 页之外去找：页码多半没错，换页的门槛要高
 PASSAGE_APPX_PENALTY = 0.03  # 附录常把正文的话再说一遍：分数接近时优先正文
@@ -941,7 +942,12 @@ def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMa
             if qn else np.zeros(len(wins))
         rank = raw + bonus - appx
         vetoed = np.array([len(qdec & wn) < 2 for wn in wnums]) if len(qdec) >= 3 else np.zeros(len(wins), bool)
-        accept = np.where(vetoed, raw >= PASSAGE_VETO_RAW, raw + bonus >= PASSAGE_MIN_SCORE)
+        # 绝对下限：数字加分最多 +0.12，光靠它能把余弦 0.50 的段落抬过 0.62。实测 rossiUnreasonable
+        # 那句「图3/图6 沿横轴报告缺失率 0.00、0.10…0.99」被配到 Label Propagation 的超参网格
+        # [0.1,0.2,…,0.95,0.99] 上——数字全中、内容无关（raw=0.539）。审核样本里真出处的最低余弦
+        # 是 0.571，所以 0.55 这条线不会伤到真出处；全库只影响 53 句（0.3%）。
+        accept = np.where(vetoed, raw >= PASSAGE_VETO_RAW,
+                          (raw + bonus >= PASSAGE_MIN_SCORE) & (raw >= PASSAGE_MIN_RAW))
 
         def best(mask, extra=None) -> Optional[int]:
             m = mask & accept if extra is None else mask & accept & extra
@@ -1002,7 +1008,7 @@ def render_passage(doc, pdf_index: int, rect, out: Path, dpi: int = PASSAGE_DPI)
     return out
 
 
-PASSAGE_VERSION = "4"
+PASSAGE_VERSION = "5"
 
 
 def sentence_key(text: str) -> str:
