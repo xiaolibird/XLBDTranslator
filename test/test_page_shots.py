@@ -865,3 +865,39 @@ def test_files_of_a_pdf_fingerprint_that_no_longer_exists_are_reaped_but_a_livin
     left = [p.name for p in (out / "k").iterdir() if tag_b in p.name]
     assert left == []                                                    # 旧标记名下的 q 图、缓存、整页图全部回收
     assert (out / "k/p0019.jpg").is_file()                               # a 的裸名图不受影响
+
+
+def test_side_by_side_booktabs_tables_each_caption_takes_the_rules_under_itself(tmp_path):
+    """um25a p.25：Table 27 | Table 28 并排。只按纵向取最近的横线，会把左表的表注配给右表的线。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    for x0, x1, name, ys in ((58, 287, "Table 27. Dataset statistics.", (89, 104, 170)),
+                             (309, 539, "Table 28. Statistics of medical datasets.", (88, 103, 146))):
+        pg.insert_text((x0 + 40, 76), name, fontsize=9)
+        for y in ys:
+            pg.draw_line((x0, y), (x1, y))
+        for i in range(3):
+            pg.insert_text((x0 + 4, 120 + i * 12), "row {} 1,234 5,678".format(i), fontsize=8)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        left, _ = PS.find_figure_bbox(d[0], "Table 27")
+        right, _ = PS.find_figure_bbox(d[0], "Table 28")
+    assert left.x1 < 300 and left.y1 >= 170                        # 左表：不含右表，且一直到自己的底线
+    assert right.x0 > 295 and right.y1 < 165
+
+
+def test_wordy_table_row_between_the_rules_is_not_a_prose_wall(tmp_path):
+    """leon-tramontini26a Table 1：表注在表下方，表里一行的文字长得像正文，表被从那一行拦腰截断。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    for y in (91, 103, 199):
+        pg.draw_line((74, y), (538, y))
+    pg.insert_textbox(fitz.Rect(74, 106, 538, 190),
+                      "Beattie et al. (2024), using ada-002 (Greene et al., 2022) and GPT-4 (Achiam et al., 2023), "
+                      "with a personified role, manually modified criteria definitions, and a JSON response format, "
+                      "returning the criterion name, a list of medications, the rationale, and a binary prediction.", fontsize=8)
+    pg.insert_text((72, 218), "Table 1: Break down of the methods by the models used for embedding.", fontsize=10)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Table 1")
+    assert how == "caption+rules" and r.y0 <= 91 and r.y1 >= 218

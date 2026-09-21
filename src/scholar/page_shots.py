@@ -28,7 +28,7 @@ JPEG_QUALITY = 82
 ASSET_DIR = "assets/shots"
 # 裁剪算法一变就 +1：每篇目录下的 `.v` 记着生成它的版本，不一致则整篇强制重渲染。
 # 没有它的话，改了算法重跑也只会命中旧缓存——错图永远留在库里。
-SHOT_VERSION = "5"
+SHOT_VERSION = "6"
 
 _KINDS = {"fig": "Fig.", "table": "Table", "box": "Box", "algorithm": "Algorithm"}
 _QUAL = r"(Extended\s+Data|Supplementary|Supplemental|Supp\.?|Suppl\.?|Appendix|扩展数据|补充材料|补充|附)?"
@@ -294,11 +294,16 @@ def _is_prose(rect, text: str, col_width: float) -> bool:
     return letters > 0.8 and len(re.findall(r"[.;,] ", t)) >= 3
 
 
-def _stop_before(region, cap, page, others, below: bool):
-    """区域向下（或向上）延伸时，遇到别的图注或成段正文就截止。"""
+def _stop_before(region, cap, page, others, below: bool, protect=None):
+    """区域向下（或向上）延伸时，遇到别的图注或成段正文就截止。
+
+    `protect`：首尾表线框出的范围。落在里面的文字是表格内容，哪怕长得像正文（一行里好几格带引用
+    的长文字，字母占比高、标点多）也不算墙——否则表从那一行被拦腰截断（leon-tramontini26a Table 1）。
+    """
     import fitz
     reg = fitz.Rect(region)
-    walls = list(others) + [r for r, t in _text_blocks(page) if r != cap and _is_prose(r, t, reg.width)]
+    walls = list(others) + [r for r, t in _text_blocks(page) if r != cap and _is_prose(r, t, reg.width)
+                            and not (protect is not None and r.y0 >= protect.y0 - 2 and r.y1 <= protect.y1 + 2)]
     for w in walls:
         if _x_overlap(w, reg) <= 0:
             continue
@@ -396,7 +401,12 @@ def _rule_table(page, cap, other_caps):
     rules = []
     for d in page.get_drawings():
         r = fitz.Rect(d["rect"])
-        if r.height < 2.5 and r.width > max(80, cap.width * 0.5):
+        # 横线必须在表注**正上/正下方**（盖住表注中点，或与表注横向重叠过半）：并排两张表时，
+        # 只按纵向取最近会把左表的表注配给右表的线（um25a Table 27 | Table 28，裁出来是右表 +
+        # 被截断的左表）。
+        mid = (cap.x0 + cap.x1) / 2
+        if r.height < 2.5 and r.width > max(80, cap.width * 0.5) and \
+                (r.x0 <= mid <= r.x1 or _x_overlap(r, cap) > cap.width * 0.5):
             rules.append(r)
     if not rules:
         return None
@@ -459,7 +469,7 @@ def find_figure_bbox(page, label: str):
 
     if kind == "table":
         tcaps = [r for (q, k, n), r in caps_all if k == "table"]
-        region, how = None, "not-found"
+        region, how, ruled = None, "not-found", None
         for kw in ({}, {"horizontal_strategy": "lines", "vertical_strategy": "text"}):
             tabs = _detect_tables(page, **kw)
             if not tabs:
@@ -469,13 +479,16 @@ def find_figure_bbox(page, label: str):
             if ci in m:
                 region, how = fitz.Rect(tabs[m[ci]]) | cap, "caption+table"
                 break
+            # （试过、撤掉了）检出的表框把表注自己也包进去时，拿表注把框切成两截、取大的那截当表：
+            # 真库 102 个这类失败能救回 29 个，但抽 9 张亲眼看有 4 张是错的——会把表注包进去的框本身
+            # 就是过度检出（连带下面整张折线图、横排表旁的整页正文）。错裁比不裁危险，继续退回整页。
         if region is None:
             rt = _rule_table(page, cap, others)
             if rt is None:
                 return None, "not-found"
-            region, how = rt | cap, "caption+rules"
+            region, how, ruled = rt | cap, "caption+rules", rt
         below = region.y1 > cap.y1 + 4
-        region = _stop_before(region, cap, page, others, below=below) | cap
+        region = _stop_before(region, cap, page, others, below=below, protect=ruled) | cap
         if region.height < cap.height + 30:       # 只裁到表注本身（无线表没检出）→ 交给整页兜底
             return None, "not-found"
         # 有表线的表，底边（表注在下时是顶边）以**最外一条表线**为准：检测到的表格区域常多带一行
