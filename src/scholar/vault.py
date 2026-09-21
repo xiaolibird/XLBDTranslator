@@ -1006,8 +1006,8 @@ SHOT_DIR = "assets/shots"            # 与 notes._SHOT_DIR 同值；月度 md �
 _SHOT_LINK = re.compile(r"\]\(" + re.escape(SHOT_DIR) + r"/([^)/]+)/([^)]+)\)")
 
 
-def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: bool = False
-                 ) -> Tuple[List[str], int]:
+def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: bool = False,
+                 referenced: Optional[Set[Tuple[str, str]]] = None) -> Tuple[List[str], int]:
     """把正文里引用到的原文截图镜像进 vault，并把链接改写成相对 `01-文献/` 的路径。
 
     为什么要改写：per-paper 笔记的「原文精读」是从月度 md **原样切**出来的，那里的图片路径
@@ -1020,6 +1020,8 @@ def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: 
     def _one(m):
         nonlocal n
         ck, name = m.group(1), m.group(2)
+        if referenced is not None:
+            referenced.add((ck, name))
         src = notes_dir / SHOT_DIR / ck / name
         dst = vault_dir / SHOT_DIR / ck / name
         if src.is_file() and not dry_run:
@@ -1038,6 +1040,38 @@ def mirror_shots(body: List[str], notes_dir: Path, vault_dir: Path, *, dry_run: 
         return "](../{}/{}/{})".format(SHOT_DIR, ck, name)
 
     return [_SHOT_LINK.sub(_one, ln) if SHOT_DIR in ln else ln for ln in body], n
+
+
+_VAULT_SHOT_LINK = re.compile(r"\]\((?:\.\./)*" + re.escape(SHOT_DIR) + r"/([^)/]+)/([^)]+)\)")
+
+
+def prune_shots(vault_dir: Path, referenced: Set[Tuple[str, str]], extra_notes: List[Path]) -> List[str]:
+    """删掉 vault 截图镜像里本轮没有任何笔记引用的文件，返回被删的相对路径。
+
+    镜像此前只增不删：源侧一改文件名（27f34d3 给逐句出处图加 PDF 指纹）或重裁，旧图在源目录
+    被清掉，vault 里那份硬链接就成了**唯一副本**、实占磁盘——2026-09-21 盘点 15,278 个孤儿 /
+    531 MB。`assets/shots/` 整个是派生物（没有用户数据，已被 vault 的 .gitignore 排除），可以删；
+    但判「没人引用」不能只看本轮生成的正文：冲突笔记（用户改过生成块、本轮没重写）、带批注而
+    保留的落选笔记、.conflict.md 里还挂着旧图名——所以再把 vault 里**磁盘上现有的** md 扫一遍。
+    """
+    keep = set(referenced)
+    for p in extra_notes:
+        try:
+            keep.update(_VAULT_SHOT_LINK.findall(p.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+    root = vault_dir / SHOT_DIR
+    gone: List[str] = []
+    if not root.is_dir():
+        return gone
+    for d in sorted(x for x in root.iterdir() if x.is_dir()):
+        for f in sorted(x for x in d.iterdir() if x.is_file()):
+            if (d.name, f.name) not in keep:
+                f.unlink()
+                gone.append(str(f.relative_to(vault_dir)))
+        if not any(d.iterdir()):
+            d.rmdir()
+    return gone
 
 
 def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
@@ -1062,11 +1096,12 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
 
     used_lower: Set[str] = set()
     files: List[Tuple[Path, str, Dict[str, Any]]] = []
+    shot_refs: Set[Tuple[str, str]] = set()
     for e in entries:
         fname = safe_filename(e["citekey"], used_lower)
         path = vault_dir / PAPERS_DIR / "{}.md".format(fname)
         body_e, n_shots = mirror_shots(bodies.get(e["citekey"]) or [], notes_dir, vault_dir,
-                                       dry_run=dry_run)
+                                       dry_run=dry_run, referenced=shot_refs)
         report["shots_mirrored"] = report.get("shots_mirrored", 0) + n_shots
         gen = render_generated_block(e, body_e, neighbors.get(e["citekey"]) or [], one_lines)
         files.append((path, gen, e))
@@ -1223,6 +1258,15 @@ def write_vault(index: Dict[str, Any], notes_dir: Path, vault_dir: Path, *,
                 p.unlink()
                 report["pruned"].append(str(p.relative_to(vault_dir)))
         report["orphan_papers"] = kept_orphans
+
+        # 截图镜像的孤儿：与上面两段同理受 limit 保护（截断后的 shot_refs 只是全集的前缀）。
+        # 月度 md 切片失败时 bodies 不全、shot_refs 会偏小，那一轮不清——宁可多留也不误删。
+        if not dry_run and not slice_failures:
+            extra = [p for p in vault_dir.rglob("*.md") if ".obsidian" not in p.parts]
+            gone = prune_shots(vault_dir, shot_refs, extra)
+            report["shots_pruned"] = len(gone)
+            if gone:
+                logger.info("  🧹 vault 截图镜像清掉 {} 个不再被引用的文件".format(len(gone)))
 
     # _meta.json 是运行记录（每次都变），别让它一直脏着 git status；已存在则尊重用户的版本
     gi = vault_dir / ".gitignore"

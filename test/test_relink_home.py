@@ -120,10 +120,61 @@ def test_home_refuses_to_overwrite_existing_target(tmp_path, roots):
     src.write_bytes(b"new")
     (reading / "2026-09-05-t").mkdir()
     (reading / "2026-09-05-t" / "k2020Dup.pdf").write_bytes(b"old")
-    notes, _ = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/d", "Paper D", "k2020Dup", src)])
-    with pytest.raises(RL.PlanError):
-        RL.build_plan("2026-09-05-t", None, notes, 0, home=True)
-    assert src.read_bytes() == b"new"
+    other = downloads / "fine.pdf"
+    other.write_bytes(b"fine")
+    notes, bdir = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/d", "Paper D", "k2020Dup", src),
+                                                 ("e2", "10.1/e", "Paper E", "k2020Fine", other)])
+    plan = RL.build_plan("2026-09-05-t", None, notes, 0, home=True)
+    RL.apply_plan(plan)
+    # 绝不覆盖：撞名那篇两份文件都原样、bundle 不改；但它不再拖累同月其余篇目（此前整月 abort，
+    # 且每次 finalize 都重复失败——对抗审核 F9-B）
+    assert src.read_bytes() == b"new" and (reading / "2026-09-05-t" / "k2020Dup.pdf").read_bytes() == b"old"
+    assert json.loads((bdir / "e1.paper.json").read_text("utf-8"))["pdf_path"] == str(src)
+    assert (reading / "2026-09-05-t" / "k2020Fine.pdf").read_bytes() == b"fine" and not other.exists()
+
+
+def test_home_identical_copy_already_in_reading_only_backfills(tmp_path, roots):
+    reading, downloads = roots
+    src = downloads / "dl.pdf"
+    src.write_bytes(b"same bytes")
+    (reading / "2026-09-05-t").mkdir()
+    (reading / "2026-09-05-t" / "k2020Same.pdf").write_bytes(b"same bytes")
+    notes, bdir = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/s", "Paper S", "k2020Same", src)])
+    RL.apply_plan(RL.build_plan("2026-09-05-t", None, notes, 0, home=True))
+    assert json.loads((bdir / "e1.paper.json").read_text("utf-8"))["pdf_path"].endswith("k2020Same.pdf")
+    assert src.exists()                                   # 源文件要不要清由用户定，脚本不替人删
+
+
+def test_home_copies_instead_of_moving_out_of_protected_trees_and_logs_every_transfer(tmp_path, roots, monkeypatch):
+    """对抗审核 F2：locate_pdf 返回的 Zotero storage 路径拿去 ingest→finalize，附件会被搬出 Zotero。"""
+    reading, downloads = roots
+    zotero = tmp_path / "Zotero" / "storage" / "ABCD1234"
+    zotero.mkdir(parents=True)
+    monkeypatch.setenv("SCHOLAR_KEEP_ROOTS", str(tmp_path / "Zotero"))
+    att = zotero / "Smith - 2020 - Paper.pdf"
+    att.write_bytes(b"zotero attachment")
+    loose = downloads / "loose.pdf"
+    loose.write_bytes(b"loose")
+    notes, bdir = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/z", "Paper Z", "smith2020Paper", att),
+                                                 ("e2", "10.1/l", "Paper L", "k2020Loose", loose)])
+    RL.apply_plan(RL.build_plan("2026-09-05-t", None, notes, 0, home=True))
+    assert att.read_bytes() == b"zotero attachment"       # Zotero 里的原件还在
+    assert (reading / "2026-09-05-t" / "smith2020Paper.pdf").read_bytes() == b"zotero attachment"
+    assert not loose.exists()                             # 普通散件照旧是搬
+    log = [json.loads(l) for l in (notes / "_archive" / "pdf_moves.jsonl").read_text("utf-8").splitlines()]
+    assert sorted((r["op"], r["citekey"]) for r in log) == [("copy", "smith2020Paper"), ("move", "k2020Loose")]
+
+
+def test_home_two_bundles_sharing_one_source_pdf_both_end_up_with_a_file(tmp_path, roots):
+    reading, downloads = roots
+    src = downloads / "shared.pdf"
+    src.write_bytes(b"shared")
+    notes, bdir = _mk(tmp_path, "2026-09-05-t", [("e1", "10.1/a", "Paper A", "k2020A", src),
+                                                 ("e2", "10.1/b", "Paper B", "k2020B", src)])
+    RL.apply_plan(RL.build_plan("2026-09-05-t", None, notes, 0, home=True))
+    for name, ck in (("e1", "k2020A"), ("e2", "k2020B")):
+        p = Path(json.loads((bdir / (name + ".paper.json")).read_text("utf-8"))["pdf_path"])
+        assert p.name == ck + ".pdf" and p.read_bytes() == b"shared"
 
 
 def test_non_home_mode_still_aborts_on_missing_source(tmp_path, roots):

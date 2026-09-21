@@ -49,6 +49,17 @@ _PROSE_TAIL = re.compile(
     r"demonstrates?\b|indicates?\b|is\b|are\b|in\b|we\b|the\b|of\b|for\b|also\b)")
 # ↑ 刻意**区分大小写**：正文里编号后接的是小写词（"Table 2 presents"），而不少投稿版/预印本的
 #   图注是「Figure 1 The flowchart of…」——编号后无标点、直接接首字母大写的标题词。
+# 动词永远列不全：真库 4,366 个被接受的图注块里有 46 个是「Figure 9 reveals / places / highlights /
+# zooms into…」这类正文句（TabPFN-3.5 的 Fig. 9 因此被定位到引用它的那一页而不是图所在页）。
+# 通则：编号后隔空白接**小写词**就是正文。豁免两种真图注：算法标题常是小写函数名
+# （"Algorithm 1 sample-batch(D)"）；续表页眉 "Table 1 continued"。
+_LOWER_TAIL = re.compile(r"^\s+(?!continued\b|cont\b)[a-z]{2,}\b")
+
+
+def _is_prose_mention(kind: str, tail: str) -> bool:
+    if _PROSE_TAIL.match(tail or ""):
+        return True
+    return not kind.lower().startswith("algorithm") and bool(_LOWER_TAIL.match(tail or ""))
 
 
 def _norm(qual: str, kind: str, num: str) -> Tuple[str, str, str]:
@@ -90,16 +101,50 @@ def labels_in(text: str) -> List[str]:
     return out
 
 
+_PAGE_SEP = re.compile(r"[,，、;；]|\s+and\s+|\s*和\s*")
+_PAGE_NOT_MAIN = re.compile(r"(?i)^\s*(supp|suppl|supplement|appendix|app\b|附|补充|ext|s\s*\d|§|sec|section|fig|table|图|表)")
+_PAGE_RANGE = re.compile(r"(\d+)\s*[-–—~至]\s*(\d+)")
+
+
 def parse_pages(page: Optional[str]) -> List[int]:
-    """'16' → [16]；'15-16' / '17–18' → [15,16] / [17,18]；'p.7' → [7]；区间上限 6 页防误写。"""
+    """札记页码 → 正文页号列表。宁缺勿错：认不准的段落返回空，调用方就不限页、不出整页图。
+
+    '16' → [16]；'15-16' / '17–18' → 区间（上限 6 页防误写）；'p.7' / '第4页' / 'R71' / 'e12' → 单页；
+    '5, 7-8' → [5,7,8]（**逐段**解析：此前只看前两个数，会得出 [5,6,7]——多渲染没被引用的第 6 页、
+    丢掉第 8 页）；'112-5' → [112..115]（缩写区间）；'241-259' → [241,259]（跨度大只取首尾）；
+    'Supp Fig 20' / 'S3' / '§5.7' → []（补充材料页、节号不是正文页码——此前会去渲染正文第 20 页，
+    还会把逐句出处的搜索锁在那一页。2026-09-21 对抗审核 F4，写法全部来自真库）。
+    """
     if page is None:
         return []
-    nums = [int(x) for x in re.findall(r"\d+", str(page))]
-    if not nums:
-        return []
-    if len(nums) >= 2 and nums[0] < nums[1] <= nums[0] + 6 and re.search(r"\d\s*[-–—~至]\s*\d", str(page)):
-        return list(range(nums[0], nums[1] + 1))
-    return nums[:1] if len(nums) == 1 else sorted(set(nums))[:6]
+    out: List[int] = []
+    for seg in _PAGE_SEP.split(str(page)):
+        seg = seg.strip()
+        if not seg or _PAGE_NOT_MAIN.match(seg):
+            continue
+        seg = re.sub(r"(?i)^(pp?\.?|pages?|第)\s*", "", seg)
+        m = _PAGE_RANGE.search(seg)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi < lo and len(m.group(2)) < len(m.group(1)):          # '112-5' = 112–115
+                hi = int(m.group(1)[:-len(m.group(2))] + m.group(2))
+            if lo < hi <= lo + 6:
+                out.extend(range(lo, hi + 1))
+            elif lo != hi:
+                out.extend(sorted((lo, hi)))
+            else:
+                out.append(lo)
+            continue
+        if re.search(r"\d\.\d", seg):                                  # '5.7'：节号，不是页码
+            continue
+        nums = re.findall(r"\d+", seg)
+        if nums:
+            out.append(int(nums[0]))
+    seen, uniq = set(), []
+    for n in out:
+        if n not in seen and n > 0:
+            seen.add(n); uniq.append(n)
+    return sorted(uniq)[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +244,7 @@ def _captions(page) -> List[Tuple[Tuple[str, str, str], "object"]]:
         if re.match(r"^\s*(Tables|Figures|Figs)\b", txt):
             continue
         m = _CAPTION_RE.match(txt)
-        if not m or _PROSE_TAIL.match(m.group("tail") or ""):
+        if not m or _is_prose_mention(m.group(2), m.group("tail") or ""):
             continue
         out.append((_norm(m.group(1), m.group(2), m.group(3)), fitz.Rect(b[:4])))
     return out
@@ -360,10 +405,11 @@ def _rule_table(page, cap, other_caps):
             group = [r for r in group if (r.y0 < oc.y0 if below and oc.y0 > cap.y1 else True)
                      and (r.y1 > oc.y1 if (not below) and oc.y1 < cap.y0 else True)]
         if len(group) >= 2:
-            reg = fitz.Rect(group[0])
-            for r in group[1:]:
-                reg |= r
-            return reg
+            # 不能用 `reg |= r`：画线命令画出的表线高度为 0，fitz 把它当空矩形、求并时直接忽略——
+            # 三条 booktabs 线并出来还是第一条线，随后被「区域过小」判失败。LaTeX 出的 ML 论文
+            # 几乎全是这种表（2026-09-21 用 TabPFN-3.5 的 Table 2–5 查出）。
+            return fitz.Rect(min(r.x0 for r in group), min(r.y0 for r in group),
+                             max(r.x1 for r in group), max(r.y1 for r in group))
     return None
 
 
@@ -521,12 +567,45 @@ def find_label_page(doc, label: str, hint: Optional[int] = None) -> Optional[int
 # 面向调用方：一篇论文要哪些截图
 # ---------------------------------------------------------------------------
 
-def shot_name(citekey: str, printed: int, label: str = "") -> str:
+def shot_name(citekey: str, printed: int, label: str = "", tag: str = "") -> str:
     safe = re.sub(r"[^\w.-]+", "_", citekey, flags=re.U)
+    suf = "_" + tag if tag else ""
     if label:
         q, k, num = norm_label(label)
-        return "{}/{}{}{}.jpg".format(safe, q, k, num)
-    return "{}/p{:04d}.jpg".format(safe, printed)
+        return "{}/{}{}{}{}.jpg".format(safe, q, k, num, suf)
+    return "{}/p{:04d}{}.jpg".format(safe, printed, suf)
+
+
+def pdf_tag(pdf_path: Path) -> Tuple[List[int], str]:
+    """PDF 指纹 [size, mtime_ns] 与它的 6 位短标记。同一 citekey 可能对应两份 PDF（同一篇在两个
+    月份桶里各读过一次，甚至是期刊版与 arXiv 版），凡按 citekey 落盘的派生物都要靠它区分。"""
+    import hashlib
+    st = Path(pdf_path).stat()
+    fp = [st.st_size, st.st_mtime_ns]
+    return fp, hashlib.sha1("{}:{}".format(*fp).encode()).hexdigest()[:6]
+
+
+_TAGGED = re.compile(r"_[0-9a-f]{6}\.jpg$")
+
+
+def _owner_tag(cdir: Path, tag: str) -> str:
+    """这个 citekey 目录里不带后缀的文件名（p0016.jpg / fig2.jpg）归哪份 PDF 所有。
+
+    第一份来的 PDF 占用裸名（绝大多数论文只有一份 PDF，文件名保持好读）；之后来的**另一份** PDF
+    一律用带指纹后缀的名字。此前整页图/图表图按 citekey 共用裸名，而陈旧判据是「图比 PDF 旧」——
+    图刚渲染过、永远比两份 PDF 都新——于是后一份 PDF 静默复用前一份渲染的图，回执和 md 都显示
+    成功，图却来自另一个版本（对抗审核 F3；真库 choi2020Learning 的 AAAI 版与 arXiv 版共用 5 张）。
+    """
+    f = cdir / ".pdf"
+    try:
+        owner = f.read_text().strip()
+    except OSError:
+        owner = ""
+    if not owner:
+        cdir.mkdir(parents=True, exist_ok=True)
+        f.write_text(tag)
+        owner = tag
+    return owner
 
 
 def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_root: Path,
@@ -549,12 +628,20 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
             wanted_labels.append((lab, pages[0] if pages else None))
     if not wanted_pages and not wanted_labels:
         return {"_map": {"how": "none"}, "_missing": []}
-    vfile = out_root / shot_name(citekey, 1).split("/")[0] / ".v"
+    cdir = out_root / shot_name(citekey, 1).split("/")[0]
+    _, mytag = pdf_tag(pdf_path)
+    tag = "" if _owner_tag(cdir, mytag) == mytag else mytag       # 裸名归第一份 PDF，另一份带后缀
+    vfile = cdir / (".v_" + tag if tag else ".v")
     if not force and (not vfile.exists() or vfile.read_text().strip() != SHOT_VERSION):
         force = True
-        if vfile.parent.is_dir():                 # 旧版本的图整目录清掉，免得留下不再被引用的错图
+        if vfile.parent.is_dir():                 # 旧版本的整页图/图表图清掉，免得留下不再被引用的错图
+            # 逐句出处图（q_*）不归这里管：它们有自己的版本戳 PASSAGE_VERSION 与缓存。这里一并删掉的话，
+            # passages 缓存仍记着「这句已命中」→ 不重算 → 返回时又因文件不在被滤掉：那一句的出处图
+            # 静默消失且永不自愈（2026-09-21 对抗审核 F1；升一次 SHOT_VERSION 就是全库 1.5 万张）。
             for old in vfile.parent.glob("*.jpg"):
-                old.unlink()
+                mine = old.name.endswith("_{}.jpg".format(tag)) if tag else not _TAGGED.search(old.name)
+                if mine and not old.name.startswith("q_"):       # 只清**这份 PDF** 名下的图
+                    old.unlink()
     with fitz.open(str(pdf_path)) as doc:
         pm = build_page_map(doc, wanted_pages)
         stale_before = pdf_path.stat().st_mtime
@@ -563,7 +650,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
             if idx is None:
                 missing.append("p.{}".format(printed))
                 continue
-            rel = shot_name(citekey, printed)
+            rel = shot_name(citekey, printed, tag=tag)
             dst = out_root / rel
             if force or not dst.exists() or dst.stat().st_mtime < stale_before:
                 render_page(doc, idx, dst)
@@ -579,7 +666,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
             if idx is None:
                 missing.append(lab)
                 continue
-            rel = shot_name(citekey, 0, lab)
+            rel = shot_name(citekey, 0, lab, tag=tag)
             dst = out_root / rel
             if force or not dst.exists() or dst.stat().st_mtime < stale_before:
                 got, how = render_figure(doc, idx, lab, dst)
@@ -587,7 +674,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
                 got, how = dst, "cached"
             if got is None:
                 # 图注找到了但区域拿不准：退回图注所在的整页，宁可大也不裁错
-                rel = "{}/pdf{:04d}.jpg".format(rel.split("/")[0], idx)
+                rel = "{}/pdf{:04d}{}.jpg".format(rel.split("/")[0], idx, "_" + tag if tag else "")
                 dst = out_root / rel
                 if force or not dst.exists() or dst.stat().st_mtime < stale_before:
                     render_page(doc, idx, dst)
@@ -734,19 +821,19 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
     结果缓存在 `<citekey>/passages.json`，键 = PDF 指纹 + 算法版本 + 句子内容哈希：finalize 是
     整月重建，不缓存的话每入库一篇新论文，当月所有旧论文都要重新算一遍向量（126 篇的月份
     要十几分钟）。只有**新句子**才触发向量计算；PDF 换了或算法升版则整篇重算。
+
+    `embed=None` 是只读缓存模式：Ollama 没起时 finalize 也要把**已经算过**的出处图写回 md——
+    此前那种情况下整步跳过，整月 md 会被重写成一张逐句图都没有的版本（对抗审核 F5）。
     """
     import json
     import fitz
     pdf_path = Path(pdf_path)
     safe = shot_name(citekey, 1).split("/")[0]
     cdir = out_root / safe
-    st = pdf_path.stat()
-    fp = [st.st_size, st.st_mtime_ns]
+    fp, tag = pdf_tag(pdf_path)
     # 缓存与截图文件名都带 PDF 指纹：同一 citekey 可能对应两份 PDF（同一篇在两个月份桶里各读过
     # 一次）。按 citekey 共用一份缓存时，后重建的月份会因「指纹变了」清空目录，把先重建那个月
     # 的截图删掉——2026-09-20 全量实测 4 篇、209 个坏链。
-    import hashlib
-    tag = hashlib.sha1("{}:{}".format(*fp).encode()).hexdigest()[:6]
     cfile = cdir / "passages.{}.json".format(tag)
     cache = {}
     if cfile.exists() and not force:
@@ -761,7 +848,12 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
                 old.unlink()
     items = cache["items"]
     keyed = [(sentence_key(x.get("text")), x) for x in sentences]
-    new = [(k, x) for k, x in keyed if k not in items]
+    # 命中过但图不在了（被误删、assets 目录被清过）也算新句：缓存只记「算过」，图才是产物，
+    # 不重算的话这一句的出处图永远回不来。负缓存（None）不受影响。
+    new = [(k, x) for k, x in keyed
+           if k not in items or (items[k] and not (out_root / items[k]["rel"]).is_file())]
+    if embed is None:                                  # 向量服务不可用：只读缓存，算过的图照出，新句留给下一轮
+        new = []
     if new:
         with fitz.open(str(pdf_path)) as doc:
             pm = build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])

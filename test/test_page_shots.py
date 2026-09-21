@@ -521,3 +521,163 @@ def test_two_pdfs_under_one_citekey_do_not_wipe_each_other(tmp_path):
     (rel_a,), (rel_b,) = [v["rel"] for v in ra.values()], [v["rel"] for v in rb.values()]
     assert rel_a != rel_b and (out / rel_a).is_file() and (out / rel_b).is_file()
     assert PS.passages_for_paper(a, "umPropagate", s, out, _fake_embed) == ra          # 前一次的缓存仍然有效
+
+
+def test_shot_version_bump_keeps_passage_crops_and_lost_crops_self_heal(tmp_path):
+    """对抗审核 F1：整页图的版本清理曾把同目录的 q_*.jpg 一并删掉，而 passages 缓存仍记着命中——
+    那一句的出处图静默消失、重跑多少次都不回来。两道防线各测一遍。"""
+    pdf = _three_paragraph_pdf(tmp_path)
+    s = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量", "page": "19"}]
+    out = tmp_path / "shots"
+    PS.shots_for_paper(pdf, "k", s, out)
+    got = PS.passages_for_paper(pdf, "k", s, out, _fake_embed)
+    (rel,) = [v["rel"] for v in got.values()]
+    (out / "k/.v").write_text("0")                                   # 整页图算法升版
+    PS.shots_for_paper(pdf, "k", s, out)
+    assert (out / rel).is_file()                                     # 第一道：升版清理不碰逐句出处图
+    assert PS.passages_for_paper(pdf, "k", s, out, _fake_embed) == got
+    (out / rel).unlink()                                             # 第二道：图真丢了 → 下一轮重算补回
+    again = PS.passages_for_paper(pdf, "k", s, out, _fake_embed)
+    assert again == got and (out / rel).is_file()
+
+
+def test_first_round_without_page_or_label_then_adding_one_keeps_passage_crops(tmp_path):
+    """F1 的另一条触发路径：第一轮没有页码也没有图表标签 → shots_for_paper 早退、不写 .v；
+    之后给句子补了页码，下一轮因「.v 不存在」触发清理。真库里有 7 个目录处于这个状态。"""
+    pdf = _three_paragraph_pdf(tmp_path)
+    s = [{"text": "男性更不愿回答性功能问题。", "section": "结果与效应量"}]
+    out = tmp_path / "shots"
+    PS.shots_for_paper(pdf, "k", s, out)
+    got = PS.passages_for_paper(pdf, "k", s, out, _fake_embed)
+    assert got and not (out / "k/.v").exists()
+    PS.shots_for_paper(pdf, "k", [dict(s[0], page="19")], out)
+    assert (out / "k/.v").exists() and all((out / v["rel"]).is_file() for v in got.values())
+
+
+def test_parse_pages_mixed_lists_and_non_main_pages():
+    """对抗审核 F4：写法全部来自真库。"""
+    assert PS.parse_pages("5, 7-8") == [5, 7, 8]                  # 此前 [5,6,7]
+    assert PS.parse_pages("10-11,15") == [10, 11, 15]             # 此前丢 15
+    assert PS.parse_pages("2, 10") == [2, 10] and PS.parse_pages("220,224") == [220, 224]
+    assert PS.parse_pages("112-5") == [112, 113, 114, 115]
+    assert PS.parse_pages("241-259") == [241, 259] and PS.parse_pages("183-187") == [183, 184, 185, 186, 187]
+    for junk in ("Supp Fig 20", "Supp Table 3", "S3", "Supp", "§5.7", "附录 B"):
+        assert PS.parse_pages(junk) == [], junk                   # 此前会去渲染正文第 20 / 3 / 5 页
+    assert PS.parse_pages("§5.7, p.14") == [14]                   # 此前 [5,7,14]
+    assert PS.parse_pages("p.14") == [14] and PS.parse_pages("pp. 3-5") == [3, 4, 5]
+    assert PS.parse_pages("第4页") == [4] and PS.parse_pages("R71") == [71] and PS.parse_pages("e12") == [12]
+    assert PS.parse_pages(7) == [7] and PS.parse_pages("0") == []
+
+
+def test_vault_prunes_unreferenced_shots_but_keeps_what_any_note_on_disk_still_links(tmp_path):
+    """对抗审核 F7：镜像只增不删，源侧改名后 vault 里的旧硬链接成了唯一副本（真库 15,278 个 / 531 MB）。"""
+    from src.scholar import vault as V
+    vault = tmp_path / "vault"
+    d = vault / "assets/shots/k"
+    d.mkdir(parents=True)
+    for n in ("q_new.jpg", "q_old.jpg", "q_conflict.jpg"):
+        (d / n).write_bytes(b"x")
+    (vault / "assets/shots/gone").mkdir()
+    (vault / "assets/shots/gone/p0001.jpg").write_bytes(b"x")
+    (vault / "01-文献").mkdir()
+    note = vault / "01-文献/k.md"                        # 冲突笔记：本轮没重写，还挂着旧图名
+    note.write_text("- 句子\n  ![原文出处 p.3](../assets/shots/k/q_conflict.jpg)\n", encoding="utf-8")
+    gone = V.prune_shots(vault, {("k", "q_new.jpg")}, [note])
+    assert sorted(gone) == ["assets/shots/gone/p0001.jpg", "assets/shots/k/q_old.jpg"]
+    assert (d / "q_new.jpg").exists() and (d / "q_conflict.jpg").exists()
+    assert not (vault / "assets/shots/gone").exists()      # 空目录一并收走
+    assert V.prune_shots(vault, {("k", "q_new.jpg")}, [note]) == []
+    refs = set()                                           # mirror_shots 顺手把引用收集出来
+    V.mirror_shots(["  ![x](assets/shots/k/q_new.jpg)"], tmp_path / "notes", vault, referenced=refs)
+    assert refs == {("k", "q_new.jpg")}
+
+
+def test_without_embedding_service_cached_passages_still_render_and_one_bad_paper_does_not_kill_the_month(tmp_path):
+    """对抗审核 F5：(1) Ollama 没起时 finalize 曾把整月 md 重写成没有任何逐句图的版本；
+    (2) 任何一篇抛异常都被当成「向量服务挂了」，本轮后面的论文全部没有出处图。"""
+    from src.scholar.notes import _make_shots
+    from src.scholar.schema import PaperSegment, PaperMetadata, CloseReading
+    pdf = _three_paragraph_pdf(tmp_path)
+
+    def seg(pid, text):
+        cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
+            {"heading": "结果与效应量", "sentences": [{"text": text, "tag": "可引用证据", "page": "19"}]}])
+        return PaperSegment(segment_id=1, paper_id=pid, close_reading=cr,
+                            metadata=PaperMetadata(paper_id=pid, title="T", authors=["A B"], doi="10.1/" + pid))
+    segs = [seg("p1", "男性更不愿回答性功能问题。"), seg("p2", "卫星瞬时故障导致观测缺失。"), seg("p3", "跳答模式造成大块缺失。")]
+    cks = {"p1": "k1", "p2": "k2", "p3": "k3"}
+    pdfs = {k: str(pdf) for k in cks}
+    out = tmp_path / "notes"
+    first = _make_shots(segs, cks, pdfs, out, embed_fn=_fake_embed)
+    assert all(len(first[p]["_passages"]) == 1 for p in cks)
+    offline = _make_shots(segs, cks, pdfs, out, embed_fn=None)               # 向量服务没起
+    assert {p: offline[p]["_passages"] for p in cks} == {p: first[p]["_passages"] for p in cks}
+
+    def picky(texts):                                                        # 只对 p1 的句子确定性地炸
+        if any("性功能" in t for t in texts):
+            raise ValueError("input too long")
+        return _fake_embed(texts)
+    out2 = tmp_path / "notes2"
+    got = _make_shots(segs, cks, pdfs, out2, embed_fn=picky)
+    assert got["p1"]["_passages"] == {} and len(got["p2"]["_passages"]) == 1 and len(got["p3"]["_passages"]) == 1
+
+
+def test_second_pdf_under_one_citekey_gets_its_own_page_and_figure_shots(tmp_path):
+    """对抗审核 F3：27f34d3 只给逐句图加了指纹；整页图/图表图仍按 citekey 共用，后一份 PDF 静默
+    复用前一份渲染的图（图刚渲染、永远比 PDF 新，陈旧判据不触发）。"""
+    def make(name, color):
+        doc = fitz.open()
+        pg = doc.new_page()
+        pg.draw_rect(fitz.Rect(80, 80, 480, 300), fill=color)
+        pg.insert_text((80, 322), "Figure 1: A figure whose colour differs between the two versions.", fontsize=9)
+        return _save(doc, tmp_path, name)
+    a, b = make("a.pdf", (0.9, 0.1, 0.1)), make("b.pdf", (0.1, 0.1, 0.9))
+    hl = [{"text": "Fig. 1 显示……", "page": "1"}]
+    out = tmp_path / "s"
+    ra = {k for k, v in PS.shots_for_paper(a, "choi2020Learning", hl, out).items() if not k.startswith("_")}
+    before = {k: (out / k).read_bytes() for k in ra}
+    rb = {k for k, v in PS.shots_for_paper(b, "choi2020Learning", hl, out).items() if not k.startswith("_")}
+    assert ra == {"choi2020Learning/p0001.jpg", "choi2020Learning/fig1.jpg"}       # 第一份 PDF 占裸名
+    assert not (ra & rb) and len(rb) == 2 and all((out / k).is_file() for k in rb)
+    assert all((out / k).read_bytes() == v for k, v in before.items())              # 前一份的图没被动
+    fig_b = next(k for k in rb if "fig1" in k)
+    assert (out / fig_b).read_bytes() != before["choi2020Learning/fig1.jpg"]        # 后一份是自己渲染的
+    (out / "choi2020Learning/.v").write_text("0")                                   # 第一份升版重渲染……
+    PS.shots_for_paper(a, "choi2020Learning", hl, out)
+    assert all((out / k).is_file() for k in rb)                                     # ……不许清掉第二份的图
+
+
+def test_booktabs_table_with_zero_height_rules_is_cropped_whole(tmp_path):
+    """LaTeX booktabs 的表线是画线命令、高度为 0：fitz 把零高矩形当空矩形，`reg |= r` 求并时直接
+    忽略，三条线并出来还是第一条 → 被「区域过小」判失败退回整页（TabPFN-3.5 的 Table 2–5）。"""
+    doc = fitz.open()
+    pg = doc.new_page()
+    pg.insert_text((72, 80), "Table 2. Leaderboard using all 51 datasets.", fontsize=9)
+    for y in (93, 122, 450):
+        pg.draw_line((72, y), (570, y))
+    for i in range(20):
+        pg.insert_text((78, 140 + i * 15), "Model {}".format(i), fontsize=9)
+        pg.insert_text((480, 140 + i * 15), "0.{}".format(40 + i), fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        r, how = PS.find_figure_bbox(d[0], "Table 2")
+    assert r is not None and how == "caption+rules" and r.y0 < 80 and r.y1 >= 450 and r.x1 >= 560
+
+
+def test_sentence_starting_with_a_figure_number_is_not_a_caption(tmp_path):
+    """「Figure 9 places the family on…」是引用它的正文；图在下一页。动词列不全，按「编号后接小写词」判。"""
+    doc = fitz.open()
+    p1 = doc.new_page()
+    p1.insert_textbox(fitz.Rect(72, 100, 520, 200),
+                      "Figure 9 places the model family on the improvability-against-time plane together with "
+                      "the tuning trajectories of the classical baselines.", fontsize=10)
+    p2 = doc.new_page()
+    p2.draw_rect(fitz.Rect(80, 80, 480, 300), fill=(0.2, 0.6, 0.4))
+    p2.insert_text((80, 322), "Figure 9. Pareto frontier on the benchmark.", fontsize=9)
+    p2.insert_text((80, 400), "Algorithm 1 sample-batch(D)", fontsize=9)               # 小写函数名的算法标题是真图注
+    p2.insert_text((80, 430), "Table 1 continued", fontsize=9)
+    pdf = _save(doc, tmp_path)
+    with fitz.open(str(pdf)) as d:
+        assert PS.find_label_page(d, "Fig. 9", hint=1) == 2
+        kinds = {k[1] + k[2] for k, _ in PS._captions(d[1])}
+    assert {"fig9", "algorithm1", "table1"} <= kinds

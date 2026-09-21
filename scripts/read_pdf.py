@@ -344,8 +344,13 @@ def _home_pdfs_best_effort(notes_dir: Path, month: str, reading_dir: str = "") -
         if plan and len(dead) < len(plan):
             rl.apply_plan(plan)
         for q in plan:
-            if not q.get("dead"):
-                print("   📁 PDF 已归位: {} → {}".format(q["src"].name, q["dst"]))
+            if q.get("conflict"):
+                print("   ⚠️ PDF 未归位（目标位已有同名但内容不同的文件，两份都没动）: {} ✗ {}".format(q["src"], q["dst"]))
+            elif q.get("same_content"):
+                print("   📁 Reading 里已有逐字节相同的一份，只回填了路径（源文件留在原处）: {} = {}".format(q["src"], q["dst"]))
+            elif not q.get("dead"):
+                print("   📁 PDF 已{}: {} → {}".format("复制（源在 Zotero/手工整理的目录里，原件不动）" if q.get("copy") else "归位",
+                                                  q["src"].name, q["dst"]))
         for q in dead:
             print("   ⚠️ pdf_path 是死链（文件已不在）: {} ← {}".format(q["citekey"], q["src"]))
     except Exception as e:   # noqa: BLE001 —— 收尾步骤绝不能把一次成功的归档变成失败

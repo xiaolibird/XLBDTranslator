@@ -44,6 +44,33 @@ def reading_root() -> Path:
                 or (Path.home() / "Desktop" / "Lab" / "Reading")).expanduser().resolve()
 
 
+def keep_roots():
+    """这些树下的 PDF 归位时只**复制**、不搬走。
+
+    归位的本意是收拢散在 Downloads/临时目录里的文件；但 `locate_pdf.py` 第 1、3 级返回的是
+    `~/Zotero/storage/<KEY>/x.pdf`——拿它 ingest 再 finalize，会把附件从 Zotero 里搬走，Zotero 那边
+    变成「文件缺失」。`~/Downloads/文献整理` 是用户按人手工整理的陶瓷目录，README 里点名引用着
+    其中的文件（2026-09-20 就从 `01_主题阅读/Yujun Yan/` 搬走过一篇，README 成了悬空引用）。
+    环境变量 SCHOLAR_KEEP_ROOTS（os.pathsep 分隔）可追加。对抗审核 F2。
+    """
+    roots = [Path.home() / "Zotero", Path.home() / "Downloads" / "文献整理"]
+    roots += [Path(x) for x in (os.environ.get("SCHOLAR_KEEP_ROOTS") or "").split(os.pathsep) if x]
+    return [r.expanduser().resolve() for r in roots]
+
+
+def _same_file_content(a: Path, b: Path) -> bool:
+    import hashlib
+    if a.stat().st_size != b.stat().st_size:
+        return False
+    def h(p):
+        m = hashlib.sha256()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                m.update(chunk)
+        return m.digest()
+    return h(a) == h(b)
+
+
 _DATED_BUCKET = re.compile(r"^\d{4}-\d{2}-\d{2}(-.+)?$")
 
 
@@ -162,8 +189,41 @@ def build_plan(month, pdf_dir, notes_dir, expect, home=False, reading_dir=""):
                 continue
             _die("源 PDF 不存在: {}".format(p["src"]))
         if p["dst"].exists():
+            if home and _same_file_content(p["src"], p["dst"]):
+                # 目标位已经躺着一份逐字节相同的：不用搬，只回填。源文件留在原处（要不要清由用户定）
+                p["backfill_only"] = p["same_content"] = True
+                continue
+            if home:
+                # 同名但内容不同：此前整月 abort，同月其余篇目也因此不归位、且每次 finalize 重复失败
+                p["conflict"] = True
+                continue
             _die("目标名已被占用（可能撞上目录里的其它 PDF）: {}".format(p["dst"]))
+        if home:
+            keep = keep_roots()
+            p["copy"] = any(_under(p["src"], r) for r in keep)
+    if home:                                   # 同月两个 bundle 指向同一个源：第一个搬走后第二个就扑空
+        seen = {}
+        for p in plan:
+            if p.get("dead") or p.get("conflict") or p["already"] or p["backfill_only"]:
+                continue
+            key = str(p["src"].resolve())
+            if key in seen:
+                p["copy"] = True
+            seen.setdefault(key, p)
     return plan
+
+
+def _log_move(bundle: Path, rec: dict) -> None:
+    """每次搬/复制落一行 jsonl。2026-09-20 批量归位没留清单，事后只能靠 ctime 与哈希还原谁动了什么。"""
+    try:
+        from datetime import datetime
+        arch = bundle.parents[2] / "_archive"
+        arch.mkdir(parents=True, exist_ok=True)
+        rec = dict(rec, at=datetime.now().isoformat(timespec="seconds"))
+        with open(arch / "pdf_moves.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def apply_plan(plan):
@@ -174,12 +234,18 @@ def apply_plan(plan):
     识别（src 缺失且 dst 已就位）跳过 mv、只补回填 pdf_path，自愈闭环。
     """
     n = 0
-    for p in plan:
-        if p.get("dead"):
+    # 复制的排在搬走的前面：同一个源既要复制又要搬时，先搬就没得复制了
+    for p in sorted(plan, key=lambda q: 0 if q.get("copy") else 1):
+        if p.get("dead") or p.get("conflict"):
             continue
         if not p["already"] and not p["backfill_only"]:
             p["dst"].parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(p["src"]), str(p["dst"]))
+            if p.get("copy"):
+                shutil.copy2(str(p["src"]), str(p["dst"]))
+            else:
+                shutil.move(str(p["src"]), str(p["dst"]))
+            _log_move(p["bundle"], {"op": "copy" if p.get("copy") else "move", "citekey": p["citekey"],
+                                    "src": str(p["src"]), "dst": str(p["dst"])})
         p["data"]["pdf_path"] = str(p["dst"])
         tmp = p["bundle"].with_suffix(".tmp")
         # 字节格式必须与 pdf_ingest.write_bundle 一致，否则以后 diff 全是噪声
@@ -217,12 +283,13 @@ def main():
     print("{:28} {:6} {:38} → {}".format("citekey", "配法", "当前文件名", "目标文件名"))
     print("-" * 118)
     for p in sorted(plan, key=lambda x: x["citekey"]):
-        mark = ("✗死链" if p.get("dead") else
-                "＝" if p["already"] else ("补" if p["backfill_only"] else "→"))
+        mark = ("✗死链" if p.get("dead") else "✗撞名" if p.get("conflict") else
+                "＝" if p["already"] else ("补" if p["backfill_only"] else ("⧉" if p.get("copy") else "→")))
         shown = (str(Path(p["dst"].parent.name) / p["dst"].name) if args.home else p["dst"].name)
         print("{:28} {:6} {:38} {} {}".format(
             p["citekey"], p["matched_by"], p["src"].name or "(空)", mark, shown))
-    todo = [p for p in plan if not p["already"] and not p["backfill_only"] and not p.get("dead")]
+    todo = [p for p in plan if not p["already"] and not p["backfill_only"] and not p.get("dead")
+            and not p.get("conflict")]
     backfill = [p for p in plan if p["backfill_only"]]
     print("\n共 {} 篇，需改名 {} 篇，仅补回填 {} 篇，已就位 {} 篇".format(
         len(plan), len(todo), len(backfill), len(plan) - len(todo) - len(backfill)))

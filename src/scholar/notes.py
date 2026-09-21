@@ -389,10 +389,14 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
         return out
     root = Path(out_dir) / _SHOT_DIR
     n_pass = 0
+    fails_in_a_row = 0
     for seg in segments:
         ck, pdf = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
         cr = seg.close_reading
-        if not (ck and pdf and cr and cr.sections and Path(pdf).is_file()):
+        if not (ck and pdf and cr and cr.sections):
+            continue
+        if not Path(pdf).is_file():                          # 死链：此前无声跳过，md 里这篇的图全部消失
+            logger.warning("  ⚠️ {} 的 pdf_path 不存在，本轮无原文截图: {}".format(ck, pdf))
             continue
         hl = [{"text": st.text, "page": getattr(st, "page", None)}
               for sec in cr.sections for st in sec.sentences]
@@ -401,15 +405,29 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
         except Exception as e:                               # noqa: BLE001
             logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
             continue
+        sents = [{"text": st.text, "page": getattr(st, "page", None), "section": sec.heading}
+                 for sec in cr.sections for st in sec.sentences]
+        got = None
         if embed_fn is not None:
-            sents = [{"text": st.text, "page": getattr(st, "page", None), "section": sec.heading}
-                     for sec in cr.sections for st in sec.sentences]
             try:
-                out[seg.paper_id]["_passages"] = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn)
-                n_pass += len(out[seg.paper_id]["_passages"])
-            except Exception as e:                           # noqa: BLE001 —— 多为 Ollama 没起
+                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn)
+                fails_in_a_row = 0
+            except Exception as e:                           # noqa: BLE001
                 logger.warning("  ⚠️ 逐句出处定位失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
-                embed_fn = None                              # 向量服务不可用：本轮后面的论文不再逐篇重试
+                # 只有**连续**两篇失败才认定是向量服务挂了、后面不再重试：单篇的确定性错误
+                # （窗口超长被 4xx、这份 PDF 渲染异常）此前会让本轮后面所有论文都没有出处图。
+                fails_in_a_row += 1
+                if fails_in_a_row >= 2:
+                    logger.warning("  ⚠️ 连续 {} 篇失败，判定向量服务不可用：本轮余下论文只读缓存".format(fails_in_a_row))
+                    embed_fn = None
+        if got is None:                                      # 没有向量服务 / 这一篇失败：已算过的图照出
+            try:
+                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, None)
+            except Exception as e:                           # noqa: BLE001
+                logger.warning("  ⚠️ 读逐句出处缓存失败 {}: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
+                got = {}
+        out[seg.paper_id]["_passages"] = got
+        n_pass += len(got)
     n = sum(1 for m in out.values() for v in m.values() if isinstance(v, dict) and v.get("kind"))
     if n:
         logger.info("  🖼 原文截图 {} 篇 / {} 张 · 逐句出处 {} 句 → {}".format(len(out), n, n_pass, root))
