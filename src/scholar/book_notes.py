@@ -168,10 +168,38 @@ def _year_of(manifest: BookManifest):
     return date(manifest.year, 1, 1) if manifest.year else None
 
 
+def book_pdf_specs(manifest: BookManifest,
+                   accepted: Sequence[Tuple[Dict[str, Any], CloseReading]]) -> Dict[str, dict]:
+    """paper_id -> {"path", "offset", "ranges"}，供 write_notes 出原文截图。
+
+    页段按**精读过的章**限定：整本 600 页的教科书只切那几章，既快，也不会让第 1 章的句子去匹配
+    第 15 章里相似的段落。页码口径直接取 manifest 的 `page_offset`（印刷页 = PDF 页序 + offset），
+    不走页眉推断——教科书的罗马数字前言让二者恒差十几页，推断多半推歪。
+    """
+    def rng(data):
+        ch = data.get("chapter") or {}
+        a, b = ch.get("pdf_start"), ch.get("pdf_end")
+        return [(int(a), int(b))] if a and b else []
+    path, off = manifest.pdf_path, manifest.page_offset
+    if not path:
+        return {}
+    if manifest.entry_type == "book":
+        ranges = [r for data, _ in accepted for r in rng(data)]
+        return {"book:{}".format(manifest.slug): {"path": path, "offset": off, "ranges": ranges}}
+    out = {}
+    for data, _ in accepted:
+        n = int((data.get("chapter") or {}).get("number") or 0)
+        out["book:{}:ch{:02d}".format(manifest.slug, n)] = {
+            "path": path, "offset": off, "ranges": rng(data)}
+    return out
+
+
 def segments_from_book(notes_dir: Path, manifest: BookManifest,
                        quote_pass_min: float = QUOTE_PASS_MIN
-                       ) -> Tuple[List[PaperSegment], List[str], List[str]]:
-    """全书 final 章 bundle → PaperSegment 列表。返回 (segments, skipped, broken)。"""
+                       ) -> Tuple[List[PaperSegment], List[str], List[str],
+                                  List[Tuple[Dict[str, Any], CloseReading]]]:
+    """全书 final 章 bundle → PaperSegment 列表。返回 (segments, skipped, broken, accepted)；
+    `accepted` 是过了门禁的原始章数据，`book_pdf_specs` 要靠它取每章的 PDF 页段。"""
     bdir = book_dir(notes_dir, manifest.slug)
     files = sorted(bdir.glob("*{}".format(CHAPTER_BUNDLE_SUFFIX))) if bdir.exists() else []
     skipped: List[str] = []
@@ -202,13 +230,13 @@ def segments_from_book(notes_dir: Path, manifest: BookManifest,
         accepted.append((data, cr))
 
     if not accepted:
-        return [], skipped, broken
+        return [], skipped, broken, []
 
     accepted.sort(key=lambda t: int((t[0].get("chapter") or {}).get("number") or 0))
 
     if manifest.entry_type == "book":
-        return ([_monograph_segment(manifest, accepted)], skipped, broken)
-    return ([_chapter_segment(manifest, d, cr) for d, cr in accepted], skipped, broken)
+        return ([_monograph_segment(manifest, accepted)], skipped, broken, accepted)
+    return ([_chapter_segment(manifest, d, cr) for d, cr in accepted], skipped, broken, accepted)
 
 
 def _monograph_segment(manifest: BookManifest,
@@ -309,7 +337,7 @@ def _archived_keys(notes_dir: Path, label: str):
 
 def rebuild_book(notes_dir: Path, manifest: BookManifest, label: str,
                  settings=None, allow_removals: bool = False,
-                 quote_pass_min: float = QUOTE_PASS_MIN) -> Dict[str, Any]:
+                 quote_pass_min: float = QUOTE_PASS_MIN, embed_fn=None) -> Dict[str, Any]:
     """从全书 final 章 bundle 重建书籍精读四件套 + 刷索引/向量库/概念页。
 
     净删除止损闸与 read_pdf._rebuild_month 同语义：有 bundle 被拒收时，先比对这一轮
@@ -319,8 +347,8 @@ def rebuild_book(notes_dir: Path, manifest: BookManifest, label: str,
     from .notes_index import update_index, write_outputs, existing_citekeys
 
     notes_dir = Path(notes_dir)
-    segments, skipped, broken = segments_from_book(notes_dir, manifest,
-                                                   quote_pass_min=quote_pass_min)
+    segments, skipped, broken, accepted = segments_from_book(notes_dir, manifest,
+                                                             quote_pass_min=quote_pass_min)
     stem = note_stem(label)
     own_note_file = stem + ".md"
     existing_ckeys = existing_citekeys(notes_dir / "literature_index.json",
@@ -366,6 +394,9 @@ def rebuild_book(notes_dir: Path, manifest: BookManifest, label: str,
         cjk_font=getattr(proc, "notes_docx_cjk_font", "") if proc else "",
         fallback_citekeys=True, index_series="book",
         existing_citekeys=existing_ckeys,
+        pdf_paths=book_pdf_specs(manifest, accepted),
+        embed_fn=embed_fn,
+        docx_shots=True,
         explicit_citekey_source="fallback")
     idx = update_index(notes_dir)
     write_outputs(idx, notes_dir)

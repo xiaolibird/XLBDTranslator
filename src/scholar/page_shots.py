@@ -20,7 +20,7 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
 
@@ -678,7 +678,7 @@ def _owner_tag(cdir: Path, tag: str) -> str:
 
 
 def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_root: Path,
-                    force: bool = False) -> Dict[str, dict]:
+                    force: bool = False, page_map: Optional[PageMap] = None) -> Dict[str, dict]:
     """渲染一篇论文被证据引用到的全部页面与图表。
 
     返回 {相对路径: {"kind": page|figure, "printed": 16, "pdf_page": 4, "label": "Fig. 2", "how": ...}}；
@@ -713,7 +713,7 @@ def shots_for_paper(pdf_path: Path, citekey: str, highlights: List[dict], out_ro
                 if mine and not old.name.startswith("q_"):       # 只清**这份 PDF** 名下的图
                     old.unlink()
     with fitz.open(str(pdf_path)) as doc:
-        pm = build_page_map(doc, wanted_pages)
+        pm = page_map or build_page_map(doc, wanted_pages)
         stale_before = pdf_path.stat().st_mtime
         for printed in sorted(set(wanted_pages)):
             idx = pm.to_pdf(printed)
@@ -902,30 +902,46 @@ def _merge_fragments(blocks):
     return out
 
 
-def passage_windows(doc) -> List[dict]:
-    """正文（含附录）的行级滑动窗口：[{page(1起), rect, text, blk, pos}]。参考文献条目、页眉页脚不要。"""
+def passage_windows(doc, ranges: Optional[Sequence[Tuple[int, int]]] = None) -> List[dict]:
+    """正文（含附录）的行级滑动窗口：[{page(1起), rect, text, blk, pos}]。参考文献条目、页眉页脚不要。
+
+    `ranges` 是 PDF 页序的闭区间列表：书籍链路按章（或按已精读章的并集）限定，整本 600 页的书
+    只切它真正读过的那几十页——既快，也不会让某一章的句子去匹配另一章的相似段落。
+    """
     import fitz
     out: List[dict] = []
     if text_looks_garbled(doc):
         logger.warning("  ⚠️ PDF 文本层是乱码（ToUnicode 表坏了），本篇不做逐句出处定位；换一份 PDF 才是解")
         return out
-    out = _windows_from(doc, from_words=False)
+    out = _windows_from(doc, from_words=False, ranges=ranges)
     # 按**结果**决定要不要回退到按词重建行，而不是按块数这类结构代理指标：块结构看着碎、但
     # `_merge_fragments` 能并回来的 PDF（双栏中文综述）走词路径反而会把左右栏交错在一起。
     # 判据就是后面 locate_passages 用的那条窗口池退化线。
-    pages = len({w["page"] for w in out}) or doc.page_count
-    if len(out) < 3 * pages and doc.page_count >= 4:
-        alt = _windows_from(doc, from_words=True)
+    n_pages = _pages_in(doc, ranges)
+    pages = len({w["page"] for w in out}) or len(n_pages)
+    if len(out) < 3 * pages and len(n_pages) >= 4:
+        alt = _windows_from(doc, from_words=True, ranges=ranges)
         if len(alt) > len(out):
             return alt
     return out
 
 
-def _windows_from(doc, from_words: bool) -> List[dict]:
+def _pages_in(doc, ranges: Optional[Sequence[Tuple[int, int]]]) -> List[int]:
+    """要切窗的 PDF 页序（1 起）。`ranges` 为空 = 整本。"""
+    if not ranges:
+        return list(range(1, doc.page_count + 1))
+    want = set()
+    for a, b in ranges:
+        want.update(range(max(1, int(a)), min(doc.page_count, int(b)) + 1))
+    return sorted(want)
+
+
+def _windows_from(doc, from_words: bool, ranges: Optional[Sequence[Tuple[int, int]]] = None) -> List[dict]:
     import fitz
     out: List[dict] = []
     in_refs, ref_size, seen_refs = False, 0.0, False
-    for pi in range(doc.page_count):
+    for pi1 in _pages_in(doc, ranges):
+        pi = pi1 - 1
         page = doc[pi]
         blocks = ([{"lines": _lines_from_words(page), "number": 0}] if from_words
                   else _merge_fragments(_page_blocks(page)))
@@ -979,7 +995,8 @@ def has_no_source(sentence: dict) -> bool:
 
 
 def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMap] = None,
-                    windows: Optional[List[dict]] = None, win_vecs=None) -> List[Optional[dict]]:
+                    windows: Optional[List[dict]] = None, win_vecs=None,
+                    ranges: Optional[Sequence[Tuple[int, int]]] = None) -> List[Optional[dict]]:
     """为每句找原文出处。返回与 sentences 等长的列表：{page, rect, score, raw, how} 或 None。
 
     sentences: [{"text", "page"(札记页码，可无), "section"}]；embed: texts -> (n,d) ndarray。
@@ -988,14 +1005,14 @@ def locate_passages(doc, sentences: List[dict], embed, page_map: Optional[PageMa
     """
     import numpy as np
     import fitz
-    wins = windows if windows is not None else passage_windows(doc)
+    wins = windows if windows is not None else passage_windows(doc, ranges)
     res: List[Optional[dict]] = [None] * len(sentences)
     todo = [i for i, s in enumerate(sentences) if not has_no_source(s) and (s.get("text") or "").strip()]
     if not wins or not todo:
         return res
     # 窗口池退化（扫描件、每页被拆成上千个零碎文本块）：出处多半不在池里，硬配只会配错
     n_text_pages = len({w["page"] for w in wins})
-    if len(wins) < 3 * max(n_text_pages, 1) and doc.page_count >= 4:
+    if len(wins) < 3 * max(n_text_pages, 1) and len(_pages_in(doc, ranges)) >= 4:
         return res
     W = win_vecs if win_vecs is not None else embed([w["text"] for w in wins])
     Q = embed([sentences[i]["text"] for i in todo])
@@ -1097,7 +1114,8 @@ def sentence_key(text: str) -> str:
 
 
 def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_root: Path, embed,
-                       force: bool = False) -> Dict[str, dict]:
+                       force: bool = False, page_map: Optional[PageMap] = None,
+                       ranges: Optional[Sequence[Tuple[int, int]]] = None) -> Dict[str, dict]:
     """逐句原文出处截图。返回 {句子键: {"rel", "printed", "score"}}（没把握的句子不在其中）。
 
     结果缓存在 `<citekey>/passages.json`，键 = PDF 指纹 + 算法版本 + 句子内容哈希：finalize 是
@@ -1150,8 +1168,8 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
            or hints.get(k, "") != str(x.get("page") or "")]
     if new:
         with fitz.open(str(pdf_path)) as doc:
-            pm = build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
-            found = locate_passages(doc, [x for _, x in new], embed, pm)
+            pm = page_map or build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
+            found = locate_passages(doc, [x for _, x in new], embed, pm, ranges=ranges)
             for (k, x), r in zip(new, found):
                 hints[k] = str(x.get("page") or "")
                 if r is None:

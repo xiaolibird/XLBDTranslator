@@ -110,7 +110,7 @@ def test_monograph_merges_chapters_into_one_entry(tmp_path):
     man = _manifest("book")
     _write_ch(tmp_path, man, 1)
     _write_ch(tmp_path, man, 2)
-    segs, skipped, broken = segments_from_book(tmp_path, man)
+    segs, skipped, broken, _acc = segments_from_book(tmp_path, man)
     assert len(segs) == 1 and not skipped and not broken
     seg = segs[0]
     assert seg.metadata.entry_type == "book"
@@ -125,7 +125,7 @@ def test_edited_volume_makes_one_entry_per_chapter(tmp_path):
     man = _manifest("chapter", title="Users' Guides", citekey="guyatt2015users")
     _write_ch(tmp_path, man, 1, chapter_meta={"title": "Harm", "authors": ["Gordon Guyatt"]})
     _write_ch(tmp_path, man, 2, chapter_meta={"title": "Prognosis", "authors": ["Ian Stiell"]})
-    segs, _, _ = segments_from_book(tmp_path, man)
+    segs, _, _, _acc = segments_from_book(tmp_path, man)
     assert len(segs) == 2
     assert [s.metadata.title for s in segs] == ["Harm", "Prognosis"]
     assert segs[0].metadata.entry_type == "chapter"
@@ -140,7 +140,7 @@ def test_rejected_chapters_are_reported_not_silently_dropped(tmp_path):
     man = _manifest("book")
     _write_ch(tmp_path, man, 1)
     _write_ch(tmp_path, man, 2, report=None)          # 无核验报告 → 拒收
-    segs, skipped, broken = segments_from_book(tmp_path, man)
+    segs, skipped, broken, _acc = segments_from_book(tmp_path, man)
     assert len(segs) == 1
     assert skipped and "ch02" in skipped[0]
 
@@ -151,7 +151,7 @@ def test_unreadable_bundle_goes_to_broken(tmp_path):
     _write_ch(tmp_path, man, 1)
     bad = chapter_bundle_path(tmp_path, man.slug, 2)
     bad.write_text("{ not json", encoding="utf-8")
-    segs, skipped, broken = segments_from_book(tmp_path, man)
+    segs, skipped, broken, _acc = segments_from_book(tmp_path, man)
     assert len(segs) == 1 and broken and "ch02" in broken[0]
 
 
@@ -230,3 +230,44 @@ def test_book_note_label_is_index_visible():
     assert ni.validate_note_label(label) == label
     m = ni.NOTE_MD_RE.match(note_stem(label) + ".md")
     assert m and ni._SERIES_MAP[m.group(2)] == "book"
+
+
+# ---------------- 原文截图（2026-09-21：书籍链路接入） ----------------
+
+def test_book_pdf_specs_limit_windows_to_the_chapters_actually_read(tmp_path):
+    """整本 462 页的教科书只切精读过的那几章：既快，也不让第 1 章的句子去匹配第 15 章的相似段落。
+    页码口径取 manifest 的权威偏移（印刷页 = PDF 页序 + page_offset），不走页眉推断——教科书的
+    罗马数字前言让二者恒差十几页。"""
+    from src.scholar.book_notes import book_pdf_specs, segments_from_book
+    man = _manifest("book")
+    _write_ch(tmp_path, man, 1)
+    _write_ch(tmp_path, man, 2)
+    segs, _, _, accepted = segments_from_book(tmp_path, man)
+    spec = book_pdf_specs(man, accepted)
+    assert list(spec) == ["book:TestBook"]                       # 专著：整本一条条目
+    assert spec["book:TestBook"]["ranges"] == [(15, 40), (41, 58)]
+    assert spec["book:TestBook"]["offset"] == -12
+
+    man2 = _manifest("collection")
+    _write_ch(tmp_path, man2, 1)
+    spec2 = book_pdf_specs(man2, segments_from_book(tmp_path, man2)[3])
+    assert spec2["book:TestBook:ch01"]["ranges"] == [(15, 40)]    # 编著：一章一条，各限各的页段
+
+
+def test_page_shots_honours_an_explicit_range_and_page_map(tmp_path):
+    import fitz
+    from src.scholar import page_shots as PS
+    doc = fitz.open()
+    for i in range(10):
+        doc.new_page().insert_textbox(fitz.Rect(60, 100, 520, 400),
+                                      "Page {} discusses data obtained from remote sensing equipment via "
+                                      "satellite that may be missing observations at certain times. ".format(i + 1) * 2,
+                                      fontsize=10)
+    pdf = tmp_path / "book.pdf"
+    doc.save(str(pdf)); doc.close()
+    with fitz.open(str(pdf)) as d:
+        assert {w["page"] for w in PS.passage_windows(d, [(3, 5)])} == {3, 4, 5}
+        assert len(PS.passage_windows(d)) > len(PS.passage_windows(d, [(3, 5)]))
+        pm = PS.PageMap(d.page_count, -2, "manifest")        # 印刷页 = PDF 页序 - 2（前言占 2 页）
+        assert pm.to_printed(3) == 1 and pm.to_pdf(1) == 3
+        assert pm.to_pdf(99) is None                          # 落不到本 PDF 内不就近凑

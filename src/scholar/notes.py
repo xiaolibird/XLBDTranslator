@@ -392,7 +392,16 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
     n_pass = 0
     fails_in_a_row = 0
     for seg in segments:
-        ck, pdf = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
+        ck, spec = citekeys.get(seg.paper_id), pdf_paths.get(seg.paper_id)
+        # 值可以是路径字符串，也可以是 {"path", "offset"(印刷页 = PDF 页序 + offset), "ranges"[(a,b)…]}
+        # ——书籍链路用后者：整本 600 页只切精读过的那几章，页码口径直接取 manifest 的权威偏移。
+        spec = {"path": spec} if isinstance(spec, str) else (spec or {})
+        pdf, ranges = spec.get("path"), spec.get("ranges")
+        pmap = None
+        if spec.get("offset") is not None and pdf and Path(pdf).is_file():
+            import fitz
+            with fitz.open(str(pdf)) as _d:
+                pmap = page_shots.PageMap(_d.page_count, int(spec["offset"]), "manifest")
         cr = seg.close_reading
         if not (ck and pdf and cr and cr.sections):
             continue
@@ -402,7 +411,7 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
         hl = [{"text": st.text, "page": getattr(st, "page", None)}
               for sec in cr.sections for st in sec.sentences]
         try:
-            out[seg.paper_id] = page_shots.shots_for_paper(Path(pdf), ck, hl, root)
+            out[seg.paper_id] = page_shots.shots_for_paper(Path(pdf), ck, hl, root, page_map=pmap)
         except Exception as e:                               # noqa: BLE001
             logger.warning("  ⚠️ 原文截图失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, e))
             continue
@@ -411,7 +420,8 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
         got = None
         if embed_fn is not None:
             try:
-                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn)
+                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, embed_fn,
+                                                    page_map=pmap, ranges=ranges)
                 fails_in_a_row = 0
             except Exception as e:                           # noqa: BLE001
                 logger.warning("  ⚠️ 逐句出处定位失败 {}（不影响归档）: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
@@ -423,7 +433,8 @@ def _make_shots(segments, citekeys, pdf_paths, out_dir, embed_fn=None) -> Dict[s
                     embed_fn = None
         if got is None:                                      # 没有向量服务 / 这一篇失败：已算过的图照出
             try:
-                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, None)
+                got = page_shots.passages_for_paper(Path(pdf), ck, sents, root, None,
+                                                    page_map=pmap, ranges=ranges)
             except Exception as e:                           # noqa: BLE001
                 logger.warning("  ⚠️ 读逐句出处缓存失败 {}: {}: {}".format(ck, type(e).__name__, str(e)[:120]))
                 got = {}
@@ -456,7 +467,8 @@ def write_notes(
 ) -> Dict[str, Any]:
     """把一个时间窗的论文聚合成【单篇】pandoc-ready 札记 + 一份 references.json（CSL-JSON）。
 
-    pdf_paths: paper_id -> 本地 PDF 路径。给了就在 citekey 定稿之后、渲染之前为每篇生成
+    pdf_paths: paper_id -> 本地 PDF 路径，或 {"path", "offset", "ranges"}（书籍链路按章限定页段、
+        页码口径取 manifest 的权威偏移）。给了就在 citekey 定稿之后、渲染之前为每篇生成
         原文截图（证据页码对应的整页 + 证据句提到的图/表），落 `<out_dir>/assets/shots/<citekey>/`，
         md 与 docx 里都会带上。再给了 embed_fn（texts -> ndarray，多语种向量）就为**每一句**
         证据定位它在原文里的出处段落并裁图，紧跟在那句下面；没给就只出整页与图表。

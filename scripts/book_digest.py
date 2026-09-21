@@ -48,6 +48,19 @@ REPO = Path(__file__).resolve().parents[1]
 TOPICS_YAML = REPO / "config" / "topics.yaml"
 
 
+def _passage_embed_fn(settings):
+    """逐句出处定位用的向量函数（与 read_pdf 同源）。探活失败返回 None：那一步整体跳过、归档照常。"""
+    try:
+        from src.scholar.embeddings import EmbeddingClient, resolve_embedding_base_url
+        client = EmbeddingClient(base_url=resolve_embedding_base_url(settings.llm),
+                                 model=settings.llm.embedding_model)
+        client.probe()
+        return client.embed
+    except Exception as e:                                   # noqa: BLE001
+        print("   ⚠️ 向量服务不可用（{}），本轮不做逐句出处截图".format(str(e)[:100]))
+        return None
+
+
 def _notes_dir(settings) -> Path:
     return Path(settings.processing.notes_dir)
 
@@ -470,7 +483,8 @@ def cmd_finalize(args):
     validate_note_label(label)
 
     res = rebuild_book(_notes_dir(settings), man, label, settings=settings,
-                       allow_removals=args.allow_removals, quote_pass_min=args.min_rate)
+                       allow_removals=args.allow_removals, quote_pass_min=args.min_rate,
+                       embed_fn=_passage_embed_fn(settings))
     if res.get("refused"):
         print("\n⛔ 净删除止损闸触发，整本未动。被拒收 bundle：{}"
               .format(", ".join((res.get("skipped") or []) + (res.get("broken") or []))))

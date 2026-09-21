@@ -976,7 +976,8 @@ def test_window_pool_falls_back_to_words_only_when_the_block_path_is_degenerate(
     with fitz.open(str(pdf)) as d:
         seen = []
         real = PS._windows_from
-        monkeypatch.setattr(PS, "_windows_from", lambda doc, from_words: (seen.append(from_words), real(doc, from_words))[1])
+        monkeypatch.setattr(PS, "_windows_from",
+                            lambda doc, from_words, ranges=None: (seen.append(from_words), real(doc, from_words, ranges))[1])
         assert PS.passage_windows(d) and seen == [False]        # 块路径够用：根本不去碰词路径
         seen.clear()
         monkeypatch.setattr(PS, "_page_blocks", lambda page: [])   # 块路径颗粒无收
