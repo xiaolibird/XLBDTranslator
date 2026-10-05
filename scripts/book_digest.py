@@ -156,11 +156,13 @@ def cmd_manifest(args):
     path = man.save(bdir)
 
     print("\n📕 {}".format(man.title or man.slug))
-    print("   类型 {} · {} 页 · 目录来源 {} · 页偏移 {:+d}".format(
-        man.entry_type, man.n_pages, man.toc_source or "无", man.page_offset))
+    print("   类型 {} · {} 页 · 目录来源 {} · 页偏移 {}".format(
+        man.entry_type, man.n_pages, man.toc_source or "无",
+        "按 PDF 页标签（{} 页，偏移分段）".format(len(man.page_labels)) if man.page_labels
+        else "{:+d}".format(man.page_offset)))
     print("   切出 {} 章：".format(len(man.chapters)))
     for c in man.chapter_objs():
-        lo, hi = c.printed_range(man.page_offset)
+        lo, hi = man.chapter_printed_range(c)
         print("     {:>2}. pp.{:>4}-{:<4} ({:>3}p)  {}".format(c.number, lo, hi, c.n_pages,
                                                                c.title[:58]))
     if old is not None:
@@ -222,7 +224,7 @@ def cmd_triage(args):
         print("\n[dry-run] 将对 {} 章 × {} 个研究问题分诊（每章 1 次 LLM 调用）"
               .format(len(targets), len(specs)))
         for c in targets:
-            lo, hi = c.printed_range(man.page_offset)
+            lo, hi = man.chapter_printed_range(c)
             print("   ch{:>2} pp.{}-{}  {}".format(c.number, lo, hi, c.title[:60]))
         print("\n加 --apply 实际执行。")
         return 0
@@ -298,7 +300,7 @@ def cmd_read(args):
     if not args.apply:
         print("\n[dry-run] 将为 {} 章建 draft bundle（已 final 的已跳过）".format(len(todo)))
         for c in todo:
-            lo, hi = c.printed_range(man.page_offset)
+            lo, hi = man.chapter_printed_range(c)
             print("   ch{:>2} pp.{}-{} ({}p) {}".format(c.number, lo, hi, c.n_pages,
                                                         c.title[:56]))
         print("\n加 --apply 实际执行。")
@@ -320,10 +322,12 @@ def _print_read_plan(man, chapters, notes_dir):
     print("\n" + "=" * 72)
     print("📖 agent 亲读计划：{}".format(man.title or man.slug))
     print("   PDF: {}".format(man.pdf_path))
-    print("   页码换算：原书页码 = PDF 页序 {:+d}".format(man.page_offset))
+    print("   页码换算：原书页码 = {}".format(
+        "按 PDF 自带页标签（偏移分段，章首跳号）" if man.page_labels
+        else "PDF 页序 {:+d}".format(man.page_offset)))
     print("=" * 72)
     for c in chapters:
-        lo, hi = c.printed_range(man.page_offset)
+        lo, hi = man.chapter_printed_range(c)
         print("\n▸ ch{} {}".format(c.number, c.title[:66]))
         print("   Read pages={}-{}   （原书 pp.{}-{}，共 {} 页）".format(
             c.pdf_start, c.pdf_end, lo, hi, c.n_pages))
@@ -368,7 +372,7 @@ def cmd_import_legacy(args):
     print("\n   章 ↔ 旧 digest 映射：")
     for ch in man.chapter_objs():
         ds = mapping.get(ch.number) or []
-        lo, hi = ch.printed_range(man.page_offset)
+        lo, hi = man.chapter_printed_range(ch)
         print("     ch{:>2} pp.{:>3}-{:<3}  {:<2}份  {}".format(
             ch.number, lo, hi, len(ds), ", ".join(d.name for d in ds) or "（无）"))
 
@@ -509,8 +513,9 @@ def cmd_status(args):
     triage = {int(k): ChapterTriage.from_dict(v) for k, v in (man.triage or {}).items()}
     sel = {c.number for c in selected_chapters(man, triage)} if triage else set()
 
-    print("\n📕 {} · {} 章 · 目录来源 {} · 页偏移 {:+d}".format(
-        man.title or man.slug, len(man.chapters), man.toc_source or "无", man.page_offset))
+    print("\n📕 {} · {} 章 · 目录来源 {} · 页偏移 {}".format(
+        man.title or man.slug, len(man.chapters), man.toc_source or "无",
+        "按 PDF 页标签" if man.page_labels else "{:+d}".format(man.page_offset)))
     print("   分诊 {}/{} 章；深读队列 {} 章".format(len(triage), len(man.chapters), len(sel)))
     print()
     print("   章  分诊  队列  bundle    门禁")

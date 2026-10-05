@@ -13,6 +13,7 @@
 页码术语（全文件统一，别混）：
   pdf_page    1-based PDF 物理页序
   printed     原书印刷页码 = pdf_page + page_offset（教科书的罗马数字前言让二者恒差十几页）
+              ——若 manifest 带 page_labels（PDF 自带页标签且偏移不恒定），以它为准
 """
 from __future__ import annotations
 
@@ -68,6 +69,32 @@ def extract_pages(pdf_path: Path) -> List[str]:
         for page in doc:
             pages.append(_page_text_columnwise(page))
     return pages
+
+
+def _clean_label(lab: str) -> str:
+    """PDF 页标签 → 纯文本。PyMuPDF 对 UTF-16 编码的标签会把 BOM 原样返回成字面量
+    `<FEFF>`（实测 Springer《Metalearning》2e：`'<FEFF>10'`），不剥掉就 isdigit() 恒假。"""
+    return (lab or "").replace("<FEFF>", "").replace("\ufeff", "").strip()
+
+
+def pdf_page_labels(doc) -> Dict[int, int]:
+    """PDF 自带的阿拉伯数字页标签 → {印刷页: PDF 页序(1 起)}；没有则空。
+
+    存在的理由：Springer 等出版商的书在每个 Part 与每章开头有不编号的空白/扉页，
+    印刷页码在章与章之间**跳号**，偏移不是常数（实测 Metalearning 2e：第 1 章 −12、
+    第 3 章 −9、第 16 章 −6）。单一 page_offset 只对其中几章对，其余章的页码锚
+    整体错 2–5 页，而 ±1 页容差的回验照样放行——错的引用定位符会安静地进库。
+    同一印刷页出现两次时取第一次（与 page_shots.build_page_map 一致）。
+    """
+    out: Dict[int, int] = {}
+    for i in range(doc.page_count):
+        try:
+            lab = _clean_label(doc[i].get_label())
+        except Exception:                        # noqa: BLE001
+            continue
+        if lab.isdigit():
+            out.setdefault(int(lab), i + 1)
+    return out
 
 
 # ---------------- 章节 ----------------
@@ -385,6 +412,9 @@ class BookManifest:
     citekey: str = ""                   # 专著的 citekey；编著为空（各章自有）
     n_pages: int = 0
     page_offset: int = 0
+    # {印刷页(str): PDF 页序(1 起)}。仅当 PDF 自带页标签**且**偏移不恒定时才写入；
+    # 非空时一切印刷页 ↔ PDF 页序换算以它为准，page_offset 只作无标签页的兜底。见 pdf_page_labels。
+    page_labels: Dict[str, int] = field(default_factory=dict)
     split_level: int = 2
     toc_source: str = ""                # native | printed（目录从哪来，覆盖报告要用）
     chapters: List[Dict[str, Any]] = field(default_factory=list)
@@ -429,6 +459,25 @@ class BookManifest:
     def chapter(self, number: int) -> Optional[Chapter]:
         return next((c for c in self.chapter_objs() if c.number == int(number)), None)
 
+    # ---- 页码换算（page_labels 优先，page_offset 兜底）----
+    def label_map(self) -> Dict[int, int]:
+        return {int(k): int(v) for k, v in (self.page_labels or {}).items()}
+
+    def printed_of(self, pdf_page: int) -> Optional[int]:
+        """PDF 页序(1 起) → 印刷页；有标签表而该页无标签（扉页/空白页）时返回 None。"""
+        lm = self.label_map()
+        if lm:
+            return next((pr for pr, pg in lm.items() if pg == int(pdf_page)), None)
+        return int(pdf_page) + self.page_offset
+
+    def chapter_printed_range(self, c: Chapter) -> Tuple[int, int]:
+        """一章的 (首, 末) 印刷页。章首常是无标签扉页，故取章内第一个/最后一个有标签的页。"""
+        lm = self.label_map()
+        if not lm:
+            return c.printed_range(self.page_offset)
+        got = sorted(pr for pr, pg in lm.items() if c.pdf_start <= pg <= c.pdf_end)
+        return (got[0], got[-1]) if got else c.printed_range(self.page_offset)
+
     # ---- 强制前缀（每次 LLM/agent 调用都必须带）----
     def prompt_prefix(self) -> str:
         """书目 + 目录概览。旧 digest 的元数据幻觉根因就是缺这一段。"""
@@ -442,12 +491,13 @@ class BookManifest:
             head.append("出版：{} {}".format(self.publisher, self.year or "").strip())
         if self.isbn:
             head.append("ISBN：{}".format(self.isbn))
-        head.append("总页数：{} 页（PDF）；印刷页码 = PDF 页序 {:+d}"
-                    .format(self.n_pages, self.page_offset))
+        head.append("总页数：{} 页（PDF）；印刷页码 = {}".format(
+            self.n_pages, "按 PDF 自带页标签（各章偏移不同）" if self.page_labels
+            else "PDF 页序 {:+d}".format(self.page_offset)))
         head.append("")
         head.append("## 全书目录（{} 章）".format(len(self.chapters)))
         for c in self.chapter_objs():
-            lo, hi = c.printed_range(self.page_offset)
+            lo, hi = self.chapter_printed_range(c)
             head.append("  {}. {} （原书 pp.{}-{}）".format(c.number, c.title, lo, hi))
         return "\n".join(head)
 
@@ -499,6 +549,13 @@ def build_manifest(pdf_path: Path, slug: str, entry_type: str,
 
     with fitz.open(str(pdf_path)) as doc:
         toc_items = load_standardized_toc(doc, custom_toc_path)
+        labels = pdf_page_labels(doc)
+    # 标签与单一偏移完全吻合时不存（旧行为不变）；不吻合才说明偏移是分段的
+    if labels and any(pr - pg != page_offset for pr, pg in labels.items()):
+        logger.info("PDF 自带页标签与单一偏移 {:+d} 不符（{} 个带标签页）——改按页标签换算"
+                    .format(page_offset, len(labels)))
+    else:
+        labels = {}
     toc_source = "native" if toc_items else ""
 
     if not toc_items and printed_toc_pages:
@@ -517,6 +574,7 @@ def build_manifest(pdf_path: Path, slug: str, entry_type: str,
         title=info["title"] or slug,
         authors=[a for a in [info["author"]] if a],
         n_pages=info["n_pages"], page_offset=page_offset,
+        page_labels={str(k): v for k, v in sorted(labels.items())},
         split_level=split_level, toc_source=toc_source,
         chapters=[asdict(c) for c in chapters],
     )
@@ -530,4 +588,4 @@ def page_index_for(manifest: BookManifest, pages: Optional[Sequence[str]] = None
     """构造引文回验用的 PageIndex（按原书印刷页码寻址）。"""
     from .quote_verify import PageIndex
     pgs = pages if pages is not None else extract_pages(Path(manifest.pdf_path))
-    return PageIndex(pgs, offset=manifest.page_offset)
+    return PageIndex(pgs, offset=manifest.page_offset, labels=manifest.label_map() or None)

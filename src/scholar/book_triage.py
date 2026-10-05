@@ -154,7 +154,7 @@ def triage_chapter(ch: Chapter, manifest: BookManifest, pages: Sequence[str],
                    specs, llm, interests: str, model: Optional[str] = None) -> ChapterTriage:
     """对一章跑分诊。LLM 失败时返回带 error 的结果（selected=True，见该属性文档）。"""
     slugs = [s.slug for s in specs]
-    p_start, p_end = ch.printed_range(manifest.page_offset)
+    p_start, p_end = manifest.chapter_printed_range(ch)
     prompt = _TRIAGE_PROMPT.format(
         manifest_prefix=manifest.prompt_prefix(),
         interests=interests,
@@ -259,7 +259,7 @@ def heatmap_md(manifest: BookManifest, triage: Dict[int, ChapterTriage], specs) 
         for slug in slugs:
             sc = (t.scores.get(slug, 0) if t else 0)
             cells.append("{} {}".format(_HEAT.get(sc, "·"), sc))
-        lo, hi = ch.printed_range(manifest.page_offset)
+        lo, hi = manifest.chapter_printed_range(ch)
         mark = "❗" if (t and t.error) else ("✅" if (t and t.selected) else "")
         lines.append("| {} | {} <br><sub>pp.{}-{}</sub> | {} | {} | {} |".format(
             ch.number, ch.title.replace("|", "/")[:60], lo, hi,

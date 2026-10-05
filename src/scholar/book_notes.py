@@ -85,8 +85,8 @@ def write_chapter_bundle(path: Path, *, manifest: BookManifest, chapter: Chapter
         "chapter": {"number": chapter.number, "title": chapter.title,
                     "label": chapter.label,
                     "pdf_start": chapter.pdf_start, "pdf_end": chapter.pdf_end,
-                    "printed_start": chapter.printed_range(manifest.page_offset)[0],
-                    "printed_end": chapter.printed_range(manifest.page_offset)[1],
+                    "printed_start": manifest.chapter_printed_range(chapter)[0],
+                    "printed_end": manifest.chapter_printed_range(chapter)[1],
                     "subsections": list(chapter.subsections)},
         "chapter_meta": chapter_meta or {},      # 编著文集：本章作者/标题（可引单元）
         "close_reading_script": (close_reading_script.model_dump(mode="json")
@@ -183,14 +183,17 @@ def book_pdf_specs(manifest: BookManifest,
     path, off = manifest.pdf_path, manifest.page_offset
     if not path:
         return {}
+    # 偏移分段的书（manifest 带 page_labels）把标签表一并交给截图链路，否则章首跳号处会截错页
+    extra = {"labels": manifest.label_map()} if manifest.page_labels else {}
     if manifest.entry_type == "book":
         ranges = [r for data, _ in accepted for r in rng(data)]
-        return {"book:{}".format(manifest.slug): {"path": path, "offset": off, "ranges": ranges}}
+        return {"book:{}".format(manifest.slug): {"path": path, "offset": off, "ranges": ranges,
+                                                  **extra}}
     out = {}
     for data, _ in accepted:
         n = int((data.get("chapter") or {}).get("number") or 0)
         out["book:{}:ch{:02d}".format(manifest.slug, n)] = {
-            "path": path, "offset": off, "ranges": rng(data)}
+            "path": path, "offset": off, "ranges": rng(data), **extra}
     return out
 
 

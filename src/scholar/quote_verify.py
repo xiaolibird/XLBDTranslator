@@ -157,13 +157,31 @@ class PageIndex:
     旧手工 digest 每份文件各自手推一次这个偏移，且同书不同文件推出过不同值。
     """
 
-    def __init__(self, pages: Sequence[str], offset: int = 0):
+    def __init__(self, pages: Sequence[str], offset: int = 0,
+                 labels: Optional[Dict[int, int]] = None):
         # 保留行结构：normalize 会把换行折成空格，若只存整页归一结果，剔除页眉页脚时
         # 就没有行可分了（_body 的判据是「短行 + 含页码」）。
         self._lines = [normalize_lines(p) for p in pages]
         self._norm = [" ".join(x for x in lines if x) for lines in self._lines]
         self._dehy = [dehyphenate(t) for t in self._norm]
         self.offset = int(offset)
+        # {印刷页: PDF 页序(1 起)}：偏移分段的书（Springer 章首跳号）用 PDF 页标签寻址，
+        # 此时 offset 不再参与换算。见 book_ingest.pdf_page_labels。
+        self.labels = {int(k): int(v) for k, v in (labels or {}).items()}
+        self._rev = {v: k for k, v in sorted(self.labels.items(), reverse=True)}
+
+    def _idx(self, printed_page: int) -> int:
+        """印刷页 → 0-based PDF 页序；落不到本书内返回 -1。"""
+        if self.labels:
+            pg = self.labels.get(int(printed_page))
+            return pg - 1 if pg else -1
+        return int(printed_page) - 1 - self.offset
+
+    def _printed_of(self, i: int) -> Optional[int]:
+        """0-based PDF 页序 → 印刷页（无标签页返回 None）。"""
+        if self.labels:
+            return self._rev.get(i + 1)
+        return i + 1 + self.offset
 
     def __len__(self) -> int:
         return len(self._norm)
@@ -171,11 +189,13 @@ class PageIndex:
     @property
     def printed_range(self):
         """(最小, 最大) 可寻址的印刷页码。"""
+        if self.labels:
+            return (min(self.labels), max(self.labels))
         return (1 + self.offset, len(self._norm) + self.offset)
 
     def printed(self, printed_page: int, dehyphenated: bool = False) -> str:
         """取某印刷页的归一化文本；越界返回空串。"""
-        idx = int(printed_page) - 1 - self.offset
+        idx = self._idx(printed_page)
         src = self._dehy if dehyphenated else self._norm
         return src[idx] if 0 <= idx < len(src) else ""
 
@@ -187,7 +207,7 @@ class PageIndex:
         (Observational Studies)" 隔断，跨页引句因此永远匹配不上。
         判据是「短行 + 含该页页码」——页眉页脚的定义性特征，正文行不会两者都满足。
         """
-        idx = int(printed_page) - 1 - self.offset
+        idx = self._idx(printed_page)
         if not (0 <= idx < len(self._lines)):
             return ""
         num = str(int(printed_page))
@@ -232,12 +252,12 @@ class PageIndex:
         if not needle:
             return None
         for i, text in enumerate(self._norm):
-            if needle in text:
-                return i + 1 + self.offset
+            if needle in text and self._printed_of(i) is not None:
+                return self._printed_of(i)
         dh = dehyphenate(needle)
         for i, text in enumerate(self._dehy):
-            if dh in text:
-                return i + 1 + self.offset
+            if dh in text and self._printed_of(i) is not None:
+                return self._printed_of(i)
         return None
 
 

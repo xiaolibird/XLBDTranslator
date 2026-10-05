@@ -437,7 +437,12 @@ def shots_for_one(ck: str, spec, sents: List[Dict[str, Any]], root: Path,
         logger.warning("  ⚠️ {} 的 pdf_path 不存在，本轮无原文截图: {}".format(ck, pdf))
         return None
     pmap = None
-    if spec.get("offset") is not None:
+    if spec.get("labels"):                                   # 书籍：偏移分段，按 PDF 页标签换算
+        import fitz
+        with fitz.open(str(pdf)) as _d:
+            pmap = page_shots.PageMap(_d.page_count, int(spec.get("offset") or 0), "label",
+                                      {int(k): int(v) for k, v in spec["labels"].items()})
+    elif spec.get("offset") is not None:
         import fitz
         with fitz.open(str(pdf)) as _d:
             pmap = page_shots.PageMap(_d.page_count, int(spec["offset"]), "manifest")
