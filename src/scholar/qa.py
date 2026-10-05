@@ -70,13 +70,14 @@ from .embeddings import EmbeddingError
 from .notes_index import write_if_changed
 from . import page_shots
 from .topics import (
-    DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, DEFAULT_USER_ZONE, GEN_BEGIN,
+    DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, Evidence, DEFAULT_USER_ZONE, GEN_BEGIN,
     GEN_END, TOPICS_DIRNAME, TopicError, TopicSpec, ValidationReport, _CITE_RE,
     _EVIDENCE_ROW_RE, _check_grounding, _clean_text, _render_frontmatter, _resolve_refs,
     flatten_linebreaks,
     parse_synthesis, read_existing, render_evidence_block, retrieve_evidence,
     select_evidence, to_wiki_links,
 )
+from .grounding import build_pool, check_numbers
 from .thresholds import QA_GAP_EVIDENCE_MIN_SIM
 from .vault import (
     GEN_BEGIN_RE, ROLE_LABEL, _gen_hash, extract_user_zone,
@@ -98,7 +99,9 @@ logger = get_logger(__name__)
 # 涨版本不会把它们判成 tampered——那会让每一页重跑都变成 conflict，谁也更新不了。
 #   v1: 首版（编号回译只盖 evidence 字段）
 #   v2: 正文编号回译 + gap 回查 + residual_refs 自检 + slug 占用校验
-QA_SCHEMA_VERSION = 2
+#   v3: 逐条数字接地徽标 + 理论类论断原句并排 + 蕴含审计（ask_notes v3 的 A1/A2/B 层，
+#       frontmatter 新增 audit_status 等字段；v2 旧页没有这些字段，`--verify` 照常通过）
+QA_SCHEMA_VERSION = 3
 QA_DIRNAME = "qa"                       # topics/ 下的问答归档子目录
 QA_GENERATOR = "scripts/ask_notes.py"   # 写进哨兵注释的「由 X 生成」
 DEFAULT_PROMPT = "config/prompts/qa_synthesis_prompt.md"
@@ -493,6 +496,204 @@ def retrieve_qa_evidence(spec: TopicSpec, store, embed_client, *,
 
 
 # ---------------------------------------------------------------------------
+# v3 C/D：理论模式召回扩展 + 角色过滤可见化
+# ---------------------------------------------------------------------------
+
+DEFAULT_THEORY_MIN_SIM = 0.45     # 补捞用的放宽阈值（公式密集句与自然语言问题的余弦偏低，实测 0.54）
+DEFAULT_THEORY_MAX_BACKFILL = 12  # 补捞总条数上限（按句分数从高到低取）
+DEFAULT_THEORY_PER_PAPER = 3      # 每篇最多补几句
+THEORY_BACKFILL_TAG = "（理论补捞）"
+_NUMERIC_RE = re.compile(r"\d")
+
+
+def theory_triggered(question: str, extra_queries: Sequence[str] = (),
+                     theory: Optional[bool] = None) -> bool:
+    """C 的触发条件：`theory` 显式给定（--theory/--no-theory）时以它为准；
+    否则问题或任一 `-q` 命中 A2 的理论关键词正则（`_THEORY_KEYWORD_RE`，不另写一套）。"""
+    if theory is not None:
+        return bool(theory)
+    return any(_THEORY_KEYWORD_RE.search(t or "")
+               for t in (question, *extra_queries))
+
+
+class _CachedEmbed:
+    """给 `embed_client` 包一层按「文本元组」的记忆：D 的差集需要在同一批 query 上
+    第二次跑 `retrieve_evidence`，C 的按篇打分也要同一批 query 向量。embed 是一次 HTTP 往返
+    （召回里最贵的一步），向量检索本身只是一次矩阵乘法——缓存后召回耗时不翻倍。"""
+
+    def __init__(self, client):
+        self._client = client
+        self._memo: Dict[Tuple[str, ...], Any] = {}
+
+    def embed(self, texts, *a, **kw):
+        key = tuple(texts)
+        if key not in self._memo:
+            self._memo[key] = self._client.embed(list(texts), *a, **kw)
+        return self._memo[key]
+
+
+@dataclass
+class RecallResult:
+    """`recall_qa_evidence` 的返回：证据 + 近邻 + C/D 的统计（供打印与 frontmatter）。"""
+    evidences: List[Any]
+    nearby: List[str]
+    theory_mode: bool = False
+    theory_papers: int = 0          # 实际贡献了补捞句的论文数
+    theory_backfilled: int = 0      # 补捞进来的新句数
+    theory_min_sim: float = DEFAULT_THEORY_MIN_SIM
+    role_filtered_out: int = 0      # 相似度达标却因角色不符被挡掉的条数
+    role_filtered_numeric: int = 0  # 其中文本含数字的条数
+    roles_counted: bool = False     # 本次是否做了角色过滤统计（roles 非空才做）
+
+
+def backfill_theory_evidence(spec: TopicSpec, store, embed_client, candidates: Sequence[Any], *,
+                             top_k: Optional[int] = None,
+                             per_paper: int = DEFAULT_THEORY_PER_PAPER,
+                             min_sim: float = DEFAULT_THEORY_MIN_SIM,
+                             max_backfill: int = DEFAULT_THEORY_MAX_BACKFILL
+                             ) -> Tuple[List[Any], int]:
+    """C：扫候选池里出现过的**全部论文**，补捞其定理/命题类句子。
+
+    不再按「论文级排名前 K」截：论文级排名按单篇最高句分，对理论类问题恰恰失效——
+    最贴题的定理句分数偏低，对口论文可能排到十几名（实测 zaffran2024 排第 15，定理句
+    0.50~0.54 够格却被前 6 篇截掉）。改为：命中**严格定理编号正则**（`_THEORY_STATEMENT_RE`）的句子按**自身得分**
+    （≥ min_sim）全局降序，每篇至多 `per_paper` 句，总数至多 `max_backfill`。
+    `top_k` 仅为可选的额外限制（默认 None = 不限）。
+
+    向量库不支持按 citekey 过滤，但 `VectorStore.search` 吃布尔 mask：这里自己按
+    「候选池论文 ∧ highlight ∧ 角色 ∧ 非排除分节 ∧ 句子命中定理编号正则」建 mask，再用
+    问题向量对这些**向量库里的 chunk**打分（余弦），所以每条补捞句都带 note_file/note_line，
+    证据表不断锚——绝不从 literature_index 的 highlights 构造。
+
+    阈值 `min_sim` 放宽到 0.45；已经在候选池里的句子（citekey+原文相同）不重复补。
+    返回 `(新增的 Evidence 列表, 实际扫描的论文数)`。
+    """
+    import numpy as np
+
+    best: Dict[str, float] = {}
+    for c in candidates:
+        s = c.score + c.bucket_boost
+        if c.citekey not in best or s > best[c.citekey]:
+            best[c.citekey] = s
+    top = sorted(best, key=lambda k: (-best[k], k))
+    if top_k is not None:
+        top = top[:max(0, top_k)]
+    if not top or per_paper <= 0 or max_backfill <= 0:
+        return [], 0
+    top_set = set(top)
+    have = {(c.citekey, c.text) for c in candidates}
+    role_filter = set(spec.roles) if spec.roles else None
+    exclude_prefixes = tuple(spec.exclude_sections) if spec.exclude_sections else ()
+    mask = np.zeros(len(store.records), dtype=bool)
+    for i, r in enumerate(store.records):
+        if r.get("level") != "highlight" or r.get("citekey") not in top_set:
+            continue
+        if role_filter and r.get("role") not in role_filter:
+            continue
+        if exclude_prefixes and str(r.get("section") or "").startswith(exclude_prefixes):
+            continue
+        if not _THEORY_STATEMENT_RE.search(r.get("text") or ""):
+            continue
+        mask[i] = True
+    if not mask.any():
+        return [], 0
+    queries = list(spec.queries)
+    vecs = embed_client.embed(queries) if queries else []
+    score_of: Dict[int, float] = {}
+    for vec in vecs:
+        for idx, sc in store.search(vec, mask=mask, top_k=0):
+            if sc > score_of.get(idx, -2.0):
+                score_of[idx] = sc
+    per_paper_rows: Dict[str, List[Tuple[float, int]]] = {}
+    for idx, sc in score_of.items():
+        if sc < min_sim:
+            continue
+        per_paper_rows.setdefault(store.records[idx]["citekey"], []).append((sc, idx))
+    flat = sorted(((sc, idx) for ck, rows in per_paper_rows.items() for sc, idx in rows),
+                  key=lambda t: (-t[0], t[1]))
+    out: List[Any] = []
+    taken: Dict[str, int] = {}
+    for sc, idx in flat:
+        if len(out) >= max_backfill:
+            break
+        r = store.records[idx]
+        ck = r["citekey"]
+        if taken.get(ck, 0) >= per_paper:
+            continue
+        text = flatten_linebreaks((r.get("text") or "").strip())
+        if (ck, text) in have:
+            continue
+        have.add((ck, text))
+        taken[ck] = taken.get(ck, 0) + 1
+        out.append(Evidence(
+            ref="", citekey=ck, text=text, role=r.get("role"), section=r.get("section"),
+            note_file=r.get("note_file"), note_line=r.get("note_line"), score=float(sc),
+            year=r.get("year"), tier=r.get("tier"),
+            pages=r.get("pages") or None, chapter=r.get("chapter") or None))
+    return out, len(taken)
+
+
+def recall_qa_evidence(spec: TopicSpec, store, embed_client, *,
+                       min_sim: float = DEFAULT_MIN_SIM,
+                       per_paper_cap: int = DEFAULT_QA_PER_PAPER_CAP,
+                       theory: Optional[bool] = None,
+                       theory_min_sim: float = DEFAULT_THEORY_MIN_SIM,
+                       theory_max_backfill: int = DEFAULT_THEORY_MAX_BACKFILL,
+                       theory_per_paper: int = DEFAULT_THEORY_PER_PAPER,
+                       count_role_filtered: bool = True) -> RecallResult:
+    """`retrieve_qa_evidence` 的 v3 版：同样的宽召回，外加 C（理论补捞）与 D（角色过滤统计）。
+
+    - **D**：`spec.roles` 非空时，再跑一次 roles=[] 的宽召回，差集 = 达到 min_sim 却因角色被挡的句子。
+      两次共用同一份 query 向量（`_CachedEmbed`），多出来的只是一次矩阵乘法。口径是
+      「每个 query 的 top-80 内」，所以是下界，不是全库精确计数。roles 为空时不统计。
+    - **C**：触发见 `theory_triggered`。补捞句并入候选池再走 `select_qa_evidence`；
+      **但 `per_paper_cap` 与 `max_evidence` 会把它们截掉**（补捞的恰恰是被截掉的那类句子），
+      所以定稿后凡是没进来的补捞句**追加保留**（额外配额，最多 theory_max_backfill 条，可使证据总数
+      略超 max_evidence），再整体按分数重编号。补捞句带 `theory_backfill=True` 属性，
+      渲染时在证据表里标「（理论补捞）」。
+    """
+    emb = _CachedEmbed(embed_client)
+    wide = replace(spec, max_evidence=_WIDE_MAX_EVIDENCE)
+    candidates = retrieve_evidence(wide, store, emb, min_sim=min_sim,
+                                   per_paper_cap=_WIDE_PER_PAPER_CAP, relative_alpha=0.0)
+    res = RecallResult(evidences=[], nearby=[], theory_min_sim=theory_min_sim)
+
+    if spec.roles and count_role_filtered:
+        allowed = set(spec.roles)
+        pool_all = retrieve_evidence(replace(wide, roles=[]), store, emb, min_sim=min_sim,
+                                     per_paper_cap=_WIDE_PER_PAPER_CAP, relative_alpha=0.0)
+        blocked = [c for c in pool_all if c.role not in allowed]
+        res.roles_counted = True
+        res.role_filtered_out = len(blocked)
+        res.role_filtered_numeric = sum(1 for c in blocked if _NUMERIC_RE.search(c.text or ""))
+
+    extra: List[Any] = []
+    if theory_triggered(spec.question, spec.queries, theory):
+        res.theory_mode = True
+        extra, res.theory_papers = backfill_theory_evidence(
+            spec, store, emb, candidates, per_paper=theory_per_paper,
+            min_sim=theory_min_sim, max_backfill=theory_max_backfill)
+        res.theory_backfilled = len(extra)
+
+    merged = list(candidates) + extra
+    picked = select_qa_evidence(merged, max_evidence=spec.max_evidence,
+                                per_paper_cap=per_paper_cap)
+    keys = {(c.citekey, c.text) for c in extra}
+    if extra:
+        got = {(e.citekey, e.text) for e in picked}
+        missing = [c for c in extra if (c.citekey, c.text) not in got]
+        if missing:
+            picked = select_evidence(list(picked) + missing, len(picked) + len(missing),
+                                     _WIDE_PER_PAPER_CAP)
+        for e in picked:
+            if (e.citekey, e.text) in keys:
+                e.theory_backfill = True
+    res.evidences = picked
+    res.nearby = nearby_papers(merged, picked)
+    return res
+
+
+# ---------------------------------------------------------------------------
 # prompt 与校验
 # ---------------------------------------------------------------------------
 
@@ -595,15 +796,132 @@ def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
-def validate_qa(data: dict, evidences) -> Tuple[dict, ValidationReport]:
+# ---------------------------------------------------------------------------
+# v3 A1/A2：逐条数字接地结果 + 理论类论断识别
+# ---------------------------------------------------------------------------
+
+@dataclass
+class QAValidationReport(ValidationReport):
+    """`ValidationReport` 的 qa 侧扩展（不改 topics.py 里的共用 dataclass）。
+
+    `audit_dropped`：`--strict` 下被蕴含审计判「不忠实」而丢弃的论断条数。
+    """
+    audit_dropped: int = 0
+
+
+# 论断 kind 的合法取值（prompt 里要求模型自报）。不在其中的一律当「没标」，
+# 不信任模型自造的类别。
+CLAIM_KINDS = ("实证", "理论", "方法", "解读")
+
+# 理论类论断的关键词兜底（A2）。判定 = LLM 自报 kind=="理论" ∪ 本正则对**论断文本或其所引
+# 证据原句任一**命中——不单信模型。来源：2026-10-03 两个实测案例（C1 zaffran2024Predictive 的
+# Thm 2.3 / Prop 2.6 / Thm 4.3：方向反转、实验观察被写成 1−α 保证而定理水平是 1−2α），
+# 那类句子公式密集、措辞里几乎必带下面这些词。宁可多判（多贴几段原句、多审几条）
+# 也不漏判：误判的代价只是页面多几行，漏判的代价是方向反转原样过关。
+_THEORY_KEYWORD_RE = re.compile(
+    r"定理|命题|引理|推论|保证|下界|上界|可识别|不可识别|不可能|不可达|硬度|充分条件|必要条件"
+    r"|渐近|一致性|Theorem|Proposition|Lemma|Corollary|guarantee|bound|identif|impossib"
+    r"|hardness|asymptot|1−α|1-α|1−2α",
+    re.I)
+
+
+# 理论补捞选句用的**严格**正则：必须是「定理类名词 + 编号」（Theorem 2.3 / Prop. 2.6 /
+# Thm 4.3 / 定理1 / 命题 2.8 / 假设 1）。来源：2026-10-04 真实库复跑，宽泛的
+# `_THEORY_KEYWORD_RE`（含「假设」「保证」「无偏」等）让补捞的 12 个名额被批评句/实验句占满
+# （如「一条从未被声明的隐含假设」），对口论文的 Thm 2.3/4.3 陈述句进不来。宽泛正则仍用于
+# 理论模式的触发判断与 A2 理论类论断识别，不变。
+_THEORY_STATEMENT_RE = re.compile(
+    r"(?:\b(?:Theorem|Thm|Proposition|Prop|Lemma|Corollary|Cor|Assumption)s?\.?\s*"
+    r"|定理|命题|引理|推论|假设)\s*\d",
+    re.I)
+
+
+def is_theory_claim(text: str, kind: str = "", quote_texts: Sequence[str] = ()) -> bool:
+    """A2：这条论断算不算理论类。LLM 自报 ∪ 关键词兜底（对论断文本或证据原句命中）。"""
+    if kind == "理论":
+        return True
+    if _THEORY_KEYWORD_RE.search(text or ""):
+        return True
+    return any(_THEORY_KEYWORD_RE.search(q or "") for q in quote_texts)
+
+
+def _grounding_result(text: str, refs: Sequence[str], ev_map: Dict[str, Any],
+                      n_evidence: int) -> List[str]:
+    """A1：返回这条论断里**在所引证据中找不到的数字**（原样写法）。
+
+    与 `topics._check_grounding` 同口径（同一个 `build_pool` / `check_numbers`、同样豁免
+    本页证据条数），区别只是**把结果返回而不是只记账**——这样页面才能指出是哪一条、
+    哪个数字。`_check_grounding` 本身不动（概念页共用）。
+
+    边界：只判「转述 vs 所引证据」，不判「证据 vs 原文」。精读句本身若抄错了数字
+    （C2 的 PaO2 即如此），这里会判已接地——那类错要回原文截图核对。
+    """
+    if not text or not refs:
+        return []
+    pool = build_pool(*(part for r in refs if r in ev_map
+                        for part in (ev_map[r].text, ev_map[r].title)))
+    return list(check_numbers(text, pool, exempt=[n_evidence]).ungrounded)
+
+
+# 论断开头的页面标记符（审计/徽标用）。\ufe0f 是 ⚠️ 的变体选择符。
+_LEADING_MARK_RE = re.compile(r"^[\s❌❔⚠📌\ufe0f]+")
+
+# v3 页面里不该喂回合成 prompt 的东西（见 `_strip_v3_annotations`）
+_PREV_NOTICE_RE = re.compile(r"^>\s*⚠️?\s*本页(?:有\s*\d+\s*条论断审计|未经蕴含审计)")
+_PREV_AUDIT_REASON_RE = re.compile(r"^\s+>\s*❌\s*审计：(.*)$")
+
+
+def _strip_v3_annotations(prev: str) -> str:
+    """上一版生成块 -> 去掉 v3 页面标注后的修订草稿（只作用于证据表之前的正文）。
+
+    去掉：缩进 `  > ` 的徽标行与原句块、answer 前的「本页…审计」提示、页尾「审计记录」节、
+    论断行首的 `❌ `。审计判「不忠实」的理由不丢，改成附在该论断末尾的一句提示，
+    让模型知道这条要改。证据表及其后的内容原样保留（v2 页面因此剥离前后不变）。
+
+    放在 `previous_answer` 里做而不是 `build_qa_prompt`：单一入口，所有取上一版的
+    调用方都自动受益，且 `build_qa_prompt` 收到的任何 previous_answer 参数照旧原样使用。
+    """
+    if not prev:
+        return prev
+    cut = prev.find(_EVIDENCE_HEADING)
+    head, tail = (prev[:cut], prev[cut:]) if cut >= 0 else (prev, "")
+    audit_sec = re.search(r"^## 审计记录.*\Z", tail, flags=re.M | re.S)
+    if audit_sec:
+        tail = tail[:audit_sec.start()].rstrip("\n") + "\n"
+    out: List[str] = []
+    last_claim = -1
+    for ln in head.split("\n"):
+        if _PREV_NOTICE_RE.match(ln):
+            continue
+        m = _PREV_AUDIT_REASON_RE.match(ln)
+        if m and last_claim >= 0:
+            out[last_claim] += "（上一版审计判为不忠实：{}）".format(m.group(1).strip())
+            continue
+        if re.match(r"^\s+>\s", ln):
+            continue
+        if ln.startswith("- "):
+            if ln.startswith("- ❌ "):
+                ln = "- " + ln[len("- ❌ "):]
+            out.append(ln)
+            last_claim = len(out) - 1
+            continue
+        out.append(ln)
+    return "\n".join(out) + tail
+
+
+def validate_qa(data: dict, evidences) -> Tuple[dict, QAValidationReport]:
     """LLM 输出 -> 编号回译后的结构。丢弃而非修补，同 `topics.validate_synthesis`。
+
+    v3：每条论断额外带 `kind`（模型自报，已归一）、`ungrounded`（A1：未接地数字列表）、
+    `theory`（A2：是否理论类）、`quote_refs`（论断实际依据的全部编号，含正文回译出来的，
+    供原句并排与审计使用）。
 
     `answer` 是总述，**允许没有编号**（它是对下面各条论断的概括），但一样要过
     `_clean_text` 把模型自写的引用剥掉——那是唯一能绕开编号校验的编造通道。
     `points` 与 `caveats` 则**每条都必须有至少一个有效编号**，凑不出的整条丢弃：
     一条没有出处的论断混在有出处的论断里，比少一条危险得多，因为读者会默认它们同质。
     """
-    report = ValidationReport()
+    report = QAValidationReport()
     ev_map = {e.ref: e for e in evidences}
     used: set = set()
     inline: set = set()          # 正文里回译出来的编号（只统计**留在页面上**的）
@@ -627,6 +945,8 @@ def validate_qa(data: dict, evidences) -> Tuple[dict, ValidationReport]:
             mine: set = set()
             text = backtranslate_inline_refs(
                 _clean_text(it.get("text"), report), ev_map, report, used=mine)
+            # 防御：模型若把上一版页面上的 ❌/❔/⚠️/📌 标记抄进新论断开头，一律剥掉
+            text = _LEADING_MARK_RE.sub("", text)
             refs = _resolve_refs(it.get("evidence"), ev_map, report)
             if not text or not refs:
                 report.dropped_claims += 1
@@ -636,9 +956,19 @@ def validate_qa(data: dict, evidences) -> Tuple[dict, ValidationReport]:
             # 数字接地（P1 第一层）：正文里已回译成 [@key] 的编号也要算进匹配池的
             # 来源，故把 refs 与 mine 并起来——否则"引用写在正文里"的那些论断会
             # 因为池子太小而被误判失真。
-            _check_grounding(text, sorted(set(refs) | mine, key=lambda r: int(r[1:])),
-                             ev_map, report, len(evidences), "论断")
-            out.append({"text": text, "refs": refs, "citekeys": _refs_to_keys(refs)})
+            all_refs = sorted(set(refs) | mine, key=lambda r: int(r[1:]))
+            _check_grounding(text, all_refs, ev_map, report, len(evidences), "论断")
+            # v3 A1/A2：把接地结果与理论类判定存进 item，渲染与审计都读它
+            kind = str(it.get("kind") or "").strip()
+            kind = kind if kind in CLAIM_KINDS else ""
+            out.append({
+                "text": text, "refs": refs, "citekeys": _refs_to_keys(refs),
+                "kind": kind,
+                "ungrounded": _grounding_result(text, all_refs, ev_map, len(evidences)),
+                "theory": is_theory_claim(text, kind,
+                                          [ev_map[r].text for r in all_refs]),
+                "quote_refs": all_refs,
+            })
             report.kept_claims += 1
         return out
 
@@ -722,6 +1052,152 @@ def synthesize_qa(llm, prompt: str, *, model: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
+# v3 B：蕴含审计（第二层）——一次额外 LLM 调用，逐条判「转述是否忠实于所引原句」
+# ---------------------------------------------------------------------------
+#
+# 为什么需要：编号回译 + citekey 剥离只保证「引的句子真实存在」，保证不了「转述没把方向
+# 弄反」。2026-10-03 实测：Prop 2.6 的硬度结果（只限 MAR/MCAR 也不行）被写成「限定证明于
+# 该分布族内」，`--verify` 全绿。A1 的数字接地抓不了这类（没有数字不一致），只能让另一次
+# LLM 调用对比「论断 vs 原句」。
+
+DEFAULT_AUDIT_PROMPT = "config/prompts/qa_audit_prompt.md"
+AUDIT_MODES = ("theory", "all", "off")
+AUDIT_VERDICTS = ("忠实", "不忠实", "无法判断")
+_AUDIT_REASON_MAX = 300
+
+
+def load_audit_template(path) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise TopicError("审计 prompt 模板不存在：{}".format(p))
+    text = p.read_text(encoding="utf-8")
+    missing = [ph for ph in ("{{QUESTION}}", "{{CLAIMS_BLOCK}}") if ph not in text]
+    if missing:
+        raise TopicError("审计 prompt 模板 {} 缺占位符 {}".format(p, missing))
+    return text
+
+
+def _claim_ids(qa: dict) -> List[Tuple[str, dict]]:
+    """给 points/caveats 逐条编号：P1.. / C1..（审计 prompt 与回填都靠它对齐）。"""
+    out = [("P{}".format(i), it) for i, it in enumerate(qa.get("points") or [], 1)]
+    out += [("C{}".format(i), it) for i, it in enumerate(qa.get("caveats") or [], 1)]
+    return out
+
+
+def build_audit_prompt(question: str, items: Sequence[Tuple[str, dict]], ev_map: Dict[str, Any],
+                       template: str) -> str:
+    """把待审论断连同它**所引的证据原句**（含 role/section）拼成 prompt。不含 citekey。"""
+    blocks: List[str] = []
+    for cid, it in items:
+        blocks.append("### [{}] 论断".format(cid))
+        blocks.append(it["text"])
+        blocks.append("所引原句：")
+        seen: set = set()
+        for r in (it.get("quote_refs") or it.get("refs") or []):
+            e = ev_map.get(r)
+            if e is None or r in seen:
+                continue
+            seen.add(r)
+            meta = [ROLE_LABEL.get(e.role or "", e.role or "")]
+            if e.section:
+                meta.append(e.section)
+            blocks.append("- （{}）{}".format(" · ".join(m for m in meta if m),
+                                            flatten_linebreaks(e.text.strip())))
+        blocks.append("")
+    return (template.replace("{{QUESTION}}", normalize_question(question))
+            .replace("{{CLAIMS_BLOCK}}", "\n".join(blocks).strip()))
+
+
+def _clean_audit_reason(raw: Any) -> str:
+    """审计理由是模型自由文本：同样剥自写引用、删证据编号、压成单行并限长。"""
+    sink = ValidationReport()
+    t = _clean_text(raw, sink)
+    t = backtranslate_inline_refs(t, {}, sink)       # ev_map 为空 => 任何 E<n> 都被剔除
+    return t[:_AUDIT_REASON_MAX]
+
+
+def run_audit(llm, qa: dict, evidences, template: str, *, question: str = "",
+              mode: str = "theory", model: Optional[str] = None, strict: bool = False,
+              report: Optional[QAValidationReport] = None, retries: int = 1) -> dict:
+    """对 `qa` 里的论断做蕴含审计，**原地**写回每条的 `audit`，返回并挂上 `qa["audit"]`。
+
+    **永不抛异常、永不阻断归档**：LLM 报错/输出解析失败 => `status="failed"`，页面顶部明说
+    「本页未经蕴含审计」。`mode`：theory（只审 A2 判为理论类的）/ all / off。
+    `strict`：把判「不忠实」的论断从 points/caveats 里丢掉，原文与理由列进 `audit.dropped`
+    并计入 `report.audit_dropped`。
+    """
+    info: Dict[str, Any] = {"status": "off", "mode": mode, "reason": "", "strict": bool(strict),
+                            "n_audited": 0, "n_unfaithful": 0, "n_uncertain": 0, "dropped": []}
+    qa["audit"] = info
+    if mode == "off":
+        return info
+    if mode not in AUDIT_MODES:
+        info.update(status="failed", reason="未知审计模式 {}".format(mode))
+        return info
+    ids = _claim_ids(qa)
+    todo = [(cid, it) for cid, it in ids if mode == "all" or it.get("theory")]
+    info["status"] = "ok"
+    if not todo:
+        return info                                   # 没有要审的：不调 LLM
+
+    ev_map = {e.ref: e for e in evidences}
+    try:
+        prompt = build_audit_prompt(question, todo, ev_map, template)
+        data = None
+        last_err = ""
+        for attempt in range(retries + 1):
+            p = prompt
+            if attempt:
+                p += ("\n\n【上一次输出格式不合规】这一次第一个字符必须是 `{`、最后一个字符必须是 "
+                      "`}`，只输出 JSON，不要任何说明或代码围栏。")
+            raw = llm.call(p, model=model, max_tokens=4000, temperature=0.0, json_mode=True)
+            try:
+                data = parse_synthesis(raw)
+                if not isinstance(data.get("audits"), list):
+                    raise TopicError("审计输出缺少 audits 列表")
+                break
+            except TopicError as e:
+                data, last_err = None, str(e)[:120]
+        if data is None:
+            raise TopicError(last_err or "审计输出无法解析")
+        by_id = {cid: it for cid, it in todo}
+        for a in data["audits"]:
+            if not isinstance(a, dict):
+                continue
+            cid, verdict = str(a.get("id") or "").strip(), str(a.get("verdict") or "").strip()
+            if cid in by_id and verdict in AUDIT_VERDICTS and "audit" not in by_id[cid]:
+                by_id[cid]["audit"] = {"verdict": verdict,
+                                       "reason": _clean_audit_reason(a.get("reason"))}
+        judged = [(cid, it) for cid, it in todo if it.get("audit")]
+        if not judged:
+            raise TopicError("审计输出里没有任何可识别的判定（id/verdict 不合规）")
+    except Exception as e:                            # noqa: BLE001 — 审计失败不得阻断归档
+        for _cid, it in todo:
+            it.pop("audit", None)
+        info.update(status="failed", n_audited=0, n_unfaithful=0, n_uncertain=0,
+                    reason="{}: {}".format(type(e).__name__, str(e)[:160]))
+        logger.warning("蕴含审计失败，本页按「未经审计」归档：{}", info["reason"])
+        return info
+
+    info["n_audited"] = len(judged)
+    info["n_unfaithful"] = sum(1 for _c, it in judged if it["audit"]["verdict"] == "不忠实")
+    info["n_uncertain"] = sum(1 for _c, it in judged if it["audit"]["verdict"] == "无法判断")
+    if len(judged) < len(todo):
+        info["reason"] = "模型漏判 {} 条（这些论断未被审计）".format(len(todo) - len(judged))
+    if strict and info["n_unfaithful"]:
+        bad = {id(it): cid for cid, it in judged if it["audit"]["verdict"] == "不忠实"}
+        for cid, it in judged:
+            if id(it) in bad:
+                info["dropped"].append({"id": cid, "text": it["text"],
+                                        "reason": it["audit"]["reason"]})
+        qa["points"] = [it for it in qa.get("points") or [] if id(it) not in bad]
+        qa["caveats"] = [it for it in qa.get("caveats") or [] if id(it) not in bad]
+        if report is not None:
+            report.audit_dropped += len(info["dropped"])
+    return info
+
+
+# ---------------------------------------------------------------------------
 # 渲染
 # ---------------------------------------------------------------------------
 
@@ -767,6 +1243,37 @@ def _gap_hit_lines(hits: Sequence["GapHit"]) -> List[str]:
     return out
 
 
+def _claim_lines(it: dict, ev_map: Dict[str, Any]) -> List[str]:
+    """一条论断的渲染：主行 + 缩进的徽标行（A1 数字 / B 审计 / A2 原句并排）。
+
+    没有任何附加信息时输出与 v2 逐字相同的一行 `- 文本 [@key]`。附加行一律以 `  > `
+    起头（**不是** `- `），page_parse 判论断的依据是「以 `- ` 开头且含 [@key]」，
+    原句里的引用标记因此不会被当成新论断。
+    """
+    audit = it.get("audit") or {}
+    verdict = audit.get("verdict")
+    mark = "❌ " if verdict == "不忠实" else ""
+    out = ["- {}{} {}".format(mark, it["text"], _cite_str(it["refs"], ev_map))]
+    if it.get("ungrounded"):
+        out.append("  > ⚠️ 数字未在所引证据中找到：{}（可能是转述失真，也可能是自行换算——"
+                   "回原句核对）".format("、".join(it["ungrounded"])))
+    if verdict == "不忠实":
+        out.append("  > ❌ 审计：{}".format(audit.get("reason") or "（未给理由）"))
+    elif verdict == "无法判断":
+        out.append("  > ❔ 审计：{}".format(audit.get("reason") or "（未给理由）"))
+    if it.get("theory"):
+        out.append("  > 📌 原句（理论类论断，请对比方向与限定条件）：")
+        seen: set = set()
+        for r in (it.get("quote_refs") or it.get("refs") or []):
+            e = ev_map.get(r)
+            if e is None or r in seen:
+                continue
+            seen.add(r)
+            out.append("  > - {} {}".format(_cite_str([r], ev_map),
+                                            flatten_linebreaks(e.text.strip())))
+    return out
+
+
 def render_qa_block(question: str, qa: dict, evidences, *,
                     related_topics: Sequence[str] = (),
                     nearby_papers: Sequence[str] = (),
@@ -792,16 +1299,31 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         L += ["> 📎 **相关概念页**：{} —— 它证据面更宽、随新论文**自动重合成**，"
               "概念级的问题先读那一页。".format(
                   "、".join("[[{}]]".format(s) for s in related_topics)), ""]
+    # v3 B：审计状态提示放在 answer 之前——读者先看到「这页有没有被查过、查出了什么」
+    audit = qa.get("audit") or {}
+    if audit.get("status") == "failed":
+        L += ["> ⚠️ 本页未经蕴含审计（原因：{}）。理论类论断请自行对比下方原句。".format(
+            audit.get("reason") or "未知"), ""]
+    if (audit.get("n_unfaithful") or 0) > 0:
+        n_bad = audit["n_unfaithful"]
+        if audit.get("strict"):
+            L += ["> ⚠️ 本页有 {} 条论断审计判为不忠实（`--strict` 已丢弃，见页尾审计记录），"
+                  "answer 可能受其影响。".format(n_bad), ""]
+        else:
+            L += ["> ⚠️ 本页有 {} 条论断审计判为不忠实（已标 ❌），"
+                  "answer 可能受其影响。".format(n_bad), ""]
     if qa["answer"]:
         L += ["> {}".format(qa["answer"]), ""]
 
     if qa["points"]:
         L += ["## 依据", ""]
-        L += ["- {} {}".format(p["text"], _cite_str(p["refs"], ev_map)) for p in qa["points"]]
+        for p in qa["points"]:
+            L += _claim_lines(p, ev_map)
         L.append("")
     if qa["caveats"]:
         L += ["## ⚠️ 用之前要知道的", ""]
-        L += ["- {} {}".format(c["text"], _cite_str(c["refs"], ev_map)) for c in qa["caveats"]]
+        for c in qa["caveats"]:
+            L += _claim_lines(c, ev_map)
         L.append("")
     if qa["gaps"]:
         # A1【本轮最严重】首版这一节叫「本次没答上来的」，正文写着
@@ -840,6 +1362,8 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         meta = [ROLE_EMOJI.get(e.role or "", "") + ROLE_LABEL.get(e.role or "", e.role or "")]
         if e.section:
             meta.append(e.section)
+        if getattr(e, "theory_backfill", False):
+            meta.append(THEORY_BACKFILL_TAG)      # v3 C：放宽阈值按篇补捞来的定理/命题句
         loc = ""
         if e.note_file:
             loc = " · {}{}".format(e.note_file, ":{}".format(e.note_line) if e.note_line else "")
@@ -876,6 +1400,12 @@ def render_qa_block(question: str, qa: dict, evidences, *,
                   "想挖深就调大 `--max-evidence`）："]
         L += ["    - `{}` {}".format(k, (titles or {}).get(k, "")[:80])
               for k in nearby_papers]
+    if audit.get("dropped"):
+        # --strict 丢掉的不忠实论断：不能悄悄消失，列出原文与理由供人核对
+        L += ["", "## 审计记录（`--strict` 丢弃的不忠实论断）", ""]
+        for d in audit["dropped"]:
+            L.append("- ❌ {}（{}）".format(d.get("text", ""), d.get("id", "")))
+            L.append("  > 审计：{}".format(d.get("reason") or "（未给理由）"))
     return "\n".join(L)
 
 
@@ -886,7 +1416,8 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
                          roles: Sequence[str] = (),
                          min_sim: Optional[float] = None,
                          max_evidence: Optional[int] = None,
-                         per_paper_cap: Optional[int] = None) -> str:
+                         per_paper_cap: Optional[int] = None,
+                         recall_stats: Optional[Dict[str, Any]] = None) -> str:
     """受管键由生成器覆盖，用户自加键原样保留（同 topics/vault 的既有约定）。
 
     `first_asked_at` 是**唯一一个"存在就不覆盖"的受管键**：同一个问题再问一次是
@@ -941,6 +1472,19 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
         "stripped_cites": report.stripped_cites,
         "numbers_checked": report.numbers_checked,
         "ungrounded_numbers": report.ungrounded_numbers,
+        # v3：蕴含审计与逐条徽标（audit_status ∈ ok/failed/off；v2 旧页没有这些键）
+        "audit_status": (qa.get("audit") or {}).get("status", "off"),
+        "audited_claims": (qa.get("audit") or {}).get("n_audited", 0),
+        "unfaithful_claims": (qa.get("audit") or {}).get("n_unfaithful", 0),
+        "uncertain_claims": (qa.get("audit") or {}).get("n_uncertain", 0),
+        "theory_claims": sum(1 for it in (qa["points"] + qa["caveats"]) if it.get("theory")),
+        "ungrounded_claims_listed": sum(
+            1 for it in (qa["points"] + qa["caveats"]) if it.get("ungrounded")),
+        # v3 C/D：召回统计（recall_stats 来自 RecallResult；旧调用点不传则写 false/0）
+        "theory_mode": bool((recall_stats or {}).get("theory_mode", False)),
+        "theory_backfilled": int((recall_stats or {}).get("theory_backfilled", 0)),
+        "role_filtered_out": int((recall_stats or {}).get("role_filtered_out", 0)),
+        "role_filtered_numeric": int((recall_stats or {}).get("role_filtered_numeric", 0)),
         # 检索参数存档（供 --reask 原样重问，见本函数 docstring「检索参数存档」）。
         "ask_query": list(extra_queries),
         "ask_role": list(roles),
@@ -1676,7 +2220,8 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
                   roles: Sequence[str] = (),
                   min_sim: Optional[float] = None,
                   max_evidence: Optional[int] = None,
-                  per_paper_cap: Optional[int] = None) -> Tuple[Path, str]:
+                  per_paper_cap: Optional[int] = None,
+                  recall_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, str]:
     """落盘 `topics/qa/<slug>.md`，走与概念页同一套哨兵合并。返回 `(路径, 状态)`。
 
     状态：`new` / `merged` / `conflict` / `unchanged` / `taken`。
@@ -1711,7 +2256,8 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
     fm = build_qa_frontmatter(question, slug, qa, evidences, report,
                               now.isoformat(timespec="seconds"), preserved=fresh_fm,
                               extra_queries=extra_queries, roles=roles, min_sim=min_sim,
-                              max_evidence=max_evidence, per_paper_cap=per_paper_cap)
+                              max_evidence=max_evidence, per_paper_cap=per_paper_cap,
+                              recall_stats=recall_stats)
     content, status = merge_qa_page(fm, gen_block, fresh_existing, generator=QA_GENERATOR)
     if content is None:
         return path, "conflict"
@@ -1734,7 +2280,7 @@ def previous_answer(qa_dir, slug: str, question: Optional[str] = None) -> str:
         prev_q = (fm or {}).get("question")
         if prev_q and question_key(prev_q) != question_key(question):
             return ""
-    return prev
+    return _strip_v3_annotations(prev)
 
 
 def render_qa_index(qa_dir) -> str:
@@ -1850,6 +2396,13 @@ class QAAudit:
     question: str = ""
     # 非空 = 文件名与问题对不上，值是这个问题**该有的** slug。见 `audit_qa_pages`。
     slug_mismatch: str = ""
+    # v3：frontmatter 里的 audit_status（ok/failed/off）；v2 旧页没有这个键 => 空串。
+    audit_status: str = ""
+
+    @property
+    def unaudited(self) -> bool:
+        """没有经过蕴含审计（旧页没字段 / 审计关闭 / 审计失败）。是事实不是错误。"""
+        return self.audit_status != "ok"
 
     @property
     def ok(self) -> bool:
@@ -1928,7 +2481,8 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
         fm, body = split_frontmatter(text)
         if not isinstance(fm, dict) or not fm.get("qa"):
             continue
-        a = QAAudit(slug=str(fm["qa"]), question=str(fm.get("question") or ""))
+        a = QAAudit(slug=str(fm["qa"]), question=str(fm.get("question") or ""),
+                    audit_status=str(fm.get("audit_status") or ""))
         # A1：`--verify` 此前检查了死键/失锚/残留编号/防线版本四件事，**唯独没检查
         # 「这一页的文件名还是不是它自己问题该有的名字」**——于是上一轮改 digest 口径
         # 亲手造出来的孤儿页在所有仪表上都是绿的（磁盘 `qa-mnar-ehr-1f424623`，
@@ -1960,6 +2514,10 @@ def audit_qa_pages(qa_dir, index: dict) -> List[QAAudit]:
             gen = gen[:end]
         cut = gen.find(_EVIDENCE_HEADING)
         prose = gen[:cut] if cut >= 0 else gen
+        # v3：理论类论断下贴的**原句**（`  > - [@key] 原句`）是证据原文，其中的 `E1`/`e2`
+        # 之类字样（表名、变量名）不是证据编号，不参与残留编号扫描。
+        prose = "\n".join(ln for ln in prose.splitlines()
+                          if not re.match(r"^\s+>\s+-\s", ln))
         a.residual_refs = sorted(
             {"E{}".format(int(m.group(1))) for m in _INLINE_REF_RE.finditer(prose)},
             key=lambda r: int(r[1:]))

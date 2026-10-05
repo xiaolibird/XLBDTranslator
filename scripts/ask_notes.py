@@ -124,8 +124,13 @@ def _resolve_ask_params(args, archived: "Q.ArchivedAskParams"
     """
     extra_queries = (list(args.query) if args.query is not None
                      else (list(archived.extra_queries) if archived.has_params else []))
-    roles = (list(args.role) if args.role is not None
-            else (list(archived.roles) if archived.has_params else []))
+    # `--role all` = 显式清空角色限制（三个角色都要）。--reask 会沿用存档里的 role，而 argparse
+    # 的 append 没有「清空」写法；2026-10-03 实测一次沿用的 `--role citable` 把「标成可反驳观点
+    # 但含硬数字」的句子整批挡掉，却无从取消。
+    if args.role is not None:
+        roles = [] if "all" in args.role else list(args.role)
+    else:
+        roles = list(archived.roles) if archived.has_params else []
     min_sim = (args.min_sim if args.min_sim is not _UNSET else
               (archived.min_sim if archived.has_params and archived.min_sim is not None
                else T.DEFAULT_MIN_SIM))
@@ -208,7 +213,12 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
             extra_queries: Sequence[str], roles: Sequence[str],
             min_sim: float, max_evidence: int, per_paper_cap: int,
             model: Optional[str], dry_run: bool,
-            no_dedup_check: bool, no_topic_check: bool) -> AskOutcome:
+            no_dedup_check: bool, no_topic_check: bool, show: int = 10,
+            audit_mode: str = "theory", audit_model: Optional[str] = None,
+            strict: bool = False, audit_template: Optional[str] = None,
+            theory: Optional[bool] = None,
+            theory_min_sim: float = Q.DEFAULT_THEORY_MIN_SIM,
+            theory_max: int = Q.DEFAULT_THEORY_MAX_BACKFILL) -> AskOutcome:
     """问一个问题（`question`）、落到确定的 `slug`。`store`/`embed_client`/
     `topic_specs`/`template`/`topic_vecs` 都是调用方已经准备好、可能跨多次调用
     复用的资源，本函数不负责创建或关闭它们（`embed_client.close()` 由最外层的
@@ -266,8 +276,25 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
             print("   概念级、会反复用的问题就去读那一页；只是临时想问一句才继续。\n")
 
     print("🔎 «{}»  →  {}".format(question, slug))
-    evidences, nearby = Q.retrieve_qa_evidence(spec, store, embed_client,
-                                               min_sim=min_sim, per_paper_cap=per_paper_cap)
+    print("   参数：角色={} | min-sim={} | per-paper-cap={} | max-evidence={} | -q×{}".format(
+        "/".join(roles) if roles else "全部", min_sim, per_paper_cap, max_evidence,
+        len(extra_queries)))
+    recall = Q.recall_qa_evidence(spec, store, embed_client, min_sim=min_sim,
+                                  per_paper_cap=per_paper_cap, theory=theory,
+                                  theory_min_sim=theory_min_sim,
+                                  theory_max_backfill=theory_max)
+    evidences, nearby = recall.evidences, recall.nearby
+    if recall.theory_mode:
+        print("📐 理论模式：从 {} 篇补捞 {} 条定理/命题句（阈值 {}）".format(
+            recall.theory_papers, recall.theory_backfilled, theory_min_sim))
+    if recall.roles_counted:
+        print("⚠️ 角色过滤（{}）挡掉 {} 条高分证据，其中 {} 条含数字；"
+              "问数字/事实时考虑 --role all".format(
+                  "/".join(roles), recall.role_filtered_out, recall.role_filtered_numeric))
+    recall_stats = {"theory_mode": recall.theory_mode,
+                    "theory_backfilled": recall.theory_backfilled,
+                    "role_filtered_out": recall.role_filtered_out,
+                    "role_filtered_numeric": recall.role_filtered_numeric}
     if not evidences:
         print("⚠️ 召回 0 条证据（相似度阈值 {}）。这多半是真的——库里没有这方面的句级"
               "证据。可以试：降低 --min-sim、用 -q 补几个别的说法（尤其英文写法）、"
@@ -281,10 +308,14 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
         len(evidences), n_papers, evidences[-1].score, evidences[0].score))
 
     if dry_run:
-        for e in evidences[:10]:
-            print("   {:<4} {:.3f} [@{}] {}".format(e.ref, e.score, e.citekey, e.text[:70]))
-        if len(evidences) > 10:
-            print("   …… 还有 {} 条（--dry-run 只列前 10）".format(len(evidences) - 10))
+        show = max(1, int(show))
+        for e in evidences[:show]:
+            print("   {:<4} {:.3f} [@{}] {}{}".format(
+                e.ref, e.score, e.citekey, Q.THEORY_BACKFILL_TAG if getattr(e, "theory_backfill", False) else "",
+                e.text[:70]))
+        if len(evidences) > show:
+            print("   …… 还有 {} 条（--dry-run 只列前 {}，--show N 可调）".format(
+                len(evidences) - show, show))
         print("【dry-run】未调用 LLM、未落盘。归档路径会是：{}/{}.md".format(qa_dir, slug))
         return AskOutcome(slug=slug, question=question, status="dry_run",
                           n_evidence=len(evidences), n_papers=n_papers)
@@ -307,6 +338,20 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                                         topic_specs=topic_specs, topic_vecs=topic_vecs,
                                         titles=titles,
                                         exclude_citekeys={e.citekey for e in evidences})
+        # v3 B：蕴含审计（复用同一个 llm；失败降级为「未经审计」，绝不阻断归档）
+        if audit_mode == "off":
+            Q.run_audit(llm, qa, evidences, "", question=question, mode="off")
+        else:
+            try:
+                a_tpl = audit_template or Q.load_audit_template(
+                    repo_path(Q.DEFAULT_AUDIT_PROMPT))
+            except T.TopicError as e:
+                qa["audit"] = {"status": "failed", "mode": audit_mode, "reason": str(e),
+                               "strict": bool(strict), "n_audited": 0, "n_unfaithful": 0,
+                               "n_uncertain": 0, "dropped": []}
+            else:
+                Q.run_audit(llm, qa, evidences, a_tpl, question=question, mode=audit_mode,
+                            model=audit_model or model, strict=strict, report=report)
     finally:
         llm.close()
 
@@ -322,7 +367,7 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                                    related_topics=related_topics, nearby_papers=nearby,
                                    titles=titles, extra_queries=extra_queries, roles=roles,
                                    min_sim=min_sim, max_evidence=max_evidence,
-                                   per_paper_cap=per_paper_cap)
+                                   per_paper_cap=per_paper_cap, recall_stats=recall_stats)
     if status == "taken":
         print("❌ slug '{}' 在这次合成期间被另一个问题占用了，本次未落盘。".format(slug),
               file=sys.stderr)
@@ -343,6 +388,18 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                 ("topics/{}.md".format(h.key) if h.kind == "topic" else "[@{}]".format(h.key))
                 for h in hits)))
     flags = []
+    ainfo = qa.get("audit") or {}
+    n_theory = sum(1 for it in (qa["points"] + qa["caveats"]) if it.get("theory"))
+    n_ungrounded = sum(1 for it in (qa["points"] + qa["caveats"]) if it.get("ungrounded"))
+    if ainfo.get("status") == "failed":
+        print("   ⚠️ 蕴含审计失败，本页未经审计：{}".format(ainfo.get("reason")))
+    elif ainfo.get("status") == "ok":
+        print("   🔍 蕴含审计 {} 条（理论类 {}）：不忠实 {} · 无法判断 {}{}".format(
+            ainfo.get("n_audited", 0), n_theory, ainfo.get("n_unfaithful", 0),
+            ainfo.get("n_uncertain", 0),
+            "（--strict 已丢弃不忠实论断）" if ainfo.get("strict") and ainfo.get("dropped") else ""))
+    if n_ungrounded:
+        print("   ⚠️ {} 条论断含所引证据里找不到的数字（页面上已逐条标出）".format(n_ungrounded))
     if report.dropped_claims:
         flags.append("丢弃 {} 条无出处论断".format(report.dropped_claims))
     if report.invalid_refs:
@@ -502,10 +559,35 @@ def main() -> int:
                     help="概念页配置；用来提示「这个问题已经有一页概念页在回答」，"
                          "以及给 gaps 回查提供概念页问题。读不出就跳过这两项")
     ap.add_argument("--role", action="append", default=None,
-                    choices=["citable", "refutable", "method"],
-                    help="只用该角色的证据（可重复）；缺省三者都要。"
+                    choices=["citable", "refutable", "method", "all"],
+                    help="只用该角色的证据（可重复）；缺省三者都要。`--role all` 显式清空角色限制"
+                         "（--reask 默认沿用存档里的 role，想去掉它就用这个）。"
+                         "注意：citable 会挡掉「标成可反驳观点但含硬数字」的句子，问数字/事实时别限角色。"
                          "配合 --reask 的覆盖/沿用语义同 --max-evidence")
+    ap.add_argument("--show", type=int, default=10, metavar="N",
+                    help="--dry-run 时列出前 N 条证据（默认 10；想确认某篇有没有被召回就调大）")
     ap.add_argument("--model", default=None, help="覆盖合成用的 LLM 模型")
+    ap.add_argument("--audit", choices=list(Q.AUDIT_MODES), default="theory",
+                    help="蕴含审计（一次额外 LLM 调用，逐条判转述是否忠实于所引原句）："
+                         "theory=只审理论类论断（默认）、all=审全部依据与注意事项、off=关闭。"
+                         "审计失败不阻断归档，页面会明说「未经审计」")
+    ap.add_argument("--audit-model", default=None,
+                    help="审计用的 LLM 模型（缺省与 --model/合成相同）")
+    ap.add_argument("--strict", action="store_true",
+                    help="审计判「不忠实」的论断直接丢弃（默认只标 ❌ 不删），"
+                         "被丢的原文与理由列在页尾审计记录里")
+    ap.add_argument("--theory", dest="theory", action="store_true", default=None,
+                    help="理论模式：对候选池里全部论文的定理/命题类句子按自身得分补捞"
+                         "（放宽阈值，见 --theory-min-sim；补捞句在证据表标「（理论补捞）」）。"
+                         "缺省按问题/-q 是否命中理论关键词（定理/保证/下界/可识别/不可能…）自动触发")
+    ap.add_argument("--no-theory", dest="theory", action="store_false",
+                    help="关闭理论模式（即使问题命中理论关键词）")
+    ap.add_argument("--theory-min-sim", type=float, default=Q.DEFAULT_THEORY_MIN_SIM,
+                    metavar="X", help="理论补捞的放宽相似度阈值（默认 {}，每篇上限 {} 句）".format(
+                        Q.DEFAULT_THEORY_MIN_SIM, Q.DEFAULT_THEORY_PER_PAPER))
+    ap.add_argument("--theory-max", type=int, default=Q.DEFAULT_THEORY_MAX_BACKFILL, metavar="N",
+                    help="理论补捞的总条数上限（默认 {}，按句分数从高到低取）".format(
+                        Q.DEFAULT_THEORY_MAX_BACKFILL))
     ap.add_argument("--no-dedup-check", action="store_true",
                     help="跳过「这个问题是不是问过了」的查重提示（不影响概念页比对）")
     ap.add_argument("--no-topic-check", action="store_true",
@@ -545,6 +627,10 @@ def main() -> int:
     if args.per_paper_cap is not _UNSET and args.per_paper_cap <= 0:
         ap.error("--per-paper-cap 必须 ≥ 1（收到 {}）。想「不限制」就给一个大于 "
                  "--max-evidence 的数".format(args.per_paper_cap))
+    if args.theory_max < 0:
+        ap.error("--theory-max 不能为负（收到 {}）".format(args.theory_max))
+    if not (-1.0 <= args.theory_min_sim <= 1.0) or args.theory_min_sim != args.theory_min_sim:
+        ap.error("--theory-min-sim 必须落在 [-1, 1] 区间内（收到 {}）".format(args.theory_min_sim))
     if args.max_evidence is not _UNSET and args.max_evidence <= 0:
         ap.error("--max-evidence 必须 ≥ 1（收到 {}）".format(args.max_evidence))
 
@@ -617,6 +703,11 @@ def main() -> int:
             print("⚠️ {} 页由旧版防线生成（低于 v{}），重问一次即可刷新：{}".format(
                 len(stale), Q.QA_SCHEMA_VERSION, "、".join(stale[:8])))
             print("   {}".format(Q.update_command(stale[0], "<那一页的问题>")))
+        unaudited = [a.slug for a in audits if a.unaudited]
+        if unaudited:
+            # 纯信息：v2 旧页没有审计字段、或审计关闭/失败。不影响退出码。
+            print("ℹ️ {} 页未经蕴含审计（v2 旧页/审计关闭/审计失败）：{}".format(
+                len(unaudited), "、".join(unaudited[:8])))
         if bad:
             # 问答页不像概念页那样随新论文自动重合成，改过的 citekey 可能挂很久，
             # 所以这里要把"怎么修"说清楚，而不是只报告。
@@ -770,7 +861,10 @@ def main() -> int:
                          template=template, store=store, embed_client=embed_client,
                          settings=settings, topic_vecs=topic_vecs, model=args.model,
                          dry_run=args.dry_run, no_dedup_check=args.no_dedup_check,
-                         no_topic_check=args.no_topic_check)
+                         no_topic_check=args.no_topic_check, show=args.show,
+                         audit_mode=args.audit, audit_model=args.audit_model,
+                         strict=args.strict, theory=args.theory,
+                         theory_min_sim=args.theory_min_sim, theory_max=args.theory_max)
 
             if reask_mode:
                 for target in prevalidated_targets:
