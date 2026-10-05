@@ -988,8 +988,8 @@ def _inject_cross_check(seg, report):
                        "——纠错/补漏内容不会进札记".format(sorted(report)[:8]))
     verified = report.get("verified_count")
     sents = [CloseReadSentence(
-        text="Claude 亲读 PDF 交叉核验：纠错 {} 处、补漏 {} 处{}。".format(
-            len(corrected), len(added),
+        text="{} 亲读 PDF 交叉核验：纠错 {} 处、补漏 {} 处{}。".format(
+            report.get("reviewer_label") or "Claude", len(corrected), len(added),
             "、核验通过 {} 项".format(verified) if verified is not None else ""),
         tag=None)]
     # 纠错条**不打 tag**：曾按「纠错 = 论文被证伪/过度断言处」打成「可反驳观点」，但实测
