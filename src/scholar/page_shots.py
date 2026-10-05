@@ -221,6 +221,17 @@ def build_page_map(doc, wanted: Optional[List[int]] = None) -> PageMap:
             # 是一张封面，印刷页 = PDF 页序 - 1）。此前只认 >= 0，这种 PDF 被当成「PDF 页序」，整篇差一页。
             if off >= -3:
                 votes[off] = votes.get(off, 0) + 1
+    # 札记页码**全部**超出 PDF 总页数 → 不可能是 PDF 页序，只在「能把全部页码落进本 PDF」的偏移里挑。
+    # 实测 IEEE 扫描件（Chow 1970，6 页、印 41–46）：页眉只在 3 页上印了页码，而每页页脚的下载水印
+    # 「Downloaded on … 2026 at 11:4…」凑出偏移 0 也得 3 票，平票按 |offset| 小取胜 → 落到 PDF 页序，
+    # 41–46 全部截不到、退成全文检索。偏移 0 在这里本就不可能，先把它排除掉。
+    if wanted and min(wanted) > n:
+        fit = [(c, o) for o, c in votes.items()
+               if o > 0 and all(1 <= w - o <= n for w in wanted)]
+        if fit:
+            c, o = max(fit, key=lambda t: (t[0], -t[1]))
+            if c >= 2:
+                return PageMap(n, o, "header")
     best = max(votes.items(), key=lambda kv: (kv[1], -abs(kv[0]))) if votes else (0, 0)
     need = max(2, (n + 1) // 2)             # 过半页面一致才采信，挡住「每页都印着年份 2023」
     if best[0] < 0 and best[1] >= need:
@@ -1399,9 +1410,21 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
         if cdir.is_dir():
             for old in cdir.glob("q_{}_*.jpg".format(tag)):
                 old.unlink()
+    keyed = [(sentence_key(x.get("text")), x) for x in sentences]
+    # 页码口径也是缓存键：items 里的 printed 是按当时的 PageMap 换算的，口径一变（页眉推断修正、
+    # 书籍改按页标签）旧命中的页码标签就全错，而句子与 PDF 都没变、前面三项键判不出来。
+    # 无此字段的旧缓存视为一致并补写——否则一次升级会让全库截图整批重算。
+    with fitz.open(str(pdf_path)) as doc:
+        pm = page_map or build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
+    sig = "{}:{}:{}".format(pm.how, pm.offset, len(pm.labels or {}))
+    if cache.get("pmap", sig) != sig:
+        cache = {"pdf_fp": fp, "v": PASSAGE_VERSION, "model": model, "items": {}, "hints": {}}
+        if cdir.is_dir():
+            for old in cdir.glob("q_{}_*.jpg".format(tag)):
+                old.unlink()
+    cache["pmap"] = sig
     items = cache["items"]
     hints = cache.setdefault("hints", {})
-    keyed = [(sentence_key(x.get("text")), x) for x in sentences]
     # 命中过但图不在了（被误删、assets 目录被清过）也算新句：缓存只记「算过」，图才是产物，
     # 不重算的话这一句的出处图永远回不来。负缓存（None）不受影响。
     # 页码锚改了也算新句：句子文字没变、只订正了 page 时，旧的命中（或旧的「没找到」）不该沿用。
@@ -1410,7 +1433,6 @@ def passages_for_paper(pdf_path: Path, citekey: str, sentences: List[dict], out_
            or hints.get(k, "") != str(x.get("page") or "")]
     if new:
         with fitz.open(str(pdf_path)) as doc:
-            pm = page_map or build_page_map(doc, [p for _, x in keyed for p in parse_pages(x.get("page"))])
             found = locate_passages(doc, [x for _, x in new], embed, pm, ranges=ranges)
             for (k, x), r in zip(new, found):
                 hints[k] = str(x.get("page") or "")
