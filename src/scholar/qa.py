@@ -72,7 +72,8 @@ from . import page_shots
 from .topics import (
     DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, Evidence, DEFAULT_USER_ZONE, GEN_BEGIN,
     GEN_END, TOPICS_DIRNAME, TopicError, TopicSpec, ValidationReport, _CITE_RE,
-    _EVIDENCE_ROW_RE, _check_grounding, _clean_text, _render_frontmatter, _resolve_refs,
+    _EVIDENCE_ROW_RE, _INLINE_REF_RE, _check_grounding, _clean_text, _render_frontmatter,
+    _resolve_refs, backtranslate_inline_refs,
     flatten_linebreaks,
     parse_synthesis, read_existing, render_evidence_block, retrieve_evidence,
     select_evidence, to_wiki_links,
@@ -718,82 +719,6 @@ def build_qa_prompt(question: str, evidences, template: str,
             .replace("{{RESEARCH_INTERESTS}}", research_interests.strip() or "（未配置）")
             .replace("{{EVIDENCE_BLOCK}}", render_evidence_block(evidences))
             .replace("{{PREVIOUS_ANSWER}}", prev or "（无上一版，这是首次归档这个问题）"))
-
-
-# 正文里模型顺手写出的证据编号（"E1 的流程图明确写……"、"E31 描述的算法"）。
-#
-# **左侧后顾断言是真防线**：它保证 `AE1`、`MICE1` 这类词尾不被误当成编号。用的是显式
-# ASCII 字符类而不是 `\b`——`\b` 与 `\w` 按 Unicode 判定、汉字算单词字符，中文行文里
-# 「见E31描述」这种紧贴写法会判不到边界而整条漏过（lint.py 那三次教训的直接应用：
-# `\w` → `\b` → 矫枉过正成 ASCII-only）。
-#
-# **右侧的 `(?![0-9])` 是冗余的**，写出来只为把意图摆明：`\d+` 本身贪婪，`E312` 一定
-# 整体匹配成 `E312`（越界 → 剔除），不可能被截成 `E31` 再错误回译到第 31 条证据上。
-# 变异测试实测把这个前瞻删掉行为完全不变——记在这里，免得后人以为它在挡什么。
-#
-# `\[?` / `\]?` 在匹配体里（后顾断言仍在最前，不受影响）：喂给模型的证据块首字段
-# 就是 `[E1]（可引用证据 · 实验方法 · 2024）`，模仿这个形状的概率不低。不吃掉那对
-# 方括号就会得到 `[[@a2024X]]`，再过 `to_wiki_links` 变成 `[[[a2024X|a2024X]]]`——
-# 不是死链，但多一对字面方括号，粘进 pandoc 也多一层。
-_INLINE_REF_RE = re.compile(r"(?<![A-Za-z0-9])\[?[Ee](\d+)\]?(?![0-9])")
-
-
-def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
-                              report: ValidationReport,
-                              used: Optional[set] = None) -> str:
-    """把正文里模型顺手写的证据编号回译成 `[@citekey]`，越界的直接剔除。
-
-    实测（首次真实运行，2026-08-17）模型确实会这么写：
-    「E1 的流程图明确写 NMAR 确认需要外部数据」「E31 描述的条件独立检验搜索父集合的算法」。
-    这些编号**不经过 `evidence` 字段的校验**——它们是自由文本的一部分。放着不管有两种坏法：
-
-      1. 编号越界（模型写 E99 而只召回 40 条）→ 页面上留下一个指向不存在证据的交叉引用，
-         而读者会以为自己没找到；
-      2. 编号有效但页面被摘去写稿后，`E31` 脱离了本页的证据表就完全失去意义——
-         它是**本次召回的内部编号**，不是任何持久标识。
-
-    回译成 `[@citekey]` 一次解决两者：越界的剔除（计入 `invalid_refs`，与 `_resolve_refs`
-    同一个计数口径），有效的变成真正可追溯、可粘进 pandoc 的引用。这不是新的防线，
-    是把已有的编号回译防线**补到自由文本这条此前没盖住的通道上**——同 `_clean_text`
-    之于模型自写的 citekey。
-
-    `used` 给了就把**本次成功回译的编号**塞进去（出参而不是改返回类型：调用点全都在
-    拿字符串用）。没有它的话，只在 `answer` 或 `gaps` 里被提到的那条证据会在证据表里
-    标 ○，而表头写着"未被引用的证据标 ○"——页面上明明有 `[@key]`，两个数字互相自洽
-    却都与页面事实不符，CLI 的"引用率"也跟着少算。
-
-    ## 已知局限（记账不修，2026-09-17 R2 对抗审核）
-
-    - **MINOR-3**：模型有时会在自由文本里复述证据原句已经带的页码（如某条
-      highlight 原文本身写着"(p.3)"，模型转述成"E7 在第 3 页显示……"）；若 E7
-      恰好是带 `pages` 定位符的书籍证据，回译后会读成"`[@key, p. 3]` 在第 3
-      页显示……"——页码信息视觉上重复了一次。这是内容层面的措辞冗余，不是引用
-      本身出错（citekey 与页码都仍然准确、可追溯），修它要么在模型自由文本里
-      做页码字符串匹配再删除（容易连累正常叙述），要么放弃给自由文本回译加
-      定位符（倒退回本轮之前的行为）——两个方向代价都不小，记账不修。
-    - **NIT-2**：`_INLINE_REF_RE` 逐个匹配 `E\\d+`，模型写"E1-E3 均支持"这种
-      range 语法时，中间的连字符不属于任何一个匹配，回译后变成
-      `[@a]-[@c]`——两个引用都对，只是连着它们的连字符成了一个孤立字符，
-      读起来略怪。这是本模块一直就有的既有行为（不是本轮改动引入的），
-      记账不修。
-    """
-    def _sub(m):
-        ref = "E{}".format(int(m.group(1)))
-        ev = ev_map.get(ref)
-        if ev is None:
-            report.invalid_refs += 1
-            return ""
-        if used is not None:
-            used.add(ref)
-        # 书籍证据带页码定位符（同 topics._cite_str/qa._cite_str 的既有格式）：
-        # 自由文本里模型随手提到的证据编号一样可能指向一条书籍句级证据，回译时
-        # 不能只给 citekey——那会让这句话与证据表里同一条证据的引用形态不一致。
-        pages = getattr(ev, "pages", None)
-        return "[@{}, p. {}]".format(ev.citekey, pages) if pages else "[@{}]".format(ev.citekey)
-
-    out = _INLINE_REF_RE.sub(_sub, text)
-    # 剔除越界编号后可能留下 "……（ 的流程图" 之类的空档
-    return re.sub(r"\s{2,}", " ", out).strip()
 
 
 # ---------------------------------------------------------------------------

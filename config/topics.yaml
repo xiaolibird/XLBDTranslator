@@ -121,3 +121,15 @@ topics:
       - 放射报告 检查开单 弱影子变量
     buckets: [A, C]
     max_evidence: 60
+
+  - slug: missingness-fairness
+    title: 缺失机制与算法公平
+    question: 缺失模式如何编码人口学信息、在哪些条件下产生或放大亚组间的性能与校准差异？因果公平框架能否刻画这条路径，现有公平审计与去偏方法在缺失数据下是否仍成立？
+    queries:
+      - missingness encodes race sex demographic information 缺失泄露人口学
+      - differential missingness across racial groups health disparities
+      - algorithmic fairness equal opportunity equalized odds 公平性定义
+      - causal fairness counterfactual path-specific effect 因果公平
+      - unfair model performance gap disadvantaged group 不公平 弱势群体
+      - clinical presence access to care observation inequity 就医可及性 观测不平等
+    max_evidence: 60

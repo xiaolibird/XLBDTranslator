@@ -2604,3 +2604,55 @@ def test_evidence_row_links_the_existing_source_crop(tmp_path):
     assert mirror_shots_only(block, notes, vault) == 1
     assert (vault / PS._SHOT_SUBDIR / rel).is_file()
     assert mirror_shots_only(block, notes, vault) == 0                # 幂等
+
+
+# ---------------- 自由文本里漏出的内部编号（2026-10-07） ----------------
+
+def test_inline_refs_in_gaps_and_notes_are_backtranslated():
+    """实测 8 页里 7 页的缺口/分歧说明写着「E21 明确指出……」——E 编号只是本次召回的
+    内部序号，摘出页面就失去意义。必须回译成 [@key]，越界的剔除。"""
+    evs = _evidences(3)
+    data = {
+        "summary": "总述引 E3",
+        "sections": [{"heading": "h", "claims": [{"text": "论断见E2描述", "evidence": ["E1"]}]}],
+        "disputes": [{"issue": "争议", "position_a": "A 说", "evidence_a": ["E1"],
+                      "position_b": "B 说", "evidence_b": ["E2"],
+                      "note": "E1 的口径与 E99 不同"}],
+        "gaps": ["E3 明确指出分组校准缺失"],
+    }
+    out, rep = T.validate_synthesis(data, evs)
+    ck = {e.ref: e.citekey for e in evs}
+    assert out["gaps"][0] == "[@{}] 明确指出分组校准缺失".format(ck["E3"])
+    assert out["disputes"][0]["note"] == "[@{}] 的口径与 不同".format(ck["E1"])   # 越界的剔除后压空格
+    assert out["sections"][0]["claims"][0]["text"] == "论断见[@{}]描述".format(ck["E2"])
+    assert out["summary"] == "总述引 [@{}]".format(ck["E3"])
+    assert rep.invalid_refs == 1                      # E99 越界
+    assert out["inline_refs"] == ["E1", "E2", "E3"]
+
+
+def test_schema_field_names_are_scrubbed():
+    """模型会在说明里写「position_a 的差距……」——页面上两侧渲染为一方/另一方，字段名换掉。"""
+    evs = _evidences(2)
+    data = {
+        "sections": [{"heading": "h", "claims": [{"text": "x", "evidence": ["E1"]}]}],
+        "disputes": [{"issue": "position_a 与 position_b 之争", "position_a": "A",
+                      "evidence_a": ["E1"], "position_b": "B", "evidence_b": ["E2"],
+                      "note": "position_a 用单疾病，evidence_b 是快照；my_position_a 不动"}],
+        "gaps": [],
+    }
+    out, _ = T.validate_synthesis(data, evs)
+    d = out["disputes"][0]
+    assert d["issue"] == "一方 与 另一方 之争"
+    assert d["note"] == "一方 用单疾病，另一方 是快照；my_position_a 不动"
+
+
+def test_ref_only_in_free_text_marked_used_in_evidence_table():
+    """只在缺口里被回译引用的证据，证据表里不能标 ○（页面上明明有它的 [@key]）。"""
+    evs = _evidences(3)
+    data = {"sections": [{"heading": "h", "claims": [{"text": "x", "evidence": ["E1"]}]}],
+            "disputes": [], "gaps": ["E3 说明了缺口"]}
+    out, rep = T.validate_synthesis(data, evs)
+    spec = T.TopicSpec(slug="t", title="标题", question="问题？", queries=["q"])
+    md = T.render_generated_block(spec, out, evs)
+    assert "- ● **E3**" in md and "- ○ **E2**" in md
+    assert rep.used_refs == 2

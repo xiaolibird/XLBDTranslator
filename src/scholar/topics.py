@@ -949,6 +949,94 @@ def _check_grounding(text: str, refs: Sequence[str], ev_map: Dict[str, Evidence]
         )
 
 
+# 2026-10-07 从 qa.py 下沉到这里：概念页的分歧/缺口区同样会漏出 E 编号（实测 8 页里
+# 7 页有），两条链路共用这一份实现；qa 从这里导入，`Q.backtranslate_inline_refs` 照旧可用。
+# 正文里模型顺手写出的证据编号（"E1 的流程图明确写……"、"E31 描述的算法"）。
+#
+# **左侧后顾断言是真防线**：它保证 `AE1`、`MICE1` 这类词尾不被误当成编号。用的是显式
+# ASCII 字符类而不是 `\b`——`\b` 与 `\w` 按 Unicode 判定、汉字算单词字符，中文行文里
+# 「见E31描述」这种紧贴写法会判不到边界而整条漏过（lint.py 那三次教训的直接应用：
+# `\w` → `\b` → 矫枉过正成 ASCII-only）。
+#
+# **右侧的 `(?![0-9])` 是冗余的**，写出来只为把意图摆明：`\d+` 本身贪婪，`E312` 一定
+# 整体匹配成 `E312`（越界 → 剔除），不可能被截成 `E31` 再错误回译到第 31 条证据上。
+# 变异测试实测把这个前瞻删掉行为完全不变——记在这里，免得后人以为它在挡什么。
+#
+# `\[?` / `\]?` 在匹配体里（后顾断言仍在最前，不受影响）：喂给模型的证据块首字段
+# 就是 `[E1]（可引用证据 · 实验方法 · 2024）`，模仿这个形状的概率不低。不吃掉那对
+# 方括号就会得到 `[[@a2024X]]`，再过 `to_wiki_links` 变成 `[[[a2024X|a2024X]]]`——
+# 不是死链，但多一对字面方括号，粘进 pandoc 也多一层。
+_INLINE_REF_RE = re.compile(r"(?<![A-Za-z0-9])\[?[Ee](\d+)\]?(?![0-9])")
+
+
+def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
+                              report: ValidationReport,
+                              used: Optional[set] = None) -> str:
+    """把正文里模型顺手写的证据编号回译成 `[@citekey]`，越界的直接剔除。
+
+    实测（首次真实运行，2026-08-17）模型确实会这么写：
+    「E1 的流程图明确写 NMAR 确认需要外部数据」「E31 描述的条件独立检验搜索父集合的算法」。
+    这些编号**不经过 `evidence` 字段的校验**——它们是自由文本的一部分。放着不管有两种坏法：
+
+      1. 编号越界（模型写 E99 而只召回 40 条）→ 页面上留下一个指向不存在证据的交叉引用，
+         而读者会以为自己没找到；
+      2. 编号有效但页面被摘去写稿后，`E31` 脱离了本页的证据表就完全失去意义——
+         它是**本次召回的内部编号**，不是任何持久标识。
+
+    回译成 `[@citekey]` 一次解决两者：越界的剔除（计入 `invalid_refs`，与 `_resolve_refs`
+    同一个计数口径），有效的变成真正可追溯、可粘进 pandoc 的引用。这不是新的防线，
+    是把已有的编号回译防线**补到自由文本这条此前没盖住的通道上**——同 `_clean_text`
+    之于模型自写的 citekey。
+
+    `used` 给了就把**本次成功回译的编号**塞进去（出参而不是改返回类型：调用点全都在
+    拿字符串用）。没有它的话，只在 `answer` 或 `gaps` 里被提到的那条证据会在证据表里
+    标 ○，而表头写着"未被引用的证据标 ○"——页面上明明有 `[@key]`，两个数字互相自洽
+    却都与页面事实不符，CLI 的"引用率"也跟着少算。
+
+    ## 已知局限（记账不修，2026-09-17 R2 对抗审核）
+
+    - **MINOR-3**：模型有时会在自由文本里复述证据原句已经带的页码（如某条
+      highlight 原文本身写着"(p.3)"，模型转述成"E7 在第 3 页显示……"）；若 E7
+      恰好是带 `pages` 定位符的书籍证据，回译后会读成"`[@key, p. 3]` 在第 3
+      页显示……"——页码信息视觉上重复了一次。这是内容层面的措辞冗余，不是引用
+      本身出错（citekey 与页码都仍然准确、可追溯），修它要么在模型自由文本里
+      做页码字符串匹配再删除（容易连累正常叙述），要么放弃给自由文本回译加
+      定位符（倒退回本轮之前的行为）——两个方向代价都不小，记账不修。
+    - **NIT-2**：`_INLINE_REF_RE` 逐个匹配 `E\\d+`，模型写"E1-E3 均支持"这种
+      range 语法时，中间的连字符不属于任何一个匹配，回译后变成
+      `[@a]-[@c]`——两个引用都对，只是连着它们的连字符成了一个孤立字符，
+      读起来略怪。这是本模块一直就有的既有行为（不是本轮改动引入的），
+      记账不修。
+    """
+    def _sub(m):
+        ref = "E{}".format(int(m.group(1)))
+        ev = ev_map.get(ref)
+        if ev is None:
+            report.invalid_refs += 1
+            return ""
+        if used is not None:
+            used.add(ref)
+        # 书籍证据带页码定位符（同 topics._cite_str/qa._cite_str 的既有格式）：
+        # 自由文本里模型随手提到的证据编号一样可能指向一条书籍句级证据，回译时
+        # 不能只给 citekey——那会让这句话与证据表里同一条证据的引用形态不一致。
+        pages = getattr(ev, "pages", None)
+        return "[@{}, p. {}]".format(ev.citekey, pages) if pages else "[@{}]".format(ev.citekey)
+
+    out = _INLINE_REF_RE.sub(_sub, text)
+    # 剔除越界编号后可能留下 "……（ 的流程图" 之类的空档
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+# 模型在自由文本里会顺手提到输出 schema 的字段名（实测 missingness-fairness 页：
+# 「二者比较条件不同：position_a 的差距出现在……」）。页面上分歧两侧渲染成「一方/另一方」，
+# 字段名对读者毫无意义，按同一口径换掉。只换整词，不碰 `evidence_ab` 之类的别的标识。
+_SCHEMA_TERM_RE = re.compile(r"(?<![A-Za-z0-9_])(position|evidence)_([ab])(?![A-Za-z0-9_])")
+
+
+def _scrub_schema_terms(text: str) -> str:
+    return _SCHEMA_TERM_RE.sub(lambda m: "一方" if m.group(2) == "a" else "另一方", text)
+
+
 def validate_synthesis(data: dict, evidences: Sequence[Evidence]
                        ) -> Tuple[dict, ValidationReport]:
     """把 LLM 输出清洗成可渲染的结构，并把每个编号回译成 citekey。
@@ -959,6 +1047,15 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
     report = ValidationReport()
     ev_map = {e.ref: e for e in evidences}
     used: set = set()
+    # 只在自由文本里出现、经回译变成 [@key] 的编号：证据表要据此标 ●（同 qa 的 inline_refs）
+    inline: set = set()
+
+    def _free_text(raw: Any, mine: Optional[set] = None) -> str:
+        """自由文本统一清洗：剥模型自写 citekey → 回译 E 编号 → 换掉 schema 字段名。
+        顺序不能反：先回译会引入 `[@key]`，再剥就把刚回译出来的也剥掉了。"""
+        sink = mine if mine is not None else inline
+        return _scrub_schema_terms(backtranslate_inline_refs(
+            _clean_text(raw, report), ev_map, report, used=sink))
 
     def _refs_to_keys(refs: List[str]) -> List[str]:
         keys: List[str] = []
@@ -977,12 +1074,16 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
         for c in (sec.get("claims") or []):
             if not isinstance(c, dict):
                 continue
-            text = _clean_text(c.get("text"), report)
+            mine: set = set()
+            text = _free_text(c.get("text"), mine)
             refs = _resolve_refs(c.get("evidence"), ev_map, report)
             if not text or not refs:
                 report.dropped_claims += 1
                 continue
-            _check_grounding(text, refs, ev_map, report, len(evidences), "论断")
+            inline.update(mine)
+            # 正文里回译出的编号也算匹配池来源（同 qa._items），否则会误判数字失真
+            all_refs = sorted(set(refs) | mine, key=lambda r: int(r[1:]))
+            _check_grounding(text, all_refs, ev_map, report, len(evidences), "论断")
             claims.append({"text": text, "refs": refs, "citekeys": _refs_to_keys(refs)})
             report.kept_claims += 1
         if claims:
@@ -993,9 +1094,11 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
     for d in (data.get("disputes") or []):
         if not isinstance(d, dict):
             continue
-        issue = _clean_text(d.get("issue"), report)
-        pos_a = _clean_text(d.get("position_a"), report)
-        pos_b = _clean_text(d.get("position_b"), report)
+        mine = set()
+        # issue 渲染成 `### 标题`，不往标题里塞 [@key]，只剥 citekey、换字段名
+        issue = _scrub_schema_terms(_clean_text(d.get("issue"), report))
+        pos_a = _free_text(d.get("position_a"), mine)
+        pos_b = _free_text(d.get("position_b"), mine)
         refs_a = _resolve_refs(d.get("evidence_a"), ev_map, report)
         refs_b = _resolve_refs(d.get("evidence_b"), ev_map, report)
         # 分歧必须两侧都有证据，否则它只是一条普通论断被写成了争议
@@ -1011,22 +1114,26 @@ def validate_synthesis(data: dict, evidences: Sequence[Evidence]
             report.dropped_disputes += 1
             continue
         # 分歧两侧同样带数字，同样会失真——bench 是在渲染后的页面上测的，两侧都算
+        inline.update(mine)
         _check_grounding(pos_a, refs_a, ev_map, report, len(evidences), "分歧·一方")
         _check_grounding(pos_b, refs_b, ev_map, report, len(evidences), "分歧·另一方")
         disputes.append({
             "issue": issue,
             "position_a": pos_a, "refs_a": refs_a, "citekeys_a": _refs_to_keys(refs_a),
             "position_b": pos_b, "refs_b": refs_b, "citekeys_b": _refs_to_keys(refs_b),
-            "note": _clean_text(d.get("note"), report),
+            "note": _free_text(d.get("note")),
         })
 
-    gaps = [t for t in (_clean_text(g, report) for g in (data.get("gaps") or [])) if t]
+    gaps = [t for t in (_free_text(g) for g in (data.get("gaps") or [])) if t]
+    summary = _free_text(data.get("summary"))
+    used |= inline
     report.used_refs = len(used)
     return {
-        "summary": _clean_text(data.get("summary"), report),
+        "summary": summary,
         "sections": sections,
         "disputes": disputes,
         "gaps": gaps,
+        "inline_refs": sorted(inline, key=lambda r: int(r[1:])),
     }, report
 
 
@@ -1087,6 +1194,7 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
     for d in synthesis["disputes"]:
         used_refs.update(d["refs_a"])
         used_refs.update(d["refs_b"])
+    used_refs.update(synthesis.get("inline_refs") or ())
     lines: List[str] = ["# {}".format(spec.title), ""]
     lines += ["> {}".format(spec.question), ""]
     if synthesis["summary"]:
