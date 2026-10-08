@@ -132,4 +132,7 @@ topics:
       - causal fairness counterfactual path-specific effect 因果公平
       - unfair model performance gap disadvantaged group 不公平 弱势群体
       - clinical presence access to care observation inequity 就医可及性 观测不平等
-    max_evidence: 60
+      - race ethnicity poorly recorded missing demographic field 种族族裔记录缺失
+      - self-masking missingness depends on the missing value itself 自掩蔽缺失
+      - fairness accuracy trade-off 公平与准确性权衡
+    max_evidence: 45
