@@ -26,6 +26,7 @@ from ._citekey_utils import (
     _suffix_seq, _priority_tier, _TIER_MAP, _reading_depth,
     _collect_highlights, dedup_key_fields, entry_from_segment, _norm_title,
     recompute_entry_key, TAG_LINE_RE, BOOK_ENTRY_FIELDS, build_csl_common,
+    PROVENANCE_FIELDS,
 )
 
 # 向后兼容：旧公开 API
@@ -985,6 +986,105 @@ def _citekey_collisions(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for ck, keys in sorted(by_key.items()) if len(keys) > 1]
 
 
+# ---------------- 来源字段 overlay（可信度加固 WO-3）----------------
+#
+# 存量条目没有 / 无法写入来源字段（43 个 auto 月份无 sidecar、老 sidecar 无键），回填值放在
+# output/scholar_notes/_provenance/overlay.json（scripts/backfill_provenance.py 生成），
+# 索引构建时按身份合并进条目。口径：
+#   · 只填缺失（键不存在或为 None），绝不覆盖 sidecar 已有的值；provenance_origin=native 的
+#     条目整条跳过（本批之后写入、来源已是实测，回填值不该掺进去）；
+#   · None 当缺失；False 是有意义的值（decision_model_verified=False = 只有请求值），不算缺失；
+#   · 合并发生在月份级增量缓存之后，overlay 变化不需要让月份缓存失效；
+#   · overlay 缺失静默，损坏只告警——索引照常构建。
+PROVENANCE_OVERLAY_REL = Path("_provenance") / "overlay.json"
+# overlay 允许写入的键：PROVENANCE_FIELDS 外加说明性的 decision_model_note
+OVERLAY_ALLOWED_KEYS = frozenset(PROVENANCE_FIELDS) | {"decision_model_note"}
+
+
+def load_provenance_overlay(notes_dir: Path) -> Optional[Dict[str, Any]]:
+    """读 overlay；文件不存在返回 None（静默），损坏/结构不对告警后返回 None。"""
+    path = Path(notes_dir) / PROVENANCE_OVERLAY_REL
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+            raise ValueError("缺少 records 列表")
+        return data
+    except Exception as e:
+        logger.warning("  ⚠️ 来源 overlay 读取失败（{}: {}）——本次索引不合并来源回填，其余照常：{}"
+                       .format(type(e).__name__, e, path))
+        return None
+
+
+def _norm_doi(doi: Any) -> str:
+    return str(doi or "").strip().lower()
+
+
+def apply_provenance_overlay(papers: List[Dict[str, Any]],
+                             overlay: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """把 overlay 的 fields 只填缺失地合并进 papers（原地）。返回计数。
+
+    认领梯：当前键梯重算的 dedup_key（同 recompute_entry_key）→ DOI → arXiv → 规范化标题。
+    记录带 series 时只认同系列的条目（同一论文 auto/manual 两条各有各的来源）。
+    一条记录可命中多条目（keeper + duplicate 副本），都填。
+    """
+    stats = {"records": 0, "unmatched": 0, "entries_filled": 0, "keys_filled": 0,
+             "skipped_native": 0}
+    if not overlay:
+        return stats
+    by_key: Dict[str, List[int]] = {}
+    by_doi: Dict[str, List[int]] = {}
+    by_arxiv: Dict[str, List[int]] = {}
+    by_title: Dict[str, List[int]] = {}
+    for i, e in enumerate(papers):
+        k = recompute_entry_key(e)
+        by_key.setdefault(k, []).append(i)
+        if e.get("dedup_key") and e["dedup_key"] != k:
+            by_key.setdefault(e["dedup_key"], []).append(i)
+        if e.get("doi"):
+            by_doi.setdefault(_norm_doi(e["doi"]), []).append(i)
+        if e.get("arxiv_id"):
+            by_arxiv.setdefault(str(e["arxiv_id"]).strip().lower(), []).append(i)
+        t = _norm_title(e.get("title"))
+        if t:
+            by_title.setdefault(t, []).append(i)
+
+    filled_idx: Set[int] = set()
+    for rec in overlay.get("records") or []:
+        if not isinstance(rec, dict) or not isinstance(rec.get("fields"), dict):
+            continue
+        stats["records"] += 1
+        hit: List[int] = []
+        for lookup, val in ((by_key, rec.get("dedup_key")),
+                            (by_doi, _norm_doi(rec.get("doi"))),
+                            (by_arxiv, str(rec.get("arxiv_id") or "").strip().lower()),
+                            (by_title, _norm_title(rec.get("title")))):
+            if val and lookup.get(val):
+                hit = lookup[val]
+                break
+        if rec.get("series"):
+            hit = [i for i in hit if papers[i].get("series") == rec["series"]]
+        if not hit:
+            stats["unmatched"] += 1
+            continue
+        for i in hit:
+            e = papers[i]
+            if e.get("provenance_origin") == "native":
+                stats["skipped_native"] += 1
+                continue
+            n = 0
+            for k, v in rec["fields"].items():
+                if k in OVERLAY_ALLOWED_KEYS and e.get(k) is None and v is not None:
+                    e[k] = v
+                    n += 1
+            if n:
+                filled_idx.add(i)
+                stats["keys_filled"] += n
+    stats["entries_filled"] = len(filled_idx)
+    return stats
+
+
 def update_index(notes_dir: Path, *, full: bool = False,
                  since: Optional[str] = None, until: Optional[str] = None) -> Dict[str, Any]:
     """构建/更新索引 dict。
@@ -1057,6 +1157,18 @@ def update_index(notes_dir: Path, *, full: bool = False,
 
     for e in papers:
         e.pop("_source", None)
+    # 存量来源回填（overlay）：在全局去重之前合并，使 keeper 与 duplicate 副本都带上来源键
+    _ov = load_provenance_overlay(notes_dir)
+    if _ov is not None:
+        try:
+            _st = apply_provenance_overlay(papers, _ov)
+        except Exception as e:   # overlay 是增值信息，合并出错不能拖垮索引构建
+            logger.warning("  ⚠️ 来源 overlay 合并失败（{}: {}），已忽略".format(type(e).__name__, e))
+            _st = {"records": 0, "entries_filled": 0, "keys_filled": 0,
+                   "unmatched": 0, "skipped_native": 0}
+        logger.info("  来源 overlay：{} 条记录，填充 {} 条目/{} 键，认不到 {}，跳过 native {}".format(
+            _st["records"], _st["entries_filled"], _st["keys_filled"],
+            _st["unmatched"], _st["skipped_native"]))
     review_pairs: List[Dict[str, Any]] = []
     stale_inline: List[str] = []
     papers = _global_pass(papers, notes_dir=notes_dir, review_out=review_pairs,
