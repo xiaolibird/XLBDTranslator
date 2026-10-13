@@ -46,7 +46,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from ..utils.logger import get_logger
 from .grounding import build_pool, check_numbers
 from .notes_index import write_if_changed
-from .thresholds import TOPICS_MIN_SIM, TOPICS_RELATIVE_ALPHA
+from .thresholds import TOPIC_MIN_INDEPENDENT_SOURCES, TOPICS_MIN_SIM, TOPICS_RELATIVE_ALPHA
+from . import coverage as cov
 from . import page_shots
 from .vault import (
     mirror_shots_only,
@@ -56,7 +57,11 @@ from .vault import (
 
 logger = get_logger(__name__)
 
-TOPIC_SCHEMA_VERSION = 1
+# v2（可信度加固 WO-5）：frontmatter 新增覆盖说明与合成模型留痕键（coverage_pool_papers /
+# n_independent_sources / evidence_status / synth_model 等，见 coverage.frontmatter_items），
+# 页面顶部多一块「本页覆盖范围」，证据不足时可能是存根页。v1 旧页没有这些键：读取、重建、
+# `--verify` 一律照常（受管键由生成器覆盖，缺失不报错）。
+TOPIC_SCHEMA_VERSION = 2
 
 TOPICS_DIRNAME = "topics"           # notes_dir 下的概念页目录
 DEFAULT_CONFIG = "config/topics.yaml"
@@ -1178,13 +1183,26 @@ def _cite_str(refs: Sequence[str], ev_map: Dict[str, Evidence]) -> str:
     return " ".join(parts)
 
 
+def _claim_ref_groups(synthesis: dict) -> List[List[str]]:
+    """概念页各小节论断的证据编号列表（覆盖说明统计单一来源论断用；分歧两侧不计）。"""
+    return [list(c["refs"]) for sec in synthesis["sections"] for c in sec["claims"]]
+
+
 def render_generated_block(spec: TopicSpec, synthesis: dict,
                            evidences: Sequence[Evidence],
                            crops: Optional[Dict[Tuple[str, str], str]] = None,
-                           crop_prefix: str = "../") -> str:
+                           crop_prefix: str = "../",
+                           coverage: Optional["cov.CoverageContext"] = None,
+                           stub: Optional["cov.Sufficiency"] = None,
+                           force_command: str = "") -> str:
     """哨兵之间的正文：总述 → 小节论断 → 分歧 → 缺口 → 证据表。
 
     证据表列出全部召回证据（含未被引用的），并标注哪些没被用上。
+
+    `coverage`（WO-5）：给了就在问题引文后印「本页覆盖范围」、论断行末加单一来源徽标、
+    「证据缺口」下加免责——文案全部来自 coverage 模块，与 qa.render_qa_block 的调用点镜像
+    （两侧必须同步）。`stub` 非 None 表示证据不足存根页：不印总述与论断，改印「库内证据不足」
+    两节，证据表照常（synthesis 传空结构）。不给 coverage 时输出与 v1 逐字相同。
     """
     ev_map = {e.ref: e for e in evidences}       # _cite_str 据此把编号回译成定位符引用
     used_refs = {r for sec in synthesis["sections"] for c in sec["claims"] for r in c["refs"]}
@@ -1197,6 +1215,11 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
     used_refs.update(synthesis.get("inline_refs") or ())
     lines: List[str] = ["# {}".format(spec.title), ""]
     lines += ["> {}".format(spec.question), ""]
+    if coverage is not None:
+        profile = cov.page_evidence_profile(evidences, coverage, _claim_ref_groups(synthesis))
+        lines += cov.render_coverage_block(coverage, profile, kind="topic")
+    if stub is not None:
+        lines += cov.render_insufficient_section(stub, kind="topic", force_command=force_command)
     if synthesis["summary"]:
         lines += [synthesis["summary"], ""]
 
@@ -1204,7 +1227,9 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
         lines.append("## {}".format(sec["heading"]))
         lines.append("")
         for c in sec["claims"]:
-            lines.append("- {} {}".format(c["text"], _cite_str(c["refs"], ev_map)))
+            badge = (cov.single_source_badge(c["refs"], ev_map, coverage.keeper_of)
+                     if coverage is not None else "")
+            lines.append("- {} {}{}".format(c["text"], _cite_str(c["refs"], ev_map), badge))
         lines.append("")
 
     if synthesis["disputes"]:
@@ -1220,6 +1245,8 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
 
     if synthesis["gaps"]:
         lines += ["## 证据缺口", ""]
+        if coverage is not None:
+            lines += [cov.render_gap_disclaimer("topic", len(evidences)), ""]
         lines += ["- {}".format(g) for g in synthesis["gaps"]]
         lines.append("")
 
@@ -1370,7 +1397,8 @@ def _render_frontmatter(items: Dict[str, Any]) -> str:
 
 def build_frontmatter(spec: TopicSpec, synthesis: dict, evidences: Sequence[Evidence],
                       report: ValidationReport, generated_at: str,
-                      preserved: Optional[Dict[str, Any]] = None) -> str:
+                      preserved: Optional[Dict[str, Any]] = None, *,
+                      coverage: Optional["cov.CoverageContext"] = None) -> str:
     """受管键由生成器覆盖，用户自加的键原样保留（与 vault.build_frontmatter 同约定：
     受管键在前用新值，用户自加键跟在后面）。"""
     managed: Dict[str, Any] = {
@@ -1390,8 +1418,12 @@ def build_frontmatter(spec: TopicSpec, synthesis: dict, evidences: Sequence[Evid
         "stripped_cites": report.stripped_cites,
         "numbers_checked": report.numbers_checked,
         "ungrounded_numbers": report.ungrounded_numbers,
-        "tags": ["札记/概念页", "概念/{}".format(spec.slug)],
     }
+    if coverage is not None:
+        # WO-5：覆盖说明统计 + 证据状态 + 合成模型留痕（见 coverage.frontmatter_items）
+        managed.update(cov.frontmatter_items(
+            coverage, cov.page_evidence_profile(evidences, coverage, _claim_ref_groups(synthesis))))
+    managed["tags"] = ["札记/概念页", "概念/{}".format(spec.slug)]
     items = dict(managed)
     for k, v in (preserved or {}).items():
         if k not in managed:
@@ -1453,7 +1485,14 @@ def read_existing(path: Path) -> Tuple[Optional[str], Optional[Dict[str, Any]], 
         end = body.find(GEN_END)
         prev = body[:end] if end >= 0 else body
         prev = re.sub(r"^<!-- BEGIN GENERATED.*?-->\s*", "", prev.strip(), flags=re.S)
-    return text, (fm if isinstance(fm, dict) else None), prev
+    fm_d = fm if isinstance(fm, dict) else None
+    # WO-5：上一版若是证据不足存根，它不是一份可修订的草稿；覆盖说明块也不属于“上一版答案”，
+    # 都不能喂回合成 prompt（qa.previous_answer 与 build_topic 的 prev_page 共用这里）。
+    if fm_d and fm_d.get("evidence_status") == cov.EVIDENCE_STATUS_INSUFFICIENT:
+        prev = ""
+    else:
+        prev = cov.strip_coverage_block(prev)
+    return text, fm_d, prev
 
 
 # ---------------------------------------------------------------------------
@@ -1471,10 +1510,13 @@ class TopicResult:
     report: Optional[ValidationReport] = None
     error: str = ""
     changed: bool = False
+    # WO-5：ok / insufficient（存根页，status 同为 "insufficient"）/ forced
+    evidence_status: str = cov.EVIDENCE_STATUS_OK
 
 
 def synthesize_topic(llm, prompt: str, *, model: Optional[str] = None,
-                     max_tokens: int = 8000, retries: int = 1) -> dict:
+                     max_tokens: int = 8000, retries: int = 1,
+                     meta_out: Optional[Dict[str, Any]] = None) -> dict:
     """调 LLM 合成 + 解析。
 
     G5：llm.call 抛出的任何异常统一包成 TopicError 再上抛——尤其是回退链整条耗尽时
@@ -1492,6 +1534,9 @@ def synthesize_topic(llm, prompt: str, *, model: Optional[str] = None,
     内容问题**，而重跑一页要重新召回 + 重新合成，白扔掉几分钟；追加一句更严厉的格式
     指令再试一次的代价小得多。注意只重试解析失败，provider 层的错误交给 llm_client
     自己的重试与回退链，不在这里叠加。
+
+    `meta_out`（WO-5）：非 None 时把最后一次调用的应答者留痕（provider / served_model /
+    fell_back，取不到为 None）写进去，供页面 frontmatter 记录合成模型。
     """
     last: Optional[TopicError] = None
     for attempt in range(retries + 1):
@@ -1501,8 +1546,10 @@ def synthesize_topic(llm, prompt: str, *, model: Optional[str] = None,
                   "必须是 `{`、**最后一个字符**必须是 `}`，中间是完整的合成结果。"
                   "不要写任何说明、前言、要点总结或代码围栏。")
         try:
-            raw = llm.call(p, model=model, max_tokens=max_tokens,
-                           temperature=0.3, json_mode=True)
+            raw, meta = cov.call_llm_with_meta(llm, p, model=model, max_tokens=max_tokens,
+                                               temperature=0.3, json_mode=True)
+            if meta_out is not None:
+                meta_out.update(meta)
         except TopicError:
             raise
         except Exception as e:
@@ -1521,8 +1568,20 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
                 min_sim: float = DEFAULT_MIN_SIM,
                 per_paper_cap: int = DEFAULT_PER_PAPER_CAP,
                 bucket_bonus: float = DEFAULT_BUCKET_BONUS,
-                model: Optional[str] = None, dry_run: bool = False) -> TopicResult:
-    """一个 topic 的完整链路：冲突预检 → 召回 → 合成 → 校验 → 合并 → 落盘。"""
+                model: Optional[str] = None, dry_run: bool = False,
+                force_synthesize: bool = False,
+                certification_path=None,
+                filter_fingerprint: Optional[str] = None) -> TopicResult:
+    """一个 topic 的完整链路：冲突预检 → 召回 → 证据充分性闸门 → 合成 → 校验 → 合并 → 落盘。
+
+    WO-5 闸门（固定判据，见 thresholds「证据充分性」）：召回后独立来源数（score ≥
+    EVIDENCE_SUFFICIENCY_MIN_SIM，keeper 去重、撤稿不计）< TOPIC_MIN_INDEPENDENT_SOURCES 时
+    **不调 LLM**，落「库内证据不足」存根页（status="insufficient"，保留用户批注区）。
+    倒退保护：已有的非存根页以前达标（n_independent_sources，旧页退而用 n_papers）、
+    这次却不足，多半是向量库/阈值故障而不是真实状态，不覆盖、返回 failed。
+    `force_synthesize` 跳过闸门照常合成并标 evidence_status="forced"。
+    `certification_path`/`filter_fingerprint` 只用于覆盖说明里的「筛选配置是否通过召回认证」。
+    """
     path = topics_dir / "{}.md".format(spec.slug)
     # 冲突**预检**（与 merge_topic_page 的三条判据逐字对齐）：哨兵缺失/批注区缺失/
     # 生成块被手改的页，合成结果注定被丢弃——此前冲突检测只在 LLM 调用（实测一页
@@ -1544,6 +1603,20 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
     attach_titles(evidences, index)
     n_papers = len({e.citekey for e in evidences})
 
+    ctx = cov.build_context(index, certification_path=certification_path,
+                            current_filter_fingerprint=filter_fingerprint)
+    suff = cov.fixed_sufficiency(evidences, ctx.keeper_of)
+    ctx.sufficiency = suff
+    if suff.refuse and not force_synthesize:
+        if dry_run:
+            return TopicResult(slug=spec.slug, status="skipped", path=path,
+                               n_evidence=len(evidences), n_papers=n_papers,
+                               error="dry-run（未调用 LLM）；独立来源 {} < {}，真跑会落证据不足存根页".format(
+                                   suff.n_sources, suff.min_sources))
+        return _write_insufficient_topic(spec, evidences, ctx, suff, path=path, topics_dir=topics_dir,
+                                         prior_fm=_fm0, n_papers=n_papers)
+    ctx.status = (cov.EVIDENCE_STATUS_FORCED if suff.refuse else cov.EVIDENCE_STATUS_OK)
+
     # prev_page 来自上面的预检快照，只喂 prompt；text/frontmatter 不用来做最终合并——
     # LLM 调用后落盘前会在下面重读一次最新版（X1/W1），用那份而不是这里的旧快照。
     prompt = build_prompt(spec, evidences, template, research_interests, prev_page)
@@ -1552,8 +1625,9 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
                            n_evidence=len(evidences), n_papers=n_papers,
                            error="dry-run（未调用 LLM）")
 
+    synth_meta: Dict[str, Any] = {}
     try:
-        data = synthesize_topic(llm, prompt, model=model)
+        data = synthesize_topic(llm, prompt, model=model, meta_out=synth_meta)
     except TopicError as e:
         # 保留召回统计再上抛：失败行只显示"证据 0 条"会把人引向调 queries/阈值，
         # 而真正的病灶在合成端（模型没吐出合法 JSON）。
@@ -1566,9 +1640,11 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
                            error="校验后没有任何有效论断（丢弃 {} 条，非法编号 {} 个）".format(
                                report.dropped_claims, report.invalid_refs))
 
+    ctx.synth = cov.synth_fields(synth_meta, model)
     gen_block = render_generated_block(spec, synthesis, evidences,
                                        crops=page_shots.crop_index(
-                                           Path(topics_dir).parent / page_shots._SHOT_SUBDIR))
+                                           Path(topics_dir).parent / page_shots._SHOT_SUBDIR),
+                                       coverage=ctx)
     n_disputes = len(synthesis["disputes"])
     # W1（lost update）：synthesize_topic 实测一页要 3-4 分钟，用户完全可能在这期间在
     # Obsidian 里编辑「我的批注」区，也可能在 Properties 面板加一个自定义 frontmatter
@@ -1584,7 +1660,8 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
     # 只有这里、落盘前最后一次的 frontmatter 合并与正文合并要用最新版。
     fresh_existing, fresh_fm, _ = read_existing(path)
     fm = build_frontmatter(spec, synthesis, evidences, report,
-                           datetime.now().isoformat(timespec="seconds"), preserved=fresh_fm)
+                           datetime.now().isoformat(timespec="seconds"), preserved=fresh_fm,
+                           coverage=ctx)
     content, status = merge_topic_page(fm, gen_block, fresh_existing)
     if content is None:
         return TopicResult(slug=spec.slug, status="conflict", path=path,
@@ -1594,7 +1671,56 @@ def build_topic(spec: TopicSpec, *, store, embed_client, llm, index: dict,
     changed = write_if_changed(path, content)
     return TopicResult(slug=spec.slug, status=status, path=path, n_evidence=len(evidences),
                        n_papers=n_papers, n_disputes=n_disputes, report=report,
-                       changed=changed)
+                       changed=changed, evidence_status=ctx.status)
+
+
+def _prior_page_sources(fm: Optional[Dict[str, Any]]) -> int:
+    """已有页以前的独立来源数：优先 n_independent_sources，旧页（v1）没有这个键则退而用
+    n_papers（证据篇数）。存根页与读不出的值一律 0——它们不构成“以前够、现在不够”。"""
+    if not fm or fm.get("evidence_status") == cov.EVIDENCE_STATUS_INSUFFICIENT:
+        return 0
+    for k in ("n_independent_sources", "n_papers"):
+        v = fm.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    return 0
+
+
+def _write_insufficient_topic(spec: TopicSpec, evidences: Sequence[Evidence],
+                              ctx: "cov.CoverageContext", suff: "cov.Sufficiency", *,
+                              path: Path, topics_dir: Path, prior_fm: Optional[Dict[str, Any]],
+                              n_papers: int) -> TopicResult:
+    """证据不足：不调 LLM，落存根页（走与正常页同一套哨兵合并，保留「我的批注」）。"""
+    prior = _prior_page_sources(prior_fm)
+    if prior >= TOPIC_MIN_INDEPENDENT_SOURCES:
+        return TopicResult(
+            slug=spec.slug, status="failed", path=path, n_evidence=len(evidences),
+            n_papers=n_papers,
+            error="证据数倒退：已有页独立来源 {}（达标），这次只有 {} < {}，未覆盖。"
+                  "多半是向量库/阈值故障而非真实状态，先查向量库同步；确认无误可加 "
+                  "--force-synthesize 或删除该页后重建".format(prior, suff.n_sources, suff.min_sources))
+    ctx.status = cov.EVIDENCE_STATUS_INSUFFICIENT
+    empty = {"summary": "", "sections": [], "disputes": [], "gaps": [], "inline_refs": []}
+    gen_block = render_generated_block(
+        spec, empty, evidences,
+        crops=page_shots.crop_index(Path(topics_dir).parent / page_shots._SHOT_SUBDIR),
+        coverage=ctx, stub=suff,
+        force_command="python scripts/build_topics.py --topic {} --force-synthesize".format(spec.slug))
+    fresh_existing, fresh_fm, _ = read_existing(path)
+    fm = build_frontmatter(spec, empty, evidences, ValidationReport(),
+                           datetime.now().isoformat(timespec="seconds"), preserved=fresh_fm,
+                           coverage=ctx)
+    content, status = merge_topic_page(fm, gen_block, fresh_existing)
+    if content is None:
+        return TopicResult(slug=spec.slug, status="conflict", path=path,
+                           n_evidence=len(evidences), n_papers=n_papers,
+                           error="哨兵缺失/生成块被手改，未覆盖（请把批注移到「我的批注」下）")
+    changed = write_if_changed(path, content)
+    return TopicResult(
+        slug=spec.slug, status="insufficient", path=path, n_evidence=len(evidences),
+        n_papers=n_papers, changed=changed, evidence_status=cov.EVIDENCE_STATUS_INSUFFICIENT,
+        error="独立来源 {} < {}（固定判据，相似度 ≥ {:.2f}）；未调用 LLM，已落存根页".format(
+            suff.n_sources, suff.min_sources, suff.sim_threshold))
 
 
 # ---------------------------------------------------------------------------
@@ -1639,6 +1765,9 @@ class SubprocessRefreshOutcome:
     detail 是给日志/notify 看的人话摘要。"""
     ok: bool
     detail: str = ""
+    # WO-5：证据不足而落了存根页的 slug（stdout 里 `📭 <slug>` 行）。不算失败，
+    # 退出码与 ok 都不受影响，只单列出来让日志里看得见。
+    insufficient: List[str] = field(default_factory=list)
 
 
 # Y4：失败/冲突页枚举最多展示几条，超出的部分折成"共 M 页"（见 summarize_build_topics_run
@@ -1674,9 +1803,16 @@ def summarize_build_topics_run(stdout: str, stderr: str, returncode: int
     不高，但顺手一起修。失败页列表本身也设了上限（`_MAX_FLAGGED_IN_SUMMARY`），
     超出时截成"前 N 页 + 共 M 页"，不让它自己就把 stderr 挤没。
     """
-    if returncode == 0:
-        return SubprocessRefreshOutcome(ok=True)
     out_lines = (stdout or "").strip().splitlines()
+    insufficient = []
+    for ln in out_lines:
+        t = ln.strip()
+        if t.startswith("📭"):
+            parts = t.split()
+            if len(parts) >= 2 and parts[1] not in insufficient:
+                insufficient.append(parts[1])
+    if returncode == 0:
+        return SubprocessRefreshOutcome(ok=True, insufficient=insufficient)
     flagged = [ln.strip() for ln in out_lines
               if ln.strip().startswith("❌") or ln.strip().startswith("⚠️")]
     reason = BUILD_TOPICS_EXIT_CODES.get(returncode, "未知退出码")
@@ -1690,7 +1826,7 @@ def summarize_build_topics_run(stdout: str, stderr: str, returncode: int
         if len(flagged) > len(shown):
             pages += "（等，共 {} 页，仅列前 {}）".format(len(flagged), len(shown))
         detail += "；失败/冲突页：{}".format(pages)
-    return SubprocessRefreshOutcome(ok=False, detail=detail)
+    return SubprocessRefreshOutcome(ok=False, detail=detail, insufficient=insufficient)
 
 
 # ---------------------------------------------------------------------------
@@ -2063,6 +2199,9 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
     for line in (run.stdout or "").strip().splitlines():
         logger.info("  {}".format(line))
     outcome = summarize_build_topics_run(run.stdout, run.stderr, run.returncode)
+    if outcome.insufficient:
+        logger.info("概念页证据不足已落存根（{}）：{} 页 {}".format(
+            subject, len(outcome.insufficient), ", ".join(outcome.insufficient)))
     if not outcome.ok:
         logger.warning("概念页更新未全部成功（{}）：{}".format(subject, outcome.detail))
         notify(notify_title, "概念页有页面未更新成功（{}）：{}".format(subject, outcome.detail[:300]))

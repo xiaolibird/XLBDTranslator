@@ -251,8 +251,9 @@ class TestBAudit:
 # ---------------------------------------------------------------------------
 
 class TestFrontmatterAndVerify:
-    def test_schema_version_is_3(self):
-        assert Q.QA_SCHEMA_VERSION == 3
+    def test_schema_version_is_current(self):
+        # v3 → v4：可信度加固 WO-5（设计 4.3.5 明文要求涨版本）；v3 的字段仍在 v4 里
+        assert Q.QA_SCHEMA_VERSION == 4
 
     def test_frontmatter_new_fields(self, tmp_path):
         qa, rep = _theory_qa()
@@ -264,7 +265,7 @@ class TestFrontmatterAndVerify:
                                        now=datetime(2026, 10, 4))
         assert status == "new"
         fm, _ = Q.split_frontmatter(path.read_text(encoding="utf-8"))
-        assert fm["qa_schema"] == 3 and fm["audit_status"] == "ok"
+        assert fm["qa_schema"] == Q.QA_SCHEMA_VERSION and fm["audit_status"] == "ok"
         assert fm["audited_claims"] == 2 and fm["unfaithful_claims"] == 1
         assert fm["uncertain_claims"] == 1 and fm["theory_claims"] == 1
         assert fm["ungrounded_claims_listed"] == 1
@@ -288,7 +289,8 @@ class TestFrontmatterAndVerify:
                         if not ln.split(":")[0] in (
                             "audit_status", "audited_claims", "unfaithful_claims",
                             "uncertain_claims", "theory_claims", "ungrounded_claims_listed"))
-        txt = txt.replace("qa_schema: 3", "qa_schema: 2").replace("GENERATED v3", "GENERATED v2")
+        txt = txt.replace("qa_schema: {}".format(Q.QA_SCHEMA_VERSION), "qa_schema: 2").replace(
+            "GENERATED v{}".format(Q.QA_SCHEMA_VERSION), "GENERATED v2")
         path.write_text(txt, encoding="utf-8")
         idx = {"papers": [{"citekey": e.citekey, "highlights": [{"text": e.text}]}
                           for e in EVS]}

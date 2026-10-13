@@ -76,10 +76,12 @@ from .topics import (
     _resolve_refs, backtranslate_inline_refs,
     flatten_linebreaks,
     parse_synthesis, read_existing, render_evidence_block, retrieve_evidence,
+    _prior_page_sources,
     select_evidence, to_wiki_links,
 )
 from .grounding import build_pool, check_numbers
-from .thresholds import QA_GAP_EVIDENCE_MIN_SIM
+from .thresholds import QA_GAP_EVIDENCE_MIN_SIM, QA_MIN_INDEPENDENT_SOURCES
+from . import coverage as cov
 from .vault import (
     GEN_BEGIN_RE, ROLE_LABEL, _gen_hash, extract_user_zone,
     generated_block_tampered, split_frontmatter, tokenize,
@@ -102,7 +104,10 @@ logger = get_logger(__name__)
 #   v2: 正文编号回译 + gap 回查 + residual_refs 自检 + slug 占用校验
 #   v3: 逐条数字接地徽标 + 理论类论断原句并排 + 蕴含审计（ask_notes v3 的 A1/A2/B 层，
 #       frontmatter 新增 audit_status 等字段；v2 旧页没有这些字段，`--verify` 照常通过）
-QA_SCHEMA_VERSION = 3
+#   v4: 可信度加固 WO-5——页面顶部「本页覆盖范围」、证据不足存根页、单一来源徽标、
+#       frontmatter 新增覆盖统计 / evidence_status / 合成与审计模型留痕；v3 旧页没有这些键，
+#       `--verify`、重问、vault 同步照常（见 coverage.frontmatter_items）。
+QA_SCHEMA_VERSION = 4
 QA_DIRNAME = "qa"                       # topics/ 下的问答归档子目录
 QA_GENERATOR = "scripts/ask_notes.py"   # 写进哨兵注释的「由 X 生成」
 DEFAULT_PROMPT = "config/prompts/qa_synthesis_prompt.md"
@@ -941,7 +946,8 @@ def is_archivable(qa: dict) -> bool:
 
 
 def synthesize_qa(llm, prompt: str, *, model: Optional[str] = None,
-                  max_tokens: int = 6000, retries: int = 1) -> dict:
+                  max_tokens: int = 6000, retries: int = 1,
+                  meta_out: Optional[Dict[str, Any]] = None) -> dict:
     """调 LLM + 解析。与 `topics.synthesize_topic` 同一套容错。
 
     异常统一包成 `TopicError` 再上抛：回退链整条耗尽时 `llm_client` 抛的是
@@ -951,6 +957,9 @@ def synthesize_qa(llm, prompt: str, *, model: Optional[str] = None,
     解析失败重试一次：claude-agent 没有原生 json_mode，实测会偶发输出
     「已完成合成，要点：……」这类元描述，整段没有花括号、首尾花括号兜底也救不回来。
     只重试解析失败，provider 层的错误交给 llm_client 自己的重试与回退链。
+
+    `meta_out`（WO-5）：非 None 时写入最后一次调用的应答者留痕（provider / served_model /
+    fell_back，取不到为 None），供页面 frontmatter 记录合成模型。
     """
     last: Optional[TopicError] = None
     for attempt in range(retries + 1):
@@ -960,8 +969,10 @@ def synthesize_qa(llm, prompt: str, *, model: Optional[str] = None,
                   "必须是 `{`、**最后一个字符**必须是 `}`，中间是完整的结果。"
                   "不要写任何说明、前言、要点总结或代码围栏。")
         try:
-            raw = llm.call(p, model=model, max_tokens=max_tokens,
-                           temperature=0.2, json_mode=True)
+            raw, meta = cov.call_llm_with_meta(llm, p, model=model, max_tokens=max_tokens,
+                                               temperature=0.2, json_mode=True)
+            if meta_out is not None:
+                meta_out.update(meta)
         except TopicError:
             raise
         except Exception as e:
@@ -1052,7 +1063,8 @@ def run_audit(llm, qa: dict, evidences, template: str, *, question: str = "",
     并计入 `report.audit_dropped`。
     """
     info: Dict[str, Any] = {"status": "off", "mode": mode, "reason": "", "strict": bool(strict),
-                            "n_audited": 0, "n_unfaithful": 0, "n_uncertain": 0, "dropped": []}
+                            "n_audited": 0, "n_unfaithful": 0, "n_uncertain": 0, "dropped": [],
+                            "requested_model": model}
     qa["audit"] = info
     if mode == "off":
         return info
@@ -1075,7 +1087,12 @@ def run_audit(llm, qa: dict, evidences, template: str, *, question: str = "",
             if attempt:
                 p += ("\n\n【上一次输出格式不合规】这一次第一个字符必须是 `{`、最后一个字符必须是 "
                       "`}`，只输出 JSON，不要任何说明或代码围栏。")
-            raw = llm.call(p, model=model, max_tokens=4000, temperature=0.0, json_mode=True)
+            raw, ameta = cov.call_llm_with_meta(llm, p, model=model, max_tokens=4000,
+                                                temperature=0.0, json_mode=True)
+            # WO-5：审计模型留痕（与合成模型分开记；取不到 served_model 时 audit_model 记请求值，
+            # frontmatter 里只有 synth_model_verified 一个“已验证”标记，审计的验证状态见 audit_provider）
+            info["provider"] = ameta.get("provider")
+            info["served_model"] = ameta.get("served_model")
             try:
                 data = parse_synthesis(raw)
                 if not isinstance(data.get("audits"), list):
@@ -1168,7 +1185,8 @@ def _gap_hit_lines(hits: Sequence["GapHit"]) -> List[str]:
     return out
 
 
-def _claim_lines(it: dict, ev_map: Dict[str, Any]) -> List[str]:
+def _claim_lines(it: dict, ev_map: Dict[str, Any],
+                 keeper_of: Optional[Dict[str, Optional[str]]] = None) -> List[str]:
     """一条论断的渲染：主行 + 缩进的徽标行（A1 数字 / B 审计 / A2 原句并排）。
 
     没有任何附加信息时输出与 v2 逐字相同的一行 `- 文本 [@key]`。附加行一律以 `  > `
@@ -1178,7 +1196,9 @@ def _claim_lines(it: dict, ev_map: Dict[str, Any]) -> List[str]:
     audit = it.get("audit") or {}
     verdict = audit.get("verdict")
     mark = "❌ " if verdict == "不忠实" else ""
-    out = ["- {}{} {}".format(mark, it["text"], _cite_str(it["refs"], ev_map))]
+    # WO-5：只挂一个独立来源的论断行末加「单一来源」徽标（keeper_of 为 None = 不启用，行为同 v3）
+    badge = cov.single_source_badge(it["refs"], ev_map, keeper_of) if keeper_of is not None else ""
+    out = ["- {}{} {}{}".format(mark, it["text"], _cite_str(it["refs"], ev_map), badge)]
     if it.get("ungrounded"):
         out.append("  > ⚠️ 数字未在所引证据中找到：{}（可能是转述失真，也可能是自行换算——"
                    "回原句核对）".format("、".join(it["ungrounded"])))
@@ -1204,8 +1224,16 @@ def render_qa_block(question: str, qa: dict, evidences, *,
                     nearby_papers: Sequence[str] = (),
                     titles: Optional[Dict[str, str]] = None,
                     crops: Optional[Dict[Tuple[str, str], str]] = None,
-                    crop_prefix: str = "../../") -> str:
+                    crop_prefix: str = "../../",
+                    coverage: Optional["cov.CoverageContext"] = None,
+                    stub: Optional["cov.Sufficiency"] = None,
+                    force_command: str = "") -> str:
     """哨兵之间的正文：问题 → 相关概念页 → 直接回答 → 论断 → 注意事项 → 没覆盖到的 → 证据表。
+
+    `coverage`/`stub`（WO-5）与 `topics.render_generated_block` 同名参数镜像（两侧必须同步）：
+    给了 coverage 就在「相关概念页」提示之后、审计提示之前印「本页覆盖范围」，论断行末加单一来源
+    徽标，并在 points 的独立来源合计不足时于 answer 前加提示；`stub` 非 None 表示证据不足存根页
+    （qa 传空 points/caveats/gaps/answer，证据表照常）。不给 coverage 时输出与 v3 逐字相同。
 
     「本次召回没覆盖到的」（gaps）**排在证据表之前而不是文末**：它是这一页最容易被
     跳过、却最该被看到的一节——一个答案的边界在哪里，比答案本身更决定它能不能
@@ -1224,6 +1252,13 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         L += ["> 📎 **相关概念页**：{} —— 它证据面更宽、随新论文**自动重合成**，"
               "概念级的问题先读那一页。".format(
                   "、".join("[[{}]]".format(s) for s in related_topics)), ""]
+    if coverage is not None:
+        profile = cov.page_evidence_profile(
+            evidences, coverage, [it["refs"] for it in (qa["points"] + qa["caveats"])])
+        L += cov.render_coverage_block(coverage, profile, kind="qa")
+    if stub is not None:
+        L += cov.render_insufficient_section(stub, kind="qa", force_command=force_command)
+    keeper_of = coverage.keeper_of if coverage is not None else None
     # v3 B：审计状态提示放在 answer 之前——读者先看到「这页有没有被查过、查出了什么」
     audit = qa.get("audit") or {}
     if audit.get("status") == "failed":
@@ -1238,17 +1273,22 @@ def render_qa_block(question: str, qa: dict, evidences, *,
             L += ["> ⚠️ 本页有 {} 条论断审计判为不忠实（已标 ❌），"
                   "answer 可能受其影响。".format(n_bad), ""]
     if qa["answer"]:
+        if coverage is not None:
+            note = cov.answer_support_notice([p["refs"] for p in qa["points"]], ev_map,
+                                             coverage.keeper_of)
+            if note:
+                L += [note, ""]
         L += ["> {}".format(qa["answer"]), ""]
 
     if qa["points"]:
         L += ["## 依据", ""]
         for p in qa["points"]:
-            L += _claim_lines(p, ev_map)
+            L += _claim_lines(p, ev_map, keeper_of)
         L.append("")
     if qa["caveats"]:
         L += ["## ⚠️ 用之前要知道的", ""]
         for c in qa["caveats"]:
-            L += _claim_lines(c, ev_map)
+            L += _claim_lines(c, ev_map, keeper_of)
         L.append("")
     if qa["gaps"]:
         # A1【本轮最严重】首版这一节叫「本次没答上来的」，正文写着
@@ -1261,10 +1301,7 @@ def render_qa_block(question: str, qa: dict, evidences, *,
         # **答错了用户还能核对，指错方向他不会去核对**——这一节按设计没有出处可点。
         hits_by_gap = qa.get("gap_hits") or {}
         L += ["## 本次召回没覆盖到的", "",
-              "这是**本次这 {} 条证据**没能回答的部分，**不等于库里没有**——"
-              "召回是按单个问题从全库切出来的窄切片，召回不到 ≠ 不存在。"
-              "决定要不要去补文献之前，先查 `topics/INDEX.md` 与 `notes_search.py`。".format(
-                  len(evidences)), ""]
+              cov.render_gap_disclaimer("qa", len(evidences)), ""]
         for g in qa["gaps"]:
             L.append("- {}".format(g))
             hits = hits_by_gap.get(g) or []
@@ -1342,7 +1379,8 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
                          min_sim: Optional[float] = None,
                          max_evidence: Optional[int] = None,
                          per_paper_cap: Optional[int] = None,
-                         recall_stats: Optional[Dict[str, Any]] = None) -> str:
+                         recall_stats: Optional[Dict[str, Any]] = None,
+                         coverage: Optional["cov.CoverageContext"] = None) -> str:
     """受管键由生成器覆盖，用户自加键原样保留（同 topics/vault 的既有约定）。
 
     `first_asked_at` 是**唯一一个"存在就不覆盖"的受管键**：同一个问题再问一次是
@@ -1416,8 +1454,18 @@ def build_qa_frontmatter(question: str, slug: str, qa: dict, evidences,
         "ask_min_sim": min_sim,
         "ask_max_evidence": max_evidence,
         "ask_per_paper_cap": per_paper_cap,
-        "tags": ["札记/问答归档"],
     }
+    if coverage is not None:
+        # WO-5：覆盖统计 / evidence_status / 合成模型留痕；audit_model 取审计应答者（取不到记请求值）
+        a_info = qa.get("audit") or {}
+        coverage.audit_model = (a_info.get("served_model") or a_info.get("requested_model")
+                                if a_info.get("status") in ("ok", "failed") else None)
+        managed.update(cov.frontmatter_items(
+            coverage,
+            cov.page_evidence_profile(evidences, coverage,
+                                      [it["refs"] for it in (qa["points"] + qa["caveats"])]),
+            include_audit_model=True))
+    managed["tags"] = ["札记/问答归档"]
     items = dict(managed)
     for k, v in preserved.items():
         if k not in managed:
@@ -2146,10 +2194,15 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
                   min_sim: Optional[float] = None,
                   max_evidence: Optional[int] = None,
                   per_paper_cap: Optional[int] = None,
-                  recall_stats: Optional[Dict[str, Any]] = None) -> Tuple[Path, str]:
+                  recall_stats: Optional[Dict[str, Any]] = None,
+                  coverage: Optional["cov.CoverageContext"] = None,
+                  stub: Optional["cov.Sufficiency"] = None,
+                  force_command: str = "") -> Tuple[Path, str]:
     """落盘 `topics/qa/<slug>.md`，走与概念页同一套哨兵合并。返回 `(路径, 状态)`。
 
-    状态：`new` / `merged` / `conflict` / `unchanged` / `taken`。
+    状态：`new` / `merged` / `conflict` / `unchanged` / `taken` / `regressed`。
+    `regressed`（WO-5，仅 `stub` 非 None 时）：已有的非存根页以前达标、这次判不足——多半是
+    向量库/阈值故障而非真实状态，不覆盖（倒退保护，同 topics._write_insufficient_topic）。
     走哨兵而不是直接覆盖：这一页天然会被人在旁边写批注（"这个答案我核对过，第 3 条不对"），
     那正是它的用法。生成块被手改时报 conflict 而不是强行覆盖，同 vault 约定。
 
@@ -2174,15 +2227,18 @@ def write_qa_page(qa_dir, slug: str, question: str, qa: dict, evidences,
     prev_q = (fresh_fm or {}).get("question")
     if prev_q and question_key(prev_q) != question_key(question):
         return path, "taken"
+    if stub is not None and _prior_page_sources(fresh_fm) >= QA_MIN_INDEPENDENT_SOURCES:
+        return path, "regressed"
     gen_block = render_qa_block(question, qa, evidences, related_topics=related_topics,
                                 titles=titles, nearby_papers=nearby_papers,
                                 crops=page_shots.crop_index(
-                                    qa_dir.parent.parent / page_shots._SHOT_SUBDIR))
+                                    qa_dir.parent.parent / page_shots._SHOT_SUBDIR),
+                                coverage=coverage, stub=stub, force_command=force_command)
     fm = build_qa_frontmatter(question, slug, qa, evidences, report,
                               now.isoformat(timespec="seconds"), preserved=fresh_fm,
                               extra_queries=extra_queries, roles=roles, min_sim=min_sim,
                               max_evidence=max_evidence, per_paper_cap=per_paper_cap,
-                              recall_stats=recall_stats)
+                              recall_stats=recall_stats, coverage=coverage)
     content, status = merge_qa_page(fm, gen_block, fresh_existing, generator=QA_GENERATOR)
     if content is None:
         return path, "conflict"

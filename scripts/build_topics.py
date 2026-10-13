@@ -38,6 +38,7 @@ from src.scholar.llm_client import LLMClient                              # noqa
 from src.scholar.notes_index import load_index_file                       # noqa: E402
 from src.scholar.research_profile import get_default_research_interests   # noqa: E402
 from src.scholar import topics as T                                       # noqa: E402
+from src.scholar.thresholds import TOPIC_MIN_INDEPENDENT_SOURCES         # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
 
 logger = get_logger("build_topics")
@@ -52,7 +53,9 @@ def _load_index(index_path: Path):
 
 
 def _fmt(r: T.TopicResult) -> str:
-    icon = {"new": "🆕", "merged": "✅", "conflict": "⚠️", "skipped": "⏭️", "failed": "❌"}
+    # 📭 证据不足存根：不是失败（不以 ❌/⚠️ 开头，summarize_build_topics_run 不会把它当失败页）
+    icon = {"new": "🆕", "merged": "✅", "conflict": "⚠️", "skipped": "⏭️", "failed": "❌",
+            "insufficient": "📭"}
     line = "{} {:<28} 证据 {:>3} 条 / {:>2} 篇".format(
         icon.get(r.status, "?"), r.slug, r.n_evidence, r.n_papers)
     if r.report:
@@ -111,6 +114,9 @@ def main() -> int:
                          "同一天全部过期），无上限会让单次运行连续跑 8×3-4 分钟 LLM 合成，正是 "
                          "P2 路由机制本来要避免的成本形状，也更容易撞订阅限流（默认 3，<=0 不限）")
     ap.add_argument("--model", default=None, help="覆盖合成用的 LLM 模型")
+    ap.add_argument("--force-synthesize", action="store_true",
+                    help="证据不足（独立来源 < {}）时也照常调 LLM 合成，页面标注“证据不足时被强制生成”。"
+                         "默认遇到证据不足会落存根页、不调 LLM".format(TOPIC_MIN_INDEPENDENT_SOURCES))
     ap.add_argument("--dry-run", action="store_true", help="只跑召回统计，不调用 LLM、不落盘")
     ap.add_argument("--list", action="store_true", help="列出配置里的概念页后退出")
     ap.add_argument("--verify", action="store_true",
@@ -352,6 +358,8 @@ def main() -> int:
                     min_sim=args.min_sim, per_paper_cap=args.per_paper_cap,
                     bucket_bonus=args.bucket_bonus,
                     model=args.model, dry_run=args.dry_run,
+                    force_synthesize=args.force_synthesize,
+                    certification_path=repo_path("config/filter_eval/certification.json"),
                 )
             except T.TopicError as e:
                 r = T.TopicResult(slug=spec.slug, status="failed", error=str(e))
@@ -373,7 +381,8 @@ def main() -> int:
             # 连败打断），也不是 provider 故障（不能累加）。
             if r.status == "failed":
                 streak += 1
-            elif r.status != "conflict":
+            elif r.status not in ("conflict", "insufficient"):
+                # 存根页同样没打 LLM：对连败计数中性（既不证明 provider 恢复，也不是故障）
                 streak = 0
             print("  " + _fmt(r))
     finally:
@@ -394,9 +403,13 @@ def main() -> int:
     for r in results:
         print(_fmt(r))
     bad = [r for r in results if r.status in ("failed", "conflict")]
-    print("{} 页成功 · {} 页跳过 · {} 页失败或冲突".format(
+    insufficient = [r for r in results if r.status == "insufficient"]
+    print("{} 页成功 · {} 页跳过 · {} 页证据不足（存根，不算失败） · {} 页失败或冲突".format(
         sum(1 for r in results if r.status in ("new", "merged")),
-        sum(1 for r in results if r.status == "skipped"), len(bad)))
+        sum(1 for r in results if r.status == "skipped"), len(insufficient), len(bad)))
+    if insufficient:
+        print("ℹ️ 证据不足存根 {} 页：{}（认为是误拒可对该页加 --force-synthesize）".format(
+            len(insufficient), ", ".join(r.slug for r in insufficient)))
     return 1 if bad else 0
 
 

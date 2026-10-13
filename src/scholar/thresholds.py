@@ -107,3 +107,47 @@ DIGEST_NEIGHBOR_MIN_SIM = 0.62
 # 标定档案本身一直是齐的，但值留在 qa.py 就绕开了本文件的铁律，换 embedding 时
 # 扫不到。qa.py 侧保留同名别名以兼容既有引用。
 QA_GAP_EVIDENCE_MIN_SIM = 0.65
+
+# ---------------------------------------------------------------------------
+# 证据充分性（拒答闸门，可信度加固 WO-4 / WO-4b 标定，WO-5 接线）
+# ---------------------------------------------------------------------------
+# 页面级闸门：召回到的独立来源（按 keeper 去重、撤稿不计）太少时不调 LLM，落一页
+# 「库内证据不足」存根（`--force-synthesize` 可跳过）。两条链路用**不同判据**，原因如下。
+#
+# 标定档案：docs/decisions/evidence_sufficiency_calibration_2026-10-13.md（WO-4，固定阈值）
+#           docs/decisions/evidence_sufficiency_distribution_2026-10-13.md（WO-4b，分布判据）
+# 样本：正例 20（9 概念页 + 6 已归档问答 + **5 道代拟冷门题**）、反例 13（含 3 道平凡反例）。
+#
+# 摘要（诚实版）：
+#   * 分布判据**没有显著优于**固定阈值：样本内漏拒 1/13 对 3/13，但留一检验两者都漏拒 3/13
+#     （误拒都是 0），样本内那点优势不能外推。三道难例（机器人抓取、影像分割数据增强、
+#     糖尿病视网膜病变筛查）两种判据都分不开——它们在库里有真实的 ML/影像方法学近邻，
+#     相似度本身不区分「相邻但画像外」。真正兜底的是页面顶部的覆盖范围说明，不是闸门。
+#   * 5 道冷门正例是**代拟的**，用户尚未替换；这组样本决定了余量（Rubin 1976 一类题恰好卡线），
+#     替换后须复跑标定再回头核对下面的取值。
+#   * 换 embedding 模型后必须重标：
+#       python scripts/calibrate_evidence_sufficiency.py --mode distribution --notes-dir <新快照>
+#       python scripts/calibrate_evidence_sufficiency.py --mode fixed        --notes-dir <新快照>
+#     floor 与固定下限与模型的余弦分布绑定，必须重标；e 不必（z* 随背景规模 N 自动变）。
+
+# --- 问答页：分布判据（coverage.dynamic_sufficiency，基于全库扫描，不经召回截断）---
+# 动态阈值 T = max(EVIDENCE_DYNAMIC_FLOOR, mean + z*·std)，z* = Φ⁻¹(1 − e/N)；
+# 独立来源数 = 全库扫描里最高分 ≥ T 的 keeper 数，< QA_MIN_INDEPENDENT_SOURCES 即拒答。
+# 0.58 是绝对下限：冷门问题（Rubin 1976、影子变量，背景均值约 0.35）上真正起作用的就是它。
+EVIDENCE_DYNAMIC_FLOOR = 0.58
+# e：N 个背景点里期望只有 e 个靠偶然越过阈值（e=1、N≈3.7 万时 z*≈4.04）。名义值，非显著性水平。
+EVIDENCE_DYNAMIC_EXPECTED_CHANCE = 1.0
+# m=2：WO-4b 的「稳」档（正例余量 1，漏拒 3/13，与固定阈值持平）。激进档 m=3 漏拒 1/13，
+# 但 4 个正例恰好卡线（余量 0），一道更冷的真实问题就会误拒；Q8「宁可回避不足也不误拒」。
+QA_MIN_INDEPENDENT_SOURCES = 2
+# 问答 answer 级判据：points 引用的独立来源合计不足此数，answer 前加「库内证据不足」提示行。
+# **未标定**（需要真实合成出的 points，无 LLM 无法评估）；已归档 6 页「依据」篇数 5~14，均不触发。
+QA_ANSWER_MIN_SOURCES = 2
+
+# --- 概念页：固定判据（WO-4，按召回后的证据列表计数）---
+# WO-4b 实测概念页背景高（均值 0.46~0.48），动态阈值会被抬到 0.63~0.69，部分页来源数只剩
+# 3 篇（adversarial-evidence），余量远小于固定判据（9 页在 0.55 下每页 ≥ 45 篇，k=3 余量 41），
+# 所以概念页**不接动态判据**。下限取 TOPICS_MIN_SIM 同值 0.55（召回本身的门槛，概念页的
+# 所有证据都已 ≥ 它；这里单列常量，是为了日后召回门槛变动不会悄悄改掉拒答口径）。
+EVIDENCE_SUFFICIENCY_MIN_SIM = 0.55
+TOPIC_MIN_INDEPENDENT_SOURCES = 3

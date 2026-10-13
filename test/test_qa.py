@@ -824,12 +824,12 @@ def test_an_old_schema_page_is_flagged_but_not_treated_as_tampered(tmp_path):
           'generated_at: "2026-01-01T00:00:00"\n---')
     old.write_text(T.assemble(fm, Q.render_qa_block("问题", _QA, EVS),
                               T.DEFAULT_USER_ZONE, generator=Q.QA_GENERATOR),
-                   encoding="utf-8")   # T.assemble 写的是 TOPIC_SCHEMA_VERSION=1
+                   encoding="utf-8")   # T.assemble 写的是 TOPIC_SCHEMA_VERSION（< QA_SCHEMA_VERSION，仍是“旧防线页”）
     _fm, body = V.split_frontmatter(old.read_text(encoding="utf-8"))
     assert not V.generated_block_tampered(body)
 
     a = Q.audit_qa_pages(d, {"papers": []})[0]
-    assert a.schema_version == 1 and a.outdated
+    assert a.schema_version == T.TOPIC_SCHEMA_VERSION and a.outdated
 
     _p, status = Q.write_qa_page(d, "qa-old", "问题", _QA, EVS, T.ValidationReport())
     assert status in ("merged", "unchanged"), "版本号前进不该把既有页面变成 conflict"
@@ -1784,7 +1784,7 @@ def test_an_old_page_with_a_clean_local_scan_is_not_flagged_for_a_rerun(tmp_path
     index = {"papers": [{"citekey": e.citekey, "highlights": [{"text": "证据句"}]}
                         for e in EVS]}
     a = Q.audit_qa_pages(d, index)[0]
-    assert a.schema_version == 1 and a.outdated, "版本号本身照旧如实报告"
+    assert a.schema_version == T.TOPIC_SCHEMA_VERSION and a.outdated, "版本号本身照旧如实报告"
     assert a.ok
     assert not a.needs_rerun, "本地自检无异常的旧页不该被催着重跑"
 

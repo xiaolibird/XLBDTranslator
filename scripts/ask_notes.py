@@ -83,6 +83,8 @@ from src.scholar.llm_client import LLMClient                              # noqa
 from src.scholar.research_profile import get_default_research_interests   # noqa: E402
 from src.scholar.notes_index import load_index_file, write_if_changed     # noqa: E402
 from src.scholar import qa as Q                                           # noqa: E402
+from src.scholar.thresholds import QA_MIN_INDEPENDENT_SOURCES            # noqa: E402
+from src.scholar import coverage as COV                                   # noqa: E402
 from src.scholar import topics as T                                       # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
 
@@ -218,7 +220,8 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
             strict: bool = False, audit_template: Optional[str] = None,
             theory: Optional[bool] = None,
             theory_min_sim: float = Q.DEFAULT_THEORY_MIN_SIM,
-            theory_max: int = Q.DEFAULT_THEORY_MAX_BACKFILL) -> AskOutcome:
+            theory_max: int = Q.DEFAULT_THEORY_MAX_BACKFILL,
+            force_synthesize: bool = False) -> AskOutcome:
     """问一个问题（`question`）、落到确定的 `slug`。`store`/`embed_client`/
     `topic_specs`/`template`/`topic_vecs` 都是调用方已经准备好、可能跨多次调用
     复用的资源，本函数不负责创建或关闭它们（`embed_client.close()` 由最外层的
@@ -227,6 +230,11 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
     与旧版单问题流程唯一的行为差异：不良结局不再让整个进程 `sys.exit`，而是
     包成 `AskOutcome(status="failed"/"taken"/...)` 返回——`main()` 据此决定单个
     问题时的退出码，或在批量场景里继续处理下一页。
+
+    WO-5 证据充分性闸门（分布判据，见 thresholds「证据充分性」）：召回之后、合成之前，按
+    该问题自身的全库相似度分布判一次，独立来源不足时**不调 LLM**，归档「库内证据不足」存根页
+    （`status="insufficient"`，退出码 0，存根页本身就是一个答案：问过了，库里不够）。
+    `force_synthesize` 跳过闸门照常合成，页面标注“证据不足时被强制生成”。
     """
     try:
         spec = Q.build_qa_spec(question, extra_queries=extra_queries, roles=roles,
@@ -307,6 +315,54 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
     print("   证据 {} 条 / {} 篇（相似度 {:.2f}~{:.2f}）".format(
         len(evidences), n_papers, evidences[-1].score, evidences[0].score))
 
+    ctx = COV.build_context(index, certification_path=repo_path("config/filter_eval/certification.json"))
+    suff = COV.qa_dynamic_verdict(spec, store, embed_client, ctx.keeper_of)
+    ctx.sufficiency = suff
+    d = suff.detail
+    print("📏 证据充分性（分布判据）：独立来源 {} 篇达标（要求 ≥ {}），动态阈值 {:.3f}{}，最高来源 {:.3f}  → {}".format(
+        suff.n_sources, suff.min_sources, suff.sim_threshold,
+        "（下限起作用）" if d.get("floor_binding") else "", suff.top1,
+        "不足" if suff.refuse else "充足"))
+    stub_command = "{} --force-synthesize".format(Q.update_command(slug, question))
+    if suff.refuse and not force_synthesize:
+        if dry_run:
+            print("【dry-run】证据不足：真跑会归档存根页（不调用 LLM）。归档路径会是：{}/{}.md".format(
+                qa_dir, slug))
+            return AskOutcome(slug=slug, question=question, status="dry_run",
+                              n_evidence=len(evidences), n_papers=n_papers)
+        ctx.status = COV.EVIDENCE_STATUS_INSUFFICIENT
+        stub_qa = {"answer": "", "points": [], "caveats": [], "gaps": [], "inline_refs": []}
+        path, status = Q.write_qa_page(
+            qa_dir, slug, question, stub_qa, evidences, Q.QAValidationReport(),
+            related_topics=related_topics, nearby_papers=nearby, titles=titles,
+            extra_queries=extra_queries, roles=roles, min_sim=min_sim,
+            max_evidence=max_evidence, per_paper_cap=per_paper_cap, recall_stats=recall_stats,
+            coverage=ctx, stub=suff, force_command=stub_command)
+        if status == "regressed":
+            msg = ("证据数倒退：这一页以前有足够的独立来源，这次判不足（{} < {}）——多半是向量库/阈值"
+                   "故障而非真实状态，未覆盖。先查向量库同步；确认无误可加 --force-synthesize。".format(
+                       suff.n_sources, suff.min_sources))
+            print("❌ {}".format(msg), file=sys.stderr)
+            return AskOutcome(slug=slug, question=question, status="failed", detail=msg,
+                              n_evidence=len(evidences), n_papers=n_papers)
+        if status == "taken":
+            print("❌ slug '{}' 在这次归档期间被另一个问题占用了，本次未落盘。".format(slug),
+                  file=sys.stderr)
+            return AskOutcome(slug=slug, question=question, status="taken",
+                              n_evidence=len(evidences), n_papers=n_papers)
+        print("\n📭 库内证据不足（独立来源 {} < {}），未调用 LLM，已归档存根页：{}（{}）".format(
+            suff.n_sources, suff.min_sources, path, status))
+        print("   认为是误拒：{}".format(stub_command))
+        if status == "conflict":
+            print("   哨兵缺失或生成块被手改，未覆盖——把批注移到「我的批注」下后重跑。",
+                  file=sys.stderr)
+            return AskOutcome(slug=slug, question=question, status="conflict",
+                              n_evidence=len(evidences), n_papers=n_papers)
+        return AskOutcome(slug=slug, question=question, status="insufficient",
+                          detail="独立来源 {} < {}".format(suff.n_sources, suff.min_sources),
+                          n_evidence=len(evidences), n_papers=n_papers)
+    ctx.status = COV.EVIDENCE_STATUS_FORCED if suff.refuse else COV.EVIDENCE_STATUS_OK
+
     if dry_run:
         show = max(1, int(show))
         for e in evidences[:show]:
@@ -324,9 +380,10 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                                get_default_research_interests(),
                                Q.previous_answer(qa_dir, slug, question))
     llm = LLMClient(settings.llm)
+    synth_meta: Dict[str, Any] = {}
     try:
         try:
-            data = Q.synthesize_qa(llm, prompt, model=model)
+            data = Q.synthesize_qa(llm, prompt, model=model, meta_out=synth_meta)
         except T.TopicError as e:
             print("❌ 合成失败（召回本身正常：{} 条证据 / {} 篇）：{}".format(
                 len(evidences), n_papers, e), file=sys.stderr)
@@ -354,6 +411,7 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                             model=audit_model or model, strict=strict, report=report)
     finally:
         llm.close()
+    ctx.synth = COV.synth_fields(synth_meta, model)
 
     if not Q.is_archivable(qa):
         print("❌ 校验后没有任何带出处的论断（丢弃 {} 条，非法编号 {} 个）——"
@@ -367,13 +425,16 @@ def _run_one(question: str, slug: str, *, qa_dir: Path, index: dict, titles: Dic
                                    related_topics=related_topics, nearby_papers=nearby,
                                    titles=titles, extra_queries=extra_queries, roles=roles,
                                    min_sim=min_sim, max_evidence=max_evidence,
-                                   per_paper_cap=per_paper_cap, recall_stats=recall_stats)
+                                   per_paper_cap=per_paper_cap, recall_stats=recall_stats,
+                                   coverage=ctx)
     if status == "taken":
         print("❌ slug '{}' 在这次合成期间被另一个问题占用了，本次未落盘。".format(slug),
               file=sys.stderr)
         return AskOutcome(slug=slug, question=question, status="taken",
                           n_evidence=len(evidences), n_papers=n_papers)
     icon = {"new": "🆕", "merged": "✅", "unchanged": "＝", "conflict": "⚠️"}.get(status, "?")
+    if ctx.status == COV.EVIDENCE_STATUS_FORCED:
+        print("⚠️ 证据不足时被强制生成（--force-synthesize）：页面已标注，结论请当线索而非定论。")
 
     print()
     if qa["answer"]:
@@ -492,8 +553,10 @@ def _load_reask_target(qa_dir: Path, raw_slug: str, args
 
 
 _BATCH_ICON = {"new": "🆕", "merged": "✅", "unchanged": "＝", "conflict": "⚠️",
-              "taken": "❌", "skipped": "⏭️", "failed": "❌", "dry_run": "🔍"}
-_BATCH_ORDER = ("new", "merged", "unchanged", "dry_run", "skipped", "conflict", "taken", "failed")
+              "taken": "❌", "skipped": "⏭️", "failed": "❌", "dry_run": "🔍",
+              "insufficient": "📭"}
+_BATCH_ORDER = ("new", "merged", "unchanged", "insufficient", "dry_run", "skipped", "conflict",
+                "taken", "failed")
 
 
 def _print_batch_summary(outcomes: Sequence[AskOutcome]) -> None:
@@ -593,6 +656,10 @@ def main() -> int:
     ap.add_argument("--no-topic-check", action="store_true",
                     help="跳过「已经有一页概念页在回答这个问题」的比对。注意它同时会让"
                          "归档页顶部那条「相关概念页」消失——两件事是同一份数据")
+    ap.add_argument("--force-synthesize", action="store_true",
+                    help="证据不足（分布判据：独立来源 < {}）时也照常调 LLM 合成，页面标注“证据不足时被强制生成”。"
+                         "默认遇到证据不足会归档存根页、不调 LLM（退出码仍为 0）".format(
+                             QA_MIN_INDEPENDENT_SOURCES))
     ap.add_argument("--dry-run", action="store_true",
                     help="只跑召回，看能捞到多少证据，不调 LLM、不落盘。"
                          "与 --reask/--reask-all 组合时对每一页都只跑召回")
@@ -864,7 +931,8 @@ def main() -> int:
                          no_topic_check=args.no_topic_check, show=args.show,
                          audit_mode=args.audit, audit_model=args.audit_model,
                          strict=args.strict, theory=args.theory,
-                         theory_min_sim=args.theory_min_sim, theory_max=args.theory_max)
+                         theory_min_sim=args.theory_min_sim, theory_max=args.theory_max,
+                         force_synthesize=args.force_synthesize)
 
             if reask_mode:
                 for target in prevalidated_targets:
@@ -901,12 +969,12 @@ def main() -> int:
     # 调用过 `write_qa_page`（dry-run 提前退出、0 证据提前退出、合成/校验失败、
     # slug 占用），此时目录内容与运行前逐字节相同，重建只是空转 IO。dry-run 更是
     # **不能**碰——它对用户的承诺是"未调用 LLM、未落盘"，INDEX.md 也是盘。
-    if qa_dir.exists() and any(o.status in ("new", "merged", "unchanged", "conflict")
+    if qa_dir.exists() and any(o.status in ("new", "merged", "unchanged", "conflict", "insufficient")
                                for o in outcomes):
         idx = qa_dir / "INDEX.md"
         write_if_changed(idx, Q.render_qa_index(qa_dir))
         print("📇 问答目录：{}".format(idx))
-    if any(o.status in ("new", "merged") for o in outcomes):
+    if any(o.status in ("new", "merged", "insufficient") for o in outcomes):
         # B3 后续：vault job 的 WatchPaths 已补上 `topics/` 与 `topics/qa/`（W5 完整
         # 修复），归档落盘会在节流窗口（约 2 分钟）后自动同步进 Obsidian——原来这里
         # 教用户手动跑的是一件如今已自动化的事。保留兜底命令给"怀疑没触发"的场景。

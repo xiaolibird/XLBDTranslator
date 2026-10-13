@@ -1212,7 +1212,8 @@ def test_build_topic_does_not_lose_annotation_written_during_synthesis(tmp_path)
     index = {"papers": [{"citekey": "aKey", "title": "T"}]}
     result = T.build_topic(spec, store=store, embed_client=_FakeEmbedClient(),
                            llm=_LLMEditsFileDuringCall(), index=index,
-                           topics_dir=topics_dir, template="模板", min_sim=0.5)
+                           topics_dir=topics_dir, template="模板", min_sim=0.5,
+                           force_synthesize=True)   # 本测试只测 lost-update；单来源夹具会被 WO-5 闸门拦下
 
     assert result.status == "merged"
     final = path.read_text(encoding="utf-8")
@@ -1258,7 +1259,8 @@ def test_build_topic_does_not_lose_frontmatter_key_added_during_synthesis(tmp_pa
     index = {"papers": [{"citekey": "aKey", "title": "T"}]}
     result = T.build_topic(spec, store=store, embed_client=_FakeEmbedClient(),
                            llm=_LLMAddsFrontmatterKeyDuringCall(), index=index,
-                           topics_dir=topics_dir, template="模板", min_sim=0.5)
+                           topics_dir=topics_dir, template="模板", min_sim=0.5,
+                           force_synthesize=True)   # 本测试只测 lost-update；单来源夹具会被 WO-5 闸门拦下
 
     assert result.status == "merged"
     from src.scholar.vault import split_frontmatter
