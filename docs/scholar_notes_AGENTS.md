@@ -347,7 +347,7 @@ PYTHONPATH=. python scripts/ask_notes.py --reask-all --dry-run          # 每页
 `jq`/`notes_query.py` 是精确子串匹配；查不到换述表达（如中文"缺失机制不可忽略"查不到英文
 "informative missingness"）时改用 `PYTHONPATH=. python scripts/notes_search.py <查询...>
 [--role ...] [--json]`(默认 `--mode hybrid`=向量+BM25 关键词融合)。句级证据同样只覆盖库内
-约三成精读文献(668/2254,截至 2026-08-21;实时数以 literature_index.json 为准),语义命中若
+约四成精读文献(1095/2743,截至 2026-10-13;实时数以 literature_index.json 为准),语义命中若
 标注"该篇无精读句级证据"是真的没有,不是没搜到。
 
 ## 检索流程(四步法)
