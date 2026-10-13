@@ -595,6 +595,9 @@ def test_llm_failure_counts_as_fallback_dropped(tmp_path):
 
 def test_neighbor_exclude_set_during_call_and_cleared_after(tmp_path):
     wf = _wf(tmp_path)
+    # 与环境无关：notes_dir 指到不存在的临时目录，真实 _library_neighbors 必走「向量库不存在」降级分支，
+    # 绝不会碰仓库 output/ 里的生产向量库
+    wf.settings.processing.notes_dir = tmp_path / "no_such_notes"
     it = _gi(1)
     it["citekey"] = "self2020"
     seen = {}
