@@ -42,29 +42,56 @@ class CallMeta:
     at: str                        # ISO 时间（秒）
 
 
-def _claude_envelope_served_model(envelope: dict) -> Optional[str]:
+def _claude_envelope_served_model(envelope: dict, requested: Optional[str] = None) -> Optional[str]:
     """从 claude CLI `--output-format json` 信封取实际应答的模型 id。
 
-    信封顶层 `modelUsage` 是以模型 id 为键的字典（键形如 claude-sonnet-…），值里带
-    `outputTokens`（驼峰，对齐 Claude Agent SDK 的 ModelUsage 类型，二进制内亦有
-    outputTokens/costUSD 字样；防御性兼容下划线写法）。一次调用可能含多个模型
-    （如子任务用了 haiku），取输出 token 最多的那个；并列取先出现者。
-    信封没有 modelUsage 或结构不符 → None（调用方据此退化，不猜）。
+    信封顶层 `modelUsage` 是以模型 id 为键的字典，值含 inputTokens / outputTokens /
+    cacheReadInputTokens / cacheCreationInputTokens / canonicalModel 等（驼峰）。
+    一次调用里常有多个模型：CLI 会在后台用 haiku 做辅助调用。
+
+    **不能按 outputTokens 取最大**。2026-10-13 真实信封（请求 sonnet、提示「只回复 ok」）：
+      claude-haiku-4-5-20251001  inputTokens 902, outputTokens 9   （CLI 后台辅助）
+      claude-sonnet-5-5          inputTokens 2, cacheCreationInputTokens 37869, outputTokens 4（真正应答者）
+    按 outputTokens 会记成 haiku。选择规则：
+      1. 先找与请求模型同族的条目：requested（alias 如 sonnet/opus/haiku 或完整 id）等于
+         key / canonicalModel，或作为子串出现在其中；多个命中取输入侧 token 之和最大者；
+      2. 没有匹配（如请求值被主链覆写、alias 对不上）→ 取「inputTokens + cacheReadInputTokens
+         + cacheCreationInputTokens」最大的条目（主对话承载整份提示）；
+      3. 仍无法判定（无 modelUsage / 结构畸形 / 输入侧全并列为 0 且无匹配）→ None，不猜。
     """
     usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
     if not isinstance(usage, dict) or not usage:
         return None
-    best, best_tok = None, -1
+
+    def _num(u, *keys):
+        for k in keys:
+            v = u.get(k) if isinstance(u, dict) else None
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return v
+        return 0
+
+    rows = []   # (key, 输入侧 token 之和, canonical)
     for mid, u in usage.items():
         if not isinstance(mid, str) or not mid:
             continue
-        tok = 0
-        if isinstance(u, dict):
-            v = u.get('outputTokens', u.get('output_tokens', 0))
-            tok = v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
-        if tok > best_tok:
-            best, best_tok = mid, tok
-    return best
+        inp = (_num(u, 'inputTokens', 'input_tokens')
+               + _num(u, 'cacheReadInputTokens', 'cache_read_input_tokens')
+               + _num(u, 'cacheCreationInputTokens', 'cache_creation_input_tokens'))
+        canon = u.get('canonicalModel') if isinstance(u, dict) else None
+        rows.append((mid, inp, canon if isinstance(canon, str) else ''))
+    if not rows:
+        return None
+
+    req = (requested or '').strip().lower()
+    if req:
+        hit = [r for r in rows if req == r[0].lower() or req == r[2].lower()
+               or req in r[0].lower() or (r[2] and req in r[2].lower())]
+        if hit:
+            return max(hit, key=lambda r: r[1])[0]
+    best = max(rows, key=lambda r: r[1])
+    if best[1] <= 0 and len(rows) > 1:
+        return None   # 无任何输入侧信息且多模型，无法判定
+    return best[0]
 
 
 class _RetryableHTTP(Exception):
@@ -486,8 +513,8 @@ class LLMClient:
         CallMeta 记的是**实际应答者**（链位、provider 取自应答那份 conn），与请求值无关；
         每次调用独立产出，不依赖「最后一次调用」类实例状态，多线程不串线。
         served_model 取值来源：openai-compatible（deepseek/ollama）= 响应体顶层 `model`；
-        gemini = 响应对象 `model_version`；claude-agent = 信封 `modelUsage` 中输出 token
-        最多的模型 id。取不到一律 None。
+        gemini = 响应对象 `model_version`；claude-agent = 信封 `modelUsage` 中与请求模型同族
+        的条目（无匹配取输入侧 token 最大者）。取不到一律 None。
         """
         with self._conn_lock:
             base_idx, base_gen = self._chain_idx, self._sticky_gen
@@ -689,7 +716,7 @@ class LLMClient:
 
         stop = envelope.get('stop_reason')
         term = envelope.get('terminal_reason')
-        served = _claude_envelope_served_model(envelope)
+        served = _claude_envelope_served_model(envelope, model)
         out_tok = (envelope.get('usage') or {}).get('output_tokens')
         # 错误类信封（subtype=error_*）**没有 result 字段，只有 errors[]**；
         # 只取 result 会让 msg 恒为空串，关键词分类与 _is_content_refusal 全部落空。

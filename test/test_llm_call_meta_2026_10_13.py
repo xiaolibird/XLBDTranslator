@@ -5,9 +5,8 @@
 真实应答者、多线程不串线、各 provider 分支的 served_model 解析、降级半截正文标记、
 call() 与 call_with_meta() 文本一致。全部桩/mock，不联网、不调真实 LLM。
 
-claude-agent 信封样本说明：modelUsage 是以模型 id 为键、值含 outputTokens 的字典，
-结构依据 Claude Agent SDK 的 ModelUsage 类型（本机 CLI 2.1.287 二进制内可见 modelUsage /
-outputTokens / costUSD 字样）。样本为按该结构手写的固定夹具，没有真实调用抓取。
+claude-agent 信封样本：test/fixtures/claude_envelope_real_2026-10-13.json 是真实 CLI 信封
+（请求 sonnet）精简而来，保留 modelUsage 全部字段；其余合成用例按同结构手写。
 """
 import json
 import threading
@@ -177,8 +176,8 @@ def _agent_envelope(**over):
     e = {"is_error": False, "stop_reason": "end_turn", "terminal_reason": "completed",
          "api_error_status": None, "result": "hello", "usage": {"output_tokens": 50},
          "modelUsage": {
-             "claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 5, "costUSD": 0.0001},
-             "claude-sonnet-5-5": {"inputTokens": 100, "outputTokens": 45, "costUSD": 0.01},
+             "claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 50, "costUSD": 0.0001},
+             "claude-sonnet-5-5": {"inputTokens": 100, "outputTokens": 4, "costUSD": 0.01},
          }}
     e.update(over)
     return e
@@ -195,10 +194,39 @@ def _run_agent(client, envelope, json_mode=False, **call_kw):
         return client.call_with_meta("p", json_mode=json_mode, **call_kw)
 
 
-def test_claude_agent_取modelUsage中输出token最多的模型():
-    text, meta = _run_agent(_agent_client(), _agent_envelope())
-    assert text == "hello"
-    assert (meta.provider, meta.served_model) == ("claude-agent", "claude-sonnet-5-5")
+def _real_envelope():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "fixtures" /
+                       "claude_envelope_real_2026-10-13.json").read_text(encoding="utf-8"))
+
+
+def test_真实信封_请求sonnet_取sonnet而不是输出token更多的haiku():
+    env = _real_envelope()
+    # 夹具自检：haiku 的 outputTokens 确实更大，旧规则会判错
+    assert env["modelUsage"]["claude-haiku-4-5-20251001"]["outputTokens"] > \
+        env["modelUsage"]["claude-sonnet-5-5"]["outputTokens"]
+    c = _agent_client()
+    text, meta = _run_agent(c, env, model="sonnet")
+    assert text == "ok"
+    assert meta.served_model == "claude-sonnet-5-5"
+    assert _claude_envelope_served_model(env, "sonnet") == "claude-sonnet-5-5"
+    assert _claude_envelope_served_model(env, "claude-sonnet-5-5") == "claude-sonnet-5-5"
+
+
+def test_请求haiku时取haiku():
+    assert _claude_envelope_served_model(_real_envelope(), "haiku") == "claude-haiku-4-5-20251001"
+
+
+def test_请求值无匹配_退化为输入侧token最大者():
+    env = _real_envelope()
+    assert _claude_envelope_served_model(env, "opus") == "claude-sonnet-5-5"
+    assert _claude_envelope_served_model(env, None) == "claude-sonnet-5-5"
+
+
+def test_canonicalModel也参与匹配():
+    env = {"modelUsage": {"x-alias-1": {"inputTokens": 1, "canonicalModel": "claude-opus-4"},
+                          "y-alias-2": {"inputTokens": 9, "canonicalModel": "claude-sonnet-5"}}}
+    assert _claude_envelope_served_model(env, "opus") == "x-alias-1"
 
 
 def test_claude_agent_信封无modelUsage则None():
@@ -207,16 +235,14 @@ def test_claude_agent_信封无modelUsage则None():
     assert _run_agent(_agent_client(), env)[1].served_model is None
 
 
-@pytest.mark.parametrize("usage", [None, {}, [], "x", {"m": "bad"}, {"": {"outputTokens": 3}}])
-def test_modelUsage畸形结构不抛(usage):
-    env = {"modelUsage": usage}
-    r = _claude_envelope_served_model(env)
-    assert r in (None, "m")     # {"m": "bad"} 无 token 信息时仍可取唯一键
+@pytest.mark.parametrize("usage", [None, {}, [], "x", {"": {"inputTokens": 3}}])
+def test_modelUsage畸形结构不抛且为None(usage):
+    assert _claude_envelope_served_model({"modelUsage": usage}, "sonnet") is None
 
 
-def test_modelUsage下划线写法兼容():
-    env = {"modelUsage": {"a": {"output_tokens": 1}, "b": {"output_tokens": 9}}}
-    assert _claude_envelope_served_model(env) == "b"
+def test_多模型且无输入侧信息_返回None():
+    env = {"modelUsage": {"a": {}, "b": {}}}
+    assert _claude_envelope_served_model(env, None) is None
 
 
 # ==================== 降级半截正文 ====================
