@@ -12,8 +12,10 @@ import re
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 
@@ -21,6 +23,48 @@ from ..utils.logger import get_logger
 from ..utils.json_tools import looks_like_complete_json, loads_lenient
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CallMeta:
+    """一次 LLM 调用的「实际是谁答的」记录（`LLMClient.call_with_meta` 随文本返回）。
+
+    原有 `model` 一类字段记的都是**请求值**；回退链、内容拒答的临时切换都会让
+    实际应答者与请求值不同，所以这里单独记应答侧的事实。
+    """
+    provider: str                  # 链上名字：deepseek / claude-agent / gemini / ollama / openai-compatible
+    requested_model: Optional[str]  # 调用方传入的 model 参数（原样，可为 None）
+    sent_model: str                # 实际发出请求时用的模型名（_model_for 解析后的值）
+    served_model: Optional[str]    # 应答方自报的模型 id；拿不到为 None（不退回 sent_model，由消费方决定）
+    chain_index: int               # 应答时的链位，0 = 主 provider
+    fell_back: bool                # 本次调用期间是否推进过链位（含内容拒答的临时切换）
+    degraded_partial: bool         # 是否为「重试耗尽后交还的半截正文」
+    at: str                        # ISO 时间（秒）
+
+
+def _claude_envelope_served_model(envelope: dict) -> Optional[str]:
+    """从 claude CLI `--output-format json` 信封取实际应答的模型 id。
+
+    信封顶层 `modelUsage` 是以模型 id 为键的字典（键形如 claude-sonnet-…），值里带
+    `outputTokens`（驼峰，对齐 Claude Agent SDK 的 ModelUsage 类型，二进制内亦有
+    outputTokens/costUSD 字样；防御性兼容下划线写法）。一次调用可能含多个模型
+    （如子任务用了 haiku），取输出 token 最多的那个；并列取先出现者。
+    信封没有 modelUsage 或结构不符 → None（调用方据此退化，不猜）。
+    """
+    usage = envelope.get('modelUsage') if isinstance(envelope, dict) else None
+    if not isinstance(usage, dict) or not usage:
+        return None
+    best, best_tok = None, -1
+    for mid, u in usage.items():
+        if not isinstance(mid, str) or not mid:
+            continue
+        tok = 0
+        if isinstance(u, dict):
+            v = u.get('outputTokens', u.get('output_tokens', 0))
+            tok = v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+        if tok > best_tok:
+            best, best_tok = mid, tok
+    return best
 
 
 class _RetryableHTTP(Exception):
@@ -154,6 +198,10 @@ class LLMClient:
         # 逻辑，没有这个计数器，持续吐半截的 provider 就永远切不掉。
         self._degraded_lock = threading.Lock()
         self._degraded_streak = 0
+        # 单次调用的应答侧事实（served_model / 实发模型 / 是否降级半截）。_call_once 与
+        # _call_agent 的返回值是裸 str（既有测试与调用点依赖），这些事实只能走旁路；
+        # 精读是多线程的，实例级普通属性会串线，所以用线程本地存储。
+        self._tls = threading.local()
 
     def _note_degraded(self) -> int:
         """记一次「降级返回半截正文」，返回当前连续次数。"""
@@ -200,6 +248,7 @@ class LLMClient:
             try:
                 conn = self._create(name)
                 conn['name'] = name
+                conn['chain_idx'] = self._chain_idx   # 供 CallMeta 记录应答时的链位
                 # `provider:model` 写法指定的模型覆盖该家缺省（如 claude-agent:opus）
                 mdl = self._chain_models[self._chain_idx]
                 if mdl:
@@ -415,7 +464,15 @@ class LLMClient:
     def call(self, prompt: str, model: Optional[str] = None,
              max_tokens: Optional[int] = None, temperature: Optional[float] = None,
              json_mode: bool = False, max_retries: int = 4) -> str:
-        """调用 LLM，返回文本。
+        """调用 LLM，返回文本（行为见 `call_with_meta`，这里只丢弃应答元数据）。"""
+        return self.call_with_meta(prompt, model=model, max_tokens=max_tokens,
+                                   temperature=temperature, json_mode=json_mode,
+                                   max_retries=max_retries)[0]
+
+    def call_with_meta(self, prompt: str, model: Optional[str] = None,
+                       max_tokens: Optional[int] = None, temperature: Optional[float] = None,
+                       json_mode: bool = False, max_retries: int = 4) -> Tuple[str, CallMeta]:
+        """调用 LLM，返回 (文本, CallMeta)。参数与 `call` 相同。
 
         model/max_tokens/temperature 缺省时用 settings；json_mode=True 请求结构化 JSON。
         对限流(429)/服务端(5xx)/超时/连接错误做指数退避重试（并发多月回填时保证稳健）；
@@ -425,16 +482,36 @@ class LLMClient:
         **内容层拒答例外**：换下家接手本次调用，但收尾时把链位拨回来——被过滤器挡住的
         是「这一篇」而不是 provider。粘性处理的代价实测过：一篇论文触发 AUP 拒答，
         整个 client 被永久推到本地 ollama，同一批后续 28 篇全部陪葬。
+
+        CallMeta 记的是**实际应答者**（链位、provider 取自应答那份 conn），与请求值无关；
+        每次调用独立产出，不依赖「最后一次调用」类实例状态，多线程不串线。
+        served_model 取值来源：openai-compatible（deepseek/ollama）= 响应体顶层 `model`；
+        gemini = 响应对象 `model_version`；claude-agent = 信封 `modelUsage` 中输出 token
+        最多的模型 id。取不到一律 None。
         """
         with self._conn_lock:
             base_idx, base_gen = self._chain_idx, self._sticky_gen
         soft = False
+        advanced = False
         try:
             while True:
                 conn = self.conn  # 懒建；构造失败会自动沿链推进
                 try:
-                    return self._call_once(conn, prompt, model, max_tokens, temperature,
+                    text = self._call_once(conn, prompt, model, max_tokens, temperature,
                                            json_mode, max_retries)
+                    chain_idx = conn.get('chain_idx', self._chain_idx)
+                    tls = self._tls
+                    meta = CallMeta(
+                        provider=conn.get('name') or conn.get('provider') or '',
+                        requested_model=model,
+                        sent_model=getattr(tls, 'sent_model', None) or conn.get('model') or '',
+                        served_model=getattr(tls, 'served_model', None),
+                        chain_index=chain_idx,
+                        fell_back=advanced or chain_idx > base_idx,
+                        degraded_partial=bool(getattr(tls, 'degraded', False)),
+                        at=datetime.now().isoformat(timespec='seconds'),
+                    )
+                    return text, meta
                 except Exception as e:
                     if not self._is_switchable(e):
                         raise
@@ -442,6 +519,7 @@ class LLMClient:
                     soft = soft or refusal
                     if not self._advance_chain(conn, str(e), sticky=not refusal):
                         raise
+                    advanced = True
         finally:
             if soft:
                 self._restore_chain(base_idx, base_gen)
@@ -451,6 +529,10 @@ class LLMClient:
                    json_mode: bool, max_retries: int) -> str:
         provider = conn.get('provider')
         model = self._model_for(conn, model)
+        # 重置旁路：本次调用的应答事实从空白开始（线程本地，见 __init__）
+        self._tls.served_model = None
+        self._tls.degraded = False
+        self._tls.sent_model = model
         # ollama 的 thinking 型模型（qwen3.5）思考过程同样消耗生成预算，
         # 8K 会被 thinking 烧光导致 content 为空（实测），下限抬到 24K
         if conn.get('name') == 'ollama' and (max_tokens is None or max_tokens < 24576):
@@ -495,6 +577,9 @@ class LLMClient:
                     # 今天 partial 只在 claude-agent 路径产生所以无实际后果，但若将来给
                     # HTTP 路径也挂 partial，漏掉这行会让成功调用打不断连击）。
                     self._reset_degraded()
+                    # served_model：响应对象的 model_version；缺失或非字符串（桩/老 SDK）→ None
+                    mv = getattr(response, 'model_version', None)
+                    self._tls.served_model = mv if isinstance(mv, str) and mv else None
                     return response.text
 
                 # OpenAI 兼容
@@ -525,6 +610,9 @@ class LLMClient:
                         "OpenAI 兼容响应内容为空（finish_reason={}），"
                         "可能被内容过滤拦截或模型未生成有效输出".format(finish_reason))
                 self._reset_degraded()   # 同上：完整正文路径清零降级连击
+                # served_model：OpenAI 兼容响应体顶层 `model`（deepseek/ollama 均有）
+                mv = body.get('model') if isinstance(body, dict) else None
+                self._tls.served_model = mv if isinstance(mv, str) and mv else None
                 return content
             except (_RetryableHTTP, httpx.TimeoutException, httpx.TransportError,
                     subprocess.TimeoutExpired) as e:
@@ -562,6 +650,9 @@ class LLMClient:
                     logger.error(
                         "  重试后仍未拿到完整响应，降级把半截正文交给下游抢救层"
                         "（连续第 {} 次）: {}".format(streak, e))
+                    self._tls.degraded = True
+                    # 半截正文来自信封干净但正文被截的那次响应；served_model 随异常带出
+                    self._tls.served_model = getattr(e, 'served_model', None)
                     return partial
                 raise
         if last_exc:
@@ -598,6 +689,7 @@ class LLMClient:
 
         stop = envelope.get('stop_reason')
         term = envelope.get('terminal_reason')
+        served = _claude_envelope_served_model(envelope)
         out_tok = (envelope.get('usage') or {}).get('output_tokens')
         # 错误类信封（subtype=error_*）**没有 result 字段，只有 errors[]**；
         # 只取 result 会让 msg 恒为空串，关键词分类与 _is_content_refusal 全部落空。
@@ -656,6 +748,7 @@ class LLMClient:
             if term in _AGENT_TERM_TRANSIENT:
                 exc = _RetryableHTTP("claude CLI 非正常结束（terminal_reason={}）".format(term))
                 exc.partial = text
+                exc.served_model = served
                 raise exc
             # 确定性收尾：重试拿不到更好的正文，**这是这段正文唯一的机会**，
             # 正文可用就直接用，整份丢弃再粘性切链是纯亏。
@@ -663,6 +756,7 @@ class LLMClient:
                 logger.warning(
                     "  ⚠️ claude CLI 以 terminal_reason={} 收尾，但正文可用，照常采用".format(term))
                 self._reset_degraded()
+                self._tls.served_model = served
                 return text
             raise RuntimeError("claude CLI 非正常结束（terminal_reason={}）: {}".format(term, str(raw_msg)[:300]))
 
@@ -679,6 +773,7 @@ class LLMClient:
                 "claude CLI 响应不是完整 JSON，多半被截断"
                 "（stop_reason={} terminal_reason={} 正文 {} 字符）".format(stop, term, len(text)))
             exc.partial = text
+            exc.served_model = served
             exc.json_incomplete = True
             raise exc
 
@@ -692,4 +787,5 @@ class LLMClient:
             logger.debug("  claude CLI ok: stop={} term={} out_tok={}".format(stop, term, out_tok))
         # 拿到完整响应 → 降级连击清零。只有这一条路径算「provider 是健康的」。
         self._reset_degraded()
+        self._tls.served_model = served   # 信封无 modelUsage 时为 None
         return text
