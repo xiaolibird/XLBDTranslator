@@ -20,7 +20,7 @@ import json
 import math
 import re
 import subprocess
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -826,3 +826,476 @@ def gold_counts(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         d[it["split"]] += 1
         d["no_abstract"] += it["abstract_source"] == "none"
     return c
+
+
+# ======================================================================
+# 评测执行器（WO-7，设计 §5.5/§5.6）
+#
+# 复用生产的 ScholarWorkflow._filter_by_llm（不另写 prompt 组装），把 gold 条目装成 PaperSegment
+# 混洗后按生产批大小送审；重复 N 次取更差；按「实际应答的 provider:served_model」拆分统计。
+# 本段本身不联网、不调 LLM：LLM 调用全部发生在传入的 workflow 实例里（测试用桩替换 _call_llm）。
+# ======================================================================
+
+# 生产口径摘要长度：D11 实测近 6 次运行 1233 条送审摘要中位数 407 字符，取 400。
+# （prompt 本身截 800；full 模式即 gold 里存的 800 截断版，作对照臂）
+PROD_ABSTRACT_CHARS = 400
+ABSTRACT_MODES = ("prod", "full")
+DEFAULT_REPEATS = 2
+SMOKE_PER_GROUP = 20             # --smoke：每组固定抽 20 条（3 组共 60 条 = 3 批）
+SMOKE_GROUPS = (("P1", ("P1-in", "P1-out")), ("M-core", ("M-core",)), ("H-stream", ("H-stream",)))
+# 默认入跑的层：M-side/R-stable 无标签、只做观察，要看须显式 --strata 指定
+DEFAULT_RUN_STRATA = ("P1-in", "P1-out", "M-core", "F-override", "H-stream")
+# --split 只作用于大层（M-core 的 test 是主门槛；P1/H/F 规模小，一律全收）
+SPLIT_STRATA = ("M-core", "M-side")
+# 这些层的「标签/判定」来自生产 LLM 裁决；decision_source 为 manual 系列的条目其裁决不是 LLM 给的，剔除
+SKIP_DECISION_SOURCES = ("manual", "manual_pick")
+SKIP_SOURCE_STRATA = ("H-stream", "R-stable")
+F_OVERRIDE_MIN_N = 10            # F-override 累积到此数才进门槛（设计 §5.3）
+VERDICT_ORDER = {"EXCLUDE": 0, "FALLBACK": 0, "MAYBE": 1, "INCLUDE": 2}
+# 设计 §5.6 的建议门槛，**仅供报告对照**；正式常量由 WO-8 迁入 thresholds.py，那之前此处不具放行效力
+REFERENCE_GATES = {
+    "p1_keep_min": 0.95, "core_keep_min": 0.92, "core_keep_wilson_min": 0.88,
+    "false_include_max": 0.15, "stream_miss_max": 0.05, "regression_max": 0.02, "flip_max": 0.15,
+}
+RUN_SCHEMA = 1
+
+
+def truncate_abstract(text: Optional[str], mode: str) -> str:
+    """送审摘要：prod 截 PROD_ABSTRACT_CHARS（对齐生产实测中位数），full 保持 gold 里的 800。"""
+    if mode not in ABSTRACT_MODES:
+        raise ValueError("abstract-mode 只能是 {}，收到 {!r}".format(ABSTRACT_MODES, mode))
+    t = (text or "")
+    return t[:PROD_ABSTRACT_CHARS] if mode == "prod" else t[:ABSTRACT_MAX_CHARS]
+
+
+def _parse_ts(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s)).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def load_gold(edir, version: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+    """读 gold_v{N}.jsonl 与 meta，返回 (条目, meta, 文件 sha256)。meta 缺失直接报错——没有登记时间戳就不许跑。"""
+    gp = Path(edir) / "gold_v{}.jsonl".format(version)
+    mp = Path(edir) / "gold_v{}.meta.json".format(version)
+    if not gp.exists() or not mp.exists():
+        raise ValueError("找不到 gold v{}（{} / {}）；先 build-gold".format(version, gp.name, mp.name))
+    blob = gp.read_bytes()
+    items = [json.loads(l) for l in blob.decode("utf-8").splitlines() if l.strip()]
+    return items, json.loads(mp.read_text(encoding="utf-8")), _sha256_bytes(blob)
+
+
+def check_run_preconditions(meta: Dict[str, Any], gold_sha256: str, items: Sequence[Dict[str, Any]],
+                            now: Optional[datetime] = None) -> None:
+    """运行前闸：gold 内容与 meta 一致；manual 登记时间戳（及盲标时间）早于本次运行。违反即 ValueError。
+
+    先登记后评测是防事后找补的核心约束（设计 §5.3）：登记晚于运行 = 看过结果才分支线，数字作废。
+    """
+    now = now or datetime.now()
+    if meta.get("gold_sha256") != gold_sha256:
+        raise ValueError("gold 文件内容与 meta 记录的 sha256 不一致（被改过？），拒绝运行")
+    reg = meta.get("registry") or {}
+    b_at = _parse_ts(reg.get("batches_registered_at"))
+    if b_at is None:
+        raise ValueError("gold meta 没有 manual 批次登记时间戳（registry.batches_registered_at），拒绝运行")
+    stamps = [("批次登记", b_at)]
+    if reg.get("papers_registered_at"):
+        p_at = _parse_ts(reg["papers_registered_at"])
+        if p_at is None:
+            raise ValueError("按篇登记时间戳无法解析：{!r}".format(reg["papers_registered_at"]))
+        stamps.append(("按篇登记", p_at))
+    for it in items:
+        if it.get("stratum") == "H-stream" and it.get("labeled_at"):
+            t = _parse_ts(it["labeled_at"])
+            if t is not None:
+                stamps.append(("盲标导出", t))
+    for name, t in stamps:
+        if t >= now:
+            raise ValueError("{}时间 {} 不早于本次运行 {}，拒绝运行（先登记/标注，后评测）".format(
+                name, t.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")))
+
+
+def select_items(items: Sequence[Dict[str, Any]], *, split: str = "all",
+                 strata: Optional[Sequence[str]] = None, smoke: bool = False,
+                 seed: int = SEED) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """按层/切分/冒烟挑出本次要跑的条目，返回 (条目, 选择统计)。纯函数，同输入同输出。
+
+    - strata 缺省 DEFAULT_RUN_STRATA；split 只作用于 SPLIT_STRATA 中的层；
+    - decision_source 为 manual/manual_pick 的 H/R 层条目剔除（其裁决不是生产 LLM 给的）；
+    - smoke：每组按 _rank_key 固定抽 SMOKE_PER_GROUP 条（与输入顺序、批次无关），组内再按 strata 过滤。
+    """
+    if split not in ("test", "dev", "all"):
+        raise ValueError("split 只能是 test/dev/all")
+    use = tuple(strata) if strata else DEFAULT_RUN_STRATA
+    bad = [s for s in use if s not in STRATA]
+    if bad:
+        raise ValueError("未知层：{}".format(bad))
+    stat = {"skipped_manual_source": 0, "skipped_split": 0}
+    pool = []
+    for it in items:
+        if it["stratum"] not in use:
+            continue
+        if it["stratum"] in SKIP_SOURCE_STRATA and it.get("decision_source") in SKIP_DECISION_SOURCES:
+            stat["skipped_manual_source"] += 1
+            continue
+        if split != "all" and it["stratum"] in SPLIT_STRATA and it["split"] != split:
+            stat["skipped_split"] += 1
+            continue
+        pool.append(it)
+    if smoke:
+        picked = []
+        for tag, members in SMOKE_GROUPS:
+            grp = sorted((i for i in pool if i["stratum"] in members),
+                         key=lambda i: _rank_key(seed, "smoke:" + tag, i["item_id"]))
+            picked.extend(grp[:SMOKE_PER_GROUP])
+        pool = picked
+    pool = sorted(pool, key=lambda i: i["item_id"])
+    stat["n"] = len(pool)
+    return pool, stat
+
+
+def shuffled_order(items: Sequence[Dict[str, Any]], seed: int) -> List[Dict[str, Any]]:
+    """确定性混洗：阳性与阴性打散，避免整批全是同一类（批内对比效应会扭曲判定）。"""
+    return sorted(items, key=lambda i: _rank_key(seed, "shuffle", i["item_id"]))
+
+
+def build_segment(item: Dict[str, Any], segment_id: int, abstract_mode: str):
+    """gold 条目 → PaperSegment（生产同口径：标题 + 英文原始摘要；gold 没存 journal，置空）。"""
+    from .schema import PaperMetadata, PaperSegment
+    pid = "eval_{}".format(item["item_id"])
+    return PaperSegment(
+        segment_id=segment_id, paper_id=pid,
+        original_abstract=truncate_abstract(item.get("abstract"), abstract_mode),
+        metadata=PaperMetadata(paper_id=pid, title=item.get("title") or "", source_email_id="filter_eval"))
+
+
+def verdict_of(seg) -> Dict[str, Any]:
+    """从 _filter_by_llm 处理后的 segment 取本条裁决。关键词回退/无裁决记 FALLBACK（按丢弃计，且使本次运行不可用于认证）。"""
+    d = seg.filter_decision
+    if d is None or d.stage != "llm_judge" or d.decision not in ("INCLUDE", "MAYBE", "EXCLUDE"):
+        return {"verdict": "FALLBACK", "confidence": None, "stage": getattr(d, "stage", None),
+                "provider": getattr(d, "provider", None), "served_model": getattr(d, "served_model", None),
+                "fell_back": getattr(d, "fell_back", None)}
+    return {"verdict": d.decision, "confidence": d.confidence, "stage": d.stage, "provider": d.provider,
+            "served_model": d.served_model, "fell_back": d.fell_back}
+
+
+def model_key(provider: Optional[str], served_model: Optional[str]) -> str:
+    """按实际应答者记账的键。served_model 为 None（未认证）记 unknown，不退回请求值。"""
+    return "{}:{}".format(provider or "unknown", served_model or "unknown")
+
+
+def neighbor_exclusion(item: Dict[str, Any], cit_by_dedup: Optional[Dict[str, str]] = None) -> set:
+    """近邻自排除集：被测条目自己的 dedup_key 与 citekey（gold 里的 + 库索引里按 dedup_key 查到的）。"""
+    out = {item.get("dedup_key"), item.get("citekey"), (cit_by_dedup or {}).get(item.get("dedup_key"))}
+    return {x for x in out if x}
+
+
+def run_once(wf, items: Sequence[Dict[str, Any]], *, seed: int, abstract_mode: str, rag_on: bool,
+             id_base: int = 0, cit_by_dedup: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """跑一遍：混洗 → 装 segment → wf._filter_by_llm → 逐条取裁决。返回与 items 顺序无关的逐条记录列表。
+
+    每遍重置 wf 的裁决累积状态与近邻缓存，segment_id 用独立号段（id_base 起），两遍互不串扰。
+    rag_on=False 时置 _library_neighbors_unavailable，近邻恒为空（RAG 关闭对照臂）；
+    rag_on=True 时给每条设近邻自排除集（D4：库内论文重审不得被判「与自己重复」）。
+    """
+    order = shuffled_order(items, seed)
+    wf.excluded, wf.included_decisions, wf.undecided_segments = [], [], []
+    wf._filter_fallback_count = 0
+    wf._filter_retry_recovered = 0
+    wf._filter_served_models = {}
+    wf._library_neighbors_cache = {}
+    wf._library_neighbors_unavailable = not rag_on
+    segs, by_seg = [], {}
+    wf._neighbor_exclude = {}
+    for k, it in enumerate(order):
+        seg = build_segment(it, id_base + k, abstract_mode)
+        segs.append(seg)
+        by_seg[seg.segment_id] = (k, it)
+        if rag_on:
+            wf._neighbor_exclude[seg.segment_id] = neighbor_exclusion(it, cit_by_dedup)
+    try:
+        wf._filter_by_llm(segs)
+    finally:
+        wf._neighbor_exclude = {}
+    from .workflow import FILTER_BATCH_SIZE
+    # 想开 RAG 却中途降级（向量库缺失/陈旧/Ollama 不可达）：这一遍其实是 RAG 关闭臂，必须在记录里留痕
+    degraded = bool(rag_on and wf._library_neighbors_unavailable)
+    out = []
+    for seg in segs:
+        k, it = by_seg[seg.segment_id]
+        v = verdict_of(seg)
+        v.update(item_id=it["item_id"], batch_index=k // FILTER_BATCH_SIZE, rag_degraded=degraded)
+        out.append(v)
+    return out
+
+
+def _worst(vs: Sequence[str]) -> str:
+    return worse_of_repeats([[v] for v in vs])[0]
+
+
+def build_entries(items: Sequence[Dict[str, Any]], repeat_results: Sequence[Sequence[Dict[str, Any]]]
+                  ) -> List[Dict[str, Any]]:
+    """把各遍逐条记录并成每条目一行：verdicts 按遍排列，model 为各遍应答者的并（不同则标 mixed）。"""
+    by_rep = [{r["item_id"]: r for r in rep} for rep in repeat_results]
+    entries = []
+    for it in sorted(items, key=lambda i: i["item_id"]):
+        reps = [m[it["item_id"]] for m in by_rep if it["item_id"] in m]
+        keys = {model_key(r["provider"], r["served_model"]) for r in reps if r["verdict"] != "FALLBACK"}
+        e = {"item_id": it["item_id"], "stratum": it["stratum"], "label": it.get("label"), "split": it.get("split"),
+             "title": it.get("title"), "abstract_source": it.get("abstract_source"), "origin": it.get("origin"),
+             "sample": it.get("sample"), "batch": it.get("batch"),
+             "verdicts": [r["verdict"] for r in reps],
+             "confidence": [r["confidence"] for r in reps],
+             "served_model": [model_key(r["provider"], r["served_model"]) if r["verdict"] != "FALLBACK" else None
+                              for r in reps],
+             "verified": [bool(r["served_model"]) for r in reps],
+             "fell_back": [r["fell_back"] for r in reps],
+             "rag_degraded": any(r.get("rag_degraded") for r in reps),
+             "worst": _worst([r["verdict"] for r in reps]) if reps else "FALLBACK"}
+        e["model"] = (next(iter(keys)) if len(keys) == 1 else ("mixed" if keys else "none"))
+        entries.append(e)
+    return entries
+
+
+# ---------------- 指标汇总 ----------------
+
+def _rate(k: int, n: int) -> Dict[str, Any]:
+    p, lo, hi = wilson_interval(k, n)
+    return {"k": k, "n": n, "p": (k / n if n else None), "lo": (lo if n else None), "hi": (hi if n else None)}
+
+
+def _keep(entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    k, n = keep_rate([e["worst"] for e in entries])
+    return _rate(k, n)
+
+
+def _flip(entries: Sequence[Dict[str, Any]]) -> Optional[float]:
+    es = [e for e in entries if len(e["verdicts"]) > 1]
+    if not es:
+        return None
+    n_rep = min(len(e["verdicts"]) for e in es)
+    return flip_rate([[e["verdicts"][r] for e in es] for r in range(n_rep)])
+
+
+def compute_metrics(entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """设计 §5.2/§5.6 的指标。每条取各遍中更差者（worst）；所有比例带 Wilson 95% 区间。
+
+    只有有人类/行为标签的层进门槛类指标；M-side 与 R-stable 只给裁决分布。
+    """
+    E = list(entries)
+    positive = [e for e in E if e["label"] == "positive"]
+    p1 = [e for e in E if e["stratum"] in ("P1-in", "P1-out") and e.get("origin") != "auto"]
+    p1_auto = [e for e in E if e["stratum"] == "P1-in" and e.get("origin") == "auto"]
+    core = [e for e in E if e["stratum"] == "M-core"]
+    f_over = [e for e in E if e["stratum"] == "F-override"]
+    h = [e for e in E if e["stratum"] == "H-stream"]
+    m: Dict[str, Any] = {"n_items": len(E)}
+    m["p1_keep"] = _keep(p1)
+    m["p1_out_keep"] = _keep([e for e in p1 if e["stratum"] == "P1-out"])
+    m["p1_dropped"] = [{"item_id": e["item_id"], "title": e["title"], "stratum": e["stratum"],
+                        "verdicts": e["verdicts"]} for e in p1 if e["worst"] == "EXCLUDE" or e["worst"] == "FALLBACK"]
+    m["p1_auto_keep"] = _keep(p1_auto)                 # 幸存者偏倚，单列不进门槛
+    m["core_test_keep"] = _keep([e for e in core if e["split"] == "test"])
+    m["core_dev_keep"] = _keep([e for e in core if e["split"] == "dev"])
+    m["core_dropped_test"] = [{"item_id": e["item_id"], "title": e["title"]}
+                              for e in core if e["split"] == "test" and e["worst"] in ("EXCLUDE", "FALLBACK")]
+    k_inc = sum(1 for e in positive if e["worst"] == "INCLUDE")
+    m["include_recall"] = _rate(k_inc, len(positive))
+    m["f_override_keep"] = dict(_keep(f_over), gated=len(f_over) >= F_OVERRIDE_MIN_N)
+    neg = [e for e in h if e["label"] == "negative"]
+    m["h_false_include"] = _rate(sum(1 for e in neg if e["worst"] == "INCLUDE"), len(neg))
+    m["h_false_keep"] = _rate(sum(1 for e in neg if e["worst"] in ("INCLUDE", "MAYBE")), len(neg))
+    # 生产漏判率：生产 EXCLUDE 样本里人判「应收」的比例，按抽样权重还原总体；边缘不进分母
+    hx = [e for e in h if (e.get("sample") or {}).get("prod_verdict") == "EXCLUDE"
+          and e["label"] in ("positive", "negative")]
+    wts = [float((e["sample"] or {}).get("weight") or 1.0) for e in hx]
+    flags = [e["label"] == "positive" for e in hx]
+    m["h_stream_miss"] = dict(_rate(sum(flags), len(hx)), weighted=(weighted_rate(flags, wts) if hx else None))
+    bins: Dict[str, List[bool]] = defaultdict(list)
+    for e, f in zip(hx, flags):
+        bins[(e["sample"] or {}).get("conf_bin") or "?"].append(f)
+    m["h_stream_miss_by_conf_bin"] = {b: {"k": sum(v), "n": len(v)} for b, v in sorted(bins.items())}
+    m["h_borderline_n"] = sum(1 for e in h if e["label"] == "borderline")
+    # 本次复跑与生产裁决的一致度（观察用）：生产 EXCLUDE 而本次保留 / 生产保留而本次 EXCLUDE
+    m["h_vs_prod"] = {
+        "prod_exclude_now_keep": sum(1 for e in h if (e.get("sample") or {}).get("prod_verdict") == "EXCLUDE"
+                                      and e["worst"] in ("INCLUDE", "MAYBE")),
+        "prod_keep_now_exclude": sum(1 for e in h if (e.get("sample") or {}).get("prod_verdict") in ("INCLUDE", "MAYBE")
+                                      and e["worst"] == "EXCLUDE")}
+    m["no_abstract_keep"] = _keep([e for e in positive if e.get("abstract_source") == "none"])
+    m["flip"] = {"all": _flip(E), **{s: _flip([e for e in E if e["stratum"] == s]) for s in STRATA
+                                     if any(e["stratum"] == s for e in E)}}
+    m["verdict_counts"] = {s: dict(Counter(e["worst"] for e in E if e["stratum"] == s))
+                           for s in STRATA if any(e["stratum"] == s for e in E)}
+    m["n_fallback_items"] = sum(1 for e in E if "FALLBACK" in e["verdicts"])
+    return m
+
+
+def reference_check(m: Dict[str, Any]) -> Dict[str, Optional[bool]]:
+    """对照 REFERENCE_GATES 的逐项达标情况；n=0 记 None。**仅供报告，不是放行判定**（WO-8 才有）。"""
+    G = REFERENCE_GATES
+
+    def le(v, lim):
+        return None if v is None else v <= lim
+
+    def ge(v, lim):
+        return None if v is None else v >= lim
+    return {
+        "p1_keep": ge(m["p1_keep"]["p"], G["p1_keep_min"]),
+        "core_keep_point": ge(m["core_test_keep"]["p"], G["core_keep_min"]),
+        "core_keep_wilson": ge(m["core_test_keep"]["lo"], G["core_keep_wilson_min"]),
+        "false_include": le(m["h_false_include"]["p"], G["false_include_max"]),
+        "stream_miss": le(m["h_stream_miss"]["weighted"], G["stream_miss_max"]),
+        "flip(仅告警)": le(m["flip"]["all"], G["flip_max"]),
+    }
+
+
+def summarize(entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """整体 + 按实际应答模型拆分的汇总，并判定本次运行能否用于认证（必须单一已验证模型、无回退、无关键词兜底）。"""
+    E = list(entries)
+    models = sorted({e["model"] for e in E})
+    by_model = {mk: compute_metrics([e for e in E if e["model"] == mk]) for mk in models}
+    reasons = []
+    real = [mk for mk in models if mk not in ("none",)]
+    if len(real) > 1:
+        reasons.append("多于一个应答模型（{}）：回退发生，需按模型拆分，认证无效".format("、".join(models)))
+    if "mixed" in models:
+        reasons.append("同一条目两遍由不同模型应答（mixed）")
+    if any(mk.endswith(":unknown") for mk in real):
+        reasons.append("存在 served_model 未知（未验证）的应答")
+    if any(not all(e["verified"]) for e in E if e["model"] != "none"):
+        reasons.append("存在 decision_model_verified=false 的应答")
+    nf = sum(1 for e in E if "FALLBACK" in e["verdicts"])
+    if nf:
+        reasons.append("{} 条出现关键词回退/无裁决（FALLBACK，按丢弃计）".format(nf))
+    if any(e.get("rag_degraded") for e in E):
+        reasons.append("RAG 近邻检索中途降级（向量库不可用），实际是 RAG 关闭臂，与 rag_mode=on 的认证键不符")
+    return {"overall": compute_metrics(E), "reference": reference_check(compute_metrics(E)),
+            "models": models, "by_model": by_model, "not_certifiable_reasons": reasons}
+
+
+def paired_between_runs(base: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    """两次运行在**共同条目**上的配对比较（回归检查 / 两条对照臂的差异）。用各自的 worst 裁决。"""
+    b = {e["item_id"]: e for e in base["entries"]}
+    n = {e["item_id"]: e for e in new["entries"]}
+    common = sorted(set(b) & set(n))
+    res = paired_regression([b[i]["worst"] for i in common], [n[i]["worst"] for i in common])
+    res["lost_items"] = [{"item_id": i, "title": n[i]["title"]} for i in common
+                         if b[i]["worst"] != "EXCLUDE" and n[i]["worst"] == "EXCLUDE"]
+    res["n_only_base"], res["n_only_new"] = len(set(b) - set(n)), len(set(n) - set(b))
+    return res
+
+
+def run_eval(wf, items: Sequence[Dict[str, Any]], *, repeats: int = DEFAULT_REPEATS, seed: int = SEED,
+             abstract_mode: str = "prod", rag_on: bool = True,
+             cit_by_dedup: Optional[Dict[str, str]] = None, on_repeat=None) -> List[Dict[str, Any]]:
+    """跑 repeats 遍（每遍种子 seed+r，混洗不同），返回每遍逐条记录。on_repeat(r, 记录) 供落盘断点。"""
+    if repeats < 1:
+        raise ValueError("repeats 至少 1")
+    reps = []
+    for r in range(repeats):
+        rep = run_once(wf, items, seed=seed + r, abstract_mode=abstract_mode, rag_on=rag_on,
+                       id_base=(r + 1) * 1_000_000, cit_by_dedup=cit_by_dedup)
+        reps.append(rep)
+        if on_repeat:
+            on_repeat(r, reps)
+    return reps
+
+
+# ---------------- 报告 ----------------
+
+def _fmt_rate(r: Dict[str, Any]) -> str:
+    if not r["n"]:
+        return "n=0（无样本）"
+    return "{:.1%} ({}/{})  Wilson95% [{:.1%}, {:.1%}]".format(r["p"], r["k"], r["n"], r["lo"], r["hi"])
+
+
+def format_report(run: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None,
+                  show_verdicts: bool = False) -> str:
+    """把 runs/{run_id}.json 渲染成文本。show_verdicts 打印逐条裁决（盲标完成前不得用；由 CLI 把关）。"""
+    cfg, S = run["config"], run["summary"]
+    L = ["运行 {}  状态={}".format(run["run_id"], run.get("status")),
+         "gold={}  split={}  strata={}  smoke={}".format(cfg["gold_version"], cfg["split"], ",".join(cfg["strata"]),
+                                                       cfg["smoke"]),
+         "指纹={}  请求模型={}  rag={}  摘要口径={}  批大小={}  重复={}  种子={}".format(
+             cfg["prompt_fingerprint"], cfg["requested_model"], "on(自排除)" if cfg["rag_on"] else "off",
+             cfg["abstract_mode"], cfg["batch_size"], cfg["repeats"], cfg["seed"]),
+         "条目 {}；跳过 {}".format(run["n_items"], json.dumps(run["selection"], ensure_ascii=False))]
+    certifiable = not S["not_certifiable_reasons"] and not cfg["smoke"] and cfg["repeats"] >= 2 \
+        and run.get("status") == "complete"
+    L.append("可用于认证：{}".format("是" if certifiable else "否"))
+    for why in S["not_certifiable_reasons"] + (["冒烟运行"] if cfg["smoke"] else []) + \
+            (["重复次数 <2"] if cfg["repeats"] < 2 else []) + \
+            ([] if run.get("status") == "complete" else ["运行未完成（断点）"]):
+        L.append("  - 不可认证原因：{}".format(why))
+    L.append("应答模型分布：{}".format(", ".join(
+        "{}={}".format(mk, sum(1 for e in run["entries"] if e["model"] == mk)) for mk in S["models"])))
+
+    def block(title, m, ref=None):
+        L.append("")
+        L.append("== {} ==".format(title))
+        L.append("P1 保留率（不含 auto 来源）  {}".format(_fmt_rate(m["p1_keep"])))
+        for d in m["p1_dropped"]:
+            L.append("    被丢 P1：{}  [{}] {}".format(d["title"], d["stratum"], d["verdicts"]))
+        L.append("P1-in(auto 来源，幸存者偏倚)  {}".format(_fmt_rate(m["p1_auto_keep"])))
+        L.append("M-core test 保留率        {}".format(_fmt_rate(m["core_test_keep"])))
+        L.append("M-core dev 保留率         {}".format(_fmt_rate(m["core_dev_keep"])))
+        for d in m["core_dropped_test"]:
+            L.append("    被丢 M-core(test)：{}".format(d["title"]))
+        L.append("INCLUDE 召回(全部阳性)    {}".format(_fmt_rate(m["include_recall"])))
+        f = m["f_override_keep"]
+        L.append("F-override 保留率         {}{}".format(_fmt_rate(f), "" if f["gated"] else "  （n<10，不进门槛）"))
+        L.append("H 过度纳入(无关→INCLUDE)  {}".format(_fmt_rate(m["h_false_include"])))
+        L.append("H 过度纳入(无关→INCL|MAYBE) {}".format(_fmt_rate(m["h_false_keep"])))
+        hm = m["h_stream_miss"]
+        L.append("H 生产漏判率(EXCLUDE 中应收) {}  加权还原={}".format(
+            _fmt_rate(hm), "n/a" if hm["weighted"] is None else "{:.1%}".format(hm["weighted"])))
+        L.append("    按置信度段（应收/样本）：{}".format(
+            ", ".join("{}={}/{}".format(b, v["k"], v["n"]) for b, v in m["h_stream_miss_by_conf_bin"].items()) or "无"))
+        L.append("    H 边缘 {} 条不进分母；复跑 vs 生产：{}".format(m["h_borderline_n"], m["h_vs_prod"]))
+        L.append("无摘要阳性保留率          {}".format(_fmt_rate(m["no_abstract_keep"])))
+        L.append("翻转率：{}".format(", ".join(
+            "{}={}".format(k, "n/a" if v is None else "{:.1%}".format(v)) for k, v in m["flip"].items())))
+        for s, c in m["verdict_counts"].items():
+            L.append("  {:<11}裁决分布（worst）：{}".format(s, c))
+        if ref:
+            L.append("对照建议门槛（仅参考，非放行判定）：{}".format(
+                ", ".join("{}={}".format(k, {True: "达标", False: "未达标", None: "n/a"}[v]) for k, v in ref.items())))
+    block("整体", S["overall"], S["reference"])
+    if len(S["models"]) > 1:
+        for mk, m in S["by_model"].items():
+            block("按应答模型 {}".format(mk), m)
+    if baseline is not None:
+        pr = paired_between_runs(baseline, run)
+        L.append("")
+        L.append("== 配对比较：{} → {} ==".format(baseline["run_id"], run["run_id"]))
+        L.append("共同条目 {}；保留率 {:.1%} → {:.1%}（差 {:+.1%}，参考上限 {:.0%}）；新增丢弃 {}，新增保留 {}".format(
+            pr["n"], pr["keep_base"], pr["keep_new"], pr["delta"], REFERENCE_GATES["regression_max"],
+            pr["lost"], pr["gained"]))
+        for d in pr["lost_items"]:
+            L.append("    新增丢弃：{}".format(d["title"]))
+    if show_verdicts:
+        L.append("")
+        L.append("== 逐条裁决 ==")
+        for e in run["entries"]:
+            L.append("{:<10}{:<9}{:<11}{}  {}  {}".format(e["stratum"], e["label"] or "-", e["worst"], e["verdicts"],
+                                                     e["model"], e["title"]))
+    return "\n".join(L)
+
+
+def assemble_run(run_id: str, config: Dict[str, Any], selection: Dict[str, Any],
+                 items: Sequence[Dict[str, Any]], repeat_results: Sequence[Sequence[Dict[str, Any]]],
+                 *, status: str, started_at: str, finished_at: Optional[str] = None) -> Dict[str, Any]:
+    """把配置 + 逐遍结果装成 runs/{run_id}.json 的内容（逐条 + 汇总 + 配置键）。纯函数。
+
+    断点（status=partial）时 repeat_results 可能少于 config.repeats 遍，汇总只基于已完成的遍。
+    """
+    entries = build_entries(items, repeat_results)
+    return {"schema": RUN_SCHEMA, "run_id": run_id, "status": status, "started_at": started_at,
+            "finished_at": finished_at, "config": config, "selection": selection, "n_items": len(items),
+            "n_repeats_done": len(repeat_results), "entries": entries, "summary": summarize(entries),
+            "llm_batches_ok": None}

@@ -152,6 +152,10 @@ class ScholarWorkflow:
         self._paper_mask = None  # 随 _vector_store 一次算好的 paper 级布尔掩码（万级 records 别每批重建）
         self._embedding_client = None  # 懒加载的 embeddings.EmbeddingClient
         self._library_neighbors_unavailable = False  # 一次失败后本次 run 内不再重试，避免刷屏
+        # 仅评测使用的近邻自排除钩子（可信度加固 WO-7）：segment_id -> 要排除的 citekey / dedup_key 集合。
+        # 默认空字典 = 生产行为不变（自命中照旧保留近邻本体、只掐 one_line，见 _library_neighbors）；
+        # 评测重审库内论文时必须排除它自己，否则会被判「与自己重复」（设计 D4）。
+        self._neighbor_exclude: Dict[int, Set[str]] = {}
 
         # 跨来源去重（邮件路径与外部检索共用，保证 Gmail/PubMed/arXiv 不重复入库）
         self._seen_paper_ids: set = set()
@@ -945,7 +949,9 @@ class ScholarWorkflow:
 
             n_self = 0
             for paper, vec in zip(to_query, vecs):
-                hits = store.search(vec, mask=mask, top_k=k * 2)
+                # 评测钩子：有排除集的论文多取几条补位（自身最多占 paper+abstract 两个 chunk）
+                excl = (getattr(self, "_neighbor_exclude", None) or {}).get(paper.segment_id)
+                hits = store.search(vec, mask=mask, top_k=k * 2 + (4 if excl else 0))
                 by_ck = {}
                 self_key = _norm_title(paper.metadata.title)
                 for idx, sim in hits:
@@ -953,6 +959,8 @@ class ScholarWorkflow:
                         continue
                     rec = store.records[idx]
                     ck = rec.get("citekey")
+                    if excl and (ck in excl or rec.get("dedup_key") in excl):
+                        continue         # 评测自排除：被测条目本身
                     if ck in by_ck:      # paper/abstract 双 chunk 同篇命中：保留首个（分数更高）
                         continue
                     prec = paper_rec_by_ck.get(ck)
@@ -962,6 +970,8 @@ class ScholarWorkflow:
                     # 摘要独立成 ab: chunk，永远不在这份文本里）
                     text_parts = (prec.get("text") or "").split("\n")
                     one_line = text_parts[1] if len(text_parts) > 1 else ""
+                    if excl and self_key and _norm_title(text_parts[0]) == self_key:
+                        continue         # 评测自排除：同标题（预印本/正式版并存）也算自己
                     # 自命中：Google Scholar 邮件臂每周会重复推送已入库论文，而 seen 去重发生在
                     # filter 之后，所以这里必然会检索到论文自己。**保留这条近邻**——prompt 要靠它
                     # 判「与已收文献重复 → MAYBE」，journal_screen 的 in_library 列也只读 sim；

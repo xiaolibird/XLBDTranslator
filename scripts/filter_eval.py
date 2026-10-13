@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""筛选召回评测集（金标准）工具：登记表、盲标表、gold 构造、统计。设计见
-docs/decisions/trust_hardening_design_2026-10-13.md §5（本脚本只覆盖 WO-6，不含评测执行）。
+"""筛选召回评测集（金标准）工具：登记表、盲标表、gold 构造、统计（WO-6），评测执行与报告（WO-7）。
+设计见 docs/decisions/trust_hardening_design_2026-10-13.md §5。
 
-典型流程（全程不调 LLM、不联网）：
+典型流程（1-7 步不调 LLM、不联网；run 会真调 LLM，须在金标准完成并登记之后才跑）：
   1. registry-export --kind batches        导出 manual 批次登记表，用户填 core/side/mixed
   2. registry-import --kind batches        校验并盖登记时间戳；有 mixed 批次则：
      registry-export --kind papers → 用户填 → registry-import --kind papers
@@ -12,6 +12,8 @@ docs/decisions/trust_hardening_design_2026-10-13.md §5（本脚本只覆盖 WO-
   5. （库外 P1 摘要由联网步骤补进 p1_out_abstracts.json；build-gold 会列出缺口）
   6. build-gold                            产出 gold_v{N}.jsonl / .meta.json（登记缺失则拒绝）
   7. stats                                 打印各层规模
+  8. run --gold v1 [--smoke]               复用生产 _filter_by_llm 跑评测（调 LLM！先 --smoke 看链路）
+  9. report [RUN_ID] [--vs BASE_RUN_ID]    渲染报告 / 与另一次运行配对比较
 
 所有产物落在 <notes_dir>/_eval/filter/（gitignore 数据目录；稿件引用清单属未发表信息，不进 git）。
 """
@@ -19,6 +21,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -256,6 +259,112 @@ def cmd_stats(args):
     return 0
 
 
+def _gold_version(args):
+    g = getattr(args, "gold", None)
+    return int(str(g).lstrip("vV")) if g else args.version
+
+
+def _runs_dir(edir):
+    return edir / "runs"
+
+
+def _load_run(edir, ref):
+    """ref 为 run_id 或 json 路径；缺省取 runs/ 里最新一份。"""
+    rd = _runs_dir(edir)
+    if ref:
+        p = Path(ref)
+        p = p if p.exists() else rd / (ref if ref.endswith(".json") else ref + ".json")
+    else:
+        fs = sorted(rd.glob("run_*.json"))
+        if not fs:
+            raise ValueError("{} 里没有运行记录".format(rd))
+        p = fs[-1]
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def cmd_run(args):
+    """评测执行（调 LLM）。批数 ≈ ceil(条目数/20) × 重复次数；每遍结束落一次断点。"""
+    notes, _, edir = _paths(args)
+    FE.assert_ignored(edir)
+    ver = _gold_version(args)
+    try:
+        gitems, meta, gsha = FE.load_gold(edir, ver)
+        FE.check_run_preconditions(meta, gsha, gitems)
+        strata = [s for s in args.strata.split(",") if s] if args.strata else None
+        items, sel = FE.select_items(gitems, split=args.split, strata=strata, smoke=args.smoke, seed=args.seed)
+    except ValueError as e:
+        print("拒绝运行：{}".format(e), file=sys.stderr)
+        return 2
+    if not items:
+        print("选不出任何条目（检查 --strata / --split）", file=sys.stderr)
+        return 2
+    repeats = args.repeats if args.repeats is not None else (1 if args.smoke else FE.DEFAULT_REPEATS)
+
+    from src.scholar.schema import ScholarSettings
+    from src.scholar.workflow import FILTER_BATCH_SIZE, ScholarWorkflow
+    cfg_path = repo_path(args.config)
+    settings = ScholarSettings.from_env_file(cfg_path) if cfg_path.exists() else ScholarSettings()
+    wf = ScholarWorkflow(settings)
+    lib = FE.load_library(notes / "literature_index.json")
+    cit_by_dedup = {e["dedup_key"]: e["citekey"] for e in lib if e.get("dedup_key") and e.get("citekey")}
+
+    started = datetime.now()
+    run_id = "run_{}_{}{}".format(started.strftime("%Y%m%d_%H%M%S"), meta["gold_sha8"], "_smoke" if args.smoke else "")
+    config = {"gold_version": "gold-v{}@{}".format(ver, meta["gold_sha8"]), "split": args.split,
+              "strata": list(strata or FE.DEFAULT_RUN_STRATA), "smoke": args.smoke, "repeats": repeats,
+              "seed": args.seed, "abstract_mode": args.abstract_mode, "rag_on": args.rag == "on",
+              "batch_size": FILTER_BATCH_SIZE, "prompt_fingerprint": wf._get_filter_prompt_version(),
+              "requested_model": settings.llm.filter_model or settings.llm.model,
+              "main_provider": settings.llm.provider}
+    n_batches = -(-len(items) // FILTER_BATCH_SIZE) * repeats
+    print("{}：{} 条 × {} 遍 ≈ {} 批 LLM 调用（rag={}, 摘要={}）".format(
+        run_id, len(items), repeats, n_batches, args.rag, args.abstract_mode))
+    out = _runs_dir(edir) / (run_id + ".json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def save(reps, status, finished=None):
+        rec = FE.assemble_run(run_id, config, sel, items, reps, status=status,
+                              started_at=started.isoformat(timespec="seconds"), finished_at=finished)
+        rec["llm_batches_ok"] = sum(wf._filter_served_models.values())
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+        tmp.replace(out)
+        return rec
+
+    t0 = time.time()
+    try:
+        reps = FE.run_eval(wf, items, repeats=repeats, seed=args.seed, abstract_mode=args.abstract_mode,
+                           rag_on=args.rag == "on", cit_by_dedup=cit_by_dedup,
+                           on_repeat=lambda r, rs: (save(rs, "partial"),
+                                                    print("  第 {}/{} 遍完成（{:.0f}s）".format(r + 1, repeats, time.time() - t0))))
+    finally:
+        wf.close_rag_resources()
+    rec = save(reps, "complete", datetime.now().isoformat(timespec="seconds"))
+    print("已写入 {}\n".format(out))
+    print(FE.format_report(rec))
+    return 0
+
+
+def cmd_report(args):
+    _, _, edir = _paths(args)
+    try:
+        run = _load_run(edir, args.run)
+        base = _load_run(edir, args.vs) if args.vs else None
+        if args.show_verdicts:
+            gitems, _, _ = FE.load_gold(edir, int(run["config"]["gold_version"].split("-v")[1].split("@")[0]))
+            if not any(i["stratum"] == "H-stream" and i.get("label") for i in gitems):
+                print("gold 里没有已回收标签的 H-stream：盲标完成前不得 --show-verdicts", file=sys.stderr)
+                return 2
+    except (ValueError, OSError) as e:
+        print("report 失败：{}".format(e), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(run["summary"], ensure_ascii=False, indent=1, sort_keys=True))
+    else:
+        print(FE.format_report(run, baseline=base, show_verdicts=args.show_verdicts))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--notes-dir", default="output/scholar_notes")
@@ -280,10 +389,26 @@ def main(argv=None):
     p.add_argument("--bib-exclude", default=None, help="追加剔除的 bib citekey 清单（一行一个）")
     p.add_argument("--bib-include", default=None, help="追加纳入的 bib citekey 清单（捞回被默认规则剔掉的）")
     sub.add_parser("stats")
+    p = sub.add_parser("run", help="评测执行（调 LLM；复用生产 _filter_by_llm）")
+    p.add_argument("--gold", default=None, help="gold 版本，如 v1（缺省取 --version）")
+    p.add_argument("--split", choices=("test", "dev", "all"), default="test", help="只作用于 M-core/M-side")
+    p.add_argument("--strata", default=None, help="逗号分隔的层；缺省 " + ",".join(FE.DEFAULT_RUN_STRATA))
+    p.add_argument("--repeats", type=int, default=None, help="重复遍数；缺省 2（--smoke 时 1）")
+    p.add_argument("--rag", choices=("on", "off"), default="on", help="on=开启并自排除近邻；off=对照臂")
+    p.add_argument("--abstract-mode", choices=FE.ABSTRACT_MODES, default="prod",
+                   help="prod=截 {} 字符（认证口径）；full=800 字符（对照臂）".format(FE.PROD_ABSTRACT_CHARS))
+    p.add_argument("--smoke", action="store_true", help="每组固定抽 {} 条（P1/M-core/H-stream 共 3 批）".format(FE.SMOKE_PER_GROUP))
+    p.add_argument("--config", default="config/scholar.env")
+    p = sub.add_parser("report", help="渲染运行报告")
+    p.add_argument("run", nargs="?", default=None, help="run_id 或 json 路径；缺省最新一份")
+    p.add_argument("--vs", default=None, help="基线运行，做共同条目上的配对比较")
+    p.add_argument("--show-verdicts", action="store_true", help="逐条打印裁决（盲标完成前禁用）")
+    p.add_argument("--json", action="store_true", help="只输出汇总 JSON")
     args = ap.parse_args(argv)
     fn = {"registry-export": cmd_registry_export, "registry-import": cmd_registry_import,
           "label-export": cmd_label_export, "label-import": cmd_label_import,
-          "build-gold": cmd_build_gold, "stats": cmd_stats}[args.cmd]
+          "build-gold": cmd_build_gold, "stats": cmd_stats,
+          "run": cmd_run, "report": cmd_report}[args.cmd]
     return fn(args)
 
 
