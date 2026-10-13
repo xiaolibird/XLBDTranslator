@@ -392,6 +392,9 @@ def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
         elif fd.verdict != "included":
             logger.info("  手选覆盖裁决：{} 原判 {} → INCLUDE".format(
                 (seg.metadata.title or "")[:48], fd.decision))
+            # 被用户手选推翻的 LLM 原判（尤其 EXCLUDE）是现成的「漏判」样本，要留在条目上，
+            # 不能只进日志；关键词回退没有三态原判（decision=None）时保持 None
+            fd.llm_decision_before_override = fd.decision
             fd.verdict, fd.decision = "included", "INCLUDE"
             fd.stage = "manual_pick"
             fd.exclude_reason = None

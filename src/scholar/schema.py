@@ -274,8 +274,8 @@ class FilterDecision(BaseModel):
     decision: Optional[Literal["INCLUDE", "MAYBE", "EXCLUDE"]] = Field(
         None, description="三态裁决（LLM 方法学审稿；关键词阶段为 None）"
     )
-    stage: Literal["blacklist_keyword", "llm_judge", "whitelist_keyword", "keyword_fallback"] = Field(
-        description="裁决阶段：黑名单确定性匹配 / LLM 相关性裁决 / 关键词白名单 / LLM 失败后的关键词回退"
+    stage: Literal["blacklist_keyword", "llm_judge", "whitelist_keyword", "keyword_fallback", "manual_pick"] = Field(
+        description="裁决阶段：黑名单确定性匹配 / LLM 相关性裁决 / 关键词白名单 / LLM 失败后的关键词回退 / 用户手选（含 manual 精读）"
     )
     reason: str = Field(default="", description="裁决理由（LLM 的 one_line 或命中的关键词）")
     bucket: List[str] = Field(default_factory=list, description="命中的纳入维度（A..G）")
@@ -287,6 +287,14 @@ class FilterDecision(BaseModel):
     model: Optional[str] = Field(None, description="做出裁决的 LLM 模型（确定性阶段为 None）")
     prompt_version: Optional[str] = Field(None, description="裁决 prompt 版本标签+模板哈希（如 filter-v3@a1b2c3d4）")
     decided_at: datetime = Field(default_factory=datetime.now, description="裁决时间")
+    # ---- 实际应答者留痕（可信度加固 WO-2；全部 Optional，老 JSON 反序列化不受影响）----
+    # 上面的 model 是**请求值**（语义不变）；回退链换人后实际应答者可能不同，故另记应答侧事实。
+    provider: Optional[str] = Field(None, description="实际应答的 provider（CallMeta.provider）")
+    served_model: Optional[str] = Field(None, description="应答方自报的模型 id；拿不到为 None（视为未验证）")
+    fell_back: Optional[bool] = Field(None, description="该次调用期间是否发生过回退")
+    llm_decision_before_override: Optional[Literal["INCLUDE", "MAYBE", "EXCLUDE"]] = Field(
+        None, description="被用户手选覆盖前的 LLM 原判；仅覆盖时写")
+    gate: Optional[str] = Field(None, description="筛选闸门处置标记（预留，WO-8 使用）")
     # RAG phase 3：札记库语义近邻（{citekey, year, one_line, sim}），随裁决固化供复盘；
     # 向量库/Ollama 不可用时上游返回空列表，此处默认 [] 且不影响旧 digest JSON 反序列化。
     library_neighbors: List[dict] = Field(
@@ -342,6 +350,15 @@ class CloseReading(BaseModel):
     model: Optional[str] = Field(None, description="精读使用的 LLM 模型")
     source: Optional[str] = Field(None, description="全文来源：arxiv/unpaywall/abstract")
     read_at: datetime = Field(default_factory=datetime.now, description="精读时间")
+    # ---- 实际应答者留痕（可信度加固 WO-2；model 仍是请求值）----
+    # 分块深读取汇总步那次调用的 meta；各块 served_model 去重后记在 chunk_models。
+    provider: Optional[str] = Field(None, description="实际应答的 provider")
+    served_model: Optional[str] = Field(None, description="应答方自报的模型 id；拿不到为 None")
+    fell_back: Optional[bool] = Field(None, description="调用期间是否发生过回退")
+    chunk_models: Optional[List[str]] = Field(None, description="分块深读各块 served_model 去重列表")
+    prompt_version: Optional[str] = Field(
+        None, description="精读 prompt 指纹 label@md5前8位（closeread-single/closeread-chunked/manual-synth）")
+    final_by: Optional[str] = Field(None, description="manual 终稿署名（自由文本原样保留）")
 
     # ---- 阅读深度量尺（全部 Optional 且默认 None：老 bundle / 老 digest JSON 反序列化不炸）----
     # 这几个字段只回答一个问题：这篇的「精读」到底喂进去了多少正文、有没有被截断、读了几跳。

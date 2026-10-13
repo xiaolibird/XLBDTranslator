@@ -24,7 +24,10 @@ from .schema import (
     PaperSegment, PaperMetadata, PaperField, DigestStatus,
     FilterDecision, CloseReading,
 )
-from .closereading import pdf_to_text, parse_closeread, _pdf_text_with_stats
+from .closereading import (
+    pdf_to_text, parse_closeread, _pdf_text_with_stats,
+    call_llm_with_meta, apply_meta_to_closereading, chunk_models_from_metas, prompt_fingerprint,
+)
 from .research_profile import get_contamination_example_terms
 from ..utils.logger import get_logger
 from ..utils.json_tools import strip_code_fences as _strip_json
@@ -544,10 +547,14 @@ def is_credit_error(exc) -> bool:
 
 def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
                      research_interests: str = "",
-                     max_workers: int = 4) -> List[Dict[str, Any]]:
+                     max_workers: int = 4,
+                     meta_out: Optional[list] = None) -> List[Dict[str, Any]]:
     """每块一次强模型调用，产出结构化块笔记。失败块记 error 并继续（不中断整篇）。
 
     额度/鉴权类失败额外标 `_api_error`，供上层决定是否回退到 subagent 对抗生成。
+
+    meta_out：可选出参列表，各块成功调用的 CallMeta 追加进来（线程安全的 list.append，
+    顺序不保证）；不放进块笔记本身——块笔记会被原样序列化进汇总 prompt。
 
     `research_interests` 保留在签名里只为兼容既有调用，**本步刻意不使用**——
     见 `_CHUNK_PROMPT` 上方注释：画像进通读 prompt 会让模型把主观关联写成原文事实。
@@ -569,7 +576,9 @@ def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
             return {"_chunk": i, "_error": True, "_api_error": True}
         prompt = _CHUNK_PROMPT.format(idx=i, total=total, chunk=chunk)
         try:
-            resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
+            resp, _m = call_llm_with_meta(llm, prompt, model=model, max_tokens=8192, json_mode=True)
+            if meta_out is not None and _m is not None:
+                meta_out.append(_m)
         except Exception as e:
             logger.warning("  ⚠️ 通读块 {}/{} 失败: {}".format(i, total, e))
             api = is_credit_error(e)
@@ -652,6 +661,11 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
     {{"heading": "逐节通读要点", "sentences": [{{"text": "…", "tag": null}}]}}
   ]
 }}"""
+
+
+def chunked_prompt_version(label: str) -> str:
+    """分块深读的 prompt 指纹：块通读 + 汇总两份模板一起取 md5（任一改动指纹即变）。"""
+    return prompt_fingerprint(label, _CHUNK_PROMPT, _SYNTH_PROMPT)
 
 
 # 汇总步喂进 synth prompt 的块笔记总预算。与 settings.closeread_max_chars 零和耦合：
@@ -766,7 +780,7 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
         availability=avail_txt,
         chunk_notes=packed)
     try:
-        resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
+        resp, _meta = call_llm_with_meta(llm, prompt, model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
         logger.warning("  ⚠️ 汇总精读 LLM 调用失败: {}".format(e))
         if budget_info is not None:
@@ -788,6 +802,9 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
         cr.from_full_text = True
         cr.model = model
         cr.source = "manual-pdf"
+        # 应答者留痕：取**汇总步**这次调用的 meta（块级另记 chunk_models，由调用方补）
+        apply_meta_to_closereading(cr, _meta)
+        cr.prompt_version = chunked_prompt_version("manual-synth")
         # 裁剪留痕落在条目上（两条链路共用）：draft_note 只在 manual 的 bundle 里，
         # 而 sidecar/索引的消费方看到的是 CloseReading。缺失 = 未知，不是"没裁过"。
         if budget_info and budget_info.get("note"):
@@ -804,7 +821,7 @@ def build_segment(meta: PaperMetadata, abstract_en: str, abstract_zh: str,
     fd = FilterDecision(
         paper_id=meta.paper_id, title=meta.title,
         verdict="included", decision="INCLUDE",
-        stage="llm_judge", reason="手动选入深度精读",
+        stage="manual_pick", reason="手动选入深度精读",
         one_line=one_line or "手动深度精读文献", confidence=1.0,
     )
     seg = PaperSegment(
@@ -896,10 +913,27 @@ def segment_from_bundle(data: Dict[str, Any]) -> PaperSegment:
     """
     seg = PaperSegment.model_validate(data["segment"])
     final = data.get("close_reading_final")
+    script = data.get("close_reading_script")
     if final:
-        seg.close_reading = CloseReading.model_validate(final)
-    elif data.get("close_reading_script"):
-        seg.close_reading = CloseReading.model_validate(data["close_reading_script"])
+        cr = CloseReading.model_validate(final)
+        # 终稿是 agent 亲读后的产物，其 model 常是自由文本署名（如 "opus-gen+sonnet-adversarial"），
+        # 不是规范模型名。拆两层记：终稿署名 → final_by（原样保留）；规范模型名与应答者留痕
+        # 取脚本草稿——终稿覆盖精读后，脚本草稿的模型信息不能丢。
+        report = data.get("cross_check_report") or {}
+        by = (cr.final_by or (final.get("model") or "").strip()
+              or (report.get("reviewer_label") or "").strip() or None)
+        cr.final_by = by
+        if script:
+            sc = CloseReading.model_validate(script)
+            cr.model = sc.model
+            cr.provider, cr.served_model, cr.fell_back = sc.provider, sc.served_model, sc.fell_back
+            cr.chunk_models, cr.prompt_version = sc.chunk_models, sc.prompt_version
+        else:
+            # 没有脚本草稿：终稿的自由文本不能冒充规范模型名进分组统计
+            cr.model = None
+        seg.close_reading = cr
+    elif script:
+        seg.close_reading = CloseReading.model_validate(script)
     one_line = (data.get("one_line") or "").strip()
     if one_line and seg.filter_decision is not None:
         seg.filter_decision.one_line = one_line
@@ -1051,7 +1085,8 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
 
     chunks = chunk_text(full_text)
     logger.info("  分块通读: {} 块（全文 {} 字符）".format(len(chunks), len(full_text)))
-    chunk_notes = deep_read_chunks(chunks, llm, model, research_interests)
+    chunk_metas: List[Any] = []
+    chunk_notes = deep_read_chunks(chunks, llm, model, research_interests, meta_out=chunk_metas)
     # 代码/数据可得性走确定性抽取，不指望分块 LLM 在最后一块里注意到（第 3 类系统性错误）
     availability = extract_availability_statements(full_text)
     if availability:
@@ -1060,6 +1095,8 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     cr, one_line, synth_api_err = synthesize_deep_read(
         chunk_notes, llm, model, research_interests, budget_info=budget_info,
         availability=availability)
+    if cr is not None:
+        cr.chunk_models = chunk_models_from_metas(chunk_metas)
 
     # 草稿状态（五态，语义见 write_bundle docstring）：
     #   有草稿 → ok / degraded（部分块失败）；无草稿 → api_error / empty / synth_failed。

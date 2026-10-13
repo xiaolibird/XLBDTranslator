@@ -6,10 +6,11 @@
 付费墙无全文 → 基于摘要的降级精读（from_full_text=False）。
 复用：fulltext.ipv4_client 下载、PyMuPDF(fitz) 抽文本、llm_client.LLMClient 调模型。
 """
+import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
     PaperSegment, CloseReading, CloseReadSection, CloseReadSentence,
@@ -21,6 +22,55 @@ from ..utils.logger import get_logger
 from ..utils.json_tools import strip_code_fences as _strip_json
 
 logger = get_logger(__name__)
+
+
+# ---------------- LLM 调用元数据（可信度加固 WO-2）----------------
+
+def call_llm_with_meta(llm, prompt: str, **kwargs) -> Tuple[str, Optional[Any]]:
+    """调 llm，返回 (文本, CallMeta|None)。
+
+    真实 LLMClient 走 call_with_meta 拿「实际应答者」；测试里的假 llm（只实现 .call，
+    或 MagicMock）退回 .call，meta 为 None——判据是**类上**有没有 call_with_meta，
+    这样 MagicMock 自动生成的属性不会被误当成带 meta 的客户端。
+    """
+    if hasattr(type(llm), "call_with_meta"):
+        text, meta = llm.call_with_meta(prompt, **kwargs)
+        return text, meta
+    return llm.call(prompt, **kwargs), None
+
+
+def meta_provenance(meta) -> Dict[str, Any]:
+    """CallMeta → {provider, served_model, fell_back}；meta 为 None（取不到）时三项均 None。"""
+    if meta is None:
+        return {"provider": None, "served_model": None, "fell_back": None}
+    return {"provider": meta.provider or None,
+            "served_model": meta.served_model or None,
+            "fell_back": bool(meta.fell_back)}
+
+
+def chunk_models_from_metas(metas) -> Optional[List[str]]:
+    """各块 meta → served_model 去重（保序）列表；一块 meta 都没收到（假 llm）→ None。"""
+    metas = [m for m in (metas or []) if m is not None]
+    if not metas:
+        return None
+    out: List[str] = []
+    for m in metas:
+        if m.served_model and m.served_model not in out:
+            out.append(m.served_model)
+    return out
+
+
+def apply_meta_to_closereading(cr: CloseReading, meta) -> None:
+    """把应答者留痕写进 CloseReading（model 仍是请求值，不动）。"""
+    for k, v in meta_provenance(meta).items():
+        setattr(cr, k, v)
+
+
+def prompt_fingerprint(label: str, *templates: str) -> str:
+    """prompt 指纹 `label@md5前8位`（对模板原文取，与 workflow._get_filter_prompt_version 同法）。"""
+    digest = hashlib.md5("\x00".join(templates).encode("utf-8")).hexdigest()[:8]
+    return "{}@{}".format(label, digest)
+
 
 _VALID_TAGS = {"可引用证据", "可反驳观点", "方法论借鉴"}
 
@@ -636,7 +686,7 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
         page_rule=page_rule,
     )
     try:
-        resp = llm.call(prompt, model=model, max_tokens=8192, json_mode=True)
+        resp, _meta = call_llm_with_meta(llm, prompt, model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
         logger.warning("  ⚠️ 精读 LLM 调用失败({}): {}".format(seg.paper_id[:8], e))
         _note(llm_error="{}: {}".format(type(e).__name__, str(e)[:200]),
@@ -656,6 +706,8 @@ def close_read(seg: PaperSegment, body_text: str, research_interests: str,
     cr.truncated = (raw_chars is not None and raw_chars > len(body_text))
     cr.reading_depth = "single-call"
     cr.n_chunks = 1
+    apply_meta_to_closereading(cr, _meta)
+    cr.prompt_version = prompt_fingerprint("closeread-single", _CLOSEREAD_PROMPT)
     return cr
 
 
@@ -681,7 +733,8 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
         if diag is not None:
             diag["no_body"] = True
         return None
-    notes = deep_read_chunks(chunks, llm, model, max_workers=4)
+    chunk_metas: List[Any] = []
+    notes = deep_read_chunks(chunks, llm, model, max_workers=4, meta_out=chunk_metas)
     if diag is not None:
         # 块级的额度/鉴权终局由 deep_read_chunks 标 `_api_error`（限流走同一条 except）；
         # 全部块都挂且带该标记 = 模型侧不可用，不是「这篇没正文」。
@@ -710,6 +763,11 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     cr.from_full_text = from_full_text
     cr.reading_depth = "chunked"
     cr.n_chunks = len(chunks)
+    # 应答者留痕：provider/served_model/fell_back 已由 synthesize_deep_read 按汇总步写好；
+    # 这里补各块的 served_model（块间换人时可见）与 auto 链路的 prompt 标签
+    cr.chunk_models = chunk_models_from_metas(chunk_metas)
+    from .pdf_ingest import chunked_prompt_version
+    cr.prompt_version = chunked_prompt_version("closeread-chunked")
     if _binfo.get("note"):
         cr.synth_truncated = True
         cr.synth_dropped_chunks = int(_binfo.get("n_dropped") or 0)

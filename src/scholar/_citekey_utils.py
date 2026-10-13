@@ -434,6 +434,79 @@ BOOK_ENTRY_FIELDS = ("entry_type", "isbn", "publisher", "edition", "editors",
                      "book_key", "container_title", "chapter_number", "page_range")
 
 
+# ---------------- 来源字段（可信度加固 WO-2）----------------
+#
+# 裁决来源 + 精读来源，平铺进索引条目（与 fulltext_* 同风格）。口径：
+#   · 缺失 / None = 未知（老 sidecar、老 digest），与 fulltext_truncated 同一套「缺失≠false」；
+#   · 不进 md 正文（来源不是裁决，不需要人读；写进 md 会踩 md+sidecar+表格三处同步的雷）；
+#   · 老 segment（无应答者留痕）产出的这些键全为 None，provenance_origin 也不会冒充 native。
+PROVENANCE_FIELDS = (
+    "decision_source", "decision_provider", "decision_model", "decision_model_verified",
+    "decision_prompt_version", "decision_at",
+    "closeread_provider", "closeread_model", "closeread_model_verified",
+    "closeread_prompt_version", "closeread_at", "closeread_final_by",
+    "provenance_origin",
+)
+
+
+def _date_iso(dt) -> Optional[str]:
+    """datetime/date → ISO 日期串；取不到 None。"""
+    if dt is None:
+        return None
+    try:
+        return dt.date().isoformat() if hasattr(dt, "date") else dt.isoformat()
+    except Exception:
+        return None
+
+
+def _decision_source(fd, series: str) -> Optional[str]:
+    """裁决由谁做出：digest（filter-v3 LLM 流水线）/ manual / manual_pick / keyword_fallback。
+
+    manual 系列的老 segment 的 stage 仍是名不副实的 llm_judge，按 series 纠正为 manual；
+    其余旧来源（promotion-scan-... / unknown-legacy）由 WO-3 的 overlay 回填，这里不推测。
+    """
+    if fd is None:
+        return None
+    if fd.stage == "manual_pick":
+        return "manual" if series == "manual" else "manual_pick"
+    if series == "manual":
+        return "manual"
+    if fd.stage in ("keyword_fallback", "whitelist_keyword", "blacklist_keyword"):
+        return "keyword_fallback"
+    if fd.stage == "llm_judge":
+        return "digest"
+    return None
+
+
+def provenance_fields(fd, cr, series: str = "auto") -> Dict[str, Any]:
+    """FilterDecision + CloseReading → 索引来源键（见 PROVENANCE_FIELDS）。
+
+    *_model = 应答方自报的 served_model，取不到退回请求值 model；*_model_verified
+    标记取的是不是自报值（False = 只是请求值，回退链换人后可能不准）。
+    """
+    d_served = getattr(fd, "served_model", None) if fd else None
+    d_model = (d_served or getattr(fd, "model", None)) if fd else None
+    c_served = getattr(cr, "served_model", None) if cr else None
+    c_model = (c_served or getattr(cr, "model", None)) if cr else None
+    native = bool((fd and (getattr(fd, "provider", None) or d_served))
+                  or (cr and (getattr(cr, "provider", None) or c_served)))
+    return {
+        "decision_source": _decision_source(fd, series),
+        "decision_provider": getattr(fd, "provider", None) if fd else None,
+        "decision_model": d_model,
+        "decision_model_verified": (bool(d_served) if d_model else None),
+        "decision_prompt_version": getattr(fd, "prompt_version", None) if fd else None,
+        "decision_at": _date_iso(getattr(fd, "decided_at", None)) if fd else None,
+        "closeread_provider": getattr(cr, "provider", None) if cr else None,
+        "closeread_model": c_model,
+        "closeread_model_verified": (bool(c_served) if c_model else None),
+        "closeread_prompt_version": getattr(cr, "prompt_version", None) if cr else None,
+        "closeread_at": _date_iso(getattr(cr, "read_at", None)) if cr else None,
+        "closeread_final_by": getattr(cr, "final_by", None) if cr else None,
+        "provenance_origin": "native" if native else None,
+    }
+
+
 # ---------------- 从内存对象构造条目（write_notes sidecar 复用，无损） ----------------
 
 def entry_from_segment(seg, citekey: str, rank: int, total: int,
@@ -487,6 +560,7 @@ def entry_from_segment(seg, citekey: str, rank: int, total: int,
         "fulltext_truncated_by_page_cap": (getattr(cr, "truncated_by_page_cap", None) if cr else None),
         "fulltext_tail_chars": (getattr(cr, "tail_chars", None) if cr else None),
         "reading_depth": _reading_depth(cr, series),
+        **provenance_fields(fd, cr, series),
         "tag_counts": tag_counts,
         "highlights": highlights,
         "dedup_key": dedup_key_fields(meta.doi, meta.arxiv_id, meta.title,

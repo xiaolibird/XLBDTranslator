@@ -596,6 +596,28 @@ jq -r '.papers[] | select(.duplicate_of == null and .reading_depth == "chunked")
        | [.citekey, .month, .title] | @tsv' literature_index.json
 ```
 
+## 裁决与精读的「来源」字段(2026-10-13 起,谁做的判断/谁读的)
+
+条目上有两组来源键,回答「这条裁决/这份精读**实际**是哪个模型做的」。**缺失 / None = 未知**
+(老 sidecar、老 digest、md 降级解析的 43 个月都没有这些键),与 `fulltext_truncated` 同一套
+「缺失≠false」口径——不要把 None 当成某个默认模型,也不要按时间线去猜。
+
+| 键 | 含义 |
+|---|---|
+| `decision_source` | `digest`(filter-v3 流水线)/ `manual`(手动精读)/ `manual_pick`(用户在 digest 候选里手选,覆盖了 LLM 判断)/ `keyword_fallback`(LLM 失败后关键词兜底) |
+| `decision_provider` / `decision_model` | 实际应答的 provider / 模型。`decision_model` = 应答方自报的模型 id,取不到退回**请求值** |
+| `decision_model_verified` | `true` = `decision_model` 是应答方自报值;`false` = 只是请求值(回退链换人后可能不准);None = 无裁决 |
+| `decision_prompt_version` / `decision_at` | 裁决 prompt 指纹(如 `filter-v3@08540624`)/ 裁决日期 |
+| `closeread_provider` / `closeread_model` / `closeread_model_verified` | 精读同上;分块深读取**汇总步**那次调用 |
+| `closeread_prompt_version` / `closeread_at` | 精读 prompt 指纹(`closeread-single` / `closeread-chunked` / `manual-synth` + `@md5前8位`)/ 精读日期 |
+| `closeread_final_by` | 仅 manual:agent 亲读终稿的署名(自由文本原样保留,**不是规范模型名**,别拿来分组) |
+| `provenance_origin` | `native` = 新写入时就带应答者留痕;None = 老条目(WO-3 回填会写 `backfill-*` / `unknown-legacy`) |
+
+manual 条目的 `closeread_model` 是**脚本草稿**的模型(终稿覆盖精读后仍保留草稿的模型信息),
+终稿署名单独在 `closeread_final_by`。原有的 `model` 字段在 digest/sidecar 里仍是**请求值**,语义不变。
+被手选覆盖的 LLM 原判在 digest/sidecar 的 `filter_decision.llm_decision_before_override`
+(被用户推翻的 EXCLUDE 就是现成的漏判样本)。这些键**不写进 md 正文**,只在 sidecar 与索引里。
+
 ## 查询配方(在本目录下执行)
 
 ```bash

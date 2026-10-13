@@ -6,6 +6,7 @@ Scholar Digest 工作流
 import json
 import hashlib
 import re
+import threading
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional, Set, Tuple
@@ -134,6 +135,11 @@ class ScholarWorkflow:
         # 「这次瞬态故障有多严重、重试这层挡下了多少」在 stats 里看得见——只看
         # fallback_count 会以为一切正常，而它恰恰是被重试轮压下去的那部分。
         self._filter_retry_recovered = 0
+        # 实际应答者留痕（可信度加固 WO-2）：{"provider:served_model": 批数}，随 excluded sidecar
+        # 落盘。_llm_meta_tls 是 _call_llm 的旁路：它仍返回 str（既有调用点与测试零改动），
+        # 应答元数据存线程本地，由 _call_llm_with_meta / _take_llm_meta 取。
+        self._filter_served_models: Dict[str, int] = {}
+        self._llm_meta_tls = threading.local()
         # 抢救计数：两类抢救损坏都不进 processed/failed/fallback 任何一个计数器，
         # 不单列就等于「下次发生时连靠 failed_papers 反推都做不到」。
         self._salvage_batches = 0     # 触发过前缀抢救的批次数
@@ -605,7 +611,9 @@ class ScholarWorkflow:
 
             try:
                 prompt = self._build_filter_prompt(batch)
+                self._take_llm_meta()   # 清掉上一批残留，避免本批失败时误用
                 response = self._call_llm(prompt, model=model, json_mode=True)
+                batch_meta = self._take_llm_meta()
                 batch_ids = {p.segment_id for p in batch}
                 verdicts = self._parse_filter_response(response, valid_ids=batch_ids)
             except Exception as e:
@@ -615,7 +623,7 @@ class ScholarWorkflow:
                 continue
 
             kept.extend(self._apply_filter_verdicts(
-                batch, verdicts, model, prompt_version, missing_out=missing))
+                batch, verdicts, model, prompt_version, missing_out=missing, meta=batch_meta))
 
         # ---- 末尾重试一轮（见本方法 docstring 的 08-17 复盘）----
         if deferred or missing:
@@ -638,7 +646,10 @@ class ScholarWorkflow:
                 logger.info("  重试{}（{} 篇）".format(label, len(batch)))
                 try:
                     prompt = self._build_filter_prompt(batch)
+                    self._take_llm_meta()
                     response = self._call_llm(prompt, model=model, json_mode=True)
+                    # 重试轮各用各自这次调用的 meta：重试很可能已经换了 provider
+                    batch_meta = self._take_llm_meta()
                     batch_ids = {p.segment_id for p in batch}
                     verdicts = self._parse_filter_response(response, valid_ids=batch_ids)
                 except Exception as e:
@@ -653,7 +664,8 @@ class ScholarWorkflow:
                 # 1 个 id」的半截响应会被记成整批救回，恰好废掉这个字段存在的意义。
                 before_fb = self._filter_fallback_count
                 try:
-                    kept.extend(self._apply_filter_verdicts(batch, verdicts, model, prompt_version))
+                    kept.extend(self._apply_filter_verdicts(
+                        batch, verdicts, model, prompt_version, meta=batch_meta))
                 except Exception as e:
                     # 落裁决这一步抛异常不能连坐掉后面还没重试的批
                     logger.warning("  {}裁决落盘异常，回退关键词白名单: {}".format(label, e))
@@ -675,7 +687,8 @@ class ScholarWorkflow:
 
     def _apply_filter_verdicts(self, batch: List[PaperSegment], verdicts: dict,
                                 model: str, prompt_version: str,
-                                missing_out: Optional[List[PaperSegment]] = None
+                                missing_out: Optional[List[PaperSegment]] = None,
+                                meta=None
                                 ) -> List[PaperSegment]:
         """把一批已解析的裁决落到 paper 上，返回入选的那些。
 
@@ -690,6 +703,10 @@ class ScholarWorkflow:
         `_parse_filter_response` docstring 记的「一次截断让整批 20 篇一起降级」）。
         只盖「整批抛异常」等于只盖了没证据的那一半。
         """
+        if meta is not None:
+            # 批级汇总：这一批实际由谁应答（served_model 取不到记 unknown，不退回请求值）
+            k = "{}:{}".format(meta.provider or "unknown", meta.served_model or "unknown")
+            self._filter_served_models[k] = self._filter_served_models.get(k, 0) + 1
         kept: List[PaperSegment] = []
         for paper in batch:
             verdict = verdicts.get(paper.segment_id)
@@ -707,7 +724,7 @@ class ScholarWorkflow:
             # 单篇裁决构造独立容错：flash 级模型常把 confidence 返回成 "high"、
             # bucket/flags 返回非 list 等，绝不能因一篇脏字段让整批 digest 崩溃。
             try:
-                decision = self._build_filter_decision(paper, verdict, model, prompt_version)
+                decision = self._build_filter_decision(paper, verdict, model, prompt_version, meta=meta)
             except Exception as e:
                 logger.warning("  裁决字段异常 id={}，回退关键词: {}".format(paper.segment_id, e))
                 self._filter_fallback_count += 1
@@ -748,7 +765,7 @@ class ScholarWorkflow:
             return None
         return max(0.0, min(1.0, f))
 
-    def _build_filter_decision(self, paper, verdict, model, prompt_version) -> FilterDecision:
+    def _build_filter_decision(self, paper, verdict, model, prompt_version, meta=None) -> FilterDecision:
         """由 LLM 单篇裁决 dict 构造 FilterDecision（字段全部容错，不因脏输入抛异常）。"""
         # 三态裁决：INCLUDE/MAYBE 入选（MAYBE 一并翻译，输出中用 decision/role 区分），EXCLUDE 排除
         decision_val = str(verdict.get('decision', 'EXCLUDE')).upper()
@@ -777,6 +794,7 @@ class ScholarWorkflow:
             model=model,
             prompt_version=prompt_version,
             library_neighbors=self._library_neighbors_cache.get(paper.segment_id) or [],
+            **self._meta_fields(meta),
         )
 
     def _record_exclusion(self, paper: PaperSegment, decision: FilterDecision):
@@ -1439,7 +1457,31 @@ __PAPERS_JSON__
             model: 覆盖默认模型（用于过滤裁决等使用不同档位模型的场景）
             json_mode: 请求结构化 JSON 输出（DeepSeek response_format=json_object 等）
         """
-        return self.llm_client.call(prompt, model=model, json_mode=json_mode)
+        return self._call_llm_with_meta(prompt, model=model, json_mode=json_mode)[0]
+
+    def _call_llm_with_meta(self, prompt: str, model: Optional[str] = None,
+                            json_mode: bool = False):
+        """同 `_call_llm`，但返回 (文本, CallMeta|None)——meta 记录**实际应答者**（可能已回退）。
+
+        假 llm（测试里只实现 .call）退回 .call，meta 为 None（视为未验证）。
+        同时把 meta 存进线程本地旁路，供只拿到 str 的调用点用 `_take_llm_meta` 取。
+        """
+        from .closereading import call_llm_with_meta
+        text, meta = call_llm_with_meta(self.llm_client, prompt, model=model, json_mode=json_mode)
+        self._llm_meta_tls.meta = meta
+        return text, meta
+
+    def _take_llm_meta(self):
+        """取走并清空本线程最近一次 `_call_llm` 的 CallMeta（没有则 None）。"""
+        meta = getattr(self._llm_meta_tls, "meta", None)
+        self._llm_meta_tls.meta = None
+        return meta
+
+    @staticmethod
+    def _meta_fields(meta) -> Dict[str, Any]:
+        """CallMeta → FilterDecision 的 provider/served_model/fell_back 三个关键字参数。"""
+        from .closereading import meta_provenance
+        return meta_provenance(meta)
     
     def _parse_llm_response(self, response: str, batch: List[PaperSegment],
                              valid_ids: Optional[Set[int]] = None):
@@ -1833,6 +1875,8 @@ __PAPERS_JSON__
             'filter_mode': mode,
             'model': (self.settings.llm.filter_model or self.settings.llm.model) if mode == 'llm' else None,
             'prompt_version': self._filter_prompt_version,
+            # 实际应答者汇总（原 model 键是请求值，保留不动）：{"provider:served_model": 批数}
+            'served_models': dict(self._filter_served_models),
             'blacklist_count': stage_counts.get('blacklist_keyword', 0),
             'llm_excluded_count': stage_counts.get('llm_judge', 0),
             'whitelist_miss_count': stage_counts.get('whitelist_keyword', 0) + stage_counts.get('keyword_fallback', 0),
