@@ -118,3 +118,7 @@ docs/*
 !docs/bugs/
 .ruff_cache/
 .claude/
+
+# deep-research skill 默认落在仓库根；统一收进 output/scholar_notes/deep_research/（见该目录 README），这里防误提交
+/reports/
+/research_notes/
