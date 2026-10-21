@@ -136,3 +136,18 @@ topics:
       - self-masking missingness depends on the missing value itself 自掩蔽缺失
       - fairness accuracy trade-off 公平与准确性权衡
     max_evidence: 45
+
+  - slug: privacy-federated-structure
+    title: 跨中心隐私协作与联邦结构学习
+    question: 多中心 EHR 在不共享明文的前提下有哪些协作路线（联邦学习、差分隐私、同态加密、安全多方计算、可信研究环境），各自的隐私保证、精度与算力代价的实证证据是什么？只共享汇总结构（因果图、缺失图拓扑、充分统计量）时泄露风险多大，联邦因果结构学习在含缺失数据、站点异质时的现状与缺口是什么？
+    queries:
+      - federated learning EHR multi-institution privacy 联邦学习 多中心
+      - gradient leakage membership inference attack 梯度泄露 成员推断
+      - differential privacy noise utility trade-off 差分隐私 精度代价
+      - homomorphic encryption secure multi-party computation 同态加密 安全多方计算
+      - secure aggregation summary statistics sharing 安全聚合 汇总统计
+      - federated causal structure learning DAG across sites 联邦因果结构学习
+      - federated causal discovery missing data heterogeneous clients 含缺失数据 站点异质
+      - federated learning with incomplete data missingness across sites 联邦 缺失数据
+      - data governance data sharing agreement distributed network 数据治理 分布式网络
+    max_evidence: 50
