@@ -632,3 +632,43 @@ def claim_independent_sources(refs, ev_map, keeper_of) -> int
 - manual：`output/scholar_notes/manual/*/*.paper.json` 483 个 bundle 的 `segment.filter_decision`、`close_reading_script.model`、`close_reading_final.model`、`cross_check_report.reviewer_label`。
 - 稿件引用：两份 bib 按 citekey → DOI → 规范化标题依次匹配索引。
 - 摘要长度：最近 6 份 excluded sidecar 的 `original_abstract` 长度（1233 条）；`abstracts.json` 1798 条。
+
+---
+
+## 12. 修订（2026-10-21）：WO-8 由「放行闸门」改为「入库确认 + 持续标注 + 漂移提醒」
+
+**起因**：基线评测（run_20261021_125541）与新画像复跑（run_20261021_163254）之后，用户指出：(1) 自己的标注也不是金标准；(2) 研究兴趣在漂移，固定门槛会过时并挡住新方向。决定：**不写死放行门槛，改为每次入库都弹窗请用户确认**，确认结果即标签。原第 5.6/9 节 WO-8（certification.json、fail-closed、运行时未认证 EXCLUDE 转待复核）作废。
+
+用户已拍板（2026-10-21）：
+
+| 问题 | 决定 |
+|---|---|
+| 弹窗列哪些 | 筛选器判 INCLUDE/MAYBE 的（默认勾选）+ 置信 ≤0.85 的 EXCLUDE（默认不勾）+ 随机 3–5 条高置信 EXCLUDE 抽查（默认不勾） |
+| 无人应答 | 挂起：不入库、不精读，进待确认队列；系统通知提醒；用户方便时一条命令再弹 |
+| 漂移提醒 | 每月一次，只在分歧成簇时提 |
+
+### 12.1 WO-8a 入库确认弹窗
+
+- **插入点**：weekly digest（筛选完成）之后、weekly ingest / 精读之前。实现者先读 `scripts/run_weekly_digest.sh`、`scholar_main.py digest`、`scripts/ingest_notes.py` 与两个 launchd plist（`com.xlbd.scholar-digest` 09:00、`com.xlbd.scholar-weekly-ingest` 09:30），确认现有流程中精读发生在哪一步，把确认点放在**任何入库/精读之前**。
+- **待确认队列**：digest 结束写 `output/scholar_notes/_pending/confirm_<run_date>.json`（每条：dedup_key、标题、来源、筛选器 decision/confidence/bucket/exclude_reason/one_line、抽样类别 include|maybe|lowconf_exclude|audit、served_model、prompt 指纹）。ingest 与精读只处理**已确认**条目；未确认的保持挂起，下次 ingest 再看。
+- **弹窗**：macOS 原生 `osascript` 的 `choose from list ... with multiple selections allowed`，`default items` = 筛选器想收的。每项显示 `[类别] 标题（截 110 字）`。另提供一个「看摘要」按钮/入口：生成一份 md（标题 + 中文 one_line + 摘要前 400 字）用系统默认程序打开；**不做 web/TUI**（用户明确不要）。条目过多时分页（每页 ≤40）。
+- **入口**：`python scripts/confirm_ingest.py [--date ...]`。launchd 跑完 digest 后先发 `display notification`；若检测到 GUI 会话可用则直接弹窗，`giving up after` 超时（如 10 分钟）即视为无人应答 → 挂起。挂起时每天提醒一次（可复用现有 launchd 或在 ingest job 里检查），直到确认。
+- **确认结果落盘**：`output/scholar_notes/_eval/filter/stream_labels.jsonl` 追加，每条含 confirmed_at、user_decision（keep/drop）、筛选器原判与置信、抽样类别、指纹、served_model。用户勾上筛选器原判 EXCLUDE 的 → 视同手选覆盖（复用 WO-2 的 `llm_decision_before_override` / `stage=manual_pick` 语义）。
+- **兼容**：`--no-confirm`（或环境变量）跳过确认，按旧行为直接入库，供补跑/回填/测试使用；回填与 `manual` 系列不走确认。
+
+### 12.2 WO-8b 持续评测（只报告，不拦截）
+
+- `filter_eval.py` 增加把 `stream_labels.jsonl` 并入金标准新层 `S-stream` 的能力（按确认日期滚动，可设窗口，默认近 12 周）；抽样类别里的 lowconf_exclude/audit 带回加权，用于还原漏判率。
+- 改 prompt / 画像 / 换模型后照常 `run`，`report --vs <上一版>` 出配对对比；**不阻断**。CI 不调 LLM，只在当前指纹没有任何评测记录时打一条告警（不失败）。
+
+### 12.3 WO-8c 月度漂移提醒
+
+- 新脚本 `scripts/profile_drift.py`：读近 4 周 `stream_labels.jsonl`，统计
+  - 用户补勾（筛选器 EXCLUDE → 用户 keep）按 exclude_reason、按向量库语义聚类成簇；
+  - 用户取消（筛选器 INCLUDE/MAYBE → 用户 drop）按 bucket 聚类成簇。
+- 只有成簇（同一原因/簇 ≥ 阈值，阈值进 thresholds.py，初值 5 篇且占该类 ≥ 50%）才提醒：`display notification` + 生成 `output/scholar_notes/_eval/filter/drift_<YYYY-MM>.md`，列出簇内论文与建议的画像改动文字（不自动改画像）。
+- 挂到现有每月 1 日的 launchd（`com.xlbd.scholar-monthly-backfill`）之后跑，或新增 job；实现者择一并说明。
+
+### 12.4 不做
+
+- 不自动改画像；不设固定放行门槛；不为确认 UI 做网页或终端界面。
