@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  月度研究画像漂移提醒（可信度加固 WO-8c，设计 §12.3）：每月 1 日 10:30 读近 4 周入库确认标签，
+  只有「分歧成簇」才发系统通知并生成 output/scholar_notes/_eval/filter/drift_<YYYY-MM>.md；
+  不自动改画像。没有成簇时静默退出。
+
+  为什么是新 job 而不是挂在 com.xlbd.scholar-monthly-backfill（每月 1 日 21:30）之后：
+  - 漂移检测只依赖 stream_labels.jsonl，与月度回填的产物无关，没有先后依赖；
+  - 回填是夜间无人值守任务，通知发出时用户多半不在；10:30 是白天，能看到。
+  - 独立 job 失败不牵连回填，反之亦然。
+
+  由 scripts/install_confirm.sh 安装（与 com.xlbd.scholar-confirm 一起）：
+  占位符 __REPO_ROOT__ / __PYTHON_BIN__ / __LOG_DIR__ 会被替换后拷入 ~/Library/LaunchAgents/。
+  语义聚类用本地 Ollama（bge-m3）；不可用时自动降级为只按原因/维度聚类。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xlbd.scholar-drift</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>scripts/profile_drift.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- 绕开本机代理，否则本地 Ollama（语义聚类）被系统代理拦成 502；同 weekly-ingest 注释 -->
+        <key>no_proxy</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>__REPO_ROOT__</string>
+    </dict>
+
+    <!-- 每月 1 日 10:30 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/cron_drift.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/cron_drift.err.log</string>
+</dict>
+</plist>

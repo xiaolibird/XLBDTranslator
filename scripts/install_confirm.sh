@@ -3,7 +3,7 @@
 # 安装/卸载 入库确认 launchd 用户代理（可信度加固 WO-8a / WO-8c）
 #
 # 用法:
-#   bash scripts/install_confirm.sh              # 安装（每天 10:00 入库确认提醒）
+#   bash scripts/install_confirm.sh              # 安装（每天 10:00 入库确认提醒 + 每月 1 日 10:30 画像漂移提醒）
 #   bash scripts/install_confirm.sh --uninstall  # 卸载
 #
 # 与既有 job 互不影响；复用同一 python 实体二进制 → TCC 完全磁盘访问无需再授权。
@@ -15,7 +15,7 @@
 # ============================================================
 set -euo pipefail
 
-LABELS=("com.xlbd.scholar-confirm")
+LABELS=("com.xlbd.scholar-confirm" "com.xlbd.scholar-drift")
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${HOME}/Library/Logs/xlbd-scholar-digest"
 GUI_DOMAIN="gui/$(id -u)"
@@ -57,4 +57,4 @@ for LABEL in "${LABELS[@]}"; do
 done
 echo ""
 echo "   验证:   launchctl kickstart ${GUI_DOMAIN}/${LABELS[0]}"
-echo "   看日志: tail -f ${LOG_DIR}/cron_confirm.log"
+echo "   看日志: tail -f ${LOG_DIR}/cron_confirm.log  （漂移 job：cron_drift.log）"
