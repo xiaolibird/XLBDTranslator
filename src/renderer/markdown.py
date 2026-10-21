@@ -251,8 +251,8 @@ class MarkdownRenderer:
                 emoji=emoji,
                 title=self._clean_text(segment.chapter_title)
             ))
-            # 章节标题后添加分割线
-            parts.append(self.templates['section_separator'])
+            # 章节标题后添加分割线（补空行：否则正文紧贴 `---` 同行，`---` 以字面文本渲染）
+            parts.append(self.templates['section_separator'] + "\n\n")
 
         # 页码标记（仅在非章节开头且配置允许时显示，永远使用 h6）
         elif (segment.page_index is not None and
@@ -261,8 +261,8 @@ class MarkdownRenderer:
             parts.append(self.templates['page_marker'].format(
                 page=segment.page_index + 1
             ))
-            # 页码标记后也添加分割线
-            parts.append(self.templates['section_separator'])
+            # 页码标记后也添加分割线（同上，补空行）
+            parts.append(self.templates['section_separator'] + "\n\n")
 
         return "".join(parts)
 
