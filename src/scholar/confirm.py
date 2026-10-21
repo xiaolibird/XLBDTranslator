@@ -240,6 +240,8 @@ def sync_queue(notes_dir, digest_dir, since: Optional[date] = None, until: Optio
         d = ts.date()
         if (since and d < since) or (until and d > until):
             continue
+        if TH.CONFIRM_START_DATE and d < date.fromisoformat(TH.CONFIRM_START_DATE):
+            continue    # 启用确认之前的 run：已按旧流程入库，不补问
         rep.runs_seen += 1
         run_id = path.stem
         if run_id in registered_runs:

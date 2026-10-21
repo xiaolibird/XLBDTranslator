@@ -826,3 +826,20 @@ def test_intro_mentions_enter_confirms_page_and_second_check(env):
     d = FakeDialogs(asks=[ask_ok("稍后")])
     C.run_session(env.notes, d, now=NOW)
     assert "列表页回车 = 确认本页；全部点完后还会再让你核对一次" in d.ask_calls[0][0]
+
+
+def test_runs_before_confirm_start_date_are_never_queued(tmp_path, monkeypatch):
+    """CONFIRM_START_DATE 之前的 digest run 不入队；当天及之后照常。"""
+    from src.scholar import confirm as C
+    from src.scholar import thresholds as TH
+    seen_dates = []
+
+    def fake_runs(_d):
+        from datetime import datetime
+        return [(datetime(2026, 10, 19, 9), tmp_path / "digest_20261019_090004.json"),
+                (datetime(2026, 10, 26, 9), tmp_path / "digest_20261026_090004.json")]
+    monkeypatch.setattr(TH, "CONFIRM_START_DATE", "2026-10-22")
+    import src.scholar.ingest as ING
+    monkeypatch.setattr(ING, "digest_runs", fake_runs)
+    rep = C.sync_queue(tmp_path / "notes", tmp_path, None, None, seen=set())
+    assert rep.runs_seen == 1      # 只有 10-26 进入候选（10-19 在起点之前被跳过）

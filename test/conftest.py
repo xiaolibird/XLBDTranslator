@@ -56,3 +56,11 @@ def _reset_host_breaker():
         _ft.reset_pmcid_cache()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _no_confirm_start_date(monkeypatch):
+    """入库确认起点（thresholds.CONFIRM_START_DATE）是生产开关；测试夹具日期早于它，默认关掉。
+    需要测起点行为的用例自己 monkeypatch 回来。"""
+    from src.scholar import thresholds as TH
+    monkeypatch.setattr(TH, "CONFIRM_START_DATE", None, raising=False)

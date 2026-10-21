@@ -174,6 +174,9 @@ CONFIRM_PAGE_TIMEOUT_S = 1800
 CONFIRM_SUMMARY_CHARS = 400
 # 队列只扫最近这么多天内的 digest run（更早的不再自动入队，须手动指定窗口）
 CONFIRM_QUEUE_LOOKBACK_DAYS = 28
+# 启用入库确认的起点：早于该日期的 digest run 永不入队（那几周已按旧流程入库，
+# 只剩低置信排除未问——用户 2026-10-21 决定不补问）。None = 不设起点。
+CONFIRM_START_DATE = "2026-10-22"
 
 # ---------------------------------------------------------------------------
 # 持续评测 S-stream 层（WO-8b，设计 §12.2）
