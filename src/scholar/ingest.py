@@ -383,21 +383,29 @@ def classify_segments(segs: Sequence[PaperSegment], settings: ScholarSettings,
     if not force_include:
         return
     for seg in segs:
-        fd = seg.filter_decision
-        if fd is None:
-            seg.filter_decision = FilterDecision(
-                paper_id=seg.paper_id, title=seg.metadata.title, verdict="included",
-                decision="INCLUDE", stage="manual_pick", reason="手动指定入库",
-                one_line="手动指定入库")
-        elif fd.verdict != "included":
-            logger.info("  手选覆盖裁决：{} 原判 {} → INCLUDE".format(
-                (seg.metadata.title or "")[:48], fd.decision))
-            # 被用户手选推翻的 LLM 原判（尤其 EXCLUDE）是现成的「漏判」样本，要留在条目上，
-            # 不能只进日志；关键词回退没有三态原判（decision=None）时保持 None
-            fd.llm_decision_before_override = fd.decision
-            fd.verdict, fd.decision = "included", "INCLUDE"
-            fd.stage = "manual_pick"
-            fd.exclude_reason = None
+        apply_manual_override(seg)
+
+
+def apply_manual_override(seg: PaperSegment) -> None:
+    """把一篇论文按「用户手选入库」处理（手选覆盖语义，WO-2；入库确认弹窗勾上原判 EXCLUDE 的也走这里）。
+
+    无裁决 → 造一条 manual_pick；原判非 included → 就地改成 INCLUDE/manual_pick，并把 LLM 原判
+    留在 llm_decision_before_override（被用户推翻的 EXCLUDE 是现成的「漏判」样本，不能只进日志）；
+    关键词回退没有三态原判（decision=None）时保持 None；原判已是 included → 不动。
+    """
+    fd = seg.filter_decision
+    if fd is None:
+        seg.filter_decision = FilterDecision(
+            paper_id=seg.paper_id, title=seg.metadata.title, verdict="included",
+            decision="INCLUDE", stage="manual_pick", reason="手动指定入库",
+            one_line="手动指定入库")
+    elif fd.verdict != "included":
+        logger.info("  手选覆盖裁决：{} 原判 {} → INCLUDE".format(
+            (seg.metadata.title or "")[:48], fd.decision))
+        fd.llm_decision_before_override = fd.decision
+        fd.verdict, fd.decision = "included", "INCLUDE"
+        fd.stage = "manual_pick"
+        fd.exclude_reason = None
 
 
 # ---------------------------------------------------------------- 共用管线

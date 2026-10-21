@@ -635,7 +635,7 @@ def test_empty_week_still_refreshes_index_and_vectors(tmp_path, monkeypatch):
     mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
     monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: {ING.dedup_key(seg.metadata)})
     monkeypatch.setattr(mod.sys, "argv",
-                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto"])
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-confirm"])
 
     rc = mod.main()
     assert rc == 1                       # 退出码语义不变（没有新论文可入）
@@ -650,7 +650,7 @@ def test_empty_after_run_ingest_still_refreshes_index_and_vectors(tmp_path, monk
                                run_ingest_report={"status": "empty"})
     monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: set())
     monkeypatch.setattr(mod.sys, "argv",
-                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto"])
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-confirm"])
 
     assert mod.main() == 1
     assert len(calls) == 1
@@ -676,7 +676,7 @@ def test_no_index_flag_still_suppresses_the_refresh(tmp_path, monkeypatch):
     mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
     monkeypatch.setattr(NI, "load_seen_keys", lambda *a, **k: {ING.dedup_key(seg.metadata)})
     monkeypatch.setattr(mod.sys, "argv",
-                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-index"])
+                        ["ingest", "--config", str(_r3_env(tmp_path)), "--auto", "--no-confirm", "--no-index"])
     assert mod.main() == 1
     assert calls == []
 
@@ -831,3 +831,34 @@ def test_ingest_receipt_key_matches_what_ingest_notes_reads():
         encoding="utf-8")
     assert 'rep.get("sidecar_ok") is False' in consumer, \
         "ingest_notes 的量尺丢失判据与 ingest 回执的键名不一致"
+
+
+# ---------------------------------------------------------------- WO-8a 入库确认闸门接线
+
+def test_confirm_gate_is_default_and_no_confirm_bypasses_it(tmp_path, monkeypatch):
+    seg = _seg(1, "Pending Paper", doi="10.1/pend")
+    seen_by_gate = []
+    for argv_extra, env_flag, expect_gate in (([], None, True), (["--no-confirm"], None, False),
+                                              ([], "1", False)):
+        mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
+        monkeypatch.setattr(mod, "_apply_confirm_gate",
+                            lambda segs, *a, **k: (seen_by_gate.append(1), [])[1])
+        if env_flag:
+            monkeypatch.setenv("SCHOLAR_NO_CONFIRM", env_flag)
+        else:
+            monkeypatch.delenv("SCHOLAR_NO_CONFIRM", raising=False)
+        monkeypatch.setattr(mod.sys, "argv", ["ingest", "--config", str(_r3_env(tmp_path)), "--list"] + argv_extra)
+        n0 = len(seen_by_gate)
+        mod.main()
+        assert (len(seen_by_gate) - n0 == 1) is expect_gate
+
+
+def test_gate_emptied_window_still_refreshes_index(tmp_path, monkeypatch):
+    """闸门把入选全部挂起 = 本批为空，同 R3-3：不蕴含向量库不用动；退出码仍是 1。"""
+    seg = _seg(1, "Pending Paper", doi="10.1/pend")
+    mod, calls = _cli_with_spy(tmp_path, monkeypatch, [seg])
+    monkeypatch.delenv("SCHOLAR_NO_CONFIRM", raising=False)
+    monkeypatch.setattr(mod, "_apply_confirm_gate", lambda segs, *a, **k: [])
+    monkeypatch.setattr(mod.sys, "argv", ["ingest", "--config", str(_r3_env(tmp_path)), "--auto"])
+    assert mod.main() == 1
+    assert len(calls) == 1

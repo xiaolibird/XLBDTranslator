@@ -10,7 +10,10 @@
   09:30 起跑，留 30 分钟余量；digest 若还没跑完，本轮读到的是上一轮的窗口，
   下周会补上（跨库去重保证不重复）。
 
-  auto 开关 = 本周 digest 入选的全部入库。想人工挑就别用这个 job，手动跑
+  入库确认（WO-8a）：本 job 默认过确认闸门，只入库用户已在弹窗里确认保留的论文；
+  确认由 com.xlbd.scholar-confirm（每天 10:00）负责。旧行为（auto 开关 = 本周 digest
+  入选的全部入库）要在 ProgramArguments 里加 no-confirm 开关（双连字符，见 ingest_notes.py -h）。
+  想人工挑就别用这个 job，手动跑
   ingest_notes.py 的 list / pick 模式（参数名前加双连字符；XML 注释里写不了
   字面双连字符，见 ingest_notes.py -h）。
 

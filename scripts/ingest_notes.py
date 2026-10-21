@@ -21,11 +21,17 @@
 本地 PDF 走另一条链路（三段式 agent 交叉核验）：
   PYTHONPATH=. python scripts/read_pdf.py ingest <目录或 PDF 路径>
 
+入库确认（WO-8a，可信度加固）：digest 窗口的入口（默认 / --week / --since）**只放行用户已在
+弹窗里确认保留的论文**——确认由 scripts/confirm_ingest.py 完成（launchd 每日 10:00 提醒），
+未确认的挂起，不入库、不精读。旧行为（digest 入选的全部入库）用 --no-confirm 或环境变量
+SCHOLAR_NO_CONFIRM=1。--papers（手动给标识符）不经确认；回填 / manual 系列本来就不走这里。
+
 退出码：0 成功 / 1 无论文可入 / 2 配置或输入错误 / 3 札记已正常入库但概念页未全部
 更新成功（不是入库失败，是它的派生产物这一轮没跟上，见 topics.trigger_topic_refresh）。
 """
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import date, datetime, timedelta
@@ -80,6 +86,30 @@ def _refresh_index_and_vectors(settings) -> None:
     logger.info("文献索引已刷新")
     sync_store_best_effort(nd, index_data, settings,
                            notify_title="Scholar 周入库", context="入库")
+
+
+def _apply_confirm_gate(segs, settings, args, since, until):
+    """入库确认闸门（WO-8a）：只留用户已确认保留的；原判 EXCLUDE 被勾上的由 sidecar 重建补入。
+
+    未确认的是**挂起**不是丢弃：这里只统计、告警，队列状态不动。全部挂起时无人值守的 job
+    不能静默——通知里写明怎么确认，否则漏装确认 job 的人会看到「每周都没入库」却没有任何信号。
+    """
+    from src.scholar import confirm as C
+    from src.scholar.notes_index import INDEX_JSON, load_seen_keys
+    nd = Path(settings.processing.notes_dir)
+    gate = C.gate_segments(segs, nd, repo_path(args.digest_dir), since, until,
+                           seen=load_seen_keys(nd / INDEX_JSON),
+                           sync=not (args.list_only or args.dry_run))
+    logger.info("入库确认闸门：放行 {} 篇（其中 {} 篇为推翻筛选器原判 EXCLUDE 的补勾）｜"
+                "待确认 {}｜已丢弃 {}".format(len(gate.segs), gate.n_override, gate.n_pending, gate.n_dropped))
+    if gate.n_rebuild_failed:
+        logger.warning("  ⚠️ {} 篇补勾论文无法从 excluded sidecar 重建，本轮未入库".format(gate.n_rebuild_failed))
+    if gate.n_pending:
+        msg = "{} 篇论文待确认入库（未确认的不会入库/精读）：python scripts/confirm_ingest.py".format(gate.n_pending)
+        print(msg, file=sys.stderr)
+        if not gate.segs and not (args.list_only or args.dry_run):
+            notify("Scholar 周入库", msg)
+    return gate.segs
 
 
 def parse_pick(spec: str, n: int) -> list:
@@ -160,6 +190,9 @@ def main() -> int:
     ap.add_argument("--no-dedup", action="store_true", help="不跨库去重（调试用；会产生重复条目）")
     ap.add_argument("--label", default="", type=_label_arg,
                     help="覆盖札记标签 YYYY-MM[-DD][-批次名]（默认所属周的周一日期）")
+    ap.add_argument("--no-confirm", action="store_true",
+                    help="跳过入库确认，digest 入选的全部直接入库（旧行为；补跑/测试用。"
+                         "环境变量 SCHOLAR_NO_CONFIRM=1 等价）")
     ap.add_argument("--dry-run", action="store_true", help="走到写盘前停下")
     args = ap.parse_args()
 
@@ -176,6 +209,7 @@ def main() -> int:
         return 2
 
     # ---- 收集候选 ----
+    gated_empty = False       # 闸门把 digest 入选的全部挂起/丢弃了（≠ digest 本来就没有入选）
     if args.papers:
         pf = Path(args.papers)
         if not pf.exists():
@@ -212,9 +246,16 @@ def main() -> int:
         label = args.label or since.strftime("%Y-%m-%d")
         logger.info("digest 窗口 {} → {}：入选 {} 篇（复用已有裁决，未重跑筛选）".format(
             since, until, len(segs)))
+        if segs and not (args.no_confirm or os.environ.get("SCHOLAR_NO_CONFIRM")):
+            segs = _apply_confirm_gate(segs, settings, args, since, until)
+            gated_empty = not segs
 
     if not segs:
-        print("该窗口没有入选论文。", file=sys.stderr)
+        print("该窗口没有入选论文。" if not gated_empty
+              else "该窗口的入选论文都还没有确认保留（待确认 / 已丢弃），本轮不入库。", file=sys.stderr)
+        # 与「无新论文」同理（_refresh_index_and_vectors 文档）：本批为空 ≠ 向量库不用动
+        if gated_empty and not (args.no_index or args.list_only or args.dry_run):
+            _refresh_index_and_vectors(settings)
         return 1
 
     # ---- 跨库去重（**在列清单之前**）----
