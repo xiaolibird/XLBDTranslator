@@ -17,6 +17,11 @@ description: 投稿前对自己的稿件(md/tex/docx)做对抗性自查——15 
 1. 拿到稿件（md/tex/docx 均可；docx 先 `pandoc -t markdown` 转出文本层，**图表数字仍须
    人眼对照原图**）；
 2. 主 agent 逐门执行下面 15 道硬门，产出核查报告表：`门 | 位置 | 状态(✓/✗/N.A.) | 证据`；
+   **必须落盘**，不能只留在对话里：每次自查一个目录
+   `/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev/output/scholar_notes/selfchecks/<YYYY-MM-DD>-<稿件名>/`，
+   内含 `report.md`（按文末模板）与 `gates.json`（逐门结构化判定，格式见文末），对抗轮的
+   立案/驳回记录写进同一份 report.md。同一稿件重跑另开新日期目录，不覆盖旧轮——前后两轮的
+   `gates.json` 对比就是修复是否到位的证据；逐条判定攒多了也是日后改检查法的评测集；
 3. **对抗轮（推荐，对应重要投稿必做）**：spawn 一个 subagent，指令只有一条——
    「逐条尝试**反驳**这篇稿件的每个数字宣称与每处图文对应，拿出复算过程」；主 agent 裁决。
    生成者与找茬者不能是同一个上下文（自己核自己会顺着写作时的思路滑过去）。
@@ -138,4 +143,13 @@ Balanced Accuracy 列替换成 AUROC/AUPRC，而其公开代码里这两个指�
 ...
 硬门未过：G5, G7 → 修复后重跑全部 15 门。
 对抗轮裁决记录：<subagent 提出 N 条，采纳 M 条，驳回理由...>
+```
+
+`gates.json` 格式（与 report.md 同目录）：
+
+```json
+{"manuscript": "<稿件路径>", "version": "<commit 或日期>", "date": "YYYY-MM-DD",
+ "gates": [{"gate": "G1", "location": "Fig.1 vs §2.1", "status": "pass|fail|na",
+            "evidence": "8731+1390=10121 == 文中总数"}],
+ "adversarial": {"raised": 13, "accepted": 12, "rejected": [{"finding": "…", "reason": "…"}]}}
 ```

@@ -11,7 +11,7 @@ description: 对一篇论文做法证式诚信审查(独立于常规精读)—�
 方法论出处：DynaGraph 撤稿案（npj Digit. Med. 2026;9:216）的独立复核——我们在不知道
 撤稿声明细节的情况下核出了与官方五类问题一一对应的实锤，外加两处官方没点名的引用错配。
 本 skill 把那套流程固化。完整案例档案：
-`output/scholar_notes/撤稿案例_DynaGraph_npjDigitalMedicine.md`。
+`output/scholar_notes/audits/2026-09-01-DynaGraph_npjDigitalMedicine/report.md`（同目录另有对照臂复现路线图）。
 
 ## 判定纪律（先读这个，违者整份审查作废）
 
@@ -146,9 +146,11 @@ rel = (a - b) / b      # 相对百分比——正文写的到底是哪个？两�
    - 回写后重建索引**并同步向量库**（在 XLBDTranslator-dev 仓库根；只跑 notes_index
      的话撤稿文献在下一次 embed 同步前仍能被检索召回）：
      `PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_index.py && PYTHONPATH=. /Users/xiaolibird/miniconda3/envs/env002_reader/bin/python3.12 scripts/notes_embed.py`。
-2. **报告归档**：落 `output/scholar_notes/`——撤稿定档用 `撤稿案例_<论文>_<venue>.md`
-   （沿 DynaGraph 案既有先例），一般审查用 `审查报告_<论文>_<venue>.md`（本条新立的约定，
-   此前无先例）。两种命名都不匹配札记索引的文件名正则，不会被误收进索引。不要只留在对话里。
+2. **报告归档**：每次审查一个目录 `output/scholar_notes/audits/<YYYY-MM-DD>-<论文>_<venue>/`
+   （日期取审查当天），主报告叫 `report.md`，首行标题注明类型——撤稿定档写「# 撤稿案例：…」，
+   一般审查写「# 审查报告：…」；配套材料（复算脚本输出、截图清单、复现路线图等）放同目录。
+   2026-10-21 前散在 `output/scholar_notes/` 根目录的旧报告已迁入此处。`audits/` 不在札记
+   索引与向量库的扫描范围内，不会被误收。不要只留在对话里。
 3. **审的是自己要引的文献时**，提醒用户：该文献所在稿件若已引用它，走 `manuscript-selfcheck`
    的引用卫生轮复核相关句。
 
