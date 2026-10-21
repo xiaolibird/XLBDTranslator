@@ -15,6 +15,13 @@
   8. run --gold v1 [--smoke]               复用生产 _filter_by_llm 跑评测（调 LLM！先 --smoke 看链路）
   9. report [RUN_ID] [--vs BASE_RUN_ID]    渲染报告 / 与另一次运行配对比较
 
+持续评测（WO-8b，只报告不拦截）：入库确认弹窗每次产生的标签落在 stream_labels.jsonl。
+  build-gold --version 2 --registry-version 1 --stream-labels   把近 12 周的确认标签并入新层 S-stream
+  run --gold v2 --strata S-stream                              改 prompt / 画像 / 换模型后照常跑
+  report --vs <上一版 run>                                      配对对比（不阻断）
+  check                                                        当前筛选器指纹有没有评测记录（只告警，退出码恒 0；
+                                                               CI 里无评测数据时静默跳过）
+
 所有产物落在 <notes_dir>/_eval/filter/（gitignore 数据目录；稿件引用清单属未发表信息，不进 git）。
 """
 import argparse
@@ -29,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar import filter_eval as FE                                  # noqa: E402
+from src.scholar import thresholds as TH                                   # noqa: E402
 from src.scholar.paths import repo_path                                    # noqa: E402
 
 DEFAULT_BIBS = {
@@ -157,7 +165,8 @@ def _latest(edir, pattern):
 def cmd_build_gold(args):
     notes, digest, edir = _paths(args)
     FE.assert_ignored(edir)
-    paths = FE.registry_paths(edir, args.version)
+    reg_ver = args.registry_version or args.version
+    paths = FE.registry_paths(edir, reg_ver)
     state = FE._load_state(paths["state"])
     bibs = _read_bibs(args)
     idx, absf = notes / "literature_index.json", notes / "abstracts.json"
@@ -183,11 +192,22 @@ def cmd_build_gold(args):
                 if l.strip() and not l.startswith("#")}
     excl, incl = _keys(args.bib_exclude), _keys(args.bib_include)
 
+    from src.scholar import confirm as CF
+    stream_labels, stream_as_of = None, None
+    if args.stream_labels:
+        stream_labels = CF.load_stream_labels(notes)
+        if args.stream_as_of:
+            stream_as_of = datetime.fromisoformat(args.stream_as_of)
+        if not stream_labels:
+            print("提示：{} 里没有确认标签，S-stream 层为空".format(CF.labels_path(notes)), file=sys.stderr)
+
     try:
         items, stats, review = FE.build_gold(
             lib=lib, manual=manual, abstracts=FE.load_abstract_cache(absf), bibs=bibs, reg_state=state,
             stream=stream, stable=FE.load_stable_audit(stable_f), p1_abstracts=p1_abs, labels=labels,
-            label_key=key, f_override=f_over, bib_exclude=excl, bib_include=incl, seed=args.seed)
+            label_key=key, f_override=f_over, bib_exclude=excl, bib_include=incl, seed=args.seed,
+            stream_labels=stream_labels, stream_as_of=stream_as_of,
+            stream_window_weeks=args.stream_window_weeks)
     except RuntimeError as e:
         print("拒绝构造 gold：{}".format(e), file=sys.stderr)
         return 2
@@ -227,6 +247,8 @@ def cmd_build_gold(args):
                      "classes": dict(Counter(state.get("batches", {}).values()))},
         "counts": FE.gold_counts(items), "build_stats": stats,
         "h_sampling_plan": key["plan"] if key else None,
+        "stream": ({"labels_sha256": FE._sha256_file(CF.labels_path(notes)), **stats["s_stream"]}
+                   if stream_labels and "s_stream" in stats else None),
         "snapshot": _snapshot(notes, digest, bibs,
                               {"literature_index": idx, "abstracts": absf, "stable_audit": stable_f,
                                **{"bib_" + k: Path(DEFAULT_BIBS[k]).expanduser() for k in bibs}}),
@@ -252,6 +274,10 @@ def cmd_stats(args):
     h = [i for i in items if i["stratum"] == "H-stream"]
     if h:
         print("H-stream 人判分布：{}".format(dict(Counter(i["label"] for i in h))))
+    st = [i for i in items if i["stratum"] == "S-stream"]
+    if st:
+        print("S-stream 确认标签分布：{}；按类别：{}".format(
+            dict(Counter(i["label"] for i in st)), dict(Counter(i.get("category") for i in st))))
     mp = edir / "gold_v{}.meta.json".format(args.version)
     if mp.exists():
         m = json.loads(mp.read_text(encoding="utf-8"))
@@ -365,6 +391,35 @@ def cmd_report(args):
     return 0
 
 
+def cmd_check(args):
+    """当前筛选器指纹有没有评测记录。只告警、退出码恒 0（设计 §12.2：不阻断）。
+
+    评测数据（runs/）在 gitignore 的 output/ 下，CI 与新机器上没有——此时静默跳过而不是误报。
+    GitHub Actions 里用 ::warning:: 注解输出，本机直接打印。
+    """
+    import os
+    notes, _, edir = _paths(args)
+    if not FE.eval_dir(notes).is_dir():
+        print("无评测目录（{}），跳过指纹检查".format(edir))
+        return 0
+    from src.scholar.schema import ScholarSettings
+    from src.scholar.workflow import ScholarWorkflow
+    cfg_path = repo_path(args.config)
+    settings = ScholarSettings.from_env_file(cfg_path) if cfg_path.exists() else ScholarSettings()
+    fp = ScholarWorkflow(settings)._get_filter_prompt_version()
+    cov = FE.fingerprint_coverage(edir, fp)
+    if not cov["runs_dir_exists"]:
+        print("无评测记录目录（runs/），跳过指纹检查")
+    elif cov["has_record"]:
+        print("筛选器指纹 {} 已有评测记录：{}".format(fp, ", ".join(cov["run_ids"][-3:])))
+    else:
+        msg = ("当前筛选器指纹 {} 没有任何完整评测记录（共 {} 次运行都是别的指纹或冒烟）。"
+               "改过 prompt / 画像 / 模型后请跑 run 并 report --vs 上一版；这只是提醒，不阻断。".format(
+                   fp, cov["n_runs_total"]))
+        print(("::warning::" if os.environ.get("GITHUB_ACTIONS") else "警告：") + msg)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--notes-dir", default="output/scholar_notes")
@@ -388,7 +443,17 @@ def main(argv=None):
     p.add_argument("--f-override", default=None, help="F-override 条目 jsonl（dedup_key,title,abstract…）")
     p.add_argument("--bib-exclude", default=None, help="追加剔除的 bib citekey 清单（一行一个）")
     p.add_argument("--bib-include", default=None, help="追加纳入的 bib citekey 清单（捞回被默认规则剔掉的）")
+    p.add_argument("--registry-version", type=int, default=None,
+                   help="沿用哪一版 manual 登记表（默认同 --version；新开 gold 版本而登记不变时指向旧版）")
+    p.add_argument("--stream-labels", action="store_true",
+                   help="并入入库确认标签（<notes_dir>/_eval/filter/stream_labels.jsonl）为 S-stream 层")
+    p.add_argument("--stream-window-weeks", type=int, default=TH.STREAM_WINDOW_WEEKS,
+                   help="S-stream 只取最近多少周的确认（默认 %(default)s，按确认日期滚动）")
+    p.add_argument("--stream-as-of", default=None, metavar="ISO",
+                   help="窗口截止时刻（默认取标签里最晚的确认时间，保证同一标签文件重建结果一致）")
     sub.add_parser("stats")
+    p = sub.add_parser("check", help="当前筛选器指纹有无评测记录（只告警，退出码恒 0）")
+    p.add_argument("--config", default="config/scholar.env")
     p = sub.add_parser("run", help="评测执行（调 LLM；复用生产 _filter_by_llm）")
     p.add_argument("--gold", default=None, help="gold 版本，如 v1（缺省取 --version）")
     p.add_argument("--split", choices=("test", "dev", "all"), default="test", help="只作用于 M-core/M-side")
@@ -407,7 +472,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     fn = {"registry-export": cmd_registry_export, "registry-import": cmd_registry_import,
           "label-export": cmd_label_export, "label-import": cmd_label_import,
-          "build-gold": cmd_build_gold, "stats": cmd_stats,
+          "build-gold": cmd_build_gold, "stats": cmd_stats, "check": cmd_check,
           "run": cmd_run, "report": cmd_report}[args.cmd]
     return fn(args)
 

@@ -4,7 +4,8 @@
 本模块**不调用任何 LLM、不联网**，只读已有产物（札记索引、sidecar、digest、稿件 bib），
 产出五类东西：
 
-1. 金标准 `gold_v{N}.jsonl`（分层：P1-in / P1-out / M-core / M-side / F-override / H-stream / R-stable）；
+1. 金标准 `gold_v{N}.jsonl`（分层：P1-in / P1-out / M-core / M-side / F-override / H-stream / S-stream / R-stable；
+   S-stream = 入库确认弹窗持续产生的标签，WO-8b，按确认日期滚动窗口并入）；
 2. manual 批次登记表（批次级 + 按篇级），登记时间戳写进 gold 元数据——**必须先于第一次评测运行**，
    否则用户会不自觉把漏判的篇目归为「支线」，召回率被事后修饰；
 3. H-stream 盲标表：只含 标题 + 生产口径摘要 + 空白标签列，**不含**任何 LLM 判定、置信度、层别、近邻；
@@ -21,7 +22,7 @@ import math
 import re
 import subprocess
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -34,7 +35,7 @@ TEST_FRACTION_PCT = 30           # sha256(item_id) % 100 < 30 → test，其余 
 ABSTRACT_MAX_CHARS = 800         # 与生产 prompt 一致；prod 口径的 400 截断由评测执行器（WO-7）负责
 FILTER_VERSION_PREFIX = "filter-v3"
 
-STRATA = ("P1-in", "P1-out", "M-core", "M-side", "F-override", "H-stream", "R-stable")
+STRATA = ("P1-in", "P1-out", "M-core", "M-side", "F-override", "H-stream", "S-stream", "R-stable")
 REG_CLASSES = ("core", "side", "mixed")
 PAPER_CLASSES = ("core", "side")
 
@@ -696,6 +697,57 @@ def import_labels(sheet_path: Path, key: Dict[str, Any], allow_partial: bool = F
     return out
 
 
+# ---------------- S-stream：入库确认标签（WO-8b，设计 §12.2）----------------
+
+def stream_gold_items(labels: Sequence[Dict[str, Any]], *, as_of: Optional[datetime] = None,
+                      window_weeks: int = 12) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """把 stream_labels.jsonl 的行变成 S-stream 层 gold 条目。纯函数。
+
+    标签语义：user_decision=keep → positive，drop → negative。
+    窗口：confirmed_at ∈ (as_of - window_weeks 周, as_of]；as_of 缺省取标签里最晚的确认时间
+    （由数据决定，同一份标签文件重建得同一份 gold）。研究兴趣在漂移，旧标签会过时，所以滚动。
+
+    抽样权重还原漏判：lowconf_exclude 是整池全取（权重 1），audit 是从高置信 EXCLUDE 池随机抽
+    （权重 = 池/抽中），二者都带在 sample.weight 里，compute_metrics 的 s_stream 据此还原
+    「生产 EXCLUDE 中其实该收」的总体比例。
+
+    ⚠️ 锚定偏倚：INCLUDE/MAYBE 类条目默认勾选，用户「没取消」不等于「认真确认过」，所以
+    s_stream 里「筛选器收了但用户丢掉」的比例是**下界**；EXCLUDE 类默认不勾，用户勾上是主动行为，
+    漏判估计不受此影响。条目上记 anchored=True 以便分开看。
+    """
+    rows = [r for r in labels if r.get("user_decision") in ("keep", "drop") and r.get("dedup_key")]
+    stamps = {}
+    for r in rows:
+        t = _parse_ts(r.get("confirmed_at"))
+        if t is not None:
+            stamps[id(r)] = t
+    if as_of is None and stamps:
+        as_of = max(stamps.values())
+    lo = (as_of - timedelta(weeks=window_weeks)) if as_of else None
+    items, dropped_window = [], 0
+    for r in rows:
+        t = stamps.get(id(r))
+        if t is None or (lo is not None and t <= lo) or (as_of is not None and t > as_of):
+            dropped_window += 1
+            continue
+        fd = r.get("filter_decision") or "INCLUDE"
+        conf = r.get("filter_confidence")
+        items.append(_item(
+            "S-stream", r["dedup_key"], r.get("title"), r.get("abstract"), "digest_original",
+            "positive" if r["user_decision"] == "keep" else "negative", "user_confirm",
+            labeled_at=r.get("confirmed_at"),
+            notes="category={}".format(r.get("category")),
+            category=r.get("category"), anchored=bool(r.get("default_checked")),
+            override=bool(r.get("override")), prompt_version=r.get("prompt_version"),
+            sample={"pool": fd, "conf_bin": conf_bin(conf) if fd == "EXCLUDE" else "-",
+                    "weight": float(r.get("sample_weight") or 1.0), "prod_verdict": fd,
+                    "prod_confidence": conf, "category": r.get("category")}))
+    items.sort(key=lambda it: it["item_id"])         # 与输入顺序无关
+    stats = {"n_labels": len(rows), "n_in_window": len(items), "n_out_of_window": dropped_window,
+             "window_weeks": window_weeks, "as_of": as_of.isoformat(timespec="seconds") if as_of else None}
+    return items, stats
+
+
 # ---------------- gold 构造 ----------------
 
 def _item(stratum, dedup_key, title, abstract, abstract_source, label, label_source, citekey=None,
@@ -715,11 +767,13 @@ def build_gold(*, lib: List[Dict[str, Any]], manual: List[Dict[str, Any]], abstr
                labels: Optional[List[Dict[str, str]]] = None, label_key: Optional[Dict[str, Any]] = None,
                f_override: Optional[List[Dict[str, Any]]] = None, bib_exclude: Iterable[str] = (),
                bib_include: Iterable[str] = (),
-               seed: int = SEED, labeled_at: Optional[str] = None
+               seed: int = SEED, labeled_at: Optional[str] = None,
+               stream_labels: Optional[Sequence[Dict[str, Any]]] = None,
+               stream_as_of: Optional[datetime] = None, stream_window_weeks: int = 12
                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     """纯函数：把各路输入装配成 (gold 条目, 构造统计, bib 审阅记录)。同输入同输出。
 
-    层间去重优先级 P1 > M > F > H > R：同一 dedup_key 只在最先命中的层出现（落选者计数写进统计）。
+    层间去重优先级 P1 > M > F > H > S > R：同一 dedup_key 只在最先命中的层出现（落选者计数写进统计）。
     """
     check_registry_complete(reg_state, manual)
     p1_abstracts = p1_abstracts or {}
@@ -793,6 +847,13 @@ def build_gold(*, lib: List[Dict[str, Any]], manual: List[Dict[str, Any]], abstr
                       sample={"pool": k["pool"], "conf_bin": k["conf_bin"], "weight": k["weight"],
                               "prod_verdict": k["prod_verdict"], "prod_confidence": k["prod_confidence"]}))
 
+    # S（入库确认标签；不给 stream_labels 则整层缺席，旧版本 gold 不受影响）
+    if stream_labels:
+        s_items, s_stats = stream_gold_items(stream_labels, as_of=stream_as_of, window_weeks=stream_window_weeks)
+        stats["s_stream"] = s_stats
+        for it in s_items:
+            add(it)
+
     # R
     for r in stable:
         lib_e = next((e for e in lib if e.get("citekey") == r.get("citekey")), None)
@@ -844,7 +905,7 @@ DEFAULT_REPEATS = 2
 SMOKE_PER_GROUP = 20             # --smoke：每组固定抽 20 条（3 组共 60 条 = 3 批）
 SMOKE_GROUPS = (("P1", ("P1-in", "P1-out")), ("M-core", ("M-core",)), ("H-stream", ("H-stream",)))
 # 默认入跑的层：M-side/R-stable 无标签、只做观察，要看须显式 --strata 指定
-DEFAULT_RUN_STRATA = ("P1-in", "P1-out", "M-core", "F-override", "H-stream")
+DEFAULT_RUN_STRATA = ("P1-in", "P1-out", "M-core", "F-override", "H-stream", "S-stream")
 # --split 只作用于大层（M-core 的 test 是主门槛；P1/H/F 规模小，一律全收）
 SPLIT_STRATA = ("M-core", "M-side")
 # 这些层的「标签/判定」来自生产 LLM 裁决；decision_source 为 manual 系列的条目其裁决不是 LLM 给的，剔除
@@ -1047,7 +1108,7 @@ def build_entries(items: Sequence[Dict[str, Any]], repeat_results: Sequence[Sequ
         keys = {model_key(r["provider"], r["served_model"]) for r in reps if r["verdict"] != "FALLBACK"}
         e = {"item_id": it["item_id"], "stratum": it["stratum"], "label": it.get("label"), "split": it.get("split"),
              "title": it.get("title"), "abstract_source": it.get("abstract_source"), "origin": it.get("origin"),
-             "sample": it.get("sample"), "batch": it.get("batch"),
+             "sample": it.get("sample"), "batch": it.get("batch"), "anchored": it.get("anchored"),
              "verdicts": [r["verdict"] for r in reps],
              "confidence": [r["confidence"] for r in reps],
              "served_model": [model_key(r["provider"], r["served_model"]) if r["verdict"] != "FALLBACK" else None
@@ -1079,6 +1140,38 @@ def _flip(entries: Sequence[Dict[str, Any]]) -> Optional[float]:
         return None
     n_rep = min(len(e["verdicts"]) for e in es)
     return flip_rate([[e["verdicts"][r] for e in es] for r in range(n_rep)])
+
+
+def _stream_metrics(s: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """S-stream（入库确认标签）的指标。n=0 时只返回 {"n": 0}。
+
+    prod_miss：生产 EXCLUDE 的样本里用户勾上（=该收）的比例，按抽样权重还原总体
+               （lowconf 全取权重 1，audit 权重 = 池/抽中）。EXCLUDE 默认不勾，勾上是主动行为，无锚定偏倚。
+    prod_false_keep：生产收了（INCLUDE/MAYBE）而用户取消的比例——**下界**（默认勾选的锚定偏倚，见
+               filter_eval.stream_gold_items 的注释）。
+    now_keep_pos / now_false_include：本次复跑（当前 prompt/画像/模型）对用户 keep/drop 标签的表现。
+    """
+    if not s:
+        return {"n": 0}
+    sx = [e for e in s if (e.get("sample") or {}).get("prod_verdict") == "EXCLUDE"]
+    wts = [float((e["sample"] or {}).get("weight") or 1.0) for e in sx]
+    flags = [e["label"] == "positive" for e in sx]
+    by_cat: Dict[str, List[bool]] = defaultdict(list)
+    for e, f in zip(sx, flags):
+        by_cat[(e["sample"] or {}).get("category") or "?"].append(f)
+    sk = [e for e in s if (e.get("sample") or {}).get("prod_verdict") in ("INCLUDE", "MAYBE")]
+    pos = [e for e in s if e["label"] == "positive"]
+    neg = [e for e in s if e["label"] == "negative"]
+    return {
+        "n": len(s),
+        "n_positive": len(pos), "n_negative": len(neg),
+        "prod_miss": dict(_rate(sum(flags), len(sx)), weighted=(weighted_rate(flags, wts) if sx else None)),
+        "prod_miss_by_category": {c: {"k": sum(v), "n": len(v)} for c, v in sorted(by_cat.items())},
+        "prod_false_keep": _rate(sum(1 for e in sk if e["label"] == "negative"), len(sk)),
+        "now_keep_pos": _keep(pos),
+        "now_false_include": _rate(sum(1 for e in neg if e["worst"] == "INCLUDE"), len(neg)),
+        "n_anchored": sum(1 for e in s if (e.get("anchored"))),
+    }
 
 
 def compute_metrics(entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1126,6 +1219,7 @@ def compute_metrics(entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                                       and e["worst"] in ("INCLUDE", "MAYBE")),
         "prod_keep_now_exclude": sum(1 for e in h if (e.get("sample") or {}).get("prod_verdict") in ("INCLUDE", "MAYBE")
                                       and e["worst"] == "EXCLUDE")}
+    m["s_stream"] = _stream_metrics([e for e in E if e["stratum"] == "S-stream"])
     m["no_abstract_keep"] = _keep([e for e in positive if e.get("abstract_source") == "none"])
     m["flip"] = {"all": _flip(E), **{s: _flip([e for e in E if e["stratum"] == s]) for s in STRATA
                                      if any(e["stratum"] == s for e in E)}}
@@ -1206,6 +1300,32 @@ def run_eval(wf, items: Sequence[Dict[str, Any]], *, repeats: int = DEFAULT_REPE
     return reps
 
 
+# ---------------- 评测覆盖告警（WO-8b：只告警，不拦截）----------------
+
+def fingerprint_coverage(edir, fingerprint: str) -> Dict[str, Any]:
+    """当前筛选器指纹（prompt 版本 + 模板/维度/画像哈希）有没有至少一次**完整、非冒烟**的评测记录。
+
+    只读 runs/*.json 的 config；不调 LLM、不联网。runs 目录不存在（CI / 新机器——评测数据 gitignore，
+    不随仓库走）记 runs_dir_exists=False，调用方据此跳过而不是误报。
+    """
+    rd = Path(edir) / "runs"
+    out: Dict[str, Any] = {"fingerprint": fingerprint, "runs_dir_exists": rd.is_dir(),
+                           "n_runs_total": 0, "run_ids": [], "has_record": False}
+    if not rd.is_dir():
+        return out
+    for f in sorted(rd.glob("run_*.json")):
+        try:
+            r = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        out["n_runs_total"] += 1
+        cfg = r.get("config") or {}
+        if cfg.get("prompt_fingerprint") == fingerprint and r.get("status") == "complete" and not cfg.get("smoke"):
+            out["run_ids"].append(r.get("run_id") or f.stem)
+    out["has_record"] = bool(out["run_ids"])
+    return out
+
+
 # ---------------- 报告 ----------------
 
 def _fmt_rate(r: Dict[str, Any]) -> str:
@@ -1257,6 +1377,18 @@ def format_report(run: Dict[str, Any], baseline: Optional[Dict[str, Any]] = None
         L.append("    按置信度段（应收/样本）：{}".format(
             ", ".join("{}={}/{}".format(b, v["k"], v["n"]) for b, v in m["h_stream_miss_by_conf_bin"].items()) or "无"))
         L.append("    H 边缘 {} 条不进分母；复跑 vs 生产：{}".format(m["h_borderline_n"], m["h_vs_prod"]))
+        sm = m.get("s_stream") or {"n": 0}
+        if sm["n"]:
+            pm = sm["prod_miss"]
+            L.append("S 入库确认标签 {} 条（keep {} / drop {}；锚定 {} 条）".format(
+                sm["n"], sm["n_positive"], sm["n_negative"], sm["n_anchored"]))
+            L.append("    生产漏判率(EXCLUDE 中用户勾上) {}  加权还原={}".format(
+                _fmt_rate(pm), "n/a" if pm["weighted"] is None else "{:.1%}".format(pm["weighted"])))
+            L.append("      按类别（勾上/样本）：{}".format(", ".join(
+                "{}={}/{}".format(c, v["k"], v["n"]) for c, v in sm["prod_miss_by_category"].items()) or "无"))
+            L.append("    生产收了而用户取消（下界，默认勾选有锚定偏倚） {}".format(_fmt_rate(sm["prod_false_keep"])))
+            L.append("    本次保留用户 keep 的比例 {}".format(_fmt_rate(sm["now_keep_pos"])))
+            L.append("    本次把用户 drop 的判成 INCLUDE {}".format(_fmt_rate(sm["now_false_include"])))
         L.append("无摘要阳性保留率          {}".format(_fmt_rate(m["no_abstract_keep"])))
         L.append("翻转率：{}".format(", ".join(
             "{}={}".format(k, "n/a" if v is None else "{:.1%}".format(v)) for k, v in m["flip"].items())))

@@ -48,3 +48,9 @@ jobs:
 
       - name: Run tests
         run: pytest test/ -q
+
+      # 筛选器指纹评测覆盖（WO-8b，只告警不失败）：当前 prompt/画像指纹没有评测记录时打注解。
+      # 评测数据在 gitignore 的 output/ 下，CI 上没有 → 静默跳过；此步在有数据的机器上才有意义。
+      - name: Filter eval coverage (warn only)
+        run: python scripts/filter_eval.py check
+        continue-on-error: true
