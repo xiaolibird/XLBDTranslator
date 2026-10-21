@@ -672,3 +672,7 @@ def claim_independent_sources(refs, ev_map, keeper_of) -> int
 ### 12.4 不做
 
 - 不自动改画像；不设固定放行门槛；不为确认 UI 做网页或终端界面。
+
+### 12.5 补丁（2026-10-21 真机测试后）
+
+用户首次真机测试「点错了」（159 条 33 秒内按默认按钮连续提交）。改为：各页「确认本页」只暂存（草稿 `_pending/_draft.json`，不算确认）；全部点完后弹汇总核对框（默认按钮「返回修改」），「确认提交」后才落盘与放行入库；任一页取消/超时则整场不生效（取消原 partial 语义，上文 12.1「每页确认即落盘」作废）。相对默认未改动的条目在 stream_labels 标 `user_decision_source=default_accepted`，S-stream 与漂移分析默认不计。新增 `confirm_ingest.py --reopen YYYY-MM-DD`（未入库才可重开，写撤销行）。修正 confirmed_at 记成会话开始时刻的 bug，另记 committed_at。
