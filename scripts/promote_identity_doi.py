@@ -86,6 +86,161 @@ def _issued(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"date": date(int(m.group(0)), 1, 1), "precision": "year"} if m else None
 
 
+def plan_layers(notes_dir: Path, e: Dict[str, Any], citekey: str, old_key: str, new_key: str,
+                *, csl_type: Optional[str] = None) -> Dict[str, Any]:
+    """只读：定位 6 类派生物，返回 ctx（plan 文本、problems 列表、定位到的对象）。"""
+    md_path = notes_dir / e["note_file"]
+    stem = md_path.name[:-3]
+    side_path = notes_dir / "{}.index.json".format(stem)
+    ref_path = notes_dir / "{}.references.json".format(stem)
+    abs_path = notes_dir / "abstracts.json"
+    plan: List[str] = []
+    problems: List[str] = []
+
+    def _add(msg: str, bad: bool = False):
+        plan.append(("⛔ " if bad else "") + msg)
+        if bad:
+            problems.append(msg)
+
+    side = json.loads(side_path.read_text(encoding="utf-8")) if side_path.exists() else None
+    row = None
+    if side:
+        cand = [r for r in side.get("papers", []) if r.get("citekey") == citekey]
+        row = cand[0] if len(cand) == 1 else None
+    if row:
+        _add("sidecar: doi/arxiv_id/url/journal/year")
+    elif side is None:
+        _add("sidecar: 该月无 sidecar（索引自 md 解析），不动")    # 早期月份确有这种情形
+    else:
+        _add("sidecar: 条目未唯一匹配", True)
+    refs = load_csl_items(ref_path) if ref_path.exists() else []
+    csl = _match_csl(e, refs)
+    _add("CSL: DOI/type={}/URL/container/卷期页/issued".format(csl_type or "不变") if csl
+         else "CSL: 未匹配", csl is None)
+    lines = md_path.read_text(encoding="utf-8").split("\n")
+    pat = re.compile(r"^## .*\[@{}\]\s*$".format(re.escape(citekey)))
+    heads = [i for i, ln in enumerate(lines) if pat.match(ln)]
+    h = heads[0] if len(heads) == 1 else None
+    _add("md: 链接行→DOI 行 / 插 DOI 行" if h is not None else "md: 标题未唯一定位", h is None)
+    bundle = None
+    if e.get("series") == "manual":
+        mdir = notes_dir / "manual" / (e.get("month") or "")
+        for bf in sorted(mdir.glob("*.paper.json")):
+            m = ((json.loads(bf.read_text(encoding="utf-8")).get("segment") or {}).get("metadata")) or {}
+            if _norm(m.get("arxiv_id")) == _norm(e.get("arxiv_id")) or _norm(m.get("title")) == _norm(e.get("title")):
+                bundle = bf
+                break
+        _add("bundle: {}".format(bundle.name) if bundle else "bundle: 未匹配", bundle is None)
+    abs_data = json.loads(abs_path.read_text(encoding="utf-8")) if abs_path.exists() else None
+    has_abs = bool(abs_data and old_key in (abs_data.get("abstracts") or {}))
+    _add("abstracts.json: 改键 {} → {}".format(old_key, new_key) if has_abs
+         else "abstracts.json: 无该键，不动")
+    return {"plan": plan, "problems": problems, "md_path": md_path, "side_path": side_path,
+            "ref_path": ref_path, "abs_path": abs_path, "side": side, "row": row, "refs": refs,
+            "csl": csl, "lines": lines, "h": h, "bundle": bundle, "abs_data": abs_data,
+            "has_abs": has_abs}
+
+
+def write_layers(ctx: Dict[str, Any], notes_dir: Path, e: Dict[str, Any], old_key: str,
+                 new_key: str, bak: Path, *, doi: Optional[str] = None, arxiv_id: Optional[str] = None,
+                 url: str = "", journal: str = "", iss: Optional[Dict[str, Any]] = None,
+                 csl_type: Optional[str] = None, item: Optional[Dict[str, Any]] = None) -> None:
+    """写盘 6 类派生物中除「按月强扫索引」外的 5 类（先备份到 bak）。
+
+    doi / arxiv_id 至少给一个。arXiv 档不改 md 链接行（md 链接本就是索引取 arXiv 号的口径之一，
+    sidecar 优先），只写 sidecar / bundle；CSL 无 arXiv 专用字段，不动。
+    """
+    item = item or {}
+    md_path, side_path, ref_path = ctx["md_path"], ctx["side_path"], ctx["ref_path"]
+    abs_path, abs_data, bundle = ctx["abs_path"], ctx["abs_data"], ctx["bundle"]
+    side, row, refs, csl, lines, h = ctx["side"], ctx["row"], ctx["refs"], ctx["csl"], ctx["lines"], ctx["h"]
+
+    def _backup(p: Path):
+        dst = bak / p.relative_to(notes_dir)
+        if dst.exists():          # 批量时同一 sidecar/abstracts 会被多次写：只留最早（原始）那份
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dst)
+
+    if row is not None:
+        _backup(side_path)
+        if doi:
+            row["doi"] = doi
+        if arxiv_id:
+            row["arxiv_id"] = arxiv_id
+        if url and not row.get("url"):
+            row["url"] = url
+        if journal:
+            row["journal"] = journal
+        if iss:
+            row["year"] = iss["date"].year
+        _write_json(side_path, side, _json_style(side_path))
+
+    _backup(ref_path)
+    if doi:
+        csl["DOI"] = doi
+    if csl_type:
+        csl["type"] = csl_type
+    if url:
+        csl["URL"] = url
+    if journal:
+        csl["container-title"] = journal
+    for src, dst in (("volume", "volume"), ("issue", "issue"), ("pages", "page")):
+        if item.get(src):
+            csl[dst] = item[src]
+    if iss:
+        csl["issued"] = {"date-parts": date_parts(iss["date"], iss["precision"])}
+    _write_json(ref_path, refs, _json_style(ref_path))
+
+    if doi:
+        _backup(md_path)
+        end = next((j for j in range(h + 1, len(lines)) if lines[j].startswith("## ") or lines[j].startswith("# ")), len(lines))
+        doi_line = "**DOI**: [{0}](https://doi.org/{0})".format(doi)
+        j_link = next((j for j in range(h + 1, end) if lines[j].startswith("**链接**: ")), None)
+        if j_link is not None:
+            lines[j_link] = doi_line
+        else:
+            j_j = next((j for j in range(h + 1, end) if lines[j].startswith("**期刊/来源**: ")), None)
+            j_a = next((j for j in range(h + 1, end) if lines[j].startswith("**作者**: ")), None)
+            k = (j_j if j_j is not None else j_a if j_a is not None else h) + 1
+            lines.insert(k, doi_line)
+        if journal:
+            j_j = next((j for j in range(h + 1, end + 1) if j < len(lines) and lines[j].startswith("**期刊/来源**: ")), None)
+            if j_j is not None:
+                lines[j_j] = "**期刊/来源**: " + journal
+        tmp = md_path.with_suffix(".md.tmp")
+        tmp.write_text("\n".join(lines), encoding="utf-8")
+        tmp.replace(md_path)
+
+    if bundle:
+        _backup(bundle)
+        data = json.loads(bundle.read_text(encoding="utf-8"))
+        m = data["segment"]["metadata"]
+        if doi:
+            m["doi"] = doi
+        if arxiv_id:
+            m["arxiv_id"] = arxiv_id
+        if url and not m.get("url"):
+            m["url"] = url
+        if journal:
+            m["journal"] = journal
+        for k in ("volume", "issue", "pages"):
+            if item.get(k):
+                m[k] = item[k]
+        if iss:
+            m["publication_date"] = iss["date"].isoformat()
+            m["date_precision"] = iss["precision"]
+        _write_json(bundle, data, _json_style(bundle))
+
+    if ctx["has_abs"]:
+        _backup(abs_path)
+        for section in ("abstracts", "failures"):
+            sec = abs_data.get(section)
+            if isinstance(sec, dict) and old_key in sec:
+                sec[new_key] = sec.pop(old_key)
+        _write_json(abs_path, abs_data, _json_style(abs_path))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="arXiv 身份 → 正刊 DOI 身份升级")
     ap.add_argument("--notes-dir", default="output/scholar_notes")
@@ -141,124 +296,19 @@ def main() -> int:
     iss = _issued(item)
     csl_type = CSL_TYPE.get(item.get("itemType") or "", "article-journal")
 
-    md_path = notes_dir / e["note_file"]
-    stem = md_path.name[:-3]
-    side_path = notes_dir / "{}.index.json".format(stem)
-    ref_path = notes_dir / "{}.references.json".format(stem)
-    abs_path = notes_dir / "abstracts.json"
-
-    # --- 计划 ---
-    plan: List[str] = []
-    side = json.loads(side_path.read_text(encoding="utf-8")) if side_path.exists() else None
-    row = None
-    if side:
-        cand = [r for r in side.get("papers", []) if r.get("citekey") == args.citekey]
-        row = cand[0] if len(cand) == 1 else None
-        plan.append("sidecar: doi/url/journal/year" if row else "sidecar: ⛔ 条目未唯一匹配")
-    refs = load_csl_items(ref_path) if ref_path.exists() else []
-    csl = _match_csl(e, refs)
-    plan.append("CSL: DOI/type={}/URL/container/卷期页/issued".format(csl_type) if csl else "CSL: ⛔ 未匹配")
-    lines = md_path.read_text(encoding="utf-8").split("\n")
-    pat = re.compile(r"^## .*\[@{}\]\s*$".format(re.escape(args.citekey)))
-    heads = [i for i, ln in enumerate(lines) if pat.match(ln)]
-    h = heads[0] if len(heads) == 1 else None
-    plan.append("md: 链接行→DOI 行 / 插 DOI 行" if h is not None else "md: ⛔ 标题未唯一定位")
-    bundle = None
-    if e.get("series") == "manual":
-        mdir = notes_dir / "manual" / (e.get("month") or "")
-        for bf in sorted(mdir.glob("*.paper.json")):
-            m = ((json.loads(bf.read_text(encoding="utf-8")).get("segment") or {}).get("metadata")) or {}
-            if _norm(m.get("arxiv_id")) == _norm(e.get("arxiv_id")) or _norm(m.get("title")) == _norm(e.get("title")):
-                bundle = bf
-                break
-        plan.append("bundle: {}".format(bundle.name if bundle else "⛔ 未匹配"))
-    abs_data = json.loads(abs_path.read_text(encoding="utf-8")) if abs_path.exists() else None
-    has_abs = bool(abs_data and old_key in (abs_data.get("abstracts") or {}))
-    plan.append("abstracts.json: 改键 {} → {}".format(old_key, new_key) if has_abs else "abstracts.json: 无该键，不动")
-    for p in plan:
+    ctx = plan_layers(notes_dir, e, args.citekey, old_key, new_key, csl_type=csl_type)
+    for p in ctx["plan"]:
         print("  · " + p)
-    if any("⛔" in p for p in plan):
+    if ctx["problems"]:
         print("⛔ 有层没定位到，拒绝写盘", file=sys.stderr)
         return 2
     if not args.apply:
         print("（dry-run，未写盘；加 --apply 执行）")
         return 0
 
-    # --- 写盘 ---
     bak = notes_dir / "_archive" / "promote_doi_{}".format(datetime.now().strftime("%Y%m%d-%H%M"))
-
-    def _backup(p: Path):
-        dst = bak / p.relative_to(notes_dir)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(p, dst)
-
-    _backup(side_path)
-    row["doi"] = doi
-    if url and not row.get("url"):
-        row["url"] = url
-    if journal:
-        row["journal"] = journal
-    if iss:
-        row["year"] = iss["date"].year
-    _write_json(side_path, side, _json_style(side_path))
-
-    _backup(ref_path)
-    csl["DOI"] = doi
-    csl["type"] = csl_type
-    if url:
-        csl["URL"] = url
-    if journal:
-        csl["container-title"] = journal
-    for src, dst in (("volume", "volume"), ("issue", "issue"), ("pages", "page")):
-        if item.get(src):
-            csl[dst] = item[src]
-    if iss:
-        csl["issued"] = {"date-parts": date_parts(iss["date"], iss["precision"])}
-    _write_json(ref_path, refs, _json_style(ref_path))
-
-    _backup(md_path)
-    end = next((j for j in range(h + 1, len(lines)) if lines[j].startswith("## ") or lines[j].startswith("# ")), len(lines))
-    doi_line = "**DOI**: [{0}](https://doi.org/{0})".format(doi)
-    j_link = next((j for j in range(h + 1, end) if lines[j].startswith("**链接**: ")), None)
-    if j_link is not None:
-        lines[j_link] = doi_line
-    else:
-        j_j = next((j for j in range(h + 1, end) if lines[j].startswith("**期刊/来源**: ")), None)
-        j_a = next((j for j in range(h + 1, end) if lines[j].startswith("**作者**: ")), None)
-        k = (j_j if j_j is not None else j_a if j_a is not None else h) + 1
-        lines.insert(k, doi_line)
-    if journal:
-        j_j = next((j for j in range(h + 1, end + 1) if j < len(lines) and lines[j].startswith("**期刊/来源**: ")), None)
-        if j_j is not None:
-            lines[j_j] = "**期刊/来源**: " + journal
-    tmp = md_path.with_suffix(".md.tmp")
-    tmp.write_text("\n".join(lines), encoding="utf-8")
-    tmp.replace(md_path)
-
-    if bundle:
-        _backup(bundle)
-        data = json.loads(bundle.read_text(encoding="utf-8"))
-        m = data["segment"]["metadata"]
-        m["doi"] = doi
-        if url and not m.get("url"):
-            m["url"] = url
-        if journal:
-            m["journal"] = journal
-        for k in ("volume", "issue", "pages"):
-            if item.get(k):
-                m[k] = item[k]
-        if iss:
-            m["publication_date"] = iss["date"].isoformat()
-            m["date_precision"] = iss["precision"]
-        _write_json(bundle, data, _json_style(bundle))
-
-    if has_abs:
-        _backup(abs_path)
-        for section in ("abstracts", "failures"):
-            sec = abs_data.get(section)
-            if isinstance(sec, dict) and old_key in sec:
-                sec[new_key] = sec.pop(old_key)
-        _write_json(abs_path, abs_data, _json_style(abs_path))
+    write_layers(ctx, notes_dir, e, old_key, new_key, bak, doi=doi, url=url, journal=journal,
+                 iss=iss, csl_type=csl_type, item=item)
 
     mp = (e.get("month") or "")[:7]
     idx2 = update_index(notes_dir, since=mp, until=mp)
