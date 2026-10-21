@@ -30,6 +30,8 @@ from src.scholar.schema import ScholarSettings
 
 # 重构前散落在 schema.py / whitelist_filter_prompt.md / journal_screen.py / pdf_ingest.py
 # 里的旧方向文本，独立于 research_profile.py 的实现固定下来，防止实现和 fixture 一起漂移。
+# 2026-10-21 有意改动：纳入维度加 H（重症/急诊/肾脏临床）与 I（相邻方法基础），X5 加 H 例外
+# ——依据 filter 召回评测 run_20261021_125541 与用户裁决，改画像时三处（yaml/默认值/本 fixture）同步。
 FIXTURE_INTERESTS = (
     "论文主题：EHR 缺失机制（MNAR）与「缺失条件依赖结构」的跨中心可迁移性；"
     "定位为 causal hypothesis generation，不做 causal identification。"
@@ -54,7 +56,14 @@ FIXTURE_INCLUSION_DIMS = (
     "   声称因果特征集不提升泛化、causal features vs. all features、\n"
     "   attention ≠ causality、可解释性权重的可靠性质疑。\n"
     "F. venue 基准：多库大规模 ICU 预测验证（MIMIC-IV / eICU / AmsterdamUMCdb / HiRID）。\n"
-    "G. 临床落地场景：sepsis subphenotype、AKI、CKD/透析、ICU 死亡率预测。"
+    "G. 临床落地场景：sepsis subphenotype、AKI、CKD/透析、ICU 死亡率预测。\n"
+    "H. 重症/急诊/肾脏临床研究（收为主线，用于观察真实研究的纳排与预处理做法）：\n"
+    "   ICU / sepsis / ARDS / AKI / CRRT / 急诊队列研究、评分（SOFA 等）开发与外部验证、\n"
+    "   轨迹表型、液体与通气管理的观察性研究；关注其纳入排除标准、缺失处理、\n"
+    "   数据预处理与队列构建。即使没有方法学贡献也纳入。\n"
+    "I. 与本线相邻的方法基础：表格基础模型（TabPFN 系）、算法公平性与因果公平、\n"
+    "   生成式建模基础方法（flow matching / diffusion，作为生成式插补的底层）、\n"
+    "   医学基础模型的表示比较与评估方法（含影像/病理，不受 X1 约束）。"
 )
 
 FIXTURE_EXCLUSION_DIMS = (
@@ -63,7 +72,7 @@ FIXTURE_EXCLUSION_DIMS = (
     "X2. 时序填补方法本身的增量改进（新 imputer + 更低 RMSE），无下游/机制分析。\n"
     "X3. 综述/观点文，且不提供可引用的定量证据或分类框架。\n"
     "X4. LLM/foundation model 通用能力，未涉及缺失或迁移。\n"
-    "X5. RCT / 流行病学关联研究，无方法学贡献。\n"
+    "X5. RCT / 流行病学关联研究，无方法学贡献——但命中 H（重症/急诊/肾脏）的不在此列。\n"
     "X6. 因果推断纯理论（do-calculus、identification proofs），无缺失或无实证。\n"
     "X7. 会议 workshop 短文、无实验的 preprint stub。"
 )

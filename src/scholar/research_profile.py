@@ -56,7 +56,14 @@ _DEFAULT_PROFILE: Dict[str, Any] = {
         "   声称因果特征集不提升泛化、causal features vs. all features、\n"
         "   attention ≠ causality、可解释性权重的可靠性质疑。\n"
         "F. venue 基准：多库大规模 ICU 预测验证（MIMIC-IV / eICU / AmsterdamUMCdb / HiRID）。\n"
-        "G. 临床落地场景：sepsis subphenotype、AKI、CKD/透析、ICU 死亡率预测。"
+        "G. 临床落地场景：sepsis subphenotype、AKI、CKD/透析、ICU 死亡率预测。\n"
+        "H. 重症/急诊/肾脏临床研究（收为主线，用于观察真实研究的纳排与预处理做法）：\n"
+        "   ICU / sepsis / ARDS / AKI / CRRT / 急诊队列研究、评分（SOFA 等）开发与外部验证、\n"
+        "   轨迹表型、液体与通气管理的观察性研究；关注其纳入排除标准、缺失处理、\n"
+        "   数据预处理与队列构建。即使没有方法学贡献也纳入。\n"
+        "I. 与本线相邻的方法基础：表格基础模型（TabPFN 系）、算法公平性与因果公平、\n"
+        "   生成式建模基础方法（flow matching / diffusion，作为生成式插补的底层）、\n"
+        "   医学基础模型的表示比较与评估方法（含影像/病理，不受 X1 约束）。"
     ),
     "exclusion_dims": (
         "# 排除维度（命中 → drop，除非同时强命中 A/C/E）\n"
@@ -64,7 +71,7 @@ _DEFAULT_PROFILE: Dict[str, Any] = {
         "X2. 时序填补方法本身的增量改进（新 imputer + 更低 RMSE），无下游/机制分析。\n"
         "X3. 综述/观点文，且不提供可引用的定量证据或分类框架。\n"
         "X4. LLM/foundation model 通用能力，未涉及缺失或迁移。\n"
-        "X5. RCT / 流行病学关联研究，无方法学贡献。\n"
+        "X5. RCT / 流行病学关联研究，无方法学贡献——但命中 H（重症/急诊/肾脏）的不在此列。\n"
         "X6. 因果推断纯理论（do-calculus、identification proofs），无缺失或无实证。\n"
         "X7. 会议 workshop 短文、无实验的 preprint stub。"
     ),
