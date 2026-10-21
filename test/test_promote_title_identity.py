@@ -18,6 +18,14 @@ from src.scholar.notes import write_notes                                       
 from src.scholar import notes_index as ni                                        # noqa: E402
 
 pt = importlib.import_module("promote_title_identity")
+pid = importlib.import_module("promote_identity_doi")
+
+
+@pytest.fixture(autouse=True)
+def _isolate(monkeypatch, tmp_path):
+    """真实 config/dedup_overrides.json 与真实 notes_embed 子进程一律不碰。"""
+    monkeypatch.setattr(ni, "REPO_OVERRIDES_PATH", tmp_path / "repo_cfg" / "dedup_overrides.json")
+    monkeypatch.setattr(pid, "run_vector_sync", lambda: (True, "stub"))
 
 MONTH = "2024-05"
 
@@ -270,3 +278,166 @@ def test_blocked_entries_not_written_on_apply(tmp_path):
 def test_cli_single_requires_gate_inputs(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(tmp_path), "--citekey", "k", "--doi", "10.1/a"])
     assert pt.main() == 2
+
+
+# ---------------- 第 7 类派生物：dedup_overrides ----------------
+
+def _write_overrides(path, old, other, *, indent=2, trailing=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"_doc": "说明", "merge": [[old, "arxiv:9999.1"], ["x:1", "x:2"]],
+            "_notes": {"k": "v"}, "distinct": [["title:zzz", old], [other, "x:3"]]}
+    raw = json.dumps(data, ensure_ascii=False, indent=indent) + ("\n" if trailing else "")
+    path.write_text(raw, encoding="utf-8")
+    return raw
+
+
+def test_overrides_rewritten_both_channels_and_format_preserved(tmp_path):
+    d, keys = _build(tmp_path)
+    old, other = keys["nayebi2024Recurrent"], keys["lee2024Graph"]
+    repo_f = ni.REPO_OVERRIDES_PATH
+    raw_repo = _write_overrides(repo_f, old, other, indent=2, trailing=False)
+    raw_nd = _write_overrides(d / "dedup_overrides.json", old, other, indent=4, trailing=True)
+    rep = _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path, apply=True)
+    assert _status(rep, "nayebi2024Recurrent")["status"] == "applied"
+    new_repo = repo_f.read_text(encoding="utf-8")
+    assert new_repo == raw_repo.replace(old, "doi:10.1/aaa")          # 仅换键，排版/键顺序/尾换行一字不动
+    new_nd = (d / "dedup_overrides.json").read_text(encoding="utf-8")
+    assert new_nd == raw_nd.replace(old, "doi:10.1/aaa") and new_nd.endswith("\n")
+    assert sorted(o["pairs_rewritten"] for o in rep["dedup_overrides"]) == [2, 2]   # merge 1 + distinct 1
+    # 备份：原始字节，repo 与 notes_dir 两份分开放
+    bak = d / "_archive" / "promote_title_T1" / "dedup_overrides"
+    assert (bak / "repo_config" / "dedup_overrides.json").read_text(encoding="utf-8") == raw_repo
+    assert (bak / "notes_dir" / "dedup_overrides.json").read_text(encoding="utf-8") == raw_nd
+
+
+def test_overrides_untouched_when_no_key_matches(tmp_path):
+    d, keys = _build(tmp_path)
+    raw = _write_overrides(ni.REPO_OVERRIDES_PATH, "title:nomatch", "title:other")
+    _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path, apply=True)
+    assert ni.REPO_OVERRIDES_PATH.read_text(encoding="utf-8") == raw
+    assert not (d / "_archive" / "promote_title_T1" / "dedup_overrides").exists()
+
+
+def test_dry_run_lists_override_pairs_and_writes_nothing(tmp_path):
+    d, keys = _build(tmp_path)
+    raw = _write_overrides(ni.REPO_OVERRIDES_PATH, keys["nayebi2024Recurrent"], "title:q")
+    before = _snapshot(d)
+    rep = _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path)
+    assert ni.REPO_OVERRIDES_PATH.read_text(encoding="utf-8") == raw
+    assert _snapshot(d) == before
+    assert rep["dedup_overrides"] == [{"file": str(ni.REPO_OVERRIDES_PATH), "pairs_to_rewrite": 2}]
+    assert "将改写 2 对" in Path(rep["files"][1]).read_text(encoding="utf-8")
+    assert rep["vector_sync"] is None
+
+
+def test_overrides_rewritten_before_reindex_so_distinct_stays_effective(tmp_path, caplog):
+    """改键后重建索引不应再报「人工裁决未生效」（旧键漂了才会报）。"""
+    d, keys = _build(tmp_path)
+    old = keys["nayebi2024Recurrent"]
+    ni.REPO_OVERRIDES_PATH.parent.mkdir(parents=True)
+    ni.REPO_OVERRIDES_PATH.write_text(json.dumps(
+        {"merge": [], "distinct": [[old, keys["lee2024Graph"]]]}, indent=2), encoding="utf-8")
+    import logging
+    with caplog.at_level(logging.WARNING):
+        _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path, apply=True)
+    assert "未生效" not in caplog.text
+    assert json.loads(ni.REPO_OVERRIDES_PATH.read_text(encoding="utf-8"))["distinct"] == [
+        ["doi:10.1/aaa", keys["lee2024Graph"]]]
+
+
+# ---------------- 写盘顺序 / 向量库竞态 ----------------
+
+def test_write_order_index_last_and_abstracts_never_orphan(tmp_path, monkeypatch):
+    d, keys = _build(tmp_path)
+    ni.REPO_OVERRIDES_PATH.parent.mkdir(parents=True)
+    ni.REPO_OVERRIDES_PATH.write_text(json.dumps({"merge": [], "distinct": [[keys["nayebi2024Recurrent"], "x:1"]]}),
+                                      encoding="utf-8")
+    ab0 = set(json.loads((d / "abstracts.json").read_text(encoding="utf-8"))["abstracts"])
+    events, violations = [], []
+
+    def _check(tag):
+        # 模拟「此刻 launchd 醒来」：索引里每个原本有摘要的条目，其当前 dedup_key 必须在 abstracts 里
+        try:
+            idx = json.loads((d / ni.INDEX_JSON).read_text(encoding="utf-8"))
+            ab = json.loads((d / "abstracts.json").read_text(encoding="utf-8"))["abstracts"]
+        except Exception:
+            return
+        cur = {p["dedup_key"] for p in idx["papers"]}
+        base = {p["citekey"]: p["dedup_key"] for p in idx["papers"]}
+        if any(k not in ab for k in cur & (ab0 | {"doi:10.1/aaa"})) or \
+                any(p["citekey"] in ("nayebi2024Recurrent", "lee2024Graph") and p["dedup_key"] not in ab
+                    for p in idx["papers"]):
+            violations.append(tag)
+
+    real_wj, real_wo = pid._write_json, pt.write_outputs
+
+    def wj(path, data, style):
+        real_wj(path, data, style)
+        events.append(Path(path).name)
+        _check("after " + Path(path).name)
+
+    def wo(index, notes_dir):
+        r = real_wo(index, notes_dir)
+        events.append(ni.INDEX_JSON)
+        _check("after index")
+        return r
+
+    monkeypatch.setattr(pid, "_write_json", wj)
+    monkeypatch.setattr(pt, "write_outputs", wo)
+    _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path, apply=True)
+    i = events.index(ni.INDEX_JSON)
+    before, after = events[:i], events[i + 1:]
+    assert "dedup_overrides.json" in before and "abstracts.json" in before
+    assert after == ["abstracts.json"]                   # 索引之后只剩清旧键
+    assert ni.INDEX_JSON not in before
+    assert violations == []
+
+
+def test_apply_triggers_vector_sync_once_after_index(tmp_path, monkeypatch):
+    d, _ = _build(tmp_path)
+    calls = []
+
+    def fake():
+        idx = json.loads((d / ni.INDEX_JSON).read_text(encoding="utf-8"))
+        ab = json.loads((d / "abstracts.json").read_text(encoding="utf-8"))["abstracts"]
+        calls.append(({p["citekey"]: p["dedup_key"] for p in idx["papers"]}, set(ab)))
+        return True, "ok"
+
+    rep = pt.run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], apply=True,
+                 out_dir=tmp_path / "out", stamp="T1", vector_sync=fake)
+    assert len(calls) == 1
+    keys_now, ab_keys = calls[0]
+    assert keys_now["nayebi2024Recurrent"] == "doi:10.1/aaa"
+    assert "doi:10.1/aaa" in ab_keys and not any(k.startswith("title:") and "recurrent" in k for k in ab_keys)
+    assert rep["vector_sync"] == {"ok": True, "message": "ok"}
+
+
+def test_vector_sync_not_called_on_dry_run_or_nothing_applied(tmp_path):
+    d, _ = _build(tmp_path)
+    calls = []
+    fake = lambda: calls.append(1) or (True, "ok")
+    pt.run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], apply=False, out_dir=tmp_path / "o", stamp="a", vector_sync=fake)
+    pt.run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa", year=2030)], apply=True, out_dir=tmp_path / "o", stamp="b", vector_sync=fake)
+    assert calls == []
+
+
+def test_vector_sync_failure_reported_and_exit_code(tmp_path, monkeypatch, capsys):
+    d, _ = _build(tmp_path)
+    monkeypatch.setattr(pid, "run_vector_sync", lambda: (False, "exit=3 Ollama down"))
+    rep = _run(d, [_rec("nayebi2024Recurrent", doi="10.1/aaa")], tmp_path, apply=True)
+    assert rep["vector_sync"]["ok"] is False
+    inv = tmp_path / "inv.json"
+    inv.write_text(json.dumps({"records": [_rec("lee2024Graph", title=TITLES["pb"][0], doi="10.1/bbb",
+                                                 authors=("Lee",))]}), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["x", "--notes-dir", str(d), "--from-inventory", str(inv),
+                                      "--out-dir", str(tmp_path / "o2"), "--apply"])
+    assert pt.main() == 4
+    assert "向量库同步失败" in capsys.readouterr().err
+
+
+def test_finalize_abstracts_keeps_old_key_without_new(tmp_path):
+    d = tmp_path
+    (d / "abstracts.json").write_text(json.dumps({"abstracts": {"a:1": "x", "b:1": "y", "b:2": "y"},
+                                                  "failures": {}}, indent=2), encoding="utf-8")
+    assert pid.finalize_abstracts(d, {"a:1": "a:2", "b:1": "b:2"}) == 1
+    assert set(json.loads((d / "abstracts.json").read_text(encoding="utf-8"))["abstracts"]) == {"a:1", "b:2"}

@@ -15,6 +15,12 @@
   5. `abstracts.json`：摘要缓存按 dedup_key 存，键要从 arxiv:… 改名为 doi:…（否则向量库同步时
      该篇的 ab: 级向量因「无摘要」被当孤儿删掉，且没有任何自动入口补回）
   6. 收尾按月强扫索引（dedup_key 由索引按当前规则重算，DOI 档优先于 arXiv 档）
+  7. `dedup_overrides.json`（仓库 config/ 与 notes_dir/ 两处）里引用旧键的 merge/distinct 人工裁决对：
+     按旧→新映射改写（否则裁决静默失效，索引重建报「人工非同文裁决未生效」）
+写盘顺序（与向量库 launchd 自动同步不竞态；WatchPaths 盯的是 literature_index.json 与 abstracts.json）：
+  sidecar/CSL/md/bundle → abstracts.json 先「新旧两键并存」→ dedup_overrides → 最后才写索引
+  → 索引落盘后再清 abstracts 旧键 → 主动调一次 notes_embed 同步（失败则非零退出码）。
+  任何中间时刻 abstracts 里都至少有索引当时用的那个键，自动同步不会把 ab: 向量当孤儿删掉。
 citekey 不动；arxiv_id 保留（DOI 在键梯里优先，arxiv 只作元数据）。
 之后：`scripts/notes_embed.py`（向量库增量，期望待嵌/待删 0）→ `scripts/sync_vault.py`。
 
@@ -22,13 +28,14 @@ citekey 不动；arxiv_id 保留（DOI 在键梯里优先，arxiv 只作元数�
     PYTHONPATH=. python3 scripts/promote_identity_doi.py --citekey fan2026Interdisciplinary \\
         --doi 10.1108/FTSIG-11-2025-0139            # dry-run
     …同上 --apply                                    # 写盘（先备份到 _archive/promote_doi_<时间戳>/）
-退出码：0 成功 / 2 参数、条目不唯一、DOI 已被占用、TS 不在线或未命中、作者闸未过。
+退出码：0 成功 / 2 参数、条目不唯一、DOI 已被占用、TS 不在线或未命中、作者闸未过 / 4 写盘成功但向量库同步失败。
 """
 import argparse
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import unicodedata
 from datetime import date, datetime
@@ -38,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.scholar.paths import repo_path                                   # noqa: E402
+from src.scholar import notes_index as _ni                                 # noqa: E402
 from src.scholar.notes_index import (                                      # noqa: E402
     INDEX_JSON, load_csl_items, _match_csl, update_index, write_outputs)
 from src.scholar._citekey_utils import csl_names, date_parts, dedup_key_fields  # noqa: E402
@@ -145,7 +153,8 @@ def write_layers(ctx: Dict[str, Any], notes_dir: Path, e: Dict[str, Any], old_ke
                  new_key: str, bak: Path, *, doi: Optional[str] = None, arxiv_id: Optional[str] = None,
                  url: str = "", journal: str = "", iss: Optional[Dict[str, Any]] = None,
                  csl_type: Optional[str] = None, item: Optional[Dict[str, Any]] = None) -> None:
-    """写盘 6 类派生物中除「按月强扫索引」外的 5 类（先备份到 bak）。
+    """写盘派生物中除「按月强扫索引」「dedup_overrides」「abstracts 旧键清理」外的部分（先备份到 bak）。
+    abstracts.json 只做「加新键、留旧键」；收尾必须调 finalize_abstracts 清旧键。
 
     doi / arxiv_id 至少给一个。arXiv 档不改 md 链接行（md 链接本就是索引取 arXiv 号的口径之一，
     sidecar 优先），只写 sidecar / bundle；CSL 无 arXiv 专用字段，不动。
@@ -234,11 +243,101 @@ def write_layers(ctx: Dict[str, Any], notes_dir: Path, e: Dict[str, Any], old_ke
 
     if ctx["has_abs"]:
         _backup(abs_path)
+        # 先「新旧并存」而不是直接改名：此刻索引仍用旧键，向量库同步（launchd WatchPaths 盯着
+        # abstracts.json）若在索引改写前醒来，旧键还在 → ab: 向量不会被当孤儿删。旧键由
+        # finalize_abstracts 在索引落盘后清掉。
         for section in ("abstracts", "failures"):
             sec = abs_data.get(section)
             if isinstance(sec, dict) and old_key in sec:
-                sec[new_key] = sec.pop(old_key)
+                sec[new_key] = sec[old_key]
         _write_json(abs_path, abs_data, _json_style(abs_path))
+
+
+# ---------------- 第 7 类派生物：dedup_overrides ----------------
+
+def override_paths(notes_dir: Path) -> List[Path]:
+    """两处 dedup_overrides.json（与 notes_index._read_override_files 同口径，存在才返回）。"""
+    cands = [Path(_ni.REPO_OVERRIDES_PATH), Path(notes_dir) / _ni.DEDUP_OVERRIDES_JSON]
+    return [p for p in cands if p.exists()]
+
+
+def _rewrite_rows(data: Dict[str, Any], mapping: Dict[str, str]) -> int:
+    """原地改写 merge/distinct 行里的键，返回被改动的「对」数（一对两端都改也只算 1）。"""
+    n = 0
+    for field in ("merge", "distinct"):
+        for row in (data.get(field) or []):
+            if not isinstance(row, list):
+                continue
+            hit = False
+            for i in range(min(2, len(row))):
+                if row[i] in mapping:
+                    row[i] = mapping[row[i]]
+                    hit = True
+            n += hit
+    return n
+
+
+def plan_overrides(notes_dir: Path, mapping: Dict[str, str]) -> List[Tuple[Path, int]]:
+    """只读：各 override 文件里将被改写的对数（0 的不列）。"""
+    out = []
+    for p in override_paths(notes_dir):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        n = _rewrite_rows(data, mapping)
+        if n:
+            out.append((p, n))
+    return out
+
+
+def write_overrides(notes_dir: Path, mapping: Dict[str, str], bak: Path) -> List[Tuple[Path, int]]:
+    """按旧→新映射改写 override 文件（保持原缩进/尾换行/键顺序），先备份到 bak/dedup_overrides/<来源>/。"""
+    done = []
+    for p, n in plan_overrides(notes_dir, mapping):
+        tag = "notes_dir" if p.parent.resolve() == Path(notes_dir).resolve() else "repo_config"
+        dst = bak / "dedup_overrides" / tag / p.name
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        _rewrite_rows(data, mapping)
+        _write_json(p, data, _json_style(p))
+        done.append((p, n))
+    return done
+
+
+def finalize_abstracts(notes_dir: Path, mapping: Dict[str, str]) -> int:
+    """索引已落盘后清 abstracts.json 里的旧键（仅当新键已在）。返回清掉的条数。"""
+    abs_path = Path(notes_dir) / "abstracts.json"
+    if not mapping or not abs_path.exists():
+        return 0
+    data = json.loads(abs_path.read_text(encoding="utf-8"))
+    n = 0
+    for section in ("abstracts", "failures"):
+        sec = data.get(section)
+        if not isinstance(sec, dict):
+            continue
+        for old, new in mapping.items():
+            if old in sec and new in sec and old != new:
+                del sec[old]
+                n += 1
+    if n:
+        _write_json(abs_path, data, _json_style(abs_path))
+    return n
+
+
+def run_vector_sync() -> Tuple[bool, str]:
+    """主动跑一次 scripts/notes_embed.py（增量）。返回 (成功, 输出尾部)。失败必须由调用方报出来。"""
+    script = Path(__file__).resolve().parent / "notes_embed.py"
+    try:
+        r = subprocess.run([sys.executable, str(script)], cwd=str(script.parents[1]),
+                           env={**os.environ, "PYTHONPATH": str(script.parents[1])},
+                           capture_output=True, text=True, timeout=1800)
+    except Exception as exc:                       # 超时/找不到解释器
+        return False, "{}: {}".format(type(exc).__name__, exc)
+    tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-3:]
+    return r.returncode == 0, "exit={} {}".format(r.returncode, " | ".join(tail))
 
 
 def main() -> int:
@@ -302,23 +401,33 @@ def main() -> int:
     if ctx["problems"]:
         print("⛔ 有层没定位到，拒绝写盘", file=sys.stderr)
         return 2
+    for p, n in plan_overrides(notes_dir, {old_key: new_key}):
+        print("  · dedup_overrides: {} 将改 {} 对".format(p, n))
     if not args.apply:
         print("（dry-run，未写盘；加 --apply 执行）")
         return 0
 
     bak = notes_dir / "_archive" / "promote_doi_{}".format(datetime.now().strftime("%Y%m%d-%H%M"))
+    mapping = {old_key: new_key}
     write_layers(ctx, notes_dir, e, old_key, new_key, bak, doi=doi, url=url, journal=journal,
                  iss=iss, csl_type=csl_type, item=item)
+    write_overrides(notes_dir, mapping, bak)
 
     mp = (e.get("month") or "")[:7]
     idx2 = update_index(notes_dir, since=mp, until=mp)
-    wrote = write_outputs(idx2, notes_dir)
+    wrote = write_outputs(idx2, notes_dir)          # literature_index.json 在所有会误导同步的改动之后才写
+    finalize_abstracts(notes_dir, mapping)
     now = [p for p in idx2["papers"] if p.get("citekey") == args.citekey]
     print("✅ 已写盘，备份 {}；索引强扫 {}：写盘 {}".format(
         bak, mp, ", ".join(k for k, v in wrote.items() if v) or "无变化"))
     print("   索引现值：doi={} dedup_key={} duplicate_of={}".format(
         now[0].get("doi"), now[0].get("dedup_key"), now[0].get("duplicate_of")) if now else "   ⛔ 索引里找不到该条目了")
-    print("下一步：PYTHONPATH=. python3 scripts/notes_embed.py（期望待嵌/待删 0 或仅本篇）→ scripts/sync_vault.py")
+    ok, msg = run_vector_sync()
+    if not ok:
+        print("⛔ 向量库同步失败（需手动 PYTHONPATH=. python3 scripts/notes_embed.py）：{}".format(msg),
+              file=sys.stderr)
+        return 4
+    print("向量库已同步：{}\n下一步：scripts/sync_vault.py".format(msg))
     return 0
 
 

@@ -26,8 +26,11 @@
     PYTHONPATH=. python3 scripts/promote_title_identity.py --citekey nayebi2021Recurrent \\
         --doi 10.xxxx/yyyy --title "…" --year 2021 --first-author Nayebi   # 单条（同样过三闸）
 dry-run 报告（JSON + md）写到 `--out-dir`（默认仓库 tmp/promote_title/；--apply 时默认 notes-dir/_inventory/）。
-之后：scripts/notes_embed.py（向量库增量）→ scripts/sync_vault.py。
-退出码：0 正常 / 2 参数错误。
+写盘顺序（避开 launchd 向量库自动同步的竞态，详见 promote_identity_doi 文档）：各条的 sidecar/CSL/md/bundle +
+abstracts 新旧键并存 → dedup_overrides 旧键改写（第 7 类派生物，dry-run 列对数）→ 按月写索引
+（literature_index.json 最后）→ 清 abstracts 旧键 → 主动跑一次 notes_embed，失败则退出码 4。
+之后：scripts/sync_vault.py。
+退出码：0 正常 / 2 参数错误 / 4 写盘成功但向量库同步失败。
 """
 import argparse
 import difflib
@@ -37,7 +40,7 @@ import sys
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -170,6 +173,14 @@ def _render_md(report: Dict[str, Any]) -> str:
     L = ["# 标题身份条目升级清单（{}）".format("已写盘" if report["applied"] else "dry-run，未写盘"), "",
          "- 生成：{}　库：`{}`".format(report["generated_at"], report["notes_dir"]),
          "- 统计：" + "；".join("{} {}".format(k, v) for k, v in sorted(report["stats"].items())), ""]
+    for o in report.get("dedup_overrides") or []:
+        L.append("- dedup_overrides：`{}` {}".format(
+            o["file"], "已改写 {} 对".format(o["pairs_rewritten"]) if "pairs_rewritten" in o
+            else "将改写 {} 对".format(o["pairs_to_rewrite"])))
+    if report.get("vector_sync"):
+        L.append("- 向量库同步：{}（{}）".format("成功" if report["vector_sync"]["ok"] else "**失败**",
+                                              report["vector_sync"]["message"]))
+    L.append("")
     order = ["pass", "blocked", "skip_doi_taken", "skip_no_key_slot", "skip_dropped", "skip_scope"]
     for grp in order:
         rows = [r for r in report["results"] if (r["status"] or "").startswith(grp)]
@@ -188,7 +199,8 @@ def _render_md(report: Dict[str, Any]) -> str:
 
 
 def run(notes_dir: Path, records: List[Dict[str, Any]], *, apply: bool, out_dir: Path,
-        stamp: Optional[str] = None) -> Dict[str, Any]:
+        stamp: Optional[str] = None,
+        vector_sync: Optional[Callable[[], Tuple[bool, str]]] = None) -> Dict[str, Any]:
     stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
     idx = json.loads((notes_dir / INDEX_JSON).read_text(encoding="utf-8"))
     papers = idx["papers"]
@@ -210,8 +222,10 @@ def run(notes_dir: Path, records: List[Dict[str, Any]], *, apply: bool, out_dir:
         results.append(r)
 
     bak = notes_dir / "_archive" / "promote_title_{}".format(stamp)
+    sync_info: Optional[Dict[str, Any]] = None
     if apply:
         months = set()
+        mapping: Dict[str, str] = {}
         for r in results:
             if r["status"] != "pass":
                 continue
@@ -223,9 +237,14 @@ def run(notes_dir: Path, records: List[Dict[str, Any]], *, apply: bool, out_dir:
             pid.write_layers(ctx, notes_dir, e, r["old_key"], r["new_key"], bak,
                              doi=r.get("doi"), arxiv_id=r.get("arxiv_id"),
                              url=(e.get("url") or ""))
+            mapping[r["old_key"]] = r["new_key"]
             months.add((e.get("month") or "")[:7])
+        # 第 7 类派生物：人工去重裁决里的旧键。须在索引重算之前改（重算时会读它）
+        ov = pid.write_overrides(notes_dir, mapping, bak)
+        # literature_index.json 是 launchd WatchPaths 的触发文件，放在所有其它写盘之后
         for m in sorted(months):
             write_outputs(update_index(notes_dir, since=m, until=m), notes_dir)
+        pid.finalize_abstracts(notes_dir, mapping)
         if months:
             now = {p["citekey"]: p for p in json.loads((notes_dir / INDEX_JSON).read_text(encoding="utf-8"))["papers"]}
             for r in results:
@@ -237,6 +256,13 @@ def run(notes_dir: Path, records: List[Dict[str, Any]], *, apply: bool, out_dir:
                         r["reason"] = "写盘后索引重算键为 {}，与预期 {} 不符".format(got, r["new_key"])
                     else:
                         r["status"] = "applied"
+            ok, msg = (vector_sync or pid.run_vector_sync)()
+            sync_info = {"ok": ok, "message": msg}
+        overrides_report = [{"file": str(p), "pairs_rewritten": n} for p, n in ov]
+    else:
+        mapping = {r["old_key"]: r["new_key"] for r in results if r["status"] == "pass"}
+        overrides_report = [{"file": str(p), "pairs_to_rewrite": n}
+                            for p, n in pid.plan_overrides(notes_dir, mapping)]
 
     stats: Dict[str, int] = {}
     for r in results:
@@ -247,7 +273,8 @@ def run(notes_dir: Path, records: List[Dict[str, Any]], *, apply: bool, out_dir:
                 stats["blocked_by_" + g] = stats.get("blocked_by_" + g, 0) + 1
     report = {"generated_at": datetime.now().isoformat(timespec="seconds"), "notes_dir": str(notes_dir),
               "applied": apply, "backup_dir": str(bak) if apply else None, "stats": stats,
-              "n_input": len(records), "results": results}
+              "n_input": len(records), "dedup_overrides": overrides_report,
+              "vector_sync": sync_info, "results": results}
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = "promote_title_{}_{}".format("apply" if apply else "dryrun", stamp)
     (out_dir / (stem + ".json")).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -297,7 +324,13 @@ def main() -> int:
     for f in rep["files"]:
         print("报告：" + f)
     if rep["applied"]:
-        print("备份：{}\n下一步：PYTHONPATH=. python3 scripts/notes_embed.py → scripts/sync_vault.py".format(rep["backup_dir"]))
+        print("备份：{}".format(rep["backup_dir"]))
+        vs = rep.get("vector_sync")
+        if vs is not None and not vs["ok"]:
+            print("⛔ 向量库同步失败（需手动 PYTHONPATH=. python3 scripts/notes_embed.py）：{}".format(vs["message"]),
+                  file=sys.stderr)
+            return 4
+        print("向量库：{}\n下一步：scripts/sync_vault.py".format(vs["message"] if vs else "无需同步（无改动）"))
     else:
         print("（dry-run，库内零写盘；加 --apply 执行）")
     return 0
