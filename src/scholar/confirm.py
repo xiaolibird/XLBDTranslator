@@ -15,7 +15,9 @@
                                     │            output/scholar_notes/_pending/confirm_<run日期>.json
                                     ├ 弹窗：开场询问 →（看摘要）→ 分页 choose from list
                                     │        纳入/待定默认勾选；低置信排除、抽查排除默认不勾
-                                    ├ 每页确认即落盘：队列 state=keep|drop + stream_labels.jsonl 追加
+                                    ├ 各页勾选只暂存（内存 + _draft.json 草稿，草稿不算确认）；全部点完后弹
+                                    │   汇总核对框（默认按钮=返回修改），点「确认提交」才落盘：
+                                    │   队列 state=keep|drop + stream_labels.jsonl 追加
                                     └ 对有新增 keep 的周调 ingest_notes.py --week <周一> --auto
                                     │
     ingest_notes.py (周一 09:30)  ──┴► gate_segments：只放行 state=keep 的；勾上的原判 EXCLUDE
@@ -268,8 +270,17 @@ def sync_queue(notes_dir, digest_dir, since: Optional[date] = None, until: Optio
 
 # ---------------------------------------------------------------- 确认结果落盘
 
-def label_row(item: Dict[str, Any], decision: str, run_date: str, now: datetime) -> Dict[str, Any]:
-    """stream_labels.jsonl 的一行（设计 §12.1）。字段说明见 scripts/filter_eval.py 与本模块 docstring。"""
+SOURCE_USER = "user"                    # 用户相对筛选器默认动过手（补勾/取消）：主动判断
+SOURCE_DEFAULT = "default_accepted"     # 用户没动、照单全收默认勾选：不当作主动判断（S-stream/漂移默认排除）
+DECISION_RETRACTED = "retracted"        # 撤销行（--reopen）：读取侧让同一 dedup_key 的此前标签失效
+
+
+def label_row(item: Dict[str, Any], decision: str, run_date: str, now: datetime, *,
+              source: str = SOURCE_USER, committed_at: Optional[datetime] = None) -> Dict[str, Any]:
+    """stream_labels.jsonl 的一行（设计 §12.1）。
+
+    confirmed_at = 该条所在页**实际点「确认本页」的时刻**（now 由调用方按页给）；committed_at = 汇总核对后
+    点「确认提交」的时刻。user_decision_source：user / default_accepted（见上）。"""
     from .filter_eval import item_id_of
     cat = item["category"]
     return {
@@ -286,18 +297,24 @@ def label_row(item: Dict[str, Any], decision: str, run_date: str, now: datetime)
         "prompt_version": item.get("prompt_version"), "provider": item.get("provider"),
         "served_model": item.get("served_model"), "model": item.get("model"),
         "sample_weight": item.get("weight", 1.0), "pool_size": item.get("pool_size", 0),
+        "user_decision_source": source,
+        "committed_at": (committed_at or now).isoformat(timespec="seconds"),
     }
 
 
 def record_decisions(notes_dir, decisions: Sequence[Tuple[Path, str, str]], *,
-                     now: Optional[datetime] = None) -> int:
+                     now: Optional[datetime] = None, sources: Optional[Dict[str, str]] = None,
+                     times: Optional[Dict[str, datetime]] = None) -> int:
     """落盘一批确认：[(队列路径, dedup_key, 'keep'|'drop')]。
 
     顺序：先追加 stream_labels（重复行可容忍，读取时按 dedup_key 取最晚），再改队列状态。
     反过来的话，崩在两步之间会永久丢一条标签；这个顺序最坏只多一行重复。
     只处理仍是 pending 的条目（重复调用幂等）。返回实际落盘条数。
+    sources：dedup_key → user/default_accepted（缺省 user）；times：dedup_key → 该条所在页的确认时刻
+    （缺省 now）。now 同时作为 committed_at。
     """
     now = now or datetime.now()
+    sources, times = sources or {}, times or {}
     by_q: Dict[Path, Dict[str, str]] = {}
     for qp, k, dec in decisions:
         if dec not in ("keep", "drop"):
@@ -308,8 +325,10 @@ def record_decisions(notes_dir, decisions: Sequence[Tuple[Path, str, str]], *,
         q = load_queue(qp)
         for it in q["items"]:
             if it["dedup_key"] in kd and it.get("state") == "pending":
-                lines.append(label_row(it, kd[it["dedup_key"]], q.get("run_date", ""), now))
-                updates.append((q, it, kd[it["dedup_key"]], qp))
+                k = it["dedup_key"]
+                lines.append(label_row(it, kd[k], q.get("run_date", ""), times.get(k, now),
+                                       source=sources.get(k, SOURCE_USER), committed_at=now))
+                updates.append((q, it, kd[k], qp))
     if not lines:
         return 0
     lp = labels_path(notes_dir)
@@ -320,7 +339,8 @@ def record_decisions(notes_dir, decisions: Sequence[Tuple[Path, str, str]], *,
     touched: Dict[Path, Dict[str, Any]] = {}
     for q, it, dec, qp in updates:
         it["state"] = dec
-        it["confirmed_at"] = now.isoformat(timespec="seconds")
+        it["confirmed_at"] = times.get(it["dedup_key"], now).isoformat(timespec="seconds")
+        it["decision_source"] = sources.get(it["dedup_key"], SOURCE_USER)
         touched[qp] = q
     for qp, q in touched.items():
         _atomic_write(qp, _dump(q))
@@ -328,8 +348,11 @@ def record_decisions(notes_dir, decisions: Sequence[Tuple[Path, str, str]], *,
 
 
 def load_stream_labels(notes_dir, *, since: Optional[datetime] = None,
-                       until: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    """读 stream_labels.jsonl：坏行跳过；同一 dedup_key 取 confirmed_at 最晚的一行；可按确认时间过滤。"""
+                       until: Optional[datetime] = None, include_retracted: bool = False) -> List[Dict[str, Any]]:
+    """读 stream_labels.jsonl：坏行跳过；同一 dedup_key 取 confirmed_at 最晚的一行（同刻取后写的）；
+    最晚一行是撤销行（--reopen）则该键整体失效，除非 include_retracted；可按确认时间过滤。
+
+    default_accepted 行在此**保留**（lint/审计要看）；评测与漂移各自按开关排除。"""
     p = labels_path(notes_dir)
     if not p.exists():
         return []
@@ -347,6 +370,8 @@ def load_stream_labels(notes_dir, *, since: Optional[datetime] = None,
             by_key[r["dedup_key"]] = r
     out = []
     for r in by_key.values():
+        if r.get("user_decision") == DECISION_RETRACTED and not include_retracted:
+            continue
         try:
             t = datetime.fromisoformat(r["confirmed_at"])
         except ValueError:
@@ -355,6 +380,39 @@ def load_stream_labels(notes_dir, *, since: Optional[datetime] = None,
             continue
         out.append(r)
     return sorted(out, key=lambda r: (r["confirmed_at"], r["dedup_key"]))
+
+
+def reopen_run(notes_dir, run_date: str, *, now: Optional[datetime] = None) -> Tuple[str, int]:
+    """撤销某 run 日期的确认：未入库 → 队列已确认条目复位 pending，并追加撤销行；已入库 → 拒绝。
+
+    返回 (status, n)：status = ok / not_found / ingested（n = 受影响条数；ingested 时 n=已入库条数）。
+    顺序同 record_decisions：先追加撤销行，再改队列（崩在中间最坏是多一行撤销，队列仍是已确认，可重跑）。
+    """
+    now = now or datetime.now()
+    qp = queue_path(notes_dir, run_date)
+    if not qp.exists():
+        return "not_found", 0
+    q = load_queue(qp)
+    n_ing = sum(1 for it in q["items"] if it.get("ingested_at"))
+    if n_ing:
+        return "ingested", n_ing
+    todo = [it for it in q["items"] if it.get("state") in ("keep", "drop")]
+    if not todo:
+        return "ok", 0
+    lp = labels_path(notes_dir)
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    with open(lp, "a", encoding="utf-8") as f:
+        for it in todo:
+            row = label_row(it, DECISION_RETRACTED, run_date, now, source=SOURCE_USER)
+            row["override"] = False
+            row["retracted_decision"] = it["state"]
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    for it in todo:
+        it["state"], it["confirmed_at"] = "pending", None
+        it.pop("decision_source", None)
+        it.pop("ingest_attempts", None)
+    _atomic_write(qp, _dump(q))
+    return "ok", len(todo)
 
 
 # ---------------------------------------------------------------- 弹窗会话
@@ -405,10 +463,35 @@ def write_summary_md(notes_dir, rows: Sequence[Tuple[Path, Dict[str, Any]]], now
     return p
 
 
+DRAFT_FILE = "_draft.json"
+
+
+def _load_draft(notes_dir) -> Dict[str, bool]:
+    """会话草稿：上次没提交完的勾选（崩溃/取消/超时后续用）。**草稿不算确认**，只当预勾状态；坏文件当没有。"""
+    try:
+        d = json.loads((pending_dir(notes_dir) / DRAFT_FILE).read_text(encoding="utf-8"))
+        return {k: bool(v) for k, v in (d.get("selection") or {}).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _save_draft(notes_dir, sel: Dict[str, bool], now: datetime) -> None:
+    _atomic_write(pending_dir(notes_dir) / DRAFT_FILE,
+                  _dump({"saved_at": now.isoformat(timespec="seconds"), "selection": sel}))
+
+
+def _clear_draft(notes_dir) -> None:
+    try:
+        (pending_dir(notes_dir) / DRAFT_FILE).unlink()
+    except OSError:
+        pass
+
+
 @dataclass
 class SessionResult:
-    """status: nothing（无待确认）/ done（全部处理完）/ partial（部分确认，其余挂起）/
-    suspended（一条都没确认：稍后/超时/取消/无 GUI）。keep_runs = 本次新增 keep 所在的 run 日期。"""
+    """status: nothing（无待确认）/ done（核对后提交，全部处理完）/ suspended（未提交：稍后/超时/取消/无 GUI）。
+    提交是整批原子的，不再有 partial。keep_runs = 本次新增 keep 所在的 run 日期。
+    n_changed = 相对筛选器默认改动的条数（n_added 补勾 + n_removed 取消）。"""
     status: str
     n_pending_before: int = 0
     n_keep: int = 0
@@ -416,14 +499,49 @@ class SessionResult:
     n_still_pending: int = 0
     reason: str = ""
     keep_run_dates: List[str] = field(default_factory=list)
+    n_added: int = 0
+    n_removed: int = 0
+
+    @property
+    def n_changed(self) -> int:
+        return self.n_added + self.n_removed
+
+
+INTRO_HINT = "提示：列表页回车 = 确认本页；全部点完后还会再让你核对一次，核对后才真正生效。"
+BTN_BACK, BTN_COMMIT = "返回修改", "确认提交"
+
+
+def selection_stats(rows: Sequence[Tuple[Path, Dict[str, Any]]], sel: Dict[str, bool]) -> Dict[str, int]:
+    """保留/丢弃数，以及相对筛选器默认（default_checked）的改动：补勾 = 默认不勾却勾了，取消 = 默认勾却没勾。"""
+    keep = sum(1 for _, it in rows if sel[it["dedup_key"]])
+    added = sum(1 for _, it in rows if sel[it["dedup_key"]] and not it.get("default_checked"))
+    removed = sum(1 for _, it in rows if not sel[it["dedup_key"]] and it.get("default_checked"))
+    return {"keep": keep, "drop": len(rows) - keep, "added": added, "removed": removed,
+            "changed": added + removed}
+
+
+def commit_message(st: Dict[str, int]) -> str:
+    msg = "保留 {keep} / 丢弃 {drop}，其中相对筛选器默认改动了 {changed} 处（补勾 {added}、取消 {removed}）。".format(**st)
+    tail = ("你完全接受了筛选器默认，这批只放行入库，不会记为你的标签。" if st["changed"] == 0
+            else "只有这 {} 处会记为你的主动标签；没动的按「默认接受」记录。".format(st["changed"]))
+    return msg + "\n" + tail + "\n\n「确认提交」后才入库、精读并落盘；「返回修改」回到第 1 页，保留你已改的勾选。"
 
 
 def run_session(notes_dir, dialogs, *, now: Optional[datetime] = None,
                 page_size: int = TH.CONFIRM_PAGE_SIZE, ask_timeout_s: int = TH.CONFIRM_ASK_TIMEOUT_S,
                 page_timeout_s: int = TH.CONFIRM_PAGE_TIMEOUT_S, require_gui: bool = True,
-                run_dates: Optional[Set[str]] = None) -> SessionResult:
-    """弹窗会话。每页确认后**立刻**落盘：中途取消/超时/崩溃，已确认的页不丢，其余仍是 pending。"""
-    now = now or datetime.now()
+                run_dates: Optional[Set[str]] = None,
+                clock: Optional[Callable[[], datetime]] = None) -> SessionResult:
+    """弹窗会话。各页「确认本页」只**暂存**勾选（内存 + 草稿文件）；全部点完后弹汇总核对框
+    （默认按钮=返回修改，连按回车不会提交），点「确认提交」才整批落盘（队列 state + stream_labels）。
+    任何一步取消/超时/崩溃 = 一条都不生效，全部仍是 pending。
+
+    时间：每页确认的时刻取 clock()（缺省：给了 now 就固定为 now——测试用；否则 datetime.now）。
+    ——旧版整场共用开场时的 now，导致一场里所有标签的 confirmed_at 都是同一个入队时刻（2026-10-21 实测）。
+    """
+    if clock is None:
+        clock = (lambda: now) if now is not None else datetime.now
+    now = now or clock()
     rows = pending_items(notes_dir, run_dates)
     res = SessionResult("nothing", n_pending_before=len(rows), n_still_pending=len(rows))
     if not rows:
@@ -436,7 +554,7 @@ def run_session(notes_dir, dialogs, *, now: Optional[datetime] = None,
         return res
 
     msg = ("有 {} 篇论文待确认入库。\n{}\n\n未确认的不会入库，也不会花钱精读；"
-           "选「稍后」或不理会，明天同一时间再提醒。").format(len(rows), summary)
+           "选「稍后」或不理会，明天同一时间再提醒。\n\n{}").format(len(rows), summary, INTRO_HINT)
     while True:
         a = dialogs.ask(msg, ["稍后", "先看摘要", "开始确认"], "开始确认", title="Scholar 入库确认",
                         giving_up_s=ask_timeout_s, timeout_s=ask_timeout_s + 60)
@@ -451,40 +569,59 @@ def run_session(notes_dir, dialogs, *, now: Optional[datetime] = None,
         res.status, res.reason = "suspended", "用户选择稍后"
         return res
 
+    sel = {it["dedup_key"]: bool(it.get("default_checked")) for _, it in rows}
+    sel.update({k: v for k, v in _load_draft(notes_dir).items() if k in sel})     # 续上次没提交完的勾选
+    page_time: Dict[str, datetime] = {}
     pages = paginate(rows, page_size)
-    gidx = 0
-    keep_dates: Set[str] = set()
-    stop_reason = ""
-    for pno, page in enumerate(pages, 1):
-        labels = [item_label(gidx + i + 1, it) for i, (_, it) in enumerate(page)]
-        by_label = dict(zip(labels, page))
-        gidx += len(page)
-        defaults = [lb for lb, (_, it) in by_label.items() if it.get("default_checked")]
-        c = dialogs.choose(
-            labels, defaults, title="Scholar 入库确认 {}/{}".format(pno, len(pages)),
-            prompt="勾选 = 入库并精读；不勾 = 丢弃。前两类已按筛选器意见预勾，后两类默认不勾（勾上即推翻筛选器）。"
-                   "点「暂不确认」= 本页及之后全部挂起。",
-            ok="确认本页", cancel="暂不确认", timeout_s=page_timeout_s)
-        if c.status != "ok":
-            stop_reason = "第 {} 页{}".format(pno, {"cancel": "点了暂不确认", "timeout": "无人应答"}.get(c.status, "出错：" + c.detail))
+    while True:
+        gidx = 0
+        for pno, page in enumerate(pages, 1):
+            labels = [item_label(gidx + i + 1, it) for i, (_, it) in enumerate(page)]
+            by_label = dict(zip(labels, page))
+            gidx += len(page)
+            defaults = [lb for lb, (_, it) in by_label.items() if sel[it["dedup_key"]]]
+            c = dialogs.choose(
+                labels, defaults, title="Scholar 入库确认 {}/{}".format(pno, len(pages)),
+                prompt="勾选 = 入库并精读；不勾 = 丢弃。前两类已按筛选器意见预勾，后两类默认不勾（勾上即推翻筛选器）。"
+                       "「确认本页」只是暂存，全部点完后还会再核对一次；「暂不确认」= 整场挂起、一条都不生效。",
+                ok="确认本页", cancel="暂不确认", timeout_s=page_timeout_s)
+            if c.status != "ok":
+                res.status = "suspended"
+                res.reason = "第 {} 页{}".format(
+                    pno, {"cancel": "点了暂不确认", "timeout": "无人应答"}.get(c.status, "出错：" + c.detail))
+                return res
+            chosen = {s_ for s_ in c.selected if s_ in by_label}
+            t = clock()
+            for lb, (_, it) in by_label.items():
+                sel[it["dedup_key"]] = lb in chosen
+                page_time[it["dedup_key"]] = t
+            _save_draft(notes_dir, sel, t)
+        st = selection_stats(rows, sel)
+        a = dialogs.ask(commit_message(st), [BTN_BACK, BTN_COMMIT], BTN_BACK, title="Scholar 入库确认：提交前核对",
+                        giving_up_s=ask_timeout_s, timeout_s=ask_timeout_s + 60)
+        if a.status != "ok":
+            res.status, res.reason = "suspended", "汇总核对框无人应答（{}），未提交".format(a.status)
+            return res
+        if a.button == BTN_COMMIT:
             break
-        chosen = {s for s in c.selected if s in by_label}
-        dec = [(qp, it["dedup_key"], "keep" if lb in chosen else "drop") for lb, (qp, it) in by_label.items()]
-        record_decisions(notes_dir, dec, now=now)
-        for lb, (qp, it) in by_label.items():
-            if lb in chosen:
-                res.n_keep += 1
-                keep_dates.add(load_queue(qp).get("run_date", ""))
-            else:
-                res.n_drop += 1
+
+    t_commit = clock()
+    dec, sources = [], {}
+    keep_dates: Set[str] = set()
+    for qp, it in rows:
+        k = it["dedup_key"]
+        dec.append((qp, k, "keep" if sel[k] else "drop"))
+        changed = sel[k] != bool(it.get("default_checked"))
+        sources[k] = SOURCE_USER if changed else SOURCE_DEFAULT
+        if sel[k]:
+            keep_dates.add(load_queue(qp).get("run_date", ""))
+    record_decisions(notes_dir, dec, now=t_commit, sources=sources, times=page_time)
+    _clear_draft(notes_dir)
+    st = selection_stats(rows, sel)
+    res.n_keep, res.n_drop, res.n_added, res.n_removed = st["keep"], st["drop"], st["added"], st["removed"]
     res.keep_run_dates = sorted(d for d in keep_dates if d)
-    res.n_still_pending = len(rows) - res.n_keep - res.n_drop
-    if res.n_still_pending == 0:
-        res.status = "done"
-    elif res.n_keep + res.n_drop > 0:
-        res.status, res.reason = "partial", stop_reason
-    else:
-        res.status, res.reason = "suspended", stop_reason
+    res.n_still_pending = 0
+    res.status = "done"
     return res
 
 

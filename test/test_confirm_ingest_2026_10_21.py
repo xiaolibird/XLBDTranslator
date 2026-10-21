@@ -7,7 +7,7 @@
 import importlib.util
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -252,7 +252,7 @@ def test_audit_quota_bounds():
 def test_session_confirms_with_defaults_and_writes_labels(env):
     make_digest(env.dig, n_inc=2, n_maybe=1, n_low=2, n_high=0)
     C.sync_queue(env.notes, env.dig, now=NOW)
-    d = FakeDialogs(asks=[ask_ok("开始确认")], chooses=[pick("defaults")])
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults")])
     res = C.run_session(env.notes, d, now=NOW)
     assert res.status == "done" and res.n_keep == 3 and res.n_drop == 2 and res.n_still_pending == 0
     items, defaults, kw = d.choose_calls[0]
@@ -280,7 +280,7 @@ def test_user_ticking_an_exclude_is_an_override_label(env):
         low = [s for s in items if "[低置信排除]" in s][0]
         return O.ChooseResult("ok", [low])
 
-    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认")], [choose]), now=NOW)
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [choose]), now=NOW)
     labs = {l["category"]: l for l in C.load_stream_labels(env.notes)}
     assert labs["include"]["user_decision"] == "drop" and labs["include"]["override"] is True
     low = [l for l in C.load_stream_labels(env.notes) if l["category"] == "lowconf_exclude"]
@@ -291,7 +291,7 @@ def test_user_ticking_an_exclude_is_an_override_label(env):
 def test_pagination_splits_at_page_size_and_persists_each_page(env):
     make_digest(env.dig, n_inc=45, n_maybe=0, n_low=0, n_high=0)
     C.sync_queue(env.notes, env.dig, now=NOW)
-    d = FakeDialogs(asks=[ask_ok("开始确认")], chooses=[pick("defaults"), pick("defaults")])
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults"), pick("defaults")])
     res = C.run_session(env.notes, d, now=NOW)
     assert [len(c[0]) for c in d.choose_calls] == [40, 5]
     assert "1/2" in d.choose_calls[0][2]["title"] and "2/2" in d.choose_calls[1][2]["title"]
@@ -299,15 +299,16 @@ def test_pagination_splits_at_page_size_and_persists_each_page(env):
     assert res.status == "done" and res.n_keep == 45
 
 
-def test_cancel_on_second_page_keeps_first_page_and_suspends_rest(env):
+def test_cancel_on_second_page_commits_nothing(env):
     make_digest(env.dig, n_inc=45, n_maybe=0, n_low=0, n_high=0)
     C.sync_queue(env.notes, env.dig, now=NOW)
-    d = FakeDialogs(asks=[ask_ok("开始确认")], chooses=[pick("defaults"), O.ChooseResult("cancel")])
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults"), O.ChooseResult("cancel")])
     res = C.run_session(env.notes, d, now=NOW)
-    assert res.status == "partial" and res.n_keep == 40 and res.n_still_pending == 5
+    assert res.status == "suspended" and res.n_keep == 0 and res.n_still_pending == 45
     assert "暂不确认" in res.reason
-    left = C.pending_items(env.notes)
-    assert len(left) == 5 and len(C.load_stream_labels(env.notes)) == 40       # 取消 ≠ 丢弃
+    # 提交前不生效：第一页点过也不落盘；取消 ≠ 丢弃
+    assert len(C.pending_items(env.notes)) == 45 and C.load_stream_labels(env.notes) == []
+    assert (C.pending_dir(env.notes) / C.DRAFT_FILE).exists()                  # 只有草稿，草稿不算确认
 
 
 @pytest.mark.parametrize("first,reason", [
@@ -318,7 +319,7 @@ def test_cancel_on_second_page_keeps_first_page_and_suspends_rest(env):
 def test_cancel_timeout_error_on_first_page_suspend_everything(env, first, reason):
     make_digest(env.dig, n_inc=3, n_maybe=0, n_low=1, n_high=0)
     C.sync_queue(env.notes, env.dig, now=NOW)
-    res = C.run_session(env.notes, FakeDialogs([ask_ok("开始确认")], [first]), now=NOW)
+    res = C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [first]), now=NOW)
     assert res.status == "suspended" and reason in res.reason
     assert len(C.pending_items(env.notes)) == 4 and C.load_stream_labels(env.notes) == []
 
@@ -345,9 +346,9 @@ def test_no_gui_suspends_without_any_dialog(env):
 def test_view_summary_writes_md_and_reasks(env):
     make_digest(env.dig, n_inc=1, n_maybe=0, n_low=1, n_high=0)
     C.sync_queue(env.notes, env.dig, now=NOW)
-    d = FakeDialogs(asks=[ask_ok("先看摘要"), ask_ok("开始确认")], chooses=[pick("defaults")])
+    d = FakeDialogs(asks=[ask_ok("先看摘要"), ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults")])
     C.run_session(env.notes, d, now=NOW)
-    assert len(d.opened) == 1 and len(d.ask_calls) == 2
+    assert len(d.opened) == 1 and len(d.ask_calls) == 3      # 开场×2 + 汇总核对
     md = Path(d.opened[0]).read_text(encoding="utf-8")
     assert "Paper number" in md and "摘要：" in md and "一句话：" in md and "001 [纳入]" in md
 
@@ -415,7 +416,7 @@ def test_gate_passes_only_kept_and_rebuilds_overridden_excludes(env):
         low = [s for s in items if "[低置信排除]" in s][0]
         return O.ChooseResult("ok", [inc, low])
 
-    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认")], [choose]), now=NOW)
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [choose]), now=NOW)
     g = C.gate_segments(_load_segs(env), env.notes, env.dig, date(2026, 10, 19), date(2026, 10, 25))
     assert len(g.segs) == 2 and g.n_override == 1 and g.n_dropped == 3 and g.n_pending == 0
     ov = [s for s in g.segs if s.filter_decision.stage == "manual_pick"]
@@ -501,7 +502,7 @@ def ci():
 
 def test_confirm_ingest_end_to_end_with_stubbed_ingest(env, ci):
     make_digest(env.dig, n_inc=2, n_maybe=0, n_low=1, n_high=0)
-    d = FakeDialogs([ask_ok("开始确认")], [pick("defaults")])
+    d = FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick("defaults")])
     ran = []
     rc = ci.main(["--notes-dir", str(env.notes), "--digest-dir", str(env.dig)], dialogs=d,
                  runner=lambda argv: (ran.append(argv), 0)[1], today=date(2026, 10, 20), now=NOW)
@@ -516,7 +517,7 @@ def test_confirm_ingest_end_to_end_with_stubbed_ingest(env, ci):
 def test_confirm_ingest_failed_ingest_retries_then_gives_up(env, ci):
     make_digest(env.dig, n_inc=1, n_maybe=0, n_low=0, n_high=0)
     base = ["--notes-dir", str(env.notes), "--digest-dir", str(env.dig)]
-    d = FakeDialogs([ask_ok("开始确认")], [pick("defaults")])
+    d = FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick("defaults")])
     fail = lambda argv: 1                                                     # noqa: E731
     ci.main(base, dialogs=d, runner=fail, today=date(2026, 10, 20), now=NOW)
     for day in (21, 22):
@@ -558,3 +559,270 @@ def test_confirm_ingest_no_gui_only_notifies(env, ci):
     ci.main(["--notes-dir", str(env.notes), "--digest-dir", str(env.dig)], dialogs=d,
             runner=lambda a: 0, today=date(2026, 10, 20), now=NOW)
     assert d.notified and not d.ask_calls
+
+
+# ====================================================================== 防误触补丁（WO-8a 补丁，2026-10-21 真机复盘）
+
+def _stepping_clock(start=datetime(2026, 10, 19, 17, 21, 43), step=10):
+    box = {"t": start}
+
+    def clock():
+        t = box["t"]
+        box["t"] = t + timedelta(seconds=step)
+        return t
+    return clock
+
+
+def _spam_enter(env, n_inc):
+    """模拟连按回车：开场默认「开始确认」、每页默认 OK、汇总框默认「返回修改」——回车永远不能提交。"""
+    make_digest(env.dig, n_inc=n_inc, n_maybe=0, n_low=1, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+
+
+def test_mashing_default_buttons_never_commits(env):
+    _spam_enter(env, 3)
+    # 汇总框默认按钮 = 返回修改；回车 = 返回修改 → 再走一遍 → 再返回修改 … 最后无人应答 = 挂起
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("返回修改"), ask_ok("返回修改"), O.AskResult("timeout", None, True)],
+                    chooses=[pick("defaults")] * 3)
+    res = C.run_session(env.notes, d, now=NOW)
+    commit_calls = [c for c in d.ask_calls if "确认提交" in c[1]]
+    assert len(commit_calls) == 3
+    assert all(c[1] == ["返回修改", "确认提交"] for c in commit_calls)
+    assert res.status == "suspended" and "未提交" in res.reason
+    assert len(C.pending_items(env.notes)) == 4 and C.load_stream_labels(env.notes) == []
+    assert all(i["state"] == "pending" for i in queue_of(env)["items"])
+
+
+def test_commit_dialog_default_button_is_back():
+    sc = O.build_ask_script(C.commit_message({"keep": 3, "drop": 1, "added": 0, "removed": 0, "changed": 0}),
+                            [C.BTN_BACK, C.BTN_COMMIT], C.BTN_BACK, title="t", giving_up_s=600)
+    assert 'buttons {"返回修改", "确认提交"} default button "返回修改"' in sc and "giving up after 600" in sc
+
+
+def test_commit_dialog_is_called_with_back_as_default(env):
+    _spam_enter(env, 2)
+    seen = {}
+
+    class D(FakeDialogs):
+        def ask(self, message, buttons, default_button=None, **kw):
+            seen.setdefault("defaults", []).append(default_button)
+            return super().ask(message, buttons, default_button, **kw)
+    d = D(asks=[ask_ok("开始确认"), O.AskResult("timeout", None, True)], chooses=[pick("defaults")])
+    C.run_session(env.notes, d, now=NOW)
+    assert seen["defaults"] == ["开始确认", "返回修改"]
+
+
+def test_summary_counts_changes_vs_filter_default(env):
+    make_digest(env.dig, n_inc=2, n_maybe=0, n_low=2, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+
+    def choose(items, defaults):          # 取消第一条纳入，补勾第一条低置信排除
+        inc = [s for s in items if "[纳入]" in s]
+        low = [s for s in items if "[低置信排除]" in s]
+        return O.ChooseResult("ok", [inc[1], low[0]])
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[choose])
+    res = C.run_session(env.notes, d, now=NOW)
+    msg = d.ask_calls[1][0]
+    assert "保留 2 / 丢弃 2" in msg and "改动了 2 处（补勾 1、取消 1）" in msg
+    assert (res.n_added, res.n_removed, res.n_changed) == (1, 1, 2)
+
+
+def test_back_to_edit_restarts_at_page_one_keeping_ticks(env):
+    make_digest(env.dig, n_inc=1, n_maybe=0, n_low=2, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+
+    def first(items, defaults):           # 第一遍：补勾第一条低置信排除，取消纳入
+        return O.ChooseResult("ok", [[s for s in items if "[低置信排除]" in s][0]])
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("返回修改"), ask_ok("确认提交")],
+                    chooses=[first, pick("defaults")])
+    res = C.run_session(env.notes, d, now=NOW)
+    (items1, defaults1, kw1), (items2, defaults2, kw2) = d.choose_calls
+    assert items1 == items2 and "1/1" in kw2["title"]
+    assert defaults1 != defaults2
+    assert defaults2 == [[s for s in items2 if "[低置信排除]" in s][0]]       # 保留第一遍改动，而非回到筛选器默认
+    # 第二遍原样提交：纳入仍被取消、低置信被补勾 → 两处改动都记为用户标签
+    labs = {l["category"]: l for l in C.load_stream_labels(env.notes)}
+    assert labs["include"]["user_decision"] == "drop" and labs["include"]["user_decision_source"] == "user"
+    assert res.n_changed == 2 and res.status == "done"
+
+
+def test_nothing_is_committed_until_confirm(env):
+    make_digest(env.dig, n_inc=2, n_maybe=0, n_low=0, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    seen = {}
+
+    class D(FakeDialogs):
+        def ask(self, message, buttons, default_button=None, **kw):
+            if "确认提交" in buttons:       # 汇总框弹出时磁盘上仍是 pending、无标签
+                seen["pending"] = len(C.pending_items(env.notes))
+                seen["labels"] = len(C.load_stream_labels(env.notes))
+            return super().ask(message, buttons, default_button, **kw)
+    d = D(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults")])
+    C.run_session(env.notes, d, now=NOW)
+    assert seen == {"pending": 2, "labels": 0}
+    assert not (C.pending_dir(env.notes) / C.DRAFT_FILE).exists()             # 提交后草稿清掉
+
+
+def test_draft_prefills_next_session_but_is_not_confirmation(env):
+    make_digest(env.dig, n_inc=2, n_maybe=0, n_low=0, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    d1 = FakeDialogs(asks=[ask_ok("开始确认"), O.AskResult("timeout", None, True)], chooses=[pick(0)])
+    C.run_session(env.notes, d1, now=NOW)                    # 取消第二条后在汇总框超时 → 挂起
+    assert len(C.pending_items(env.notes)) == 2
+    d2 = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults")])
+    # 第二遍 defaults 来自草稿（只勾了第 1 条），pick("defaults") 原样返回它
+    res = C.run_session(env.notes, d2, now=NOW)
+    assert d2.choose_calls[0][1] == [d2.choose_calls[0][0][0]] and (res.n_keep, res.n_drop) == (1, 1)
+
+
+def test_confirmed_at_is_per_page_time_not_session_start(env):
+    """真机根因：整场共用开场的 now → 所有标签 confirmed_at 都是入队/开场时刻。"""
+    make_digest(env.dig, n_inc=45, n_maybe=0, n_low=0, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    clock = _stepping_clock()
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults"), pick("defaults")])
+    C.run_session(env.notes, d, clock=clock)          # 不传 now：与真实运行一致
+    labs = C.load_stream_labels(env.notes)
+    stamps = sorted({l["confirmed_at"] for l in labs})
+    # 17:21:43 被会话开场取走（相当于入队/开场时刻）；标签用各页确认时刻，且两页不同
+    assert stamps == ["2026-10-19T17:21:53", "2026-10-19T17:22:03"]
+    assert {l["committed_at"] for l in labs} == {"2026-10-19T17:22:13"}
+    first = [l for l in labs if l["confirmed_at"] == stamps[0]]
+    assert len(first) == 40
+    q = queue_of(env)
+    assert {i["confirmed_at"] for i in q["items"]} == set(stamps)
+
+
+def test_confirm_ingest_main_uses_real_clock_per_page(env, ci, monkeypatch):
+    """main 不注入 now 时，不能把启动时刻当整场的确认时刻。"""
+    make_digest(env.dig, n_inc=1, n_maybe=0, n_low=0, n_high=0)
+    seq = iter([datetime(2026, 10, 20, 9, 0, 0), datetime(2026, 10, 20, 9, 5, 0), datetime(2026, 10, 20, 9, 5, 1)] * 5)
+
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(seq)
+    monkeypatch.setattr(ci, "datetime", FakeDT)
+    d = FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick("defaults")])
+    ci.main(["--notes-dir", str(env.notes), "--digest-dir", str(env.dig), "--no-ingest"], dialogs=d,
+            today=date(2026, 10, 20))
+    lab = C.load_stream_labels(env.notes)[0]
+    assert lab["confirmed_at"] != "2026-10-20T09:00:00"            # 不是启动时刻
+
+
+# ---- 零改动不记用户标签 ----
+
+def test_zero_change_marks_default_accepted_but_still_allows_ingest(env):
+    make_digest(env.dig, n_inc=2, n_maybe=1, n_low=2, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    d = FakeDialogs(asks=[ask_ok("开始确认"), ask_ok("确认提交")], chooses=[pick("defaults")])
+    res = C.run_session(env.notes, d, now=NOW)
+    assert res.status == "done" and res.n_changed == 0 and res.n_keep == 3
+    assert "不会记为你的标签" in d.ask_calls[1][0]
+    labs = C.load_stream_labels(env.notes)
+    assert len(labs) == 5 and {l["user_decision_source"] for l in labs} == {"default_accepted"}
+    assert all(i["state"] in ("keep", "drop") for i in queue_of(env)["items"])      # 队列照常已确认
+    segs = _load_segs(env)
+    g = C.gate_segments(segs, env.notes, env.dig, date(2026, 10, 19), date(2026, 10, 25), sync=False)
+    assert g.n_confirmed == 3 and len(g.segs) == 3                                  # 允许入库
+    from src.scholar import filter_eval as FE
+    items, st = FE.stream_gold_items(labs)
+    assert items == [] and st["n_default_accepted"] == 5 and st["n_labels"] == 0
+    items2, st2 = FE.stream_gold_items(labs, include_default_accepted=True)
+    assert len(items2) == 5 and st2["default_accepted_included"] is True
+
+
+def test_changed_items_are_user_labels_unchanged_are_default_accepted(env):
+    make_digest(env.dig, n_inc=2, n_maybe=0, n_low=2, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+
+    def choose(items, defaults):
+        inc = [s for s in items if "[纳入]" in s]
+        low = [s for s in items if "[低置信排除]" in s]
+        return O.ChooseResult("ok", [inc[0], low[0]])       # 取消 inc[1]，补勾 low[0]
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [choose]), now=NOW)
+    labs = C.load_stream_labels(env.notes)
+    assert sorted(l["user_decision_source"] for l in labs) == ["default_accepted", "default_accepted", "user", "user"]
+    assert all(l["user_decision_source"] == ("user" if l["override"] else "default_accepted") for l in labs)
+    from src.scholar import filter_eval as FE
+    items, _ = FE.stream_gold_items(labs)
+    assert len(items) == 2 and all(i["override"] for i in items)
+
+
+def test_profile_drift_ignores_default_accepted(env):
+    from src.scholar import profile_drift as PD
+    base = {"filter_decision": "EXCLUDE", "user_decision": "keep", "exclude_reason": "X1",
+            "confirmed_at": "2026-10-19T10:00:00"}
+    rows = [dict(base, dedup_key="a{}".format(i), user_decision_source="default_accepted") for i in range(5)]
+    rows += [dict(base, dedup_key="u{}".format(i), user_decision_source="user") for i in range(2)]
+    a = PD.analyze(rows, now=datetime(2026, 10, 20), embed_fn=None)
+    assert a.n_added == 2
+    a2 = PD.analyze(rows, now=datetime(2026, 10, 20), embed_fn=None, include_default_accepted=True)
+    assert a2.n_added == 7
+    legacy = [{k: v for k, v in rows[0].items() if k != "user_decision_source"}]       # 旧行无字段 = 主动
+    assert PD.analyze(legacy, now=datetime(2026, 10, 20), embed_fn=None).n_added == 1
+
+
+# ---- reopen ----
+
+def _commit_all(env, n_inc=2, n_low=1):
+    make_digest(env.dig, n_inc=n_inc, n_maybe=0, n_low=n_low, n_high=0)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick(0)]), now=NOW)
+
+
+def test_reopen_before_ingest_resets_queue_and_retracts_labels(env):
+    _commit_all(env)
+    assert len(C.load_stream_labels(env.notes)) == 3 and C.pending_items(env.notes) == []
+    st, n = C.reopen_run(env.notes, "2026-10-19", now=datetime(2026, 10, 20, 8, 0, 0))
+    assert (st, n) == ("ok", 3)
+    assert len(C.pending_items(env.notes)) == 3 and all(i["confirmed_at"] is None for i in queue_of(env)["items"])
+    assert C.load_stream_labels(env.notes) == []                                    # 同键最晚一行是撤销行 → 失效
+    assert len(C.load_stream_labels(env.notes, include_retracted=True)) == 3
+    raw = [json.loads(l) for l in C.labels_path(env.notes).read_text(encoding="utf-8").splitlines()]
+    assert len(raw) == 6 and sum(r["user_decision"] == "retracted" for r in raw) == 3
+    # 闸门重新拦住
+    g = C.gate_segments(_load_segs(env), env.notes, env.dig, date(2026, 10, 19), date(2026, 10, 25), sync=False)
+    assert g.segs == [] and g.n_pending == 3
+    # 下次弹窗重新勾：新标签压过撤销行
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick("defaults")]),
+                  now=datetime(2026, 10, 21, 8, 0, 0))
+    assert len(C.load_stream_labels(env.notes)) == 3
+
+
+def test_reopen_refused_after_ingest(env):
+    _commit_all(env)
+    C.mark_ingested(env.notes, "2026-10-19", NOW)
+    before = C.queue_path(env.notes, "2026-10-19").read_text(encoding="utf-8")
+    st, n = C.reopen_run(env.notes, "2026-10-19", now=NOW)
+    assert st == "ingested" and n >= 1
+    assert C.queue_path(env.notes, "2026-10-19").read_text(encoding="utf-8") == before
+    assert len(C.load_stream_labels(env.notes)) == 3                                 # 标签原样
+
+
+def test_reopen_missing_queue(env):
+    assert C.reopen_run(env.notes, "2026-01-01")[0] == "not_found"
+
+
+def test_confirm_ingest_reopen_cli(env, ci, capsys):
+    _commit_all(env)
+    base = ["--notes-dir", str(env.notes), "--digest-dir", str(env.dig)]
+    d = FakeDialogs()
+    assert ci.main(base + ["--reopen", "2026-10-19"], dialogs=d, today=date(2026, 10, 20), now=NOW) == 0
+    assert d.ask_calls == [] and len(C.pending_items(env.notes)) == 3                # 不弹窗
+    C.run_session(env.notes, FakeDialogs([ask_ok("开始确认"), ask_ok("确认提交")], [pick("defaults")]), now=NOW)
+    C.mark_ingested(env.notes, "2026-10-19", NOW)
+    assert ci.main(base + ["--reopen", "2026-10-19"], dialogs=d, today=date(2026, 10, 20), now=NOW) == 1
+    assert "已有" in capsys.readouterr().err
+    assert ci.main(base + ["--reopen", "2026-01-01"], dialogs=d, today=date(2026, 10, 20), now=NOW) == 2
+    assert ci.main(base + ["--reopen", "bad"], dialogs=d, today=date(2026, 10, 20), now=NOW) == 2
+
+
+# ---- 开场提示 ----
+
+def test_intro_mentions_enter_confirms_page_and_second_check(env):
+    make_digest(env.dig)
+    C.sync_queue(env.notes, env.dig, now=NOW)
+    d = FakeDialogs(asks=[ask_ok("稍后")])
+    C.run_session(env.notes, d, now=NOW)
+    assert "列表页回车 = 确认本页；全部点完后还会再让你核对一次" in d.ask_calls[0][0]

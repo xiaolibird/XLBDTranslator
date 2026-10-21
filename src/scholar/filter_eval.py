@@ -700,7 +700,7 @@ def import_labels(sheet_path: Path, key: Dict[str, Any], allow_partial: bool = F
 # ---------------- S-stream：入库确认标签（WO-8b，设计 §12.2）----------------
 
 def stream_gold_items(labels: Sequence[Dict[str, Any]], *, as_of: Optional[datetime] = None,
-                      window_weeks: int = 12) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+                      window_weeks: int = 12, include_default_accepted: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """把 stream_labels.jsonl 的行变成 S-stream 层 gold 条目。纯函数。
 
     标签语义：user_decision=keep → positive，drop → negative。
@@ -711,11 +711,18 @@ def stream_gold_items(labels: Sequence[Dict[str, Any]], *, as_of: Optional[datet
     （权重 = 池/抽中），二者都带在 sample.weight 里，compute_metrics 的 s_stream 据此还原
     「生产 EXCLUDE 中其实该收」的总体比例。
 
+    user_decision_source=default_accepted 的行（用户在汇总核对里没改过、照单全收默认勾选）**默认排除**：
+    它不是用户的主动判断，混进来会把筛选器自己的默认当成「人也同意」。include_default_accepted=True 可纳入；
+    旧行（无该字段）按主动判断处理。
+
     ⚠️ 锚定偏倚：INCLUDE/MAYBE 类条目默认勾选，用户「没取消」不等于「认真确认过」，所以
     s_stream 里「筛选器收了但用户丢掉」的比例是**下界**；EXCLUDE 类默认不勾，用户勾上是主动行为，
     漏判估计不受此影响。条目上记 anchored=True 以便分开看。
     """
     rows = [r for r in labels if r.get("user_decision") in ("keep", "drop") and r.get("dedup_key")]
+    n_default = sum(1 for r in rows if r.get("user_decision_source") == "default_accepted")
+    if not include_default_accepted:
+        rows = [r for r in rows if r.get("user_decision_source") != "default_accepted"]
     stamps = {}
     for r in rows:
         t = _parse_ts(r.get("confirmed_at"))
@@ -743,7 +750,8 @@ def stream_gold_items(labels: Sequence[Dict[str, Any]], *, as_of: Optional[datet
                     "weight": float(r.get("sample_weight") or 1.0), "prod_verdict": fd,
                     "prod_confidence": conf, "category": r.get("category")}))
     items.sort(key=lambda it: it["item_id"])         # 与输入顺序无关
-    stats = {"n_labels": len(rows), "n_in_window": len(items), "n_out_of_window": dropped_window,
+    stats = {"n_labels": len(rows), "n_default_accepted": n_default,
+             "default_accepted_included": bool(include_default_accepted), "n_in_window": len(items), "n_out_of_window": dropped_window,
              "window_weeks": window_weeks, "as_of": as_of.isoformat(timespec="seconds") if as_of else None}
     return items, stats
 
@@ -769,7 +777,8 @@ def build_gold(*, lib: List[Dict[str, Any]], manual: List[Dict[str, Any]], abstr
                bib_include: Iterable[str] = (),
                seed: int = SEED, labeled_at: Optional[str] = None,
                stream_labels: Optional[Sequence[Dict[str, Any]]] = None,
-               stream_as_of: Optional[datetime] = None, stream_window_weeks: int = 12
+               stream_as_of: Optional[datetime] = None, stream_window_weeks: int = 12,
+               stream_include_default: bool = False
                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
     """纯函数：把各路输入装配成 (gold 条目, 构造统计, bib 审阅记录)。同输入同输出。
 
@@ -849,7 +858,8 @@ def build_gold(*, lib: List[Dict[str, Any]], manual: List[Dict[str, Any]], abstr
 
     # S（入库确认标签；不给 stream_labels 则整层缺席，旧版本 gold 不受影响）
     if stream_labels:
-        s_items, s_stats = stream_gold_items(stream_labels, as_of=stream_as_of, window_weeks=stream_window_weeks)
+        s_items, s_stats = stream_gold_items(stream_labels, as_of=stream_as_of, window_weeks=stream_window_weeks,
+                                           include_default_accepted=stream_include_default)
         stats["s_stream"] = s_stats
         for it in s_items:
             add(it)

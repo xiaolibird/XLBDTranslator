@@ -10,12 +10,16 @@
   python scripts/confirm_ingest.py --daily         # launchd 每日 job：同上，但当天提醒过就静默；
                                                    # 先发系统通知；无图形会话只通知不弹
   python scripts/confirm_ingest.py --date 2026-10-19      # 只处理该 digest run 日期的队列
+  python scripts/confirm_ingest.py --reopen 2026-10-19   # 撤销该 run 的确认（须尚未入库）
   python scripts/confirm_ingest.py --no-ingest     # 只确认，不触发入库（之后手动跑 ingest_notes.py）
 
 语义：
   * 取消 / 点「稍后」/ 超时无人应答 / 无图形会话 → 全部**挂起**（pending），不入库、不精读，
     明天再提醒，直到确认；取消不是丢弃。
-  * 每页「确认本页」立刻落盘（队列 state + _eval/filter/stream_labels.jsonl 追加）。
+  * 各页「确认本页」只暂存；全部点完后弹汇总核对框（默认按钮=返回修改，连按回车不会提交），
+    点「确认提交」才落盘（队列 state + _eval/filter/stream_labels.jsonl 追加）并允许入库。
+    相对筛选器默认没动过的条目标 user_decision_source=default_accepted，评测/漂移默认不计为用户标签。
+  * --reopen YYYY-MM-DD：撤销该 run 的确认（未入库才行），队列复位 pending、标签追加撤销行，下次弹窗重勾。
   * 勾上筛选器原判 EXCLUDE 的 → 视同手选覆盖（stage=manual_pick，原判留在 llm_decision_before_override）。
   * 旧行为（不确认直接入库）：对 ingest_notes.py 用 --no-confirm（或环境变量 SCHOLAR_NO_CONFIRM=1）；
     回填（backfill_notes.py / monthly）与 manual 系列（read_pdf.py）本来就不经过本流程。
@@ -88,11 +92,14 @@ def main(argv=None, *, dialogs=None, runner=None, today=None, now=None) -> int:
     ap.add_argument("--date", default="", metavar="YYYY-MM-DD", help="只处理该 digest run 日期")
     ap.add_argument("--list", action="store_true", dest="list_only", help="只列出待确认，不弹窗")
     ap.add_argument("--daily", action="store_true", help="launchd 每日提醒模式（当天提醒过则静默）")
+    ap.add_argument("--reopen", default="", metavar="YYYY-MM-DD",
+                    help="撤销该 run 日期的确认并重置为待确认（已入库则拒绝）；不弹窗")
     ap.add_argument("--no-ingest", action="store_true", help="确认后不触发入库")
     ap.add_argument("--lookback-days", type=int, default=TH.CONFIRM_QUEUE_LOOKBACK_DAYS,
                     help="自动入队只扫最近多少天的 digest run（默认 %(default)s）")
     args = ap.parse_args(argv)
 
+    clock = (lambda: now) if now is not None else datetime.now      # 注入 now 仅测试用；真实运行每页取当时时刻
     now = now or datetime.now()
     today = today or now.date()
     notes_dir, digest_dir = repo_path(args.notes_dir), repo_path(args.digest_dir)
@@ -102,6 +109,23 @@ def main(argv=None, *, dialogs=None, runner=None, today=None, now=None) -> int:
     if dialogs is None:
         from src.utils.osa_dialog import OsaDialogs
         dialogs = OsaDialogs()
+
+    if args.reopen:
+        try:
+            date.fromisoformat(args.reopen)
+        except ValueError:
+            print("--reopen 应为 YYYY-MM-DD", file=sys.stderr)
+            return 2
+        status, n = C.reopen_run(notes_dir, args.reopen, now=clock())
+        if status == "not_found":
+            print("找不到 {} 的待确认队列".format(args.reopen), file=sys.stderr)
+            return 2
+        if status == "ingested":
+            print("拒绝：{} 已有 {} 篇入库，不能重开。请走正常的删除/补录流程。".format(args.reopen, n),
+                  file=sys.stderr)
+            return 1
+        print("已重开 {}：{} 条复位为待确认，stream_labels 已追加撤销记录；下次弹窗重新勾选。".format(args.reopen, n))
+        return 0
 
     only = None
     since, until = today - timedelta(days=args.lookback_days), today
@@ -133,14 +157,14 @@ def main(argv=None, *, dialogs=None, runner=None, today=None, now=None) -> int:
         else:
             dialogs.notify(NOTIFY_TITLE, "{} 篇论文待确认入库（未确认的不会入库/精读）".format(len(pending)))
             sess = C.run_session(notes_dir, dialogs, now=now, run_dates=only,
-                                 require_gui=True)
+                                 require_gui=True, clock=clock)
             if args.daily:
                 C.mark_prompted(notes_dir, today)
             logger.info("弹窗会话：{} · 保留 {} 丢弃 {} 仍挂起 {}{}".format(
                 sess.status, sess.n_keep, sess.n_drop, sess.n_still_pending,
                 "（{}）".format(sess.reason) if sess.reason else ""))
-            print("确认结果：保留 {} · 丢弃 {} · 仍挂起 {}{}".format(
-                sess.n_keep, sess.n_drop, sess.n_still_pending,
+            print("确认结果：保留 {} · 丢弃 {}（改动 {}）· 仍挂起 {}{}".format(
+                sess.n_keep, sess.n_drop, sess.n_changed, sess.n_still_pending,
                 "（{}）".format(sess.reason) if sess.reason else ""))
             retry_dates |= set(sess.keep_run_dates)
     else:

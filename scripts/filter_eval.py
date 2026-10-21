@@ -207,7 +207,8 @@ def cmd_build_gold(args):
             stream=stream, stable=FE.load_stable_audit(stable_f), p1_abstracts=p1_abs, labels=labels,
             label_key=key, f_override=f_over, bib_exclude=excl, bib_include=incl, seed=args.seed,
             stream_labels=stream_labels, stream_as_of=stream_as_of,
-            stream_window_weeks=args.stream_window_weeks)
+            stream_window_weeks=args.stream_window_weeks,
+            stream_include_default=args.stream_include_default)
     except RuntimeError as e:
         print("拒绝构造 gold：{}".format(e), file=sys.stderr)
         return 2
@@ -447,6 +448,8 @@ def main(argv=None):
                    help="沿用哪一版 manual 登记表（默认同 --version；新开 gold 版本而登记不变时指向旧版）")
     p.add_argument("--stream-labels", action="store_true",
                    help="并入入库确认标签（<notes_dir>/_eval/filter/stream_labels.jsonl）为 S-stream 层")
+    p.add_argument("--stream-include-default", action="store_true",
+                   help="S-stream 同时纳入 user_decision_source=default_accepted 的行（默认排除：那不是用户的主动判断）")
     p.add_argument("--stream-window-weeks", type=int, default=TH.STREAM_WINDOW_WEEKS,
                    help="S-stream 只取最近多少周的确认（默认 %(default)s，按确认日期滚动）")
     p.add_argument("--stream-as-of", default=None, metavar="ISO",
