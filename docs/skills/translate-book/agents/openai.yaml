@@ -1,0 +1,4 @@
+interface:
+  display_name: "全书翻译与阅读版"
+  short_description: "为整本书选择翻译模式、审核术语和译文，生成中文 PDF 与 EPUB 阅读版"
+  default_prompt: "使用 $translate-book 翻译这本书，选择合适文体，审核术语并生成 PDF 和 EPUB。"
