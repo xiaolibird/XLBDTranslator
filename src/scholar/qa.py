@@ -31,7 +31,7 @@
 引用率更高，而且随新论文入库**自动重合成**，而问答页只在人再问一次时才更新。
 所以提问前会拿问题与 `config/topics.yaml` 里各页的 `question` 算一次相似度
 （`find_similar_topics`），命中就先提示；命中的 slug 也会写在归档页顶部。
-三行路由表见 `docs/scholar_notes_AGENTS.md`。
+三行路由表见 `docs/agents/scholar_notes_AGENTS.md`。
 
 ## 已知局限（写在这里，也写在报告与文档里）
 

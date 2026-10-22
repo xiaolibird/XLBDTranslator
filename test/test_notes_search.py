@@ -145,8 +145,8 @@ def test_coverage_warning_not_stale():
 
     docs = {
         "scripts/notes_search.py": Path(ns.__file__).read_text(encoding="utf-8"),
-        "docs/scholar_notes_AGENTS.md":
-            Path("docs/scholar_notes_AGENTS.md").read_text(encoding="utf-8"),
+        "docs/agents/scholar_notes_AGENTS.md":
+            Path("docs/agents/scholar_notes_AGENTS.md").read_text(encoding="utf-8"),
         "docs/skills/scholar-notes/SKILL.md":
             Path("docs/skills/scholar-notes/SKILL.md").read_text(encoding="utf-8"),
         "docs/skills/scholar-write/SKILL.md":

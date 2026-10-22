@@ -1291,7 +1291,7 @@ def build_index_md(index: Dict[str, Any]) -> str:
 
 
 def _agents_source() -> Optional[Path]:
-    p = Path(__file__).resolve().parents[2] / "docs" / "scholar_notes_AGENTS.md"
+    p = Path(__file__).resolve().parents[2] / "docs" / "agents" / "scholar_notes_AGENTS.md"
     return p if p.exists() else None
 
 

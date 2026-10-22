@@ -1043,7 +1043,7 @@ def test_topic_matching_is_skipped_without_an_embedding_client():
 def test_docs_carry_the_three_way_routing_table():
     """"什么时候不该用它"必须写在两份文档里——功能有价值，但对已有概念页覆盖的问题
     它不值那 90 秒。"""
-    for p in ["docs/scholar_notes_AGENTS.md", "docs/skills/scholar-notes/SKILL.md"]:
+    for p in ["docs/agents/scholar_notes_AGENTS.md", "docs/skills/scholar-notes/SKILL.md"]:
         text = Path(p).read_text(encoding="utf-8")
         assert "notes_query.py" in text and "ask_notes.py" in text
         assert "自动保鲜" in text or "自动重合成" in text, p

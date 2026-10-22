@@ -1,31 +1,33 @@
-# Python
+# ============================================================
+# XLBDTranslator .gitignore
+# 原则：代码、配置模板、文档、skill、测试进仓库；运行产物、缓存、密钥、本地环境不进。
+# 运行产物统一在 output/（位置约定见 docs/skills/OUTPUTS.md）。
+# ============================================================
+
+# ---------- Python ----------
 __pycache__/
-*/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-*.bak
-*.backup
-*~
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+MANIFEST
 build/
 develop-eggs/
 dist/
 downloads/
 eggs/
-.eggs/
 lib/
 lib64/
 parts/
 sdist/
 var/
 wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# Virtual Environment
+# ---------- 虚拟环境 ----------
 venv/
 env/
 ENV/
@@ -35,38 +37,25 @@ venv.bak/
 env002_reader/
 .conda_env
 
-# Environment Variables
+# ---------- 密钥与本机配置（只提交 *.template） ----------
 .env
 .env.local
 .env.*.local
 config/config.env
 config/scholar.env
-
-# Project Specific
-logs/
-output/
-test_output/
-.pytest_cache
-# test/ 用白名单结构：目录排除（test/）会阻止 git 进入目录，
-# 负向规则必须配合 test/* 才生效
-test/*
-!test/*.py
-!test/data/
-!test/test_toc.csv
-!test/test_pdf.pdf
-!test/test.epub
-
-# Web UI Projects (separate development)
-web/
-web-next/
-
-# Development files
-digest_project.py
-migrating_instructions.md
 config/credentials.json
 config/token*.json
 
-# Generated content
+# ---------- 运行产物 ----------
+output/
+logs/
+test_output/
+*.log
+# deep-research skill 默认在仓库根落盘；产物统一收进 output/scholar_notes/deep_research/
+/reports/
+/research_notes/
+
+# 翻译中间文件（正常都在 output/ 下，这里兜住散落在别处的）
 **/page_images/
 **/Full_Book.md
 **/structure_map.json
@@ -76,49 +65,56 @@ config/token*.json
 **/glossary.json
 **/*.cropped.jpg
 
-# Jupyter
+# ---------- 测试：白名单结构 ----------
+# 目录排除（test/）会阻止 git 进入目录，负向规则必须配合 test/* 才生效
+test/*
+!test/*.py
+!test/data/
+!test/fixtures/
+!test/test_toc.csv
+!test/test_pdf.pdf
+!test/test.epub
+.pytest_cache/
+.coverage
+
+# ---------- 文档 ----------
+# docs/ 默认全部进仓库；早期翻译器设计笔记留在本地、不入库
+docs/_legacy/
+
+# ---------- 脚本 ----------
+# 根目录等处的临时 shell 脚本不入库；正式脚本只放 scripts/ 与各 skill 目录
+*.sh
+!scripts/*.sh
+!docs/skills/**/*.sh
+# 下划线开头的是一次性草稿脚本
+scripts/_*.py
+
+# ---------- 前端（独立开发，不在本仓库维护） ----------
+web/
+web-next/
+
+# ---------- Jupyter ----------
 .ipynb_checkpoints/
 *.ipynb
 
-# Cache
+# ---------- 缓存 ----------
 cache/
 *.cache
 .cache/
-.coverage
-scripts/_*.py
+.ruff_cache/
 
-# IDE
+# ---------- 编辑器 / agent 本地状态 ----------
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.temp
-*.sh
-!scripts/*.sh
-bfg-report/
-..bfg-report/
-docs/*
-!docs/scholar_notes_AGENTS.md
-!docs/paper_agent_prompt.md
-!docs/closeread_deep_rollout.md
-!docs/backup_restore.md
-!docs/skills/
-!docs/decisions/
-!docs/bugs/
-.ruff_cache/
 .claude/
 
-# deep-research skill 默认落在仓库根；统一收进 output/scholar_notes/deep_research/（见该目录 README），这里防误提交
-/reports/
-/research_notes/
+# ---------- 系统与临时文件 ----------
+.DS_Store
+Thumbs.db
+*.bak
+*.backup
+*.tmp
+*.temp

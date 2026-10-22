@@ -1,6 +1,7 @@
 #!/bin/bash
 # ============================================================
-# 把 docs/skills/ 下的 SKILL.md 同步到 ~/.claude/skills/ 的安装副本
+# 把 docs/skills/ 下的 SKILL.md 同步到 ~/.claude/skills/ 的安装副本，
+# 并在仓库 .agents/skills/ 下为每个 skill 维护一条软链（Codex 从这里发现 skill）
 #
 # docs/skills/ 是唯一真相源，改完 SKILL.md 必须跑本脚本才会生效到 agent 实际读到的
 # ~/.claude/skills/ ——两侧曾经各自漂移（安装版多写、docs 版漏同步），全部靠这条脚本纠正。
@@ -12,12 +13,16 @@
 # 只同步 SKILLS 数组里列出的目录，不用 --delete 整个 ~/.claude/skills/（那里还装着
 # 其它与本仓库无关的 skill，删了会误伤）；每个目录内部用 --delete 是安全的，
 # 因为该目录整个由 docs/skills/ 下同名目录定义，装的就该是 docs 版原样。
+#
+# .agents/skills/<skill> 是指向 ../../docs/skills/<skill> 的相对软链（随仓库提交），
+# 不复制内容；SKILLS 数组之外的旧链接会被清掉，保证两边清单一致。
 # ============================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCS_SKILLS="${REPO_ROOT}/docs/skills"
 INSTALL_SKILLS="${HOME}/.claude/skills"
+AGENTS_SKILLS="${REPO_ROOT}/.agents/skills"
 
 SKILLS=(read-paper read-book scholar-notes scholar-search scholar-write screen-journal paper-audit manuscript-selfcheck ask-notes translate-paper translate-book)
 
@@ -68,11 +73,32 @@ for skill in "${SKILLS[@]}"; do
     # --delete 只作用于这一个 skill 子目录内部（--delete 是 rsync 参数，随 src/dst 这对
     # 目录生效，不会波及 INSTALL_SKILLS 下其它 skill）；trailing slash 保证拷贝目录内容
     # 而不是把 src 目录本身嵌套进 dst。
-    rsync -av --delete ${DRY_RUN} "${src}" "${dst}"
+    rsync -av --delete --exclude '__pycache__/' ${DRY_RUN} "${src}" "${dst}"
 done
 
+# Codex 入口：.agents/skills/<skill> → ../../docs/skills/<skill>
+if [[ -z "${DRY_RUN}" ]]; then
+    mkdir -p "${AGENTS_SKILLS}"
+    for link in "${AGENTS_SKILLS}"/*; do
+        [[ -L "${link}" ]] || continue
+        name="$(basename "${link}")"
+        keep=0
+        for skill in "${SKILLS[@]}"; do [[ "${skill}" == "${name}" ]] && keep=1; done
+        if [[ ${keep} -eq 0 ]]; then
+            rm "${link}"
+            echo "移除过期 Codex 入口: .agents/skills/${name}"
+        fi
+    done
+    for skill in "${SKILLS[@]}"; do
+        ln -sfn "../../docs/skills/${skill}" "${AGENTS_SKILLS}/${skill}"
+    done
+    echo "Codex 入口: .agents/skills/ 下 ${#SKILLS[@]} 条软链"
+else
+    echo "（dry-run：跳过 .agents/skills/ 软链维护）"
+fi
+
 echo ""
-echo "✅ 完成：docs/skills/ → ~/.claude/skills/（${#SKILLS[@]} 个 skill）"
+echo "✅ 完成：docs/skills/ → ~/.claude/skills/ + .agents/skills/（${#SKILLS[@]} 个 skill）"
 if [[ -n "${DRY_RUN}" ]]; then
     echo "   （dry-run，未落盘；去掉 --dry-run 重跑以真正同步）"
 fi

@@ -409,100 +409,128 @@ python scripts/notes_index.py --full                # 全量重建
 python scripts/notes_index.py --since 2025-01 --until 2025-12   # 强制重扫区间
 ```
 
-数据源：新札记由 `write_notes` 自动写出无损 sidecar `{札记名}.index.json`；存量札记按 md 格式契约解析（`test/test_notes_index.py::test_roundtrip_md_parse` 锁格式）。**Agent 消费**：全局技能 `~/.claude/skills/scholar-notes/`（源码在 `docs/skills/scholar-notes/`，任何项目说"找文献/查札记"即可触发）；或直接读札记目录里的 `AGENTS.md`（源码 `docs/scholar_notes_AGENTS.md`，索引脚本自动部署）。检索四步法：查索引（过滤 `duplicate_of == null`）→ `grep '[@citekey]'` 定位精读节 → 正文 `[@citekey]` 引用 → 合并对应月 `references.json` 出 bibliography。
+数据源：新札记由 `write_notes` 自动写出无损 sidecar `{札记名}.index.json`；存量札记按 md 格式契约解析（`test/test_notes_index.py::test_roundtrip_md_parse` 锁格式）。**Agent 消费**：全局技能 `~/.claude/skills/scholar-notes/`（源码在 `docs/skills/scholar-notes/`，任何项目说"找文献/查札记"即可触发）；或直接读札记目录里的 `AGENTS.md`（源码 `docs/agents/scholar_notes_AGENTS.md`，索引脚本自动部署）。检索四步法：查索引（过滤 `duplicate_of == null`）→ `grep '[@citekey]'` 定位精读节 → 正文 `[@citekey]` 引用 → 合并对应月 `references.json` 出 bibliography。
 
-### 自动运行（launchd，两个互补 job）
+### 自动运行（launchd）
 
-```bash
-bash scripts/install_weekly_digest.sh       # 每周一 09:00：digest 速览（不出札记）
-bash scripts/install_monthly_backfill.sh    # 每月 1 日 21:30：出上月精读札记 + 刷新文献索引
-# 卸载：各自加 --uninstall；手动触发：launchctl kickstart gui/$(id -u)/<label>
-```
+定时任务模板在 `config/launchd/com.xlbd.scholar-*.plist`，由 `scripts/install_*.sh` 安装（各脚本加 `--uninstall` 卸载；手动触发：`launchctl kickstart gui/$(id -u)/<label>`）：
 
-两个 job 时间错开且 Gmail token 物理隔离（monthly 用 `config/token.monthly.json` 副本），互不冲突；复用同一 python 实体二进制，TCC 完全磁盘访问只需授权一次。日志在 `~/Library/Logs/xlbd-scholar-digest/cron_digest.log` 与 `cron_monthly.log`；错过触发时点（睡眠/关机）唤醒后自动补跑。
+| label | 触发 | 做什么 |
+|---|---|---|
+| scholar-digest | 每周一 09:00 | `scholar_main.py` 出 digest 速览（不出札记） |
+| scholar-weekly-ingest | 每周一 09:30 | `ingest_notes.py` 复用 digest 裁决出周札记 |
+| scholar-monthly | 每月 1 日 21:30 | `backfill_notes.py` 出上月精读札记并刷新文献索引 |
+| scholar-drift | 每月 1 日 10:30 | `profile_drift.py` 研究画像漂移提醒 |
+| scholar-confirm | 每天 10:00 | `confirm_ingest.py` 入库确认 |
+| scholar-inventory | 每天 09:10 | `inventory_missing_ids.py` 无 DOI 盘点续跑 |
+| scholar-backup | 每周日 20:00 | `backup_snapshot.py` 札记库快照（恢复见 `docs/guides/backup_restore.md`） |
+| scholar-embed | 札记变动时 | `notes_embed.py` 增量同步向量库 |
+| scholar-vault | 札记变动时 | `sync_vault.py` 同步 Obsidian vault |
+
+digest 与 monthly 的 Gmail token 物理隔离（monthly 用 `config/token.monthly.json` 副本），互不冲突；各任务复用同一 python 实体二进制，TCC 完全磁盘访问只需授权一次。日志在 `~/Library/Logs/xlbd-scholar-digest/cron_*.log`；错过触发时点（睡眠/关机）唤醒后自动补跑。
 
 > ⚠️ 仓库位于 `~/Documents` 等受 macOS 隐私保护的目录时，需一次性授权：系统设置 > 隐私与安全性 > **完全磁盘访问权限**，添加安装脚本打印的 python 二进制路径；否则后台任务会报 `Operation not permitted`。
+
+## 🧩 Agent Skills（Claude Code / Codex）
+
+仓库自带 11 个 skill，真相源在 `docs/skills/<名>/SKILL.md`。改完必须跑一次安装脚本：
+
+```bash
+bash scripts/install_skills.sh            # 同步到 ~/.claude/skills/，并维护 .agents/skills/ 软链（Codex 入口）
+bash scripts/install_skills.sh --dry-run  # 只看会同步什么
+```
+
+| skill | 用途 |
+|---|---|
+| read-paper | 单篇 PDF 深度精读：脚本草稿 + agent 亲读交叉核验，归档进札记库 |
+| read-book | 整本书按目录切章、分诊、只深读相关章，带页码引文回验 |
+| scholar-notes | 浏览/查找札记库文献，按角色（可引证据/可反驳/方法借鉴）取证 |
+| scholar-search | 临时检索 arXiv/PubMed，不入库，标注是否已在库 |
+| scholar-write | 写稿取证：正文写 `[@citekey]`，pandoc 挂全局书目出 docx/LaTeX |
+| ask-notes | 对札记库提问并把答案连同句级出处归档到 `topics/qa/` |
+| screen-journal | 对一整份期刊做 PubMed 检索 + 三态裁决，产出候选清单 |
+| paper-audit | 法证式诚信审查：数字自洽、图文互证、引用回对、撤稿状态 |
+| manuscript-selfcheck | 投稿前 15 道硬门对抗性自查 |
+| translate-paper | arXiv 论文逐字中译并排成 PDF（测试版） |
+| translate-book | 整本 EPUB/PDF 翻译：选模式、审术语、出 PDF/EPUB/MD 阅读版 |
+
+每个 skill 的产物位置见 [`docs/skills/OUTPUTS.md`](docs/skills/OUTPUTS.md)。
+
+## 📚 文档导航
+
+| 位置 | 内容 |
+|---|---|
+| `docs/skills/` | 各 skill 的 SKILL.md、配套脚本与模板；`OUTPUTS.md` 产物位置总表 |
+| `docs/agents/` | 部署给 agent 读的说明：`scholar_notes_AGENTS.md`（由 `notes_index.py` 部署到札记目录）、`paper_agent_prompt.md` |
+| `docs/guides/` | 运维手册：`backup_restore.md`（备份与恢复）、`closeread_deep_rollout.md`（精读加深的上线记录） |
+| `docs/decisions/` | 设计决策记录（按日期） |
+| `docs/bugs/` | 缺陷台账，索引见 `docs/bugs/README.md` |
 
 ## 📁 项目结构
 
 ```
-XLBDTranslator/
-├── main.py                 # 主入口文件
-├── scholar_main.py         # Scholar Digest 入口（Google Scholar 邮件摘要，含批量翻译）
-├── requirements.txt        # Python 依赖包
-├── requirements_scholar.txt # Scholar Digest 依赖包
-├── LICENSE                 # MIT 开源协议
-├── README.md              # 中文说明文档
-├── README.en.md           # 英文说明文档
-├── config/                # 配置文件目录
-│   ├── config.env.template # 环境变量模板
-│   ├── scholar.env.template # Scholar Digest 配置模板
-│   ├── modes.json         # 翻译人格定义
-│   ├── pdf_style.css      # PDF 输出样式
-│   ├── prompts/           # 提示词模板
-│   │   ├── system_instruction.md
-│   │   ├── system_instruction_simple.md
-│   │   ├── text_translation_prompt.md
-│   │   ├── text_translation_prompt_simple.md
-│   │   ├── vision_translation_prompt.md
-│   │   ├── scholar_digest_prompt.md
-│   │   ├── whitelist_filter_prompt.md  # 方法学审稿三态筛选 prompt
-│   │   └── thesis_introduction_prompt.md
-│   └── launchd/            # launchd 配置模板（com.xlbd.scholar-*.plist）
-├── scripts/               # 部署运维脚本
-│   ├── run_weekly_digest.sh          # 每周 digest 运行脚本
-│   ├── check_models.py               # 检查可用的 Gemini 模型
-│   └── install_weekly_digest.sh      # launchd 定时任务安装/卸载
-├── src/                   # 源代码目录
-│   ├── core/             # 核心模块（数据结构、异常）
-│   │   ├── schema.py     # Pydantic 数据模型
-│   │   └── exceptions.py # 自定义异常
-│   ├── parser/           # 文档解析器（PDF、EPUB）
-│   │   ├── loader.py     # 文档加载器
-│   │   ├── formats.py    # 格式处理
-│   │   └── helpers.py    # 辅助函数
-│   ├── translator/       # 翻译引擎（同步/异步）
-│   │   ├── base.py       # 抽象基类与阶段钩子
-│   │   ├── engine.py     # 引擎门面（实现在 engine_common/gemini/gemini_async/openai）
-│   │   ├── agent.py      # claude-agent（本机 claude CLI 订阅通路）
-│   │   ├── fallback.py   # 多供应商回退链
-│   │   └── support.py    # 断点续传 / 缓存持久化 / Prompt 管理
-│   ├── renderer/         # 渲染器（Markdown、PDF、EPUB）
-│   │   ├── markdown.py   # Markdown 渲染
-│   │   ├── pdf.py        # PDF 渲染
-│   │   └── epub.py       # EPUB 渲染
-│   ├── workflow/         # 工作流
-│   │   ├── workflow.py   # 主工作流
-│   │   └── builder.py    # 配置构建器（预设）
-│   ├── scholar/          # Scholar Digest（Gmail 邮件 + PubMed/arXiv 检索）
-│   │   ├── academic_search.py # PubMed/arXiv 检索客户端
-│   │   ├── fulltext.py   # OA 全文解析（arXiv 直链 / Unpaywall）
-│   │   ├── zotero_sync.py # Zotero 连接器写库 + Better BibTeX citekey 解析
-│   │   └── notes.py      # pandoc-ready 科研札记 + CSL-JSON 生成
-│   └── utils/            # 工具函数
-│       ├── file.py       # 文件操作
-│       ├── logger.py     # 日志系统
-│       └── ui.py         # 用户界面
-├── output/               # 翻译输出（自动生成）
-│   └── <file_md5>/      # 每个文档的缓存和结果
-├── logs/                 # 日志文件
-└── test/                 # 测试脚本和数据
+XLBDTranslator-dev/
+├── main.py                  # 书籍翻译入口
+├── scholar_main.py          # Scholar 入口（邮件/检索 digest、按月回填、札记）
+├── requirements*.txt        # 依赖：翻译 / Scholar / 开发
+├── config/                  # 配置
+│   ├── *.env.template       # 配置模板（真实 config.env / scholar.env 不入库）
+│   ├── modes.json           # 翻译人格（Persona）
+│   ├── pdf_style.css        # PDF 样式
+│   ├── prompts/             # 各类提示词
+│   ├── research_profile.yaml, topics.yaml, venue_lists.yaml, dedup_overrides.json  # 札记库配置
+│   └── launchd/             # 定时任务模板（com.xlbd.scholar-*.plist）
+├── src/
+│   ├── core/                # 数据模型（Pydantic）与异常
+│   ├── parser/              # PDF/EPUB 解析
+│   ├── translator/          # 翻译引擎与多供应商回退链
+│   ├── renderer/            # Markdown / PDF / EPUB 渲染
+│   ├── workflow/            # 翻译主流程与配置构建器
+│   ├── scholar/             # 札记库：digest、精读、索引、向量检索、概念页、问答、lint、备份等（约 50 个模块）
+│   └── utils/               # 日志、文件、界面等工具
+├── scripts/                 # 命令行工具与运维脚本（精读 read_pdf.py、检索 notes_search.py、
+│                            #   索引 notes_index.py、概念页 build_topics.py、各 install_*.sh 定时任务等）
+├── docs/                    # 见上文「文档导航」
+├── .agents/skills/          # Codex 的 skill 入口（指向 docs/skills/ 的软链，由 install_skills.sh 维护）
+├── test/                    # pytest 测试与小型固定样本（test/data/、test/fixtures/）
+├── output/                  # 全部运行产物（不入库，见下节）
+└── logs/                    # 运行日志（不入库）
 ```
 
 ## 📁 输出文件
 
-- **中间文件**: 所有缓存、图片和状态文件都保存在 `output/<文件哈希值>/` 目录下。
-    - `structure_map.json`: 核心状态文件，记录了每个片段的原文、译文和元数据，是实现断点续传的关键。
-    - `checkpoint.json`: 恢复检查点数据
-    - `glossary.json`: 提取的术语表，确保一致性
-    - `quality_report.json`: 译后质检报告（失败段/术语违例）——判断"这本书翻得能不能用"看它
-    - `blocked_segments.json`: 被安全过滤器拦截的段落记录（如有）
-- **最终文件**: 默认保存在与**源文件相同的目录**（或 `FILES__FINAL_OUTPUT_DIR`）：
-    - `_Translated.md`（Markdown）
-    - `_Translated.epub`（EPUB 源会回填出双语 EPUB）
-    - `_Translated.pdf` + `_Translated_mobile.pdf`（桌面版与移动版，需 WeasyPrint 系统库；
-      macOS + conda 环境需带 `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` 运行）
-    - 运行结束时日志会打印「📦 产物清单」列出实际生成的文件
+所有运行产物都在 `output/` 下，整体不入库。各 skill 的位置约定见 [`docs/skills/OUTPUTS.md`](docs/skills/OUTPUTS.md)。
+
+```
+output/
+├── translations/            # main.py 翻译作业
+│   ├── <文件哈希>/           # 每本书的中间文件（见下）
+│   └── _archive/            # 已完成作业的归档（2026-08 起）
+├── translations-book/       # translate-book skill：每本书一个目录（cache/ reviews/ reviewed/ previews/）
+├── scholar_notes/           # 札记库（随周备份）
+│   ├── 科研札记_*.md/.docx  # 月度/批次札记与 sidecar
+│   ├── literature_index.json, all_references.json, INDEX.md, AGENTS.md
+│   ├── manual/  books/      # 手动精读 bundle、书籍精读
+│   ├── topics/  topics/qa/  # 概念页、问答归档
+│   ├── assets/shots/        # 原文截图
+│   ├── deep_research/  audits/  selfchecks/   # 深度调研、诚信审查、稿件自查（每次运行一个日期目录）
+│   └── _archive/ _eval/ _inventory/ _provenance/ _rekey/   # 归档、评测、盘点、溯源、改键记录
+├── scholar_digest/          # digest 速览
+├── journal_screen/          # 期刊筛选候选
+└── scholar_pdfs/            # 抓取的全文 PDF（可重新获取，不备份）
+```
+
+**翻译中间文件**（`output/translations/<文件哈希>/`）：
+- `structure_map.json`：核心状态，记录每段原文、译文与元数据，断点续传靠它
+- `checkpoint.json`：恢复检查点
+- `glossary.json`：术语表，保证前后一致
+- `quality_report.json`：译后质检报告（失败段/术语违例）——判断"这本书翻得能不能用"看它
+- `blocked_segments.json`：被安全过滤器拦截的段落记录（如有）
+
+**翻译最终文件**：写到 `FILES__FINAL_OUTPUT_DIR`（本仓库配置为 `./output/translations`；未配置时默认与源文件同目录）：
+- `_Translated.md`、`_Translated.epub`（EPUB 源会回填出双语 EPUB）
+- `_Translated.pdf` + `_Translated_mobile.pdf`（桌面版与移动版，需 WeasyPrint 系统库；macOS + conda 环境需带 `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` 运行）
+- 运行结束时日志会打印「📦 产物清单」列出实际生成的文件
 
 ## 🎨 高级定制
 
@@ -533,7 +561,7 @@ body {
 }
 ```
 
-## � 贡献
+## 🤝 贡献
 
 欢迎贡献！请随时提交 Pull Request。
 

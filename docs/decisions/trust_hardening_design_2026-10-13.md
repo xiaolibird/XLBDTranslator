@@ -174,7 +174,7 @@ class CallMeta:
 
 ### 4.4 需改动的文件
 
-`src/scholar/llm_client.py`、`src/scholar/schema.py`、`src/scholar/workflow.py`、`src/scholar/closereading.py`、`src/scholar/pdf_ingest.py`、`src/scholar/ingest.py`、`src/scholar/_citekey_utils.py`、`src/scholar/notes_index.py`（overlay 合并）、新增 `scripts/backfill_provenance.py`、`scripts/provenance_report.py`、`docs/scholar_notes_AGENTS.md`（字段说明，索引重建会同步到 `output/scholar_notes/AGENTS.md`）、测试文件见工单。
+`src/scholar/llm_client.py`、`src/scholar/schema.py`、`src/scholar/workflow.py`、`src/scholar/closereading.py`、`src/scholar/pdf_ingest.py`、`src/scholar/ingest.py`、`src/scholar/_citekey_utils.py`、`src/scholar/notes_index.py`（overlay 合并）、新增 `scripts/backfill_provenance.py`、`scripts/provenance_report.py`、`docs/agents/scholar_notes_AGENTS.md`（字段说明，索引重建会同步到 `output/scholar_notes/AGENTS.md`）、测试文件见工单。
 
 ### 4.5 验收标准
 
@@ -470,7 +470,7 @@ def claim_independent_sources(refs, ev_map, keeper_of) -> int
 
 ### 6.7 需改动的文件
 
-新增 `src/scholar/coverage.py`、`scripts/calibrate_evidence_sufficiency.py`；改动 `src/scholar/topics.py`（`render_generated_block`、`build_frontmatter`、`build_topic`、`synthesize_topic` 走 meta）、`src/scholar/qa.py`（`render_qa_block`、`build_qa_frontmatter`、`synthesize_qa` / `run_audit` 走 meta、存根归档）、`scripts/build_topics.py`、`scripts/ask_notes.py`（`--force-synthesize`、退出码说明）、`src/scholar/thresholds.py`、`test/test_thresholds.py`、`docs/scholar_notes_AGENTS.md`（解释新键与存根页）、`docs/skills/ask-notes/SKILL.md`（存根页与强制参数的用法，若该 skill 文件描述了退出码则同步）。**不改** `config/topics.yaml`（工作树里有别的会话的未提交改动）与两个合成 prompt。
+新增 `src/scholar/coverage.py`、`scripts/calibrate_evidence_sufficiency.py`；改动 `src/scholar/topics.py`（`render_generated_block`、`build_frontmatter`、`build_topic`、`synthesize_topic` 走 meta）、`src/scholar/qa.py`（`render_qa_block`、`build_qa_frontmatter`、`synthesize_qa` / `run_audit` 走 meta、存根归档）、`scripts/build_topics.py`、`scripts/ask_notes.py`（`--force-synthesize`、退出码说明）、`src/scholar/thresholds.py`、`test/test_thresholds.py`、`docs/agents/scholar_notes_AGENTS.md`（解释新键与存根页）、`docs/skills/ask-notes/SKILL.md`（存根页与强制参数的用法，若该 skill 文件描述了退出码则同步）。**不改** `config/topics.yaml`（工作树里有别的会话的未提交改动）与两个合成 prompt。
 
 ### 6.8 验收标准
 
@@ -539,7 +539,7 @@ def claim_independent_sources(refs, ev_map, keeper_of) -> int
 ### WO-2 札记来源字段（依赖 WO-1）
 - **输入**：4.3.2、4.3.3；D5、D12。
 - **输出**：schema 新字段、各写入点、索引新键；`manual_pick` 进 Literal；`llm_decision_before_override`。
-- **改动文件**：`src/scholar/schema.py`、`src/scholar/workflow.py`（仅筛选调用与裁决构造处）、`src/scholar/closereading.py`、`src/scholar/pdf_ingest.py`、`src/scholar/ingest.py`、`src/scholar/_citekey_utils.py`、`docs/scholar_notes_AGENTS.md`；新测试 `test/test_provenance_fields_2026_10_13.py`。
+- **改动文件**：`src/scholar/schema.py`、`src/scholar/workflow.py`（仅筛选调用与裁决构造处）、`src/scholar/closereading.py`、`src/scholar/pdf_ingest.py`、`src/scholar/ingest.py`、`src/scholar/_citekey_utils.py`、`docs/agents/scholar_notes_AGENTS.md`；新测试 `test/test_provenance_fields_2026_10_13.py`。
 - **测试**：4.5 第 3、4 条；manual bundle 复原后 `final_by` 与脚本模型都在；`classify_segments` 覆盖分支不再抛错且保留原判；改 citekey 的流程保留新键（构造 sidecar → 调 `_rename_citekey_in_note` → 断言键仍在）。
 - **完成定义**：测试通过；老 digest JSON / 老 bundle 反序列化测试仍通过；AGENTS 文档新增字段表与「缺失 = 未知」说明。
 
@@ -560,7 +560,7 @@ def claim_independent_sources(refs, ev_map, keeper_of) -> int
 ### WO-5 覆盖说明与证据不足拒答（依赖 WO-1、WO-4 的标定结论）
 - **输入**：第 6 节全部；4.3.5。
 - **输出**：`coverage.py` 补齐统计与渲染；topics/qa 两边各一个调用点；存根页；frontmatter 新键；`--force-synthesize`；页面 synth/audit 模型记录；thresholds 新节。
-- **改动文件**：`src/scholar/coverage.py`、`src/scholar/topics.py`、`src/scholar/qa.py`、`scripts/build_topics.py`、`scripts/ask_notes.py`、`src/scholar/thresholds.py`、`test/test_thresholds.py`（只追加接线断言）、`docs/scholar_notes_AGENTS.md`、`docs/skills/ask-notes/SKILL.md`；新测试 `test/test_trust_coverage_2026_10_13.py`。
+- **改动文件**：`src/scholar/coverage.py`、`src/scholar/topics.py`、`src/scholar/qa.py`、`scripts/build_topics.py`、`scripts/ask_notes.py`、`src/scholar/thresholds.py`、`test/test_thresholds.py`（只追加接线断言）、`docs/agents/scholar_notes_AGENTS.md`、`docs/skills/ask-notes/SKILL.md`；新测试 `test/test_trust_coverage_2026_10_13.py`。
 - **测试**：6.8 第 1–5 条；`certification.json` 缺失时覆盖说明显示「尚未经召回认证」而不是报错（WO-8 之前它就不存在）。
 - **完成定义**：测试通过；主会话完成 6.8 第 7 条端到端验收。
 

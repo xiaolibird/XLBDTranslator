@@ -255,7 +255,7 @@ def fold_acked_blocks(text: Any, acks: Optional[Dict[str, str]]
     导语写"1 篇老文献是这 1 条论断的唯一地基"，**数字与内容对不上**。
 
     这不是边角路径：`contradiction_reminder` 每 45 天就在报告与 stdout 里打印
-    `--offline --skip-stale --skip-coverage`，`docs/scholar_notes_AGENTS.md` 也把它
+    `--offline --skip-stale --skip-coverage`，`docs/agents/scholar_notes_AGENTS.md` 也把它
     列为标准用法——走的正是这条。
 
     守卫放在最前面（而不是让 `_carry_section` 按 key 决定）：改动更小、更难写错，

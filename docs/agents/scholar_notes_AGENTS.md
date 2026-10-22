@@ -1,6 +1,6 @@
 # 科研札记文献库 · Agent 使用说明
 
-> 本文件由 XLBDTranslator-dev 的 `scripts/notes_index.py` 自动部署(源文件在仓库 `docs/scholar_notes_AGENTS.md`,勿直接改这份副本)。
+> 本文件由 XLBDTranslator-dev 的 `scripts/notes_index.py` 自动部署(源文件在仓库 `docs/agents/scholar_notes_AGENTS.md`,勿直接改这份副本)。
 > 面向对象:在**任何项目**(尤其论文写作项目)中工作、需要检索/引用文献的 Claude agent。
 
 本目录是一个按月精选的文献库:Gmail Scholar 提醒 + PubMed + arXiv → LLM 方法学三态筛选 → 优先级排序 → top-5 强模型**全文精读**(句级角色标记 可引用证据/可反驳观点/方法论借鉴,聚合成 `highlights[]` 供工作流按用途调取,关联研究主线 MNAR / MA-GCT / EHR 缺失机制)。

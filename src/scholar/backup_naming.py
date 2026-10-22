@@ -3,7 +3,7 @@
 
   scripts/backup_snapshot.py   守卫（"上次成功"= 目录内文件名时间戳最大值）与轮换
   src/scholar/lint_freshness.py  备份年龄子项（按文件名判龄，不打开任何快照内容）
-  docs/backup_restore.md         恢复手册引用的命名规则
+  docs/guides/backup_restore.md         恢复手册引用的命名规则
 
 口径漂移 = 永久假阳性（同 export_timeline_xlsx 的 sidecar 命名教训），所以解析
 逻辑不许二次实现。

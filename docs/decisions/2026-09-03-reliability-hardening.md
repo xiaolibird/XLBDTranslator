@@ -55,7 +55,7 @@ freshness 子项设计的三个来之不易的结论（都被对抗审核证伪�
   自检绿、恢复日整份拒收——打包侧排除）、manifest 被驱逐时静默跳过 sha 核对、
   用户自建目录被失败清理连根删、vault bundle 恢复 **clone 先行**（裸机
   `git bundle verify` 需在仓库内，verify-first 的 && 链第一步就断）。
-- **docs/backup_restore.md 曾被 .gitignore 的 `docs/*` 规则吞掉**——恢复手册进不了
+- **docs/guides/backup_restore.md 曾被 .gitignore 的 `docs/*` 规则吞掉**——恢复手册进不了
   git，白名单补了一行。检查新增 docs 文件是否被追踪应成为习惯。
 - 灾难日演练全流程通过：restore → sha256 全量吻合 → bundle clone → 重建索引
   "内容未变跳过写盘"（快照与索引逐字节自洽的最强证明）。
