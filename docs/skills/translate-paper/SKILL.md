@@ -102,7 +102,7 @@ bash $S/tone_scan.sh $W/build/main_zh.tex $W/zh/*.tex
 
 ## 8. 交付
 
-归档到仓库 `output/translations/papers/<YYYY-MM-DD>-<arXiv id>_<中文标题>/`（日期取交付当天；PDF 路径无 arXiv 号时用来源文件名）：
+归档到仓库 `output/translations/papers/<YYYY-MM-DD>-<arXiv id>_<中文标题>/`（日期取交付当天；PDF 路径无 arXiv 号时用来源文件名）。这是项目原件的长期保存位置；通过核验与实际看图验收后，默认另复制最终 PDF 到 `~/Downloads/翻译成果/论文/`，无需逐篇再次确认，目录不存在时创建。书籍译本另归 `~/Downloads/翻译成果/书籍/`，论文不要混放其中，也不要散放在 Downloads 顶层。用户本次指定其他交付位置或要求不复制时，以本次要求为准。
 
 ```bash
 R=/Users/xiaolibird/Documents/GitHub/XLBDTranslator-dev
@@ -114,10 +114,13 @@ cp $W/build/main_zh.tex "$D/src/" 2>/dev/null                 # 译文主文件
 [ -d $W/zh ] && cp -R $W/zh "$D/src/zh"                       # 子文件译文（LaTeX 路径才有）
 cp $W/meta.json $W/manifest.json "$D/" 2>/dev/null            # 来源与许可记录（第 0 步）、切块清单
 # 第 6/7 步的核验与扫描输出（verify/check/tone_scan 的终端结果）存成 checks/*.txt
-cp "$D/<arXiv id>_<中文标题>_中译.pdf" ~/Downloads/            # Downloads 另放一份方便打开
+mkdir -p "$HOME/Downloads/翻译成果/论文"
+# 验收通过后，按下述同名与哈希规则复制最终 PDF 到此目录。
 ```
 
-scratchpad 里的 `$W` 是过程目录，会话结束即清；要长期留的只有上面这些。回报：归档目录、页数、核验结果、保留未改的命中项及理由、版面瑕疵。用户要看就 `open` Downloads 那份。
+使用复制，不移动或删除项目原件；只复制已验收的最终阅读稿，源码、术语表和审校材料继续留在项目归档中。同名副本内容相同则复用；内容不同则添加“新版”及必要的时间后缀另存，不覆盖不明文件。核对副本与项目原件的 SHA-256，一致后才报告交付完成；复制失败时保留项目成品并说明副本尚未送达，不假报成功。交付记录写明项目路径、分类目录内的实际副本路径及哈希。
+
+scratchpad 里的 `$W` 是过程目录，会话结束即清；要长期留的只有上面这些。回报：归档目录、页数、核验结果、保留未改的命中项及理由、版面瑕疵，优先提供 `Downloads/翻译成果/论文/` 内的最终 PDF 链接。用户要看就打开该副本；本机归档和复制不包含发布、云端上传或发送给他人。
 
 ## 已知坑
 

@@ -20,6 +20,12 @@ def main():
     load = lambda path: json.loads(path.read_text(encoding="utf-8"))
     meta = load(job / "book.json")
     raw = load(job / "reviewed/render_segments.json")
+    restriction = job / 'reviews/delivery_restriction.json'
+    if restriction.exists():
+        required = set(load(restriction).get('restricted_source_segment_ids', []))
+        actual = {sid for s in raw if s.get('editorial_omission') and not s.get('original_text') for sid in s.get('omitted_source_segment_ids', [s['segment_id']])}
+        if not required <= actual:
+            raise ValueError('阅读层未隔离全部限制段落，禁止生成PDF')
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib.styles import ParagraphStyle
@@ -47,6 +53,7 @@ def main():
         for asset in s.get('visual_assets', []):
             chars.update(asset.get('caption', ''))
         chars.update(s.get("translated_text", "")); chars.update(s.get("chapter_title", ""))
+        chars.update(s.get('visual_omission_notice', ''))
         if meta["retain_original"]:
             chars.update(s.get("original_text", ""))
         for e in s.get("index_entries", []):
@@ -117,7 +124,7 @@ def main():
                 self.current_headers[self.page] = label
                 self.canv.bookmarkPage(key)
                 self.canv.addOutlineEntry(label, key, level=0, closed=False)
-                self.notify("TOCEntry", (level, label, self.page, key))
+                self.notify("TOCEntry", (level, markup(label), self.page, key))
                 self.headings.append([label, self.page])
 
     asset_report = load(job / 'reviewed/quality_report.json')
@@ -127,9 +134,21 @@ def main():
         if doc.page <= (2 if covers else 1):
             return
         canvas.saveState(); canvas.setFillColor(HexColor("#747474")); canvas.setFont("Book", 8)
-        canvas.drawString(margin, height - 13 * mm, meta["title"][:18])
+        def mixed(text, right=None, left=None):
+            runs = []
+            for char in text:
+                face = 'Fallback' if char in fallback_chars else 'Book'
+                if runs and runs[-1][0] == face:
+                    runs[-1][1] += char
+                else:
+                    runs.append([face, char])
+            x = left if left is not None else right - sum(pdfmetrics.stringWidth(t, f, 8) for f, t in runs)
+            for face, text in runs:
+                canvas.setFont(face, 8); canvas.drawString(x, height - 13 * mm, text)
+                x += pdfmetrics.stringWidth(text, face, 8)
+        mixed(meta["title"][:18], left=margin)
         header = doc.previous_headers.get(doc.page, doc.header) or "目录"
-        canvas.drawRightString(width - margin, height - 13 * mm, header if len(header) <= 22 else header[:21] + "…")
+        mixed(header if len(header) <= 22 else header[:21] + "…", right=width - margin)
         canvas.setStrokeColor(HexColor("#d6d6d6")); canvas.setLineWidth(.35)
         canvas.line(margin, height - 15 * mm, width - margin, height - 15 * mm)
         canvas.setFont("Book", 9); canvas.drawCentredString(width / 2, 12 * mm, str(doc.page)); canvas.restoreState()
@@ -138,7 +157,7 @@ def main():
         doc = Book(str(output), pagesize=(width, height), leftMargin=margin, rightMargin=margin, topMargin=23 * mm, bottomMargin=23 * mm,
                    title=meta["title"], author=meta.get("author", ""), pageCompression=1)
         doc.addPageTemplates(PageTemplate(id="book", frames=[Frame(margin, 23 * mm, width - 2 * margin, height - 46 * mm, leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)], onPage=page))
-        story = [Spacer(1, 43 * mm), Paragraph(markup(meta["title"]), styles["cover"]), Spacer(1, 14 * mm), Paragraph(markup(meta.get("author", "")) + " 著", styles["center"]), Spacer(1, 38 * mm), Paragraph("中文阅读版", styles["center"]), PageBreak(), Paragraph("目录", styles["heading"])]
+        story = [Spacer(1, 43 * mm), Paragraph(markup(meta["title"]), styles["cover"]), Spacer(1, 14 * mm), Paragraph(markup(meta.get("author", "")) + " " + meta.get("author_role", "著"), styles["center"]), Spacer(1, 38 * mm), Paragraph("中文阅读版", styles["center"]), PageBreak(), Paragraph("目录", styles["heading"])]
         if covers:
             image = Image(str(job / 'reviewed' / covers[0]['render_path']))
             image._restrictSize(width - 2 * margin, height - 48 * mm)
@@ -164,7 +183,7 @@ def main():
                 flow = append(markup(label), styles["heading"])
                 flow.book_heading = (label, min(5, max(0, seg.get("toc_level", 1) - 1)), "chapter" + str(sid))
             if seg.get("index_entries"):
-                append("索引依据原书链接定位到对应译文片段起始页。页码可点击；跨页词目请查阅相邻页。", styles["note"])
+                append(markup(seg.get("index_reader_note") or "索引依据原书链接定位到对应译文片段起始页。页码可点击；跨页词目请查阅相邻页。"), styles["note"])
                 entries = seg["index_entries"]
                 for i, e in enumerate(entries):
                     parent = i + 1 < len(entries) and entries[i + 1]["depth"] > e["depth"]
@@ -177,9 +196,12 @@ def main():
                 continue
             for asset in seg.get('visual_assets', []):
                 image = Image(str(job / 'reviewed' / asset['render_path']))
-                image._restrictSize(width - 2 * margin, (55 if asset['kind'] == 'illustration' else 105) * mm)
+                asset_width = min(width - 2 * margin, float(asset.get('max_width_mm', (width - 2 * margin) / mm)) * mm)
+                image._restrictSize(asset_width, (55 if asset['kind'] == 'illustration' else 105) * mm)
                 caption = Paragraph(markup(asset.get('caption', '原书插图')), styles['note'])
                 story.append(KeepTogether([image, Spacer(1, 3 * mm), caption, Spacer(1, 4 * mm)]))
+            if seg.get('visual_omission_notice'):
+                append(markup(seg['visual_omission_notice']), styles['note'])
             texts = [(seg.get("translated_text", ""), False)]
             if meta["retain_original"]:
                 texts.append((seg.get("original_text", ""), True))

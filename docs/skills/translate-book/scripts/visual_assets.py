@@ -18,6 +18,10 @@ def prepare_assets(job, view):
     assets, names = [], set()
     dest = job / 'reviewed/assets'
     dest.mkdir(parents=True, exist_ok=True)
+    edition_path = job / 'reviews/abridgement.json'
+    edition = json.loads(edition_path.read_text()) if edition_path.exists() else {}
+    excluded = {a['path']: a for a in edition.get('excluded_assets', [])}
+    excluded_seen = set()
     for entry in data.get('assets', []):
         item = dict(entry)
         path = (job / item['path']).resolve()
@@ -27,6 +31,14 @@ def prepare_assets(job, view):
             raise ValueError('插图须标明类型和核实理由，不能直接嵌入原文扫描页')
         if hashlib.sha256(path.read_bytes()).hexdigest() != item.get('sha256'):
             raise ValueError('插图已变化，需重新审核')
+        if item['path'] in excluded:
+            exclusion = excluded[item['path']]
+            if exclusion.get('sha256') != item['sha256'] or not exclusion.get('reason'):
+                raise ValueError('删节图片须有匹配哈希及理由')
+            excluded_seen.add(item['path'])
+            continue
+        if any(s.get('editorial_omission') and s['segment_id'] == item.get('segment_id') for s in view):
+            raise ValueError('省略正文关联的图片尚未排除或重新审核')
         if item['kind'] != 'cover' and item.get('segment_id') not in ids:
             raise ValueError('插图目标片段不存在')
         name = path.name
@@ -38,14 +50,23 @@ def prepare_assets(job, view):
         assets.append(item)
     if sum(a['kind'] == 'cover' for a in assets) > 1:
         raise ValueError('只允许一张封面')
+    if set(excluded) != excluded_seen:
+        raise ValueError('删节图片清单包含不存在的条目')
     for seg in view:
         seg['visual_assets'] = [a for a in assets if a['kind'] != 'cover' and a['segment_id'] == seg['segment_id']]
+        associated_ids = set(seg.get('omitted_source_segment_ids', [seg['segment_id']]))
+        count = sum(a.get('segment_id') in associated_ids and a['path'] in excluded for a in data.get('assets', []))
+        if count:
+            seg['visual_omission_notice'] = f'【图版省略：此处原有手稿或校改影印{count}幅，本删节阅读版未收录。】'
     return assets
 
 
 def figure(item):
     caption = html.escape(item.get('caption', '原书插图'))
-    return f'<figure><img src="{item["render_path"]}" alt="{caption}"/><figcaption>{caption}</figcaption></figure>\n\n'
+    size = ''
+    if 'max_width_mm' in item:
+        size = f' style="width:{float(item["max_width_mm"]):g}mm;max-width:100%;height:auto"'
+    return f'<figure><img src="{item["render_path"]}" alt="{caption}"{size}/><figcaption>{caption}</figcaption></figure>\n\n'
 
 
 def embed_epub(path, assets):
