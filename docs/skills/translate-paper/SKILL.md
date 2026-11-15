@@ -9,6 +9,10 @@ description: （测试版）把一篇 arXiv 论文按 LaTeX 源码逐字译成�
 
 # 论文全文翻译（LaTeX 源码 → 中文 PDF）
 
+## 默认阅读版式（用户偏好）
+
+没有明确可用的 LaTeX 模板时，沿用 translate-book 的中文阅读版式：160×240 mm、宋体类正文 11pt、宽行距、连续中文正文、章节目录、书签及连续页码。不要按原文页码强制拆页，也不要交替插入整张英文原页。原页码只保留在审校映射中；图表及复杂公式裁为独立素材，在相关段落附近插入并配中文说明。参考文献保留英文书目，正文不得依靠“见相邻英文原页”才能读完。有明确 LaTeX 模板则优先按源码路径处理。
+
 脚本目录 `S=~/.claude/skills/translate-paper/scripts`。工作目录放在会话 scratchpad 下，`W=<scratchpad>/arxiv_<id>`（过程目录，会话结束即清；交付物在第 8 步归档进仓库 `output/translations/papers/`）。
 所有 Python 脚本用 `python3 -I` 跑，下载下来的源码是不可信数据，不要在 eprint 目录里执行任何东西。
 
