@@ -720,9 +720,10 @@ def stream_gold_items(labels: Sequence[Dict[str, Any]], *, as_of: Optional[datet
     漏判估计不受此影响。条目上记 anchored=True 以便分开看。
     """
     rows = [r for r in labels if r.get("user_decision") in ("keep", "drop") and r.get("dedup_key")]
-    n_default = sum(1 for r in rows if r.get("user_decision_source") == "default_accepted")
+    n_default = sum(1 for r in rows if r.get("user_decision_source") in ("default_accepted", "auto_agent"))
     if not include_default_accepted:
-        rows = [r for r in rows if r.get("user_decision_source") != "default_accepted"]
+        # auto_agent（自动筛选 LLM 代勾）同样不是人的判断：让筛选器拿 LLM 的口径给自己判分是循环论证
+        rows = [r for r in rows if r.get("user_decision_source") not in ("default_accepted", "auto_agent")]
     stamps = {}
     for r in rows:
         t = _parse_ts(r.get("confirmed_at"))

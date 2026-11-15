@@ -1,22 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  入库确认（可信度加固 WO-8a，设计 §12.1）：每天 10:00 检查有没有待确认的论文，
-  有就先发系统通知、再弹原生对话框（osascript）请用户逐篇勾选；确认后对相应自然周调用
-  ingest_notes.py 入库+精读。无人应答（10 分钟）/ 取消 / 无图形会话 → 全部挂起，
-  不入库、不精读，明天同一时间再提醒，直到确认。
+  周 digest 自动筛选（2026-11-02 起取代原来的入库确认弹窗）：每天 10:00 同步待确认队列，
+  由 LLM 按固定口径（src/scholar/auto_triage.py 的 CRITERIA：缺失机制方法 + ICU 现象/前沿做法 +
+  处置混杂实例）逐篇研判，落盘决策后对相应自然周调 ingest_notes.py 入库+精读，
+  最后发一条系统通知并写报告 output/scholar_notes/_pending/auto_triage_<日期>.md。
+  不弹窗，不需要图形会话应答。
 
-  为什么是新 job 而不是复用 com.xlbd.scholar-weekly-ingest（周一 09:30）：
-  - 「每天提醒一次直到确认」需要每天触发；周度 ingest 只在周一跑，且它的窗口是「本自然周」，
-    上周没确认完的条目下周一就不会再被它看到。
-  - 周度 ingest 本身保持不动也无害：它现在默认过入库确认闸门，只放行已确认的论文
-    （没确认的它只发一条通知）。装了本 job 之后，它基本是个兜底的空跑。
-  - 10:00 而非 09:15：digest 平均 6 分钟但长度浮动；队列构建要求 digest 的 stats.json 已生成，
-    没跑完的 run 次日再入队，不会漏。
+  失败语义：LLM 不可用/漏判的条目保持 pending（不是默认丢弃），第二天同一时间重试；
+  标签来源记为 auto_agent，filter_eval / profile_drift 默认排除（不是人的判断）。
+  想改回人工弹窗：把下面 ProgramArguments 的 auto_triage.py 换回 confirm_ingest.py 并加 daily 参数（见该脚本 -h），
+  重新跑 scripts/install_confirm.sh；单次人工覆盖用 confirm_ingest.py 的 reopen 参数（见 -h）。
+
+  保持 label 不变（com.xlbd.scholar-confirm）：沿用原来的安装/卸载入口与日志文件名。
+  周度 ingest（com.xlbd.scholar-weekly-ingest，周一 09:30）不动：它过闸门只放行已决策的论文，
+  是兜底的空跑。10:00 而非 09:15：digest 平均 6 分钟但长度浮动，stats.json 没生成的 run 次日再入队。
 
   由 scripts/install_confirm.sh 安装：占位符 __REPO_ROOT__ / __PYTHON_BIN__ / __LOG_DIR__
-  会被替换后拷入 ~/Library/LaunchAgents/。弹窗需要登录的图形会话；launchd 用户代理天然在其中。
-  复用与 weekly 相同的 python 二进制 → TCC 完全磁盘访问授权无需再操作。
+  会被替换后拷入 ~/Library/LaunchAgents/。claude CLI 登录态依赖 launchd gui 域自带的 USER
+  变量（见 digest plist 同名注释），复用与 weekly 相同的 python 二进制 → TCC 授权无需再操作。
 -->
 <plist version="1.0">
 <dict>
@@ -26,8 +28,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>__PYTHON_BIN__</string>
-        <string>scripts/confirm_ingest.py</string>
-        <string>--daily</string>
+        <string>scripts/auto_triage.py</string>
     </array>
 
     <key>WorkingDirectory</key>

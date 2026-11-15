@@ -274,6 +274,8 @@ def sync_queue(notes_dir, digest_dir, since: Optional[date] = None, until: Optio
 
 SOURCE_USER = "user"                    # 用户相对筛选器默认动过手（补勾/取消）：主动判断
 SOURCE_DEFAULT = "default_accepted"     # 用户没动、照单全收默认勾选：不当作主动判断（S-stream/漂移默认排除）
+SOURCE_AGENT = "auto_agent"             # 自动筛选（auto_triage）：LLM 代勾，不是人的判断，同样默认排除
+NON_HUMAN_SOURCES = (SOURCE_DEFAULT, SOURCE_AGENT)
 DECISION_RETRACTED = "retracted"        # 撤销行（--reopen）：读取侧让同一 dedup_key 的此前标签失效
 
 

@@ -3,7 +3,7 @@
 # 安装/卸载 入库确认 launchd 用户代理（可信度加固 WO-8a / WO-8c）
 #
 # 用法:
-#   bash scripts/install_confirm.sh              # 安装（每天 10:00 入库确认提醒 + 每月 1 日 10:30 画像漂移提醒）
+#   bash scripts/install_confirm.sh              # 安装（每天 10:00 周 digest 自动筛选 + 每月 1 日 10:30 画像漂移提醒）
 #   bash scripts/install_confirm.sh --uninstall  # 卸载
 #
 # 与既有 job 互不影响；复用同一 python 实体二进制 → TCC 完全磁盘访问无需再授权。

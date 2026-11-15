@@ -84,7 +84,8 @@ def analyze(labels: Sequence[Dict[str, Any]], *, now: datetime,
             embed_fn: Optional[EmbedFn] = None, include_default_accepted: bool = False) -> DriftAnalysis:
     # default_accepted（汇总核对里没动、照单全收默认）不是用户的主动判断，默认不计入漂移
     if not include_default_accepted:
-        labels = [r for r in labels if r.get("user_decision_source") != "default_accepted"]
+        # auto_agent：LLM 代勾，不是用户的偏好信号；混进来画像漂移会被 LLM 自己的口径牵着走
+        labels = [r for r in labels if r.get("user_decision_source") not in ("default_accepted", "auto_agent")]
     lo = now - timedelta(weeks=lookback_weeks)
     win = []
     for r in labels:
