@@ -151,3 +151,22 @@ topics:
       - federated learning with incomplete data missingness across sites 联邦 缺失数据
       - data governance data sharing agreement distributed network 数据治理 分布式网络
     max_evidence: 50
+
+  - slug: observation-process-prior
+    title: 观测过程作先验：预训练与先验拟合
+    question: 把观测过程（何时测、测什么、测多频繁）当作先验或预训练对象的工作有哪些？它们的先验从几个机构学来、是否区分机构层的测量模板与患者层的偏离？观测过程的预测价值跨机构迁移的证据是正是负，迁移失败时归因于什么？
+    queries:
+      - prior-data fitted network missing values TabPFN 缺失值 先验拟合
+      - synthetic prior with structural missingness Bayesian inference 结构性缺失 合成先验
+      - joint generative model of lab values and observation masks 化验值与观测掩码联合生成
+      - generative model of test ordering decisions 开单决策 生成模型
+      - informative observation timing frequency of measurements 测量时机与频率 信息性观测
+      - observation patterns transfer across databases 观测模式 跨库迁移
+      - site-specific record-keeping practice ordering patterns 站点特异 记录习惯 开单模式
+      - pretraining on irregularly sampled EHR with missingness mask 不规则采样 掩码 预训练
+      - physiological trajectories versus observation patterns predictive value 生理轨迹 与 观测模式 预测价值
+      - deterministic versus probabilistic test ordering missingness patterns 确定性开单 概率性开单
+      - 观测模式特征的增益跨库迁移后不稳定 informative sampling external transfer
+      - 先验只来自单一源库 外部验证只有一个库 prior learned from a single source database
+    buckets: [A, B, D]
+    max_evidence: 60
