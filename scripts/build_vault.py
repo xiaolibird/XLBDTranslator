@@ -22,6 +22,9 @@ from src.scholar.topics import (                   # noqa: E402
     sync_topics_to_vault, VAULT_TOPICS_DIR, load_topic_specs, TopicError, DEFAULT_CONFIG,
 )
 from src.scholar.qa import sync_qa_to_vault, VAULT_QA_DIR   # noqa: E402
+from src.scholar.topic_weekly import (                     # noqa: E402
+    sync_weekly_to_vault, VAULT_WEEKLY_DIR,
+)
 from src.scholar.notes_index import INDEX_JSON     # noqa: E402
 
 
@@ -118,6 +121,15 @@ def main() -> int:
         print("问答归档同步写盘失败（{}）：{}".format(type(exc).__name__, exc), file=sys.stderr)
         return 2
 
+    # 每周人读增量：历史导航层，独立于概念页；不做 prune，保留 vault 侧手写批注。
+    wrep = {}
+    try:
+        wrep = sync_weekly_to_vault(notes_dir, vault_dir, rep.get("filenames") or {},
+                                    dry_run=args.dry_run)
+    except OSError as exc:
+        print("每周增量摘要同步写盘失败（{}）：{}".format(type(exc).__name__, exc), file=sys.stderr)
+        return 2
+
     print("\n{}".format("=" * 66))
     print("{} vault: {}".format("【dry-run】" if args.dry_run else "✅", vault_dir))
     print("  文献 {} 篇（新建 {} · 更新 {} · 未变 {}）· 索引页 {} 个 · 写盘 {} 个文件".format(
@@ -131,6 +143,13 @@ def main() -> int:
         print("  💬 问答归档 {} 页（新建 {} · 更新 {} · 未变 {}）→ 02-主题/{}/".format(
             qrep["new"] + qrep["merged"] + qrep["unchanged"], qrep["new"], qrep["merged"],
             qrep["unchanged"], VAULT_QA_DIR))
+    if wrep.get("new") or wrep.get("merged") or wrep.get("unchanged"):
+        print("  🗞️ 每周增量 {} 页（新建 {} · 更新 {} · 未变 {}）→ 02-主题/{}/".format(
+            wrep["new"] + wrep["merged"] + wrep["unchanged"], wrep["new"], wrep["merged"],
+            wrep["unchanged"], VAULT_WEEKLY_DIR))
+    if wrep.get("conflicts"):
+        print("  ⛔ 每周增量 {} 页有冲突，未覆盖：{}".format(
+            len(wrep["conflicts"]), ", ".join(wrep["conflicts"][:5])))
     if qrep.get("conflicts"):
         print("  ⛔ 问答归档 {} 页有冲突，未覆盖：{}".format(
             len(qrep["conflicts"]), ", ".join(qrep["conflicts"][:5])))
@@ -172,7 +191,7 @@ def main() -> int:
         print("     手工合并后删掉对应 .conflict.md 即可，或加 --force-regen 直接强制覆盖。")
     print("=" * 66)
     return 1 if (rep["conflicts"] or rep["slice_failures"] or trep.get("conflicts")
-                 or qrep.get("conflicts")) else 0
+                 or qrep.get("conflicts") or wrep.get("conflicts")) else 0
 
 
 if __name__ == "__main__":

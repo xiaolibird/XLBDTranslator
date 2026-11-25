@@ -841,6 +841,9 @@ class ValidationReport:
     numbers_derived: int = 0       # 论断自己算出的比值/百分点差，不计入失分
     ungrounded_numbers: int = 0    # 找不到出处的数字 —— **非零就该去看**
     ungrounded_claims: int = 0     # 含未接地数字的论断条数
+    # 周度人读增量摘要要指出「先回查哪里」，不能只给一个全页计数。
+    # 仅本轮内存使用，不进 frontmatter；误报语义与 ungrounded_numbers 相同。
+    ungrounded_details: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _clean_text(s: Any, report: ValidationReport) -> str:
@@ -945,6 +948,9 @@ def _check_grounding(text: str, refs: Sequence[str], ev_map: Dict[str, Evidence]
     if chk.ungrounded:
         report.ungrounded_numbers += len(chk.ungrounded)
         report.ungrounded_claims += 1
+        report.ungrounded_details.append({
+            "where": where, "numbers": list(chk.ungrounded), "text": text,
+        })
         logger.warning(
             "  ⚠️ 数字未接地{}：{} · 引用 {} · {}",
             "（{}）".format(where) if where else "",
@@ -2126,7 +2132,8 @@ def _run_refresh_child(cmd: Sequence[str], *, timeout: float, cwd: str,
 
 
 def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
-                          timeout: int = 2400, notify_title: str, subject: str
+                          timeout: int = 2400, notify_title: str, subject: str,
+                          weekly_digest: bool = False
                           ) -> SubprocessRefreshOutcome:
     """入库后触发概念页"受影响页"的路由 + 合成（P2：让概念页成为活文档）。
 
@@ -2152,6 +2159,8 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
 
     note_md（--affected-by-note，单份札记路由）与 citekeys（--affected-by 并集路由）
     二选一，都给或都不给直接 ValueError（编程错误，不走 best-effort）。
+    weekly_digest=True 只应由周度 ingest_notes.py 传入：额外生成 topics/weekly/ 人读增量；
+    月度回填和手动精读保持默认 False，不额外消耗一次摘要综合。
 
     **可观测性与孤儿**（2026-09-04，见 _run_refresh_child 上方的说明）：发起前打一行
     「即将发起 / 最长 N 秒 / 日志路径」，结束打一行「pid / 退出码 / 耗时」；子进程随父进程
@@ -2175,6 +2184,8 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
     else:
         for k in citekeys:
             cmd += ["--affected-by", k]
+    if weekly_digest:
+        cmd += ["--weekly-digest"]
     log_path = topics_refresh_log_path()
     # 这一行是「还在跑」与「真卡死」在日志上的分界：此前打印完向量同步就再无输出，
     # 父进程 0% CPU 干等子进程被当成僵死 kill 掉（两次现场，一次 28 分钟）。
@@ -2531,9 +2542,11 @@ def render_topics_index(topics_dir: Path, specs: Sequence[TopicSpec]) -> str:
 
     lines = ["# 概念页索引", "",
              "由 `scripts/build_topics.py` 生成。每页回答一个概念问题，论断均锚定到"
-             "札记库的句级证据；新论文入库后重跑本脚本，页面随之更新。", "",
-             "| 概念页 | 核心问题 | 证据 | 篇数 | 论断 | 分歧 |",
-             "|---|---|---|---|---|---|"]
+             "札记库的句级证据；新论文入库后重跑本脚本，页面随之更新。", ""]
+    if (topics_dir / "weekly" / "INDEX.md").exists():
+        lines += ["只想知道本周变了什么：👉 [每周人读增量](weekly/INDEX.md)。", ""]
+    lines += ["| 概念页 | 核心问题 | 证据 | 篇数 | 论断 | 分歧 |",
+              "|---|---|---|---|---|---|"]
     lines += [row for _, row in rows]
     lines.append("")
     if retired:

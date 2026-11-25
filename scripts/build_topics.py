@@ -10,6 +10,8 @@
   python scripts/build_topics.py --list               # 列出配置里的概念页，不做任何事
 
 产物：output/scholar_notes/topics/<slug>.md（+ topics/INDEX.md 目录页）。
+周度入库额外传 `--weekly-digest` 时，生成 topics/weekly/<周一>.md 人读增量摘要；
+它只是导航派生物，失败/降级会通知，但不改变概念页构建的退出码语义。
 页面里 `<!-- BEGIN/END GENERATED -->` 之间会被重建覆盖，批注请写在「我的批注」下——
 哨兵缺失或生成块被手改时该页**不覆盖**、报 conflict 让人工处理（同 vault 约定）。
 
@@ -38,6 +40,7 @@ from src.scholar.llm_client import LLMClient                              # noqa
 from src.scholar.notes_index import load_index_file                       # noqa: E402
 from src.scholar.research_profile import get_default_research_interests   # noqa: E402
 from src.scholar import topics as T                                       # noqa: E402
+from src.scholar import topic_weekly as W                                 # noqa: E402
 from src.scholar.thresholds import TOPIC_MIN_INDEPENDENT_SOURCES         # noqa: E402
 from src.utils.logger import get_logger                                   # noqa: E402
 
@@ -78,6 +81,21 @@ def _fmt(r: T.TopicResult) -> str:
     return line
 
 
+def _weekly_notify(text: str) -> None:
+    """摘要失败不冒充概念页失败，但无人值守时也不能只埋进日志。"""
+    from src.utils.notify import notify
+    notify("Scholar 周入库", text[:300])
+
+
+def _weekly_no_change(topics_dir: Path, source_note: str, detail: str) -> None:
+    try:
+        out = W.write_no_change(topics_dir, source_note=source_note, detail=detail)
+        print("🗞️ 每周人读增量：{}（{}）".format(out.path, out.detail))
+    except Exception as exc:
+        print("⚠️ 每周人读增量摘要未生成：{}".format(exc), file=sys.stderr)
+        _weekly_notify("概念页本轮无实质变化，但周报写盘失败：{}".format(exc))
+
+
 def main() -> int:
     # 父死联动：被 `topics._run_refresh_child` 拉起时，父进程一没就自杀。
     # 子进程自成会话（为了能整组终止）之后就逃出了 launchd 的进程组清扫网，
@@ -114,6 +132,9 @@ def main() -> int:
                          "同一天全部过期），无上限会让单次运行连续跑 8×3-4 分钟 LLM 合成，正是 "
                          "P2 路由机制本来要避免的成本形状，也更容易撞订阅限流（默认 3，<=0 不限）")
     ap.add_argument("--model", default=None, help="覆盖合成用的 LLM 模型")
+    ap.add_argument("--weekly-digest", action="store_true",
+                    help="路由模式专用：合成后生成 topics/weekly/<周一>.md 人读增量摘要；"
+                         "只由周度入库触发，月度回填/手动精读默认不开")
     ap.add_argument("--force-synthesize", action="store_true",
                     help="证据不足（独立来源 < {}）时也照常调 LLM 合成，页面标注“证据不足时被强制生成”。"
                          "默认遇到证据不足会落存根页、不调 LLM".format(TOPIC_MIN_INDEPENDENT_SOURCES))
@@ -122,6 +143,9 @@ def main() -> int:
     ap.add_argument("--verify", action="store_true",
                     help="只自检已生成的页面（引用是否仍可追溯），不调 LLM、不改文件")
     args = ap.parse_args()
+    if args.weekly_digest and not (args.affected_by or args.affected_by_note):
+        print("❌ --weekly-digest 只用于 --affected-by/--affected-by-note 路由模式", file=sys.stderr)
+        return 2
 
     try:
         specs = T.load_topic_specs(repo_path(args.topics_config))
@@ -206,6 +230,13 @@ def main() -> int:
     except T.TopicError as e:
         print("❌ {}".format(e), file=sys.stderr)
         return 2
+    weekly_template = ""
+    if args.weekly_digest:
+        try:
+            weekly_template = repo_path(W.DEFAULT_WEEKLY_PROMPT).read_text(encoding="utf-8")
+        except OSError as e:
+            print("❌ 每周增量摘要 prompt 不可读：{}".format(e), file=sys.stderr)
+            return 2
 
     try:
         store = VectorStore.load(db_path)
@@ -248,6 +279,9 @@ def main() -> int:
         if not affected_keys:
             print("ℹ️ 札记 {} 没有带进任何新 citekey（可能全部是跨月重复），无页需要更新".format(
                 args.affected_by_note))
+            if args.weekly_digest and not args.dry_run:
+                _weekly_no_change(topics_dir, args.affected_by_note,
+                                  "本批没有新增 keeper 论文，概念页无需更新。")
             embed_client.close()      # 吹毛求疵：早退路径此前不在 try/finally 覆盖范围内
             return 0
     if affected_keys:
@@ -328,9 +362,23 @@ def main() -> int:
         if not want_slugs:
             print("✅ 新论文没有进入任何概念页的证据集，也没有页面超期未更新，无需重新合成"
                   "（它们仍在札记库与向量库里，只是不改变这几页的结论）")
+            if args.weekly_digest and not args.dry_run:
+                _weekly_no_change(topics_dir, args.affected_by_note or "",
+                                  "新论文没有进入任何概念页的证据集，本周无概念页更新。")
             embed_client.close()
             return 0
         specs = [s for s in specs if s.slug in want_slugs]
+
+    weekly_before = {}
+    weekly_hits = {slug: list(keys) for slug, keys in hits} if args.weekly_digest else {}
+    if args.weekly_digest and not args.dry_run:
+        try:
+            weekly_before = W.capture_before(topics_dir, specs)
+        except Exception as exc:
+            # 没旧版快照就不能诚实地讲"增量"：关掉摘要，不影响概念页主任务。
+            args.weekly_digest = False
+            print("⚠️ 无法保存概念页旧版快照，本轮不生成增量摘要：{}".format(exc), file=sys.stderr)
+            _weekly_notify("概念页仍会继续更新，但旧版快照读取失败，本周增量摘要暂停：{}".format(exc))
 
     llm = None if args.dry_run else LLMClient(settings.llm)
     interests = get_default_research_interests()
@@ -385,6 +433,23 @@ def main() -> int:
                 # 存根页同样没打 LLM：对连败计数中性（既不证明 provider 恢复，也不是故障）
                 streak = 0
             print("  " + _fmt(r))
+
+        if args.weekly_digest and not args.dry_run:
+            try:
+                weekly_out = W.generate_weekly_digest(
+                    llm, topics_dir, results, weekly_before, specs,
+                    hit_map=weekly_hits, source_note=args.affected_by_note or "",
+                    template=weekly_template, model=args.model)
+                print("🗞️ 每周人读增量：{}（{} 页实质变化{}）".format(
+                    weekly_out.path, len(weekly_out.changed_pages),
+                    " · 含原文差分降级" if weekly_out.degraded else ""))
+                if weekly_out.degraded:
+                    _weekly_notify("每周人读增量已生成，但自动综合部分不可用，部分条目采用原文差分：{}".format(
+                        weekly_out.path))
+            except Exception as exc:
+                # 概念页已经落盘；摘要是派生导航层，失败不改 build_topics 的退出码语义。
+                print("⚠️ 每周人读增量摘要未生成：{}".format(exc), file=sys.stderr)
+                _weekly_notify("概念页已更新，但每周人读增量摘要失败：{}".format(exc))
     finally:
         embed_client.close()
         if llm is not None:

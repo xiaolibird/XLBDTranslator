@@ -325,7 +325,8 @@ def main() -> int:
             from src.scholar.topics import trigger_topic_refresh
             topics_ok = trigger_topic_refresh(
                 settings.processing.notes_dir, note_md=rep["md"],
-                notify_title="Scholar 周入库", subject="札记已正常入库").ok
+                notify_title="Scholar 周入库", subject="札记已正常入库",
+                weekly_digest=True).ok
 
     return finish_report(rep, topics_ok)
 

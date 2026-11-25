@@ -512,6 +512,7 @@ output/
 │   ├── literature_index.json, all_references.json, INDEX.md, AGENTS.md
 │   ├── manual/  books/      # 手动精读 bundle、书籍精读
 │   ├── topics/  topics/qa/  # 概念页、问答归档
+│   ├── topics/weekly/       # 每周人读增量摘要（周度入库后生成）
 │   ├── assets/shots/        # 原文截图
 │   ├── deep_research/  audits/  selfchecks/   # 深度调研、诚信审查、稿件自查（每次运行一个日期目录）
 │   └── _archive/ _eval/ _inventory/ _provenance/ _rekey/   # 归档、评测、盘点、溯源、改键记录
