@@ -238,30 +238,52 @@ def test_deep_and_single_both_fail_returns_none_and_ingest_raises(monkeypatch, t
     assert seg.close_reading is None
 
 
-def test_deep_close_read_records_synth_budget_truncation(monkeypatch):
-    """R2:auto 侧的 max_chunks=12 并**不能**保证不越 60000 汇总预算(实测 12 块 ×
-    每块 ~5.8k 字符即超),而 auto 没有 manual 那样的亲读核验兜底——裁剪必须留痕在条目上,
-    否则 reading_depth="chunked" / n_chunks=12 是在虚报"完整分块深读"。"""
+def test_deep_close_read_executes_real_hierarchical_synthesis(monkeypatch):
+    """auto 集成必须跑真实生产分层，不能在替身里手工调用旧 _pack_chunk_notes。"""
     from src.scholar import closereading as crmod
     from src.scholar import pdf_ingest as pi
-    from src.scholar.schema import CloseReading, CloseReadSection, CloseReadSentence
 
-    big = [{"claims": ["c" * 5800]} for _ in range(12)]
+    big = [{"_chunk": i, "claims": ["c" * 5800]} for i in range(1, 13)]
     monkeypatch.setattr(pi, "chunk_text", lambda *a, **k: ["x" * 1000] * 12)
     monkeypatch.setattr(pi, "deep_read_chunks", lambda *a, **k: big)
+    llm = _DeepLLM()
 
-    def _fake(notes, llm, model, ri, budget_info=None):
-        # 真跑打包逻辑（这才是被测对象），CloseReading 用固定桩
-        pi._pack_chunk_notes([n for n in notes if not n.get("_error")], info=budget_info)
-        cr = CloseReading(from_full_text=True, source="manual-pdf", sections=[
-            CloseReadSection(heading="研究问题", sentences=[
-                CloseReadSentence(text="x", tag=None)])])
-        return cr, "", False
+    out = crmod.deep_close_read(_seg(), "body", "ri", llm,
+                                source="oa-pdf", from_full_text=True)
 
-    monkeypatch.setattr(pi, "synthesize_deep_read", _fake)
-    cr = crmod.deep_close_read("body" * 5000, None, "m", "ri",
-                               source="oa-pdf", from_full_text=True)
-    assert cr is not None
-    assert cr.synth_truncated is True
-    assert cr.synth_dropped_chunks is not None
-    assert cr.n_chunks == 12 and cr.reading_depth == "chunked"
+    assert out is not None and out.source == "oa-pdf" and out.from_full_text is True
+    assert out.n_chunks == 12 and out.reading_depth == "chunked"
+    assert out.synth_truncated is False and out.synth_dropped_chunks == 0
+    assert out.synthesis_mode == "hierarchical"
+    assert out.synthesis_provenance["source_chunks"] == 12
+    assert out.synthesis_provenance["llm_calls"] == 3
+    synth_prompts = [p for p in llm.calls if p.startswith("你在把一篇论文")]
+    assert len(synth_prompts) == 3 and all("_truncated" not in p for p in synth_prompts)
+    first_pass_ids = [int(cid) for prompt in synth_prompts[:2]
+                      for cid in re.findall(r'"_chunk": (\d+)', prompt)]
+    assert first_pass_ids == list(range(1, 13))
+    assert '"_source_chunks"' in synth_prompts[2]
+
+
+def test_auto_hierarchical_group_failure_falls_back_to_single(monkeypatch, tmp_path):
+    from src.scholar import pdf_ingest as pi
+
+    class _FailSecondGroup(_DeepLLM):
+        def call(self, prompt, **kwargs):
+            if prompt.startswith("你在把一篇论文") and self.n_synth_calls == 1:
+                self.calls.append(prompt)
+                raise TimeoutError("第二组超时")
+            return super().call(prompt, **kwargs)
+
+    big = [{"_chunk": i, "claims": ["c" * 5800]} for i in range(1, 13)]
+    monkeypatch.setattr(pi, "chunk_text", lambda *a, **k: ["x" * 1000] * 12)
+    monkeypatch.setattr(pi, "deep_read_chunks", lambda *a, **k: big)
+    _pdf_route(monkeypatch, tmp_path, "正文" * 1000)
+    llm = _FailSecondGroup()
+
+    out = cr.close_read_segment(_seg(), "ri", llm, scratch_dir=tmp_path,
+                                deep=True, max_chars=120000)
+
+    assert out is not None and out.reading_depth == "single-call"
+    assert llm.n_synth_calls == 2                       # 第二组失败后不再发最终 reduce
+    assert llm.calls[-1].startswith(_SINGLE_PROMPT_HEAD)

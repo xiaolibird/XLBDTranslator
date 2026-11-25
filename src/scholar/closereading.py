@@ -9,6 +9,7 @@
 import hashlib
 import json
 import re
+import dataclasses as _dc
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -151,9 +152,6 @@ def download_pdf(url: str, dest: Path, client=None, timeout: float = 60.0,
                 c.close()
             except Exception:
                 pass
-
-
-import dataclasses as _dc
 
 
 @_dc.dataclass
@@ -766,6 +764,8 @@ def deep_close_read(seg: PaperSegment, body_text: str, research_interests: str,
     # 应答者留痕：provider/served_model/fell_back 已由 synthesize_deep_read 按汇总步写好；
     # 这里补各块的 served_model（块间换人时可见）与 auto 链路的 prompt 标签
     cr.chunk_models = chunk_models_from_metas(chunk_metas)
+    if any(m is not None and m.fell_back for m in chunk_metas):
+        cr.fell_back = True
     from .pdf_ingest import chunked_prompt_version
     cr.prompt_version = chunked_prompt_version("closeread-chunked")
     if _binfo.get("note"):

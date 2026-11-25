@@ -728,28 +728,112 @@ def test_chunk_text_never_loops_when_overlap_exceeds_size():
     assert len(out) == 4901 and all(len(c) <= 100 for c in out)
 
 
-def test_synthesize_writes_truncation_onto_closereading():
-    """R3 变异发现:裁剪写进 CloseReading 这件事只有 auto 侧被咬住,manual 侧零保护——
-    而 R1/R2 举证的活体样本(229 页/49 块)正是 manual 链路。"""
+def test_synthesize_over_budget_uses_hierarchical_groups_without_trimming():
+    """超预算不能再靠 _shrink_note 删尾部条目：两组原始块笔记 + 一次总汇总。"""
     payload = {"one_line": "x", "sections": [
         {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]}
-    llm = _FakeLLM([json.dumps(payload)])
-    notes = [{"claims": ["c" * 400 for _ in range(12)]} for _ in range(40)]
+    llm = _FakeLLM([json.dumps(payload)] * 3)
+    notes = [{"_chunk": i, "claims": ["c{}-{}".format(i, "c" * 630) for _ in range(12)]}
+             for i in range(1, 11)]
     info = {}
+
+    cr, one_line, api_err = pi.synthesize_deep_read(notes, llm, "m", "ri", budget_info=info)
+
+    assert cr is not None and one_line == "x" and not api_err
+    assert info["hierarchical"]["source_chunks"] == 10
+    assert info["hierarchical"]["llm_calls"] == 3
+    assert info["hierarchical"]["max_layer"] == 1
+    assert "note" not in info and cr.synth_truncated is False
+    assert cr.synth_dropped_chunks == 0
+    assert cr.synthesis_mode == "hierarchical"
+    assert all("_truncated" not in prompt for prompt in llm.calls)
+    # 前两次是分组汇总，10 个源块必须全部出现；第三次汇总各组结果。
+    first_pass = "".join(llm.calls[:2])
+    assert all('"_chunk": {}'.format(i) in first_pass for i in range(1, 11))
+    assert '"_source_chunks"' in llm.calls[2]
+
+
+def test_synthesize_hierarchical_failure_does_not_fall_back_to_trimming(monkeypatch):
+    payload = {"one_line": "x", "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]}
+    llm = _FakeLLM([json.dumps(payload), "not json"])
+    notes = [{"_chunk": i, "claims": ["c" * 400 for _ in range(12)]} for i in range(1, 41)]
+    info = {}
+
+    def forbidden_pack(*a, **k):
+        raise AssertionError("分层失败后不得退回裁剪")
+    monkeypatch.setattr(pi, "_pack_chunk_notes", forbidden_pack)
+
+    cr, _one, api_err = pi.synthesize_deep_read(notes, llm, "m", "ri", budget_info=info)
+
+    assert cr is None and not api_err
+    assert "第 1 层第 2 组" in info["synth_error"]
+    assert len(llm.calls) == 2 and all("_truncated" not in p for p in llm.calls)
+
+
+def test_synthesize_oversized_single_note_fails_explicitly_without_llm():
+    info = {}
+    llm = _FakeLLM([])
+    cr, _one, api_err = pi.synthesize_deep_read(
+        [{"_chunk": 1, "claims": ["x" * (pi._SYNTH_NOTES_BUDGET + 1)]}],
+        llm, "m", "ri", budget_info=info)
+    assert cr is None and not api_err and llm.calls == []
+    assert "无法无损分组" in info["synth_error"]
+
+
+def test_synthesize_persists_all_group_meta_and_source_provenance(monkeypatch):
+    from types import SimpleNamespace
+    payload = json.dumps({"one_line": "x", "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]})
+    responses = [payload] * 3
+    metas = [
+        SimpleNamespace(provider="p1", served_model="synth-1", fell_back=True),
+        SimpleNamespace(provider="p2", served_model="synth-2", fell_back=False),
+        SimpleNamespace(provider="p3", served_model="synth-3", fell_back=False),
+    ]
+
+    def fake_call(_llm, _prompt, **kwargs):
+        return responses.pop(0), metas.pop(0)
+    monkeypatch.setattr(pi, "call_llm_with_meta", fake_call)
+    notes = [{"_chunk": i, "claims": ["c{}-{}".format(i, "c" * 630) for _ in range(12)]}
+             for i in range(1, 11)]
+    info = {}
+
+    cr, _one, _err = pi.synthesize_deep_read(notes, object(), "m", "ri", budget_info=info)
+
+    assert cr.fell_back is True and cr.provider == "p3"
+    assert cr.synthesis_models == ["synth-1", "synth-2", "synth-3"]
+    provenance = cr.synthesis_provenance
+    assert provenance["mode"] == "hierarchical" and provenance["llm_calls"] == 3
+    first_pass_ids = [cid for call in provenance["calls"][:2] for cid in call["source_chunks"]]
+    assert first_pass_ids == list(range(1, 11))
+    assert provenance["calls"][0]["stage"] == "分层汇总第 1 层第 1 组"
+    assert cr.model_dump(mode="json")["synthesis_provenance"]["calls"] == provenance["calls"]
+
+
+def test_synthesize_stops_when_a_layer_does_not_shrink(monkeypatch):
+    monkeypatch.setattr(pi, "_SYNTH_NOTES_BUDGET", 250)
+    payload = json.dumps({"one_line": "x" * 100, "sections": [
+        {"heading": "研究问题", "sentences": [{"text": "s" * 200, "tag": None}]}]})
+    llm = _FakeLLM([payload] * 20)
+    notes = [{"_chunk": i, "claims": ["x" * 20]} for i in range(6)]
+    info = {}
+
     cr, _one, _err = pi.synthesize_deep_read(notes, llm, "m", "ri", budget_info=info)
-    assert info.get("note"), "构造前提：必须触发裁剪"
-    assert cr is not None
-    assert cr.synth_truncated is True
-    assert cr.synth_dropped_chunks == (info.get("n_dropped") or 0)
+
+    assert cr is None and "未缩水" in info["synth_error"]
+    assert len(llm.calls) == info["hierarchical"]["groups"]  # 只烧第一层，不递归空转
+    assert info["hierarchical"]["status"] == "failed"
 
 
-def test_synthesize_leaves_truncation_unset_when_within_budget():
-    """缺失 = 未知，不是 false。没裁过就不许写出 True（同 fulltext_chars 那组口径）。"""
+def test_synthesize_marks_known_no_truncation_when_within_budget():
+    """新产物明确写 False/0；None 只保留给无法知道旧路径的存量条目。"""
     payload = {"one_line": "x", "sections": [
         {"heading": "研究问题", "sentences": [{"text": "s", "tag": None}]}]}
     cr, _one, _err = pi.synthesize_deep_read(
         [{"claims": ["c"]}], _FakeLLM([json.dumps(payload)]), "m", "ri", budget_info={})
-    assert cr.synth_truncated is None and cr.synth_dropped_chunks is None
+    assert cr.synth_truncated is False and cr.synth_dropped_chunks == 0
+    assert cr.synthesis_mode == "single" and cr.synthesis_provenance["llm_calls"] == 1
 
 
 def test_pack_chunk_notes_drops_from_middle_not_tail():
@@ -955,6 +1039,19 @@ def test_ingest_status_empty_and_api_error_unchanged(tmp_path, monkeypatch):
     _stub_ingest_status_env(monkeypatch, tmp_path, notes, lambda *a, **k: (None, "", True))
     r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None, force=True)
     assert r["draft_status"] == "api_error"
+
+
+def test_ingest_api_error_preserves_hierarchical_stage_diagnostic(tmp_path, monkeypatch):
+    notes = [{"_chunk": i, "claims": ["c"]} for i in range(1, 11)]
+
+    def _synth(chunk_notes, llm, model, ri, budget_info=None, availability=None):
+        budget_info["synth_error"] = (
+            "分层汇总第 1 层第 2 组 LLM 调用失败：RuntimeError: 402 insufficient balance")
+        return None, "", True
+    _stub_ingest_status_env(monkeypatch, tmp_path, notes, _synth)
+    r = pi.ingest_pdf(Path("/x.pdf"), tmp_path, "2026-09", llm=None)
+    assert r["draft_status"] == "api_error"
+    assert "第 1 层第 2 组" in r["draft_note"] and "402" in r["draft_note"]
 
 
 def test_ingest_passes_meta_degraded_through(tmp_path, monkeypatch):

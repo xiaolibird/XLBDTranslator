@@ -389,6 +389,12 @@ class CloseReading(BaseModel):
     synth_truncated: Optional[bool] = Field(None, description="汇总步是否对块笔记做过裁剪")
     synth_dropped_chunks: Optional[int] = Field(
         None, description="汇总步整块丢弃的块数（均摊裁剪后仍超预算时才发生）")
+    synthesis_mode: Optional[str] = Field(
+        None, description="汇总方式：single / hierarchical；老产物缺失=未知")
+    synthesis_models: Optional[List[str]] = Field(
+        None, description="所有分层汇总调用的 served_model 去重列表（保序）")
+    synthesis_provenance: Optional[Dict[str, Any]] = Field(
+        None, description="分层汇总溯源：层/组/源块映射、每次调用的应答者与回退事实")
     # reading_depth 四态（与 AGENTS.md 逐字一致，不得有第二套定义）：
     #   'chunked'        = manual 全部 + 开关打开后的 auto
     #   'single-call'    = auto 单跳

@@ -27,6 +27,7 @@ from .schema import (
 from .closereading import (
     pdf_to_text, parse_closeread, _pdf_text_with_stats,
     call_llm_with_meta, apply_meta_to_closereading, chunk_models_from_metas, prompt_fingerprint,
+    meta_provenance,
 )
 from .research_profile import get_contamination_example_terms
 from ..utils.logger import get_logger
@@ -473,7 +474,6 @@ def extract_availability_statements(full_text: str, max_items: int = _AVAIL_MAX_
     text = full_text or ""
     if not text.strip():
         return []
-    out: List[str] = []
     spans: List[Tuple[int, int]] = []
     for m in _AVAIL_KEY_RE.finditer(text):
         # URL 分支的 \S* 会把句尾的「.」「)」一起吞掉，随后往后找句边界就跳到了下一句——
@@ -751,6 +751,138 @@ def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_B
     return out
 
 
+def _synth_prompt(packed: str, research_interests: str,
+                  availability: Optional[List[str]]) -> str:
+    avail_txt = ("\n".join("- {}".format(a) for a in availability)
+                 if availability else "（程序未抓到明确的可得性声明）")
+    return _SYNTH_PROMPT.format(
+        research_interests=research_interests or "（未提供）",
+        contamination_examples="、".join(get_contamination_example_terms()),
+        availability=avail_txt,
+        chunk_notes=packed)
+
+
+def _call_synthesis(packed: str, llm, model: Optional[str], research_interests: str,
+                    availability: Optional[List[str]], budget_info: Optional[Dict[str, Any]],
+                    *, stage: str = "汇总", trace: Optional[List[Dict[str, Any]]] = None,
+                    source_chunks: Optional[List[Any]] = None):
+    """执行一层汇总并解析。失败原因带层级，绝不在此处裁剪输入。"""
+    if budget_info and budget_info.get("hierarchical") is not None:
+        budget_info["hierarchical"]["llm_calls"] += 1
+    try:
+        resp, meta = call_llm_with_meta(
+            llm, _synth_prompt(packed, research_interests, availability),
+            model=model, max_tokens=8192, json_mode=True)
+    except Exception as e:
+        logger.warning("  ⚠️ {} LLM 调用失败: {}".format(stage, e))
+        if budget_info is not None:
+            budget_info["synth_error"] = "{} LLM 调用失败：{}: {}".format(
+                stage, type(e).__name__, str(e)[:200])
+        return None, "", None, is_credit_error(e)
+    if trace is not None:
+        trace.append({"stage": stage, "source_chunks": list(source_chunks or []),
+                      **meta_provenance(meta)})
+    one_line = ""
+    try:
+        one_line = (json.loads(_strip_json(resp)).get("one_line") or "").strip()
+    except Exception:
+        pass
+    cr = parse_closeread(resp)
+    if cr is None and budget_info is not None:
+        budget_info["synth_error"] = (
+            "{}返回不可解析为分节精读（响应 {} 字符；块笔记打包 {} 字符 / 预算 {}；"
+            "响应开头：{!r}）".format(stage, len(resp or ""), len(packed), _SYNTH_NOTES_BUDGET,
+                                   (resp or "")[:120]))
+    return cr, one_line, meta, False
+
+
+def _source_chunk_ids(note: Dict[str, Any]) -> List[Any]:
+    ids = note.get("_source_chunks")
+    if isinstance(ids, list):
+        return ids
+    return [note["_chunk"]] if note.get("_chunk") is not None else []
+
+
+def _partition_synth_notes(notes: List[Dict[str, Any]], budget: int
+                           ) -> List[List[Dict[str, Any]]]:
+    """按 JSON 实际长度分组，不删条目。单条就超预算时明确失败，而非削它。"""
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for note in notes:
+        if len(json.dumps([note], ensure_ascii=False)) > budget:
+            raise ValueError("单条笔记自身超过汇总预算 {} 字符，无法无损分组".format(budget))
+        candidate = current + [note]
+        if current and len(json.dumps(candidate, ensure_ascii=False)) > budget:
+            groups.append(current)
+            current = [note]
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _synthesize_layered(notes: List[Dict[str, Any]], llm, model: Optional[str],
+                        research_interests: str, availability: Optional[List[str]],
+                        budget_info: Optional[Dict[str, Any]], trace: List[Dict[str, Any]],
+                        *, depth: int = 0):
+    """超预算时 map-reduce：每组先看全量原始笔记，再汇总各组结果。
+
+    递归输入既可能是原始块笔记，也可能是上一层的 sections；两者都完整序列化，
+    不调用 _pack_chunk_notes。这样「超预算」不再等价于「轮转删尾部条目」。
+    """
+    packed = json.dumps(notes, ensure_ascii=False)
+    if len(packed) <= _SYNTH_NOTES_BUDGET:
+        source_ids = [cid for note in notes for cid in _source_chunk_ids(note)]
+        return _call_synthesis(packed, llm, model, research_interests, availability,
+                               budget_info, trace=trace, source_chunks=source_ids)
+    if depth >= 3:
+        if budget_info is not None:
+            budget_info["synth_error"] = "分层汇总达到 3 层后仍超预算，已停止，未裁剪输入"
+        return None, "", None, False
+    try:
+        groups = _partition_synth_notes(notes, _SYNTH_NOTES_BUDGET)
+    except ValueError as e:
+        if budget_info is not None:
+            budget_info["synth_error"] = str(e)
+        return None, "", None, False
+    if len(groups) < 2:
+        if budget_info is not None:
+            budget_info["synth_error"] = "超预算但无法拆成至少两组，已停止，未裁剪输入"
+        return None, "", None, False
+
+    logger.info("  🧩 块笔记 {} 字符超预算：第 {} 层分成 {} 组分层汇总，不裁剪条目".format(
+        len(packed), depth + 1, len(groups)))
+    if budget_info and budget_info.get("hierarchical") is not None:
+        budget_info["hierarchical"]["max_layer"] = max(
+            budget_info["hierarchical"]["max_layer"], depth + 1)
+        budget_info["hierarchical"]["groups"] += len(groups)
+    partials = []
+    for i, group in enumerate(groups, 1):
+        group_packed = json.dumps(group, ensure_ascii=False)
+        cr, one_line, _meta, api_err = _call_synthesis(
+            group_packed, llm, model, research_interests, availability, budget_info,
+            stage="分层汇总第 {} 层第 {} 组".format(depth + 1, i),
+            trace=trace, source_chunks=[cid for note in group for cid in _source_chunk_ids(note)])
+        if cr is None:
+            return None, "", None, api_err
+        source_ids = [cid for note in group for cid in _source_chunk_ids(note)]
+        partials.append({
+            "_source_chunks": source_ids,
+            "one_line": one_line,
+            "sections": cr.model_dump(mode="json")["sections"],
+        })
+    next_packed = json.dumps(partials, ensure_ascii=False)
+    if len(next_packed) >= len(packed):
+        if budget_info is not None:
+            budget_info["synth_error"] = (
+                "分层汇总第 {} 层后未缩水（{} → {} 字符），已停止，未裁剪输入".format(
+                    depth + 1, len(packed), len(next_packed)))
+        return None, "", None, False
+    return _synthesize_layered(partials, llm, model, research_interests, availability,
+                               budget_info, trace, depth=depth + 1)
+
+
 def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional[str],
                          research_interests: str,
                          budget_info: Optional[Dict[str, Any]] = None,
@@ -758,12 +890,12 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
                          ) -> Tuple[Optional[CloseReading], str, bool]:
     """把块笔记汇总为扩展分节 CloseReading。返回 (CloseReading|None, one_line, api_error)。
 
-    budget_info：可选的出参字典，超预算裁剪时写入 note/n_truncated/n_dropped，供调用方
-    落进 bundle 的 draft_note——logger.warning 在自动权限模式的 agent 会话里看不见。
-    汇总**失败**时同样把原因写进 `budget_info["synth_error"]`（异常类型+消息前 200 字符，或
-    「返回不可解析」+ 响应长度/打包长度/预算）：此前失败原因在这里被整个丢弃，bundle 只留
-    一句硬编码的「汇总步失败但部分块可用」，事后既不可复现也不可修
-    （见 docs/bugs/2026-09-04-ingest-degraded-silent.md）。
+    超过汇总预算时走分层汇总，每组都看未裁剪输入；分层失败就返回 None，让调用方
+    走既有的失败/回退协议，不再退回「删块笔记尾部条目后仍报成功」的旧路径。
+
+    budget_info：可选出参。分层时写 hierarchical（源块数/组数/层数/调用数）；失败写
+    synth_error（异常类型+消息，或不可解析响应的长度/预算/开头）。旧 note/n_truncated/
+    n_dropped 只由独立的 _pack_chunk_notes 保留给存量调用与兼容测试，本函数不再写入。
 
     availability：extract_availability_statements 抽出的代码/数据可得性原句，非空时进 prompt
     并要求「实验方法」节以它为准（第 3 类系统性错误：漏报成「原文未报告」）。
@@ -771,46 +903,47 @@ def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional
     usable = [n for n in chunk_notes if not n.get("_error")]
     if not usable:
         return None, "", False
-    packed = _pack_chunk_notes(usable, info=budget_info)
-    avail_txt = ("\n".join("- {}".format(a) for a in availability)
-                 if availability else "（程序未抓到明确的可得性声明）")
-    prompt = _SYNTH_PROMPT.format(
-        research_interests=research_interests or "（未提供）",
-        contamination_examples="、".join(get_contamination_example_terms()),
-        availability=avail_txt,
-        chunk_notes=packed)
-    try:
-        resp, _meta = call_llm_with_meta(llm, prompt, model=model, max_tokens=8192, json_mode=True)
-    except Exception as e:
-        logger.warning("  ⚠️ 汇总精读 LLM 调用失败: {}".format(e))
-        if budget_info is not None:
-            budget_info["synth_error"] = "汇总 LLM 调用失败：{}: {}".format(
-                type(e).__name__, str(e)[:200])
-        return None, "", is_credit_error(e)
-    one_line = ""
-    try:
-        one_line = (json.loads(_strip_json(resp)).get("one_line") or "").strip()
-    except Exception:
-        pass
-    cr = parse_closeread(resp)  # 复用 closereading 的宽松解析（忽略 one_line 字段）
-    if cr is None and budget_info is not None:
-        budget_info["synth_error"] = (
-            "汇总返回不可解析为分节精读（响应 {} 字符；块笔记打包 {} 字符 / 预算 {}；"
-            "响应开头：{!r}）".format(len(resp or ""), len(packed), _SYNTH_NOTES_BUDGET,
-                                   (resp or "")[:120]))
+    if budget_info is None:
+        budget_info = {}                    # provenance 不能依赖调用方是否提供出参
+    full = json.dumps(usable, ensure_ascii=False)
+    hierarchical = len(full) > _SYNTH_NOTES_BUDGET
+    if hierarchical and budget_info is not None:
+        budget_info["hierarchical"] = {
+            "source_chunks": len(usable), "groups": 0, "max_layer": 0, "llm_calls": 0,
+        }
+    trace: List[Dict[str, Any]] = []
+    cr, one_line, meta, api_err = _synthesize_layered(
+        usable, llm, model, research_interests, availability, budget_info, trace)
     if cr is not None:
         cr.from_full_text = True
         cr.model = model
         cr.source = "manual-pdf"
-        # 应答者留痕：取**汇总步**这次调用的 meta（块级另记 chunk_models，由调用方补）
-        apply_meta_to_closereading(cr, _meta)
+        apply_meta_to_closereading(cr, meta)       # final reduce 的应答者
+        if any(call.get("fell_back") for call in trace):
+            cr.fell_back = True                   # 任一组回退都不能被最终组 False 覆盖
         cr.prompt_version = chunked_prompt_version("manual-synth")
-        # 裁剪留痕落在条目上（两条链路共用）：draft_note 只在 manual 的 bundle 里，
-        # 而 sidecar/索引的消费方看到的是 CloseReading。缺失 = 未知，不是"没裁过"。
-        if budget_info and budget_info.get("note"):
-            cr.synth_truncated = True
-            cr.synth_dropped_chunks = int(budget_info.get("n_dropped") or 0)
-    return cr, one_line, False
+        cr.synth_truncated = False
+        cr.synth_dropped_chunks = 0
+        cr.synthesis_mode = "hierarchical" if hierarchical else "single"
+        cr.synthesis_models = list(dict.fromkeys(
+            call["served_model"] for call in trace if call.get("served_model"))) or None
+        cr.synthesis_provenance = {
+            "mode": cr.synthesis_mode,
+            "source_chunks": len(usable),
+            "groups": (budget_info or {}).get("hierarchical", {}).get("groups", 0),
+            "max_layer": (budget_info or {}).get("hierarchical", {}).get("max_layer", 0),
+            "llm_calls": len(trace),
+            "calls": trace,
+        }
+        if budget_info and budget_info.get("hierarchical"):
+            budget_info["hierarchical"]["status"] = "ok"
+            budget_info["hierarchical"]["calls"] = trace
+            logger.info("  ✅ 分层汇总完成：{}".format({
+                k: v for k, v in budget_info["hierarchical"].items() if k != "calls"}))
+    elif budget_info and budget_info.get("hierarchical"):
+        budget_info["hierarchical"]["status"] = "failed"
+        budget_info["hierarchical"]["calls"] = trace
+    return cr, one_line, api_err
 
 
 # ---------------- 组装 segment + bundle ----------------
@@ -1097,6 +1230,8 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
         availability=availability)
     if cr is not None:
         cr.chunk_models = chunk_models_from_metas(chunk_metas)
+        if any(m is not None and m.fell_back for m in chunk_metas):
+            cr.fell_back = True
 
     # 草稿状态（五态，语义见 write_bundle docstring）：
     #   有草稿 → ok / degraded（部分块失败）；无草稿 → api_error / empty / synth_failed。
@@ -1123,6 +1258,8 @@ def ingest_pdf(pdf_path: Path, notes_dir: Path, month: str, llm, *,
     elif synth_api_err or (n_api and n_ok == 0):
         draft_status = "api_error"
         draft_note = "LLM 无额度/鉴权失败（如 402），脚本草稿不可用——应回退 subagent 对抗生成"
+        if budget_info.get("synth_error"):
+            draft_note += " | " + budget_info["synth_error"]
         if trunc_note:
             draft_note += " | " + trunc_note
     elif n_ok == 0:
