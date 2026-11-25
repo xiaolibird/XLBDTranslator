@@ -8,8 +8,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -129,8 +127,8 @@ def test_apply_marks_agent_source_and_keeps_undecided_pending(tmp_path):
     st = {i["paper_id"]: i["state"] for i in q["items"]}
     assert st == {"p1": "keep", "p2": "drop", "p3": "pending"}      # 失败的不丢弃，保持待确认
     assert all(i["decision_source"] == "auto_agent" for i in q["items"] if i["state"] != "pending")
-    labels = [json.loads(l) for l in C.labels_path(nd).read_text(encoding="utf-8").splitlines()]
-    assert n == len(labels) == 2 and {l["user_decision_source"] for l in labels} == {"auto_agent"}
+    labels = [json.loads(line) for line in C.labels_path(nd).read_text(encoding="utf-8").splitlines()]
+    assert n == len(labels) == 2 and {row["user_decision_source"] for row in labels} == {"auto_agent"}
 
 
 def test_machine_labels_excluded_from_eval_and_drift(tmp_path):
@@ -195,3 +193,171 @@ def test_cli_all_llm_failure_exits_1_and_keeps_pending(tmp_path):
                   llm=object(), notify=lambda t, m: None, runner=lambda a: 0,
                   now=NOW, today=NOW.date(), call=boom)
     assert rc == 1 and C.load_queue(qp)["items"][0]["state"] == "pending"
+
+
+# ------------------------------------------------------------------ 周一批次完整性哨兵
+
+def _digest_run(dd, stamp, *, complete=True, run_kind="rolling", window_days=8,
+                digest_text=None, stats_text=None):
+    run_id = "digest_{}".format(stamp)
+    p = dd / "{}.json".format(run_id)
+    digest = {"digest_id": run_id, "status": "completed", "segments": []}
+    p.write_text(digest_text if digest_text is not None else json.dumps(digest), encoding="utf-8")
+    if complete:
+        stats = {"run_id": run_id, "timestamp": "2026-11-16T09:05:00",
+                 "run_kind": run_kind, "window_days": window_days,
+                 "total_emails": 0, "total_papers": 0, "processed_papers": 0, "failed_papers": 0}
+        (dd / "{}_stats.json".format(run_id)).write_text(
+            stats_text if stats_text is not None else json.dumps(stats), encoding="utf-8")
+    return p
+
+
+def test_monday_missing_digest_alerts_and_exits_nonzero(tmp_path):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    _digest_run(dd, "20261109_090000")                 # 上周完整，本周缺失
+    notified = []
+    now = datetime(2026, 11, 16, 10, 0, 0)            # 周一
+
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+
+    assert rc == 1 and len(notified) == 1
+    assert "漏跑" in notified[0][0] and "2026-11-09" in notified[0][1]
+
+
+def test_monday_complete_digest_does_not_alert(tmp_path):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000")
+    notified = []
+    now = datetime(2026, 11, 16, 10, 0, 0)
+
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+
+    assert rc == 0 and notified == []
+
+
+def test_monday_json_without_stats_is_not_a_complete_batch(tmp_path):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000", complete=False)
+    notified = []
+    now = datetime(2026, 11, 16, 10, 0, 0)
+
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+
+    assert rc == 1 and "批次异常" in notified[0][1]
+
+
+def test_digest_health_check_covers_delayed_tuesday_and_skips_dry_run(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    delayed = AT.weekly_digest_alert(dd, datetime(2026, 11, 17, 10, 0, 0))
+    assert delayed is not None and delayed.batch_date == "2026-11-16"  # 周一睡到周二仍须报
+    _digest_run(dd, "20261109_090000")
+    assert AT.weekly_digest_alert(dd, datetime(2026, 11, 16, 9, 59, 0)) is None
+
+    nd = tmp_path / "notes"
+    nd.mkdir()
+    notified = []
+    now = datetime(2026, 11, 16, 10, 0, 0)
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd), "--dry-run"],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+    assert rc == 0 and notified == []
+
+
+def test_tuesday_with_valid_monday_batch_is_healthy(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000")
+    assert AT.weekly_digest_alert(dd, datetime(2026, 11, 17, 10, 0, 0)) is None
+
+
+def test_next_monday_run_does_not_backfill_previous_week_health(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000")                 # 当前周批，上一周缺失
+    alert = AT.weekly_digest_alert(dd, datetime(2026, 11, 16, 9, 59, 0))
+    assert alert is not None and alert.batch_date == "2026-11-09"
+
+
+def test_malformed_json_roots_fail_health_without_raising(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000", digest_text="[]", stats_text="[]")
+    assert AT.weekly_digest_alert(dd, datetime(2026, 11, 16, 10, 0, 0)) is not None
+
+
+def test_history_backfill_and_short_window_do_not_impersonate_weekly(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    _digest_run(dd, "20261116_093000", run_kind="date_range", window_days=None)
+    _digest_run(dd, "20261116_094500", window_days=1)
+    alert = AT.weekly_digest_alert(dd, datetime(2026, 11, 16, 10, 0, 0))
+    assert alert is not None and alert.batch_date == "2026-11-16"
+
+
+def test_corrupt_stats_or_digest_is_not_healthy(tmp_path):
+    dd = tmp_path / "digest"
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000", stats_text="")
+    _digest_run(dd, "20261116_090100", digest_text="{")
+    alert = AT.weekly_digest_alert(dd, datetime(2026, 11, 16, 10, 0, 0))
+    assert alert is not None
+
+
+def test_health_notification_is_deduped_across_delayed_days(tmp_path):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    notified = []
+    for now in (datetime(2026, 11, 16, 10, 0, 0), datetime(2026, 11, 17, 10, 0, 0)):
+        rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                      llm=object(), notify=lambda t, m: notified.append((t, m)),
+                      runner=lambda _a: 0, now=now, today=now.date())
+        assert rc == 1
+    assert len(notified) == 1
+
+
+def test_health_is_rechecked_after_sync_race(tmp_path, monkeypatch):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    notified = []
+
+    def finishes_during_sync(*args, **kwargs):
+        _digest_run(dd, "20261116_095959")
+        return C.SyncReport()
+    monkeypatch.setattr(C, "sync_queue", finishes_during_sync)
+    now = datetime(2026, 11, 16, 10, 0, 0)
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+    assert rc == 0 and notified == []
+
+
+def test_sync_read_failure_becomes_health_alert(tmp_path, monkeypatch):
+    nd, dd = tmp_path / "notes", tmp_path / "digest"
+    nd.mkdir()
+    dd.mkdir()
+    _digest_run(dd, "20261116_090000")
+    notified = []
+
+    def broken_sync(*args, **kwargs):
+        return C.SyncReport(runs_seen=1, runs_failed=["digest_20261116_090000"])
+    monkeypatch.setattr(C, "sync_queue", broken_sync)
+    now = datetime(2026, 11, 16, 10, 0, 0)
+    rc = CLI.main(["--notes-dir", str(nd), "--digest-dir", str(dd)],
+                  llm=object(), notify=lambda t, m: notified.append((t, m)),
+                  runner=lambda _a: 0, now=now, today=now.date())
+    assert rc == 1 and "同步失败" in notified[0][1]

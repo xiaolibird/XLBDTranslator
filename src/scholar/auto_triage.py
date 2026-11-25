@@ -17,7 +17,7 @@
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -65,6 +65,90 @@ OUTPUT_SPEC = """\
 只输出一个 JSON 对象，不要任何其他文字：
 {"verdicts":[{"id":"<原样照抄的 id>","verdict":"keep"|"drop","priority":"high"|"normal"|"low","reason":"…"}]}
 必须对每个 id 恰好给一条；不要新增、遗漏或改写 id。"""
+
+
+@dataclass(frozen=True)
+class DigestHealthAlert:
+    batch_date: str
+    message: str
+
+
+def _valid_rolling_weekly_run(digest_dir: Path, run_path: Path) -> bool:
+    """JSON 与 stats 都可消费、且确实覆盖滚动近 ≥7 天，才算一个周批。"""
+    try:
+        stats_path = digest_dir / "{}_stats.json".format(run_path.stem)
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        digest = json.loads(run_path.read_text(encoding="utf-8"))
+        if stats.get("run_id") != run_path.stem or digest.get("digest_id") != run_path.stem:
+            return False
+        if stats.get("run_kind") != "rolling" or not isinstance(stats.get("window_days"), int):
+            return False
+        if stats["window_days"] < 7 or digest.get("status") != "completed":
+            return False
+        if not isinstance(digest.get("segments"), list):
+            return False
+        datetime.fromisoformat(stats["timestamp"])
+        for key in ("total_emails", "total_papers", "processed_papers", "failed_papers"):
+            if not isinstance(stats.get(key), int) or isinstance(stats.get(key), bool):
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def weekly_digest_alert(digest_dir, now: datetime) -> Optional[DigestHealthAlert]:
+    """检查最近一个已越过周一 10:00 截止点的计划批次。
+
+    周二至周日的 launchd 补跑仍检查刚过去的周一，不会因跨日漏报；同一批次是否
+    已经通知由 CLI 的 _digest_health.json 去重。周一 10:00 前看上一周，避免把正在
+    运行的本周任务报成故障。手动滚动补跑也算，但历史 date_range 回填绝不算。
+    """
+    monday = now.date() - timedelta(days=now.weekday())
+    if now.weekday() == 0 and (now.hour, now.minute) < (10, 0):
+        monday -= timedelta(days=7)
+    scheduled_start = datetime.combine(monday, time(9, 0))
+    scheduled_end = scheduled_start + timedelta(days=7)
+    deadline = datetime.combine(monday, time(10, 0))
+    if now < deadline:
+        return None
+    from .ingest import digest_runs
+
+    digest_dir = Path(digest_dir)
+    runs = list(digest_runs(digest_dir))
+    # 下周一 09:00 起属于下一批，不能 retroactively 满足上一批；周二补跑仍落在本批窗口。
+    candidates = [(ts, p) for ts, p in runs
+                  if scheduled_start <= ts < scheduled_end and ts <= now]
+    if any(_valid_rolling_weekly_run(digest_dir, p) for _ts, p in candidates):
+        return None
+    latest = max((ts.date() for ts, p in runs
+                  if (digest_dir / "{}_stats.json".format(p.stem)).exists()), default=None)
+    detail = ("该时段有 digest 产物，但没有可解析且覆盖滚动近 ≥7 天的完整批次"
+              if candidates else "该时段没有 digest run")
+    return DigestHealthAlert(monday.isoformat(), (
+        "{} 周一批次异常：{}；最近有 stats 的 run：{}。"
+        "请查 cron_digest.err.log 并手动补跑，不能按空队列处理。").format(
+            monday.isoformat(), detail, latest.isoformat() if latest else "无"))
+
+
+def digest_alert_already_sent(notes_dir, batch_date: str) -> bool:
+    p = C.pending_dir(notes_dir) / "_digest_health.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return batch_date in (data.get("alerts") or {})
+    except (OSError, ValueError):
+        return False
+
+
+def record_digest_alert(notes_dir, batch_date: str, now: datetime) -> None:
+    """按批次去重通知；健康检查本身仍每天返回非零，直到批次补齐。"""
+    p = C.pending_dir(notes_dir) / "_digest_health.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    alerts = data.setdefault("alerts", {})
+    alerts[batch_date] = {"notified_at": now.isoformat(timespec="seconds")}
+    C._atomic_write(p, json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True))
 
 
 # ------------------------------------------------------------------ 库内标题去重

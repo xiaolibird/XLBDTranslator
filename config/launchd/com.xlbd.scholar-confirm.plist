@@ -15,6 +15,9 @@
   保持 label 不变（com.xlbd.scholar-confirm）：沿用原来的安装/卸载入口与日志文件名。
   周度 ingest（com.xlbd.scholar-weekly-ingest，周一 09:30）不动：它过闸门只放行已决策的论文，
   是兜底的空跑。10:00 而非 09:15：digest 平均 6 分钟但长度浮动，stats.json 没生成的 run 次日再入队。
+  每天同步后检查最近一个已越过周一 10:00 截止点的计划批次：跨日补跑仍覆盖刚过去的周一，
+  同一批次只通知一次但持续非零退出，直到补齐。只接受 JSON/stats 均可解析、覆盖滚动近 ≥7 天的
+  完整批次，历史回填不能冒充周批；也防止 digest 未启动/中途死掉时下游把空队列误报成正常。
 
   由 scripts/install_confirm.sh 安装：占位符 __REPO_ROOT__ / __PYTHON_BIN__ / __LOG_DIR__
   会被替换后拷入 ~/Library/LaunchAgents/。claude CLI 登录态依赖 launchd gui 域自带的 USER

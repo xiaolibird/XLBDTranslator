@@ -249,6 +249,10 @@ def test_filter_by_llm_batch_failure_undecided_not_excluded(tmp_path, monkeypatc
     stats = json.loads(
         (wf.output_dir / "{}_stats.json".format(wf.run_id)).read_text(encoding="utf-8"))
     assert stats["undecided_count"] == 1
+    assert stats["run_kind"] == "rolling"
+    assert stats["window_days"] == wf.settings.processing.days_to_fetch
+    assert stats["date_range"] is None
+    assert not list(wf.output_dir.glob("{}_stats.json.tmp-*".format(wf.run_id)))
 
     # 固化 JSON 可正常 round-trip（undecided_segments 随 digest 落盘）
     from src.scholar.schema import DigestOutput
@@ -631,7 +635,7 @@ def test_filter_missing_verdicts_are_retried_not_dumped_to_keywords(tmp_path, mo
                 '{"id": 3, "decision": "EXCLUDE", "bucket": [], "one_line": "无关", "confidence": 0.9}]}')
 
     monkeypatch.setattr(wf, "_call_llm", truncated_then_full)
-    kept = wf._filter_by_llm(papers)
+    wf._filter_by_llm(papers)
 
     assert calls["n"] == 2
     stages = {d.paper_id: d.stage for d in wf.included_decisions}

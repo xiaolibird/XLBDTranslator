@@ -4,6 +4,7 @@ Scholar Digest 工作流
 完整的论文摘要处理流程
 """
 import json
+import os
 import hashlib
 import re
 import threading
@@ -17,7 +18,6 @@ from .schema import (
     PaperSegmentList,
     EmailMetadata,
     DigestOutput,
-    DigestBatch,
     DigestStatus,
     FilterDecision,
 )
@@ -1699,6 +1699,12 @@ __PAPERS_JSON__
         stats = {
             'run_id': self.run_id,
             'timestamp': datetime.now().isoformat(),
+            # 周批健康检查必须能区分滚动近 N 天与历史 --month/--since 回填；
+            # 两者共用输出目录，仅凭 run_id 的启动日期会把历史回填误当本周批次。
+            'run_kind': 'date_range' if self.date_range else 'rolling',
+            'window_days': None if self.date_range else self.settings.processing.days_to_fetch,
+            'date_range': ([self.date_range[0].isoformat(), self.date_range[1].isoformat()]
+                           if self.date_range else None),
             'total_emails': len(self.processed_emails),
             'total_papers': len(self.segments),
             'processed_papers': sum(1 for s in self.segments if s.is_processed),
@@ -1714,8 +1720,12 @@ __PAPERS_JSON__
             'salvage_dropped_items': self._salvage_dropped,
             'excluded_file': str(excluded_path) if excluded_path else None,
         }
-        with open(stats_path, 'w', encoding='utf-8') as f:
+        # stats 是 sync_queue/周批哨兵的完成标记，必须最后原子出现；直接 open(...,'w')
+        # 会在进程死亡时留下一个“存在但为空”的假健康文件。
+        stats_tmp = stats_path.with_name(stats_path.name + '.tmp-{}'.format(os.getpid()))
+        with open(stats_tmp, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
+        os.replace(stats_tmp, stats_path)
         logger.info(f"  📊 统计: {stats_path}")
 
         return output
@@ -1972,7 +1982,7 @@ __PAPERS_JSON__
                 if success:
                     logger.info(f"  ✅ 已将 {len(all_ids)} 封处理过的邮件标记为已读")
                 else:
-                    logger.warning(f"  ⚠️ 标记已读失败")
+                    logger.warning("  ⚠️ 标记已读失败")
             else:
                 logger.info("  ℹ️ 没有需要标记的邮件")
     

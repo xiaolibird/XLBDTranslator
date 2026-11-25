@@ -10,7 +10,7 @@
 
 口径与失败语义见 src/scholar/auto_triage.py。覆盖某天的决定：
   python scripts/confirm_ingest.py --reopen YYYY-MM-DD   （已入库则拒绝），再手动走原弹窗。
-退出码：0 正常（含无待处理）/ 1 LLM 整体不可用（条目保持待确认）/ 2 参数或路径错误。
+退出码：0 正常（含无待处理）/ 1 LLM 整体不可用或周一批次缺失 / 2 参数或路径错误。
 """
 import argparse
 import sys
@@ -57,6 +57,7 @@ def main(argv=None, *, llm=None, notify=None, runner=None, today=None, now=None,
         from src.utils.osa_dialog import OsaDialogs
         notify = OsaDialogs().notify
 
+    health_alert = None
     only, since, until = None, today - timedelta(days=args.lookback_days), today
     if args.date:
         try:
@@ -66,10 +67,33 @@ def main(argv=None, *, llm=None, notify=None, runner=None, today=None, now=None,
             return 2
         only, since, until = {d.isoformat()}, d, d
 
+    rep = None
     if not args.dry_run:        # dry-run 不写队列文件
         rep = C.sync_queue(notes_dir, digest_dir, since, until, seen=CI._seen_keys(notes_dir), now=now)
         if rep.runs_new:
             logger.info("新入队 {} 个 digest run，共 {} 篇".format(rep.runs_new, rep.items_added))
+
+    # 健康判定放在 sync 之后：digest 恰好在 10:00 边界完成时，以同步后的最新状态为准，
+    # 不先发一条无法撤回的误报。sync 读取失败也不能再被“没有待确认条目”吞掉。
+    if not args.date and not args.dry_run:
+        health_alert = AT.weekly_digest_alert(digest_dir, now)
+        if rep and rep.runs_failed:
+            msg = "digest 批次同步失败（{}），请修复 JSON/排除清单后重跑。".format(
+                ", ".join(rep.runs_failed))
+            if health_alert:
+                health_alert = AT.DigestHealthAlert(
+                    health_alert.batch_date, health_alert.message + " " + msg)
+            else:
+                health_alert = AT.DigestHealthAlert("sync:" + ",".join(rep.runs_failed), msg)
+        if health_alert:
+            logger.error(health_alert.message)
+            print(health_alert.message, file=sys.stderr)
+            if not AT.digest_alert_already_sent(notes_dir, health_alert.batch_date):
+                notify("Scholar 周 digest 可能漏跑", health_alert.message)
+                try:
+                    AT.record_digest_alert(notes_dir, health_alert.batch_date, now)
+                except OSError as e:
+                    logger.warning("周批健康通知状态写回失败：{}".format(e))
 
     rows = C.pending_items(notes_dir, only)
     retry_dates = set(C.keep_run_dates_uningested(notes_dir))     # 此前已保留、入库没成功的
@@ -118,7 +142,7 @@ def main(argv=None, *, llm=None, notify=None, runner=None, today=None, now=None,
             notify(NOTIFY_TITLE, "{}（报告 {}）".format(AT.notify_text(tr), out.name))
         if tr.undecided and not (tr.keep or tr.drop_llm or tr.drop_dup):
             return 1                                              # LLM 整体不可用
-    return 0
+    return 1 if health_alert else 0
 
 
 if __name__ == "__main__":

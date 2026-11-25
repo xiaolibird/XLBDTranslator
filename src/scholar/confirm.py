@@ -32,7 +32,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -219,6 +219,7 @@ class SyncReport:
     runs_new: int = 0
     items_added: int = 0
     queue_files: List[str] = field(default_factory=list)
+    runs_failed: List[str] = field(default_factory=list)
 
 
 def sync_queue(notes_dir, digest_dir, since: Optional[date] = None, until: Optional[date] = None, *,
@@ -252,8 +253,9 @@ def sync_queue(notes_dir, digest_dir, since: Optional[date] = None, until: Optio
         sidecar = digest_dir / "_archive" / "excluded" / "{}_excluded.json".format(run_id)
         try:
             items, sampling = items_for_run(run_id, path, sidecar, skip)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
             logger.warning("  ⚠️ 读取 {} 失败，跳过本 run：{}".format(run_id, e))
+            rep.runs_failed.append(run_id)
             continue
         skip |= {i["dedup_key"] for i in items}
         qp = queue_path(notes_dir, d.isoformat())
