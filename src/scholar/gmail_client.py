@@ -6,8 +6,10 @@ Gmail API 客户端
 """
 import os
 import base64
-import json
-from pathlib import Path
+import fcntl
+import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from email.utils import parsedate_to_datetime
@@ -20,6 +22,7 @@ from googleapiclient.errors import HttpError
 
 from .schema import ScholarSettings, EmailMetadata
 from ..utils.logger import get_logger
+from ..utils.notify import notify
 
 logger = get_logger(__name__)
 
@@ -67,36 +70,104 @@ class GmailClient:
             logger.info("✅ Gmail API 服务已初始化")
         return self._service
     
+    @contextmanager
+    def _credentials_lock(self):
+        """串行化同一 token 的读取→刷新→写回，防止并发进程用旧凭据后写覆盖。"""
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.token_path.with_name(self.token_path.name + ".lock")
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.chmod(str(lock_path), 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _save_credentials(self, creds: Credentials, *, best_effort: bool = False) -> None:
+        """以 0600、唯一临时文件原子写回 token。
+
+        刷新后的凭据已经在内存里可用，因此写回失败不应让本次 digest 跟着失败；
+        但必须显式告警，否则下周还会再次依赖联网刷新，形成静默的单点故障。
+        """
+        tmp_name = None
+        try:
+            self.token_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=self.token_path.name + ".", suffix=".tmp", dir=str(self.token_path.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as token_file:
+                token_file.write(creds.to_json())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, self.token_path)
+            tmp_name = None
+            logger.info("💾 凭据已保存到 {}".format(self.token_path))
+        except Exception as e:
+            if not best_effort:
+                raise
+            logger.warning("凭据写回失败（本次继续使用内存中的有效凭据）: {}".format(e))
+            notify("Scholar Gmail 凭据", "刷新成功但 token 写回失败：{}；本次 digest 继续，下周前请检查 {}"
+                   .format(str(e)[:160], self.token_path))
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+    def _refresh_credentials(self, creds: Credentials) -> Optional[Credentials]:
+        """刷新 token。授权作废返回 None；瞬时故障耗尽则抛错，绝不误入重新授权。"""
+        last_error = None
+        terminal = False
+        for attempt in range(1, 4):
+            try:
+                # 每次新建 Request，避免上一次失败留下的连接状态被带进重试。
+                creds.refresh(Request())
+                logger.info("凭据已刷新（第 {} 次尝试）".format(attempt))
+                self._save_credentials(creds, best_effort=True)
+                return creds
+            except Exception as e:
+                last_error = e
+                detail = str(e)
+                # 这些是授权服务器对 refresh_token/client 的明确否定，重试只会推迟报错。
+                terminal = any(k in detail.lower() for k in (
+                    "invalid_grant", "invalid_client", "unauthorized_client"))
+                logger.warning("刷新凭据失败（第 {}/3 次）: {}".format(attempt, e))
+                if terminal or attempt == 3:
+                    break
+                time.sleep(2 ** (attempt - 1))       # 1s、2s
+        if terminal:
+            logger.warning("凭据授权已失效: {}".format(last_error))
+            return None
+        raise RuntimeError(
+            "Gmail 凭据刷新连续 3 次失败，最后错误：{}。请检查网络后重跑；"
+            "这只是刷新失败，不代表需要重新授权。".format(last_error)) from last_error
+
     def _authenticate(self) -> None:
-        """
-        执行 OAuth 2.0 认证流程
-        
-        首次运行时会打开浏览器进行授权，
-        之后会使用保存的 token 自动认证。
-        """
+        """在跨进程锁内完成读取、刷新和写回。"""
+        with self._credentials_lock():
+            self._authenticate_locked()
+
+    def _authenticate_locked(self) -> None:
+        """执行 OAuth 认证；调用方必须持有 _credentials_lock。"""
         creds = None
-        
+
         # 尝试加载已保存的 token
         if self.token_path.exists():
             try:
                 creds = Credentials.from_authorized_user_file(
-                    str(self.token_path), 
+                    str(self.token_path),
                     self.scopes
                 )
                 logger.info("从 {} 加载已有凭据".format(self.token_path))
             except Exception as e:
                 logger.warning("加载凭据失败: {}".format(e))
                 creds = None
-        
+
         # 检查凭据是否有效或需要刷新
         if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                logger.info("凭据已刷新")
-            except Exception as e:
-                logger.warning("刷新凭据失败: {}".format(e))
+            if self._refresh_credentials(creds) is None:
                 creds = None
-        
+
         # 如果没有有效凭据，执行授权流程
         if not creds or not creds.valid:
             if not self.credentials_path.exists():
@@ -104,7 +175,7 @@ class GmailClient:
                     "OAuth 凭据文件不存在: {}\n".format(self.credentials_path) +
                     "请从 Google Cloud Console 下载 OAuth 2.0 客户端凭据文件"
                 )
-            
+
             # run_local_server 要起本地回调服务器并打开浏览器授权，headless（launchd
             # 周批）下会挂起等待或以难解的方式失败。refresh_token 被吊销/过期正是走到
             # 这里的常见原因——非交互环境直接给出可操作的报错，而不是静默挂死。
@@ -121,13 +192,8 @@ class GmailClient:
             )
             creds = flow.run_local_server(port=0)
             logger.info("✅ 授权成功")
-            
-            # 保存凭据以供下次使用
-            self.token_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.token_path, 'w') as token_file:
-                token_file.write(creds.to_json())
-            logger.info(f"💾 凭据已保存到 {self.token_path}")
-        
+            self._save_credentials(creds)
+
         self._creds = creds
     
     def get_user_profile(self) -> Dict[str, Any]:

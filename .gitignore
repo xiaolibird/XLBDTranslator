@@ -45,6 +45,7 @@ config/config.env
 config/scholar.env
 config/credentials.json
 config/token*.json
+config/token*.json.lock
 
 # ---------- 运行产物 ----------
 output/
