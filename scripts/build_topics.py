@@ -284,6 +284,7 @@ def main() -> int:
                                   "本批没有新增 keeper 论文，概念页无需更新。")
             embed_client.close()      # 吹毛求疵：早退路径此前不在 try/finally 覆盖范围内
             return 0
+    hits = []                  # --weekly-digest 在 affected_keys 为空以外的路径上都已早退
     if affected_keys:
         # Y1：stale 集合先算——它只读页面 frontmatter 的 generated_at，不碰向量库，
         # 不该被下面的向量库陈旧判断连带挡住。W2（路由不可信要拒绝）与 W8（日历兜底
@@ -369,16 +370,18 @@ def main() -> int:
             return 0
         specs = [s for s in specs if s.slug in want_slugs]
 
-    weekly_before = {}
+    weekly_state = None
     weekly_hits = {slug: list(keys) for slug, keys in hits} if args.weekly_digest else {}
     if args.weekly_digest and not args.dry_run:
         try:
-            weekly_before = W.capture_before(topics_dir, specs)
+            # 只在本周第一次见到某页时记基线；同周后续运行继续与同一基线比较，
+            # 否则第二次入库会把第一次的变化挤出周报。
+            weekly_state = W.begin_week(topics_dir, specs)
         except Exception as exc:
-            # 没旧版快照就不能诚实地讲"增量"：关掉摘要，不影响概念页主任务。
+            # 没周基线就不能诚实地讲"累计增量"：关掉摘要，不影响概念页主任务。
             args.weekly_digest = False
-            print("⚠️ 无法保存概念页旧版快照，本轮不生成增量摘要：{}".format(exc), file=sys.stderr)
-            _weekly_notify("概念页仍会继续更新，但旧版快照读取失败，本周增量摘要暂停：{}".format(exc))
+            print("⚠️ 无法建立概念页周基线，本轮不生成增量摘要：{}".format(exc), file=sys.stderr)
+            _weekly_notify("概念页仍会继续更新，但周基线读写失败，本周增量摘要暂停：{}".format(exc))
 
     llm = None if args.dry_run else LLMClient(settings.llm)
     interests = get_default_research_interests()
@@ -437,7 +440,7 @@ def main() -> int:
         if args.weekly_digest and not args.dry_run:
             try:
                 weekly_out = W.generate_weekly_digest(
-                    llm, topics_dir, results, weekly_before, specs,
+                    llm, topics_dir, results, weekly_state, specs,
                     hit_map=weekly_hits, source_note=args.affected_by_note or "",
                     template=weekly_template, model=args.model)
                 print("🗞️ 每周人读增量：{}（{} 页实质变化{}）".format(
