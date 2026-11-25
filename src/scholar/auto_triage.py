@@ -126,7 +126,9 @@ def weekly_digest_alert(digest_dir, now: datetime) -> Optional[DigestHealthAlert
               if candidates else "该时段没有 digest run")
     return DigestHealthAlert(monday.isoformat(), (
         "{} 周一批次异常：{}；最近有 stats 的 run：{}。"
-        "请查 cron_digest.err.log 并手动补跑，不能按空队列处理。").format(
+        "请查 cron_digest.err.log 并手动补跑，不能按空队列处理"
+        "（若 digest 实际仍在运行——本周批次曾跑到 39 分钟——或已在手动补跑，"
+        "本提醒可忽略：通知只发一次，明日同一时间会自动复核）。").format(
             monday.isoformat(), detail, latest.isoformat() if latest else "无"))
 
 

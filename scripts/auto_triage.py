@@ -84,7 +84,8 @@ def main(argv=None, *, llm=None, notify=None, runner=None, today=None, now=None,
                 health_alert = AT.DigestHealthAlert(
                     health_alert.batch_date, health_alert.message + " " + msg)
             else:
-                health_alert = AT.DigestHealthAlert("sync:" + ",".join(rep.runs_failed), msg)
+                # 伪批次键排序后拼接：不同天失败集合顺序不同也能命中同一条去重记录。
+                health_alert = AT.DigestHealthAlert("sync:" + ",".join(sorted(rep.runs_failed)), msg)
         if health_alert:
             logger.error(health_alert.message)
             print(health_alert.message, file=sys.stderr)

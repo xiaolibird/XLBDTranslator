@@ -615,6 +615,29 @@ def deep_read_chunks(chunks: List[str], llm, model: Optional[str],
     return notes
 
 
+_SYNTH_OUTPUT_SPEC = """
+请汇总为如下分节的精读，句级组织。按**对后续工作流的用途**给句子打 tag：
+- "可引用证据"：含具体数字/效应量/可溯源结果，写作可直接取证
+- "可反驳观点"：作者的主张/立场/可质疑处，是写 critique 的靶子
+- "方法论借鉴"：方法/建模思路有方法学借鉴价值
+其余句子 tag 置 null（如纯背景/动机）。
+
+只输出 JSON（不要额外文字）：
+{{
+  "one_line": "一句话说清这篇对研究者的用处（≤30字）",
+  "sections": [
+    {{"heading": "研究问题", "sentences": [{{"text": "…", "tag": null}}]}},
+    {{"heading": "方法与数据", "sentences": [{{"text": "…", "tag": "方法论借鉴"}}]}},
+    {{"heading": "实验方法", "sentences": [{{"text": "…（数据集/划分/超参/评估协议/基线/代码可得性；原文未报告的写「原文未报告：X」）", "tag": "方法论借鉴"}}]}},
+    {{"heading": "结果与效应量", "sentences": [{{"text": "…（保留关键数值）", "tag": "可引用证据"}}]}},
+    {{"heading": "图表与补充材料要点", "sentences": [{{"text": "…", "tag": null}}]}},
+    {{"heading": "局限与可质疑点", "sentences": [{{"text": "…", "tag": "可反驳观点"}}]}},
+    {{"heading": "对我研究的联想", "sentences": [{{"text": "…", "tag": "方法论借鉴"}}]}},
+    {{"heading": "逐节通读要点", "sentences": [{{"text": "…", "tag": null}}]}}
+  ]
+}}"""
+
+
 _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结构化的深度精读，供研究者引用。
 
 研究者的研究主线（**仅用于写「对我研究的联想」一节**）：
@@ -640,32 +663,45 @@ _SYNTH_PROMPT = """你在把一篇论文的逐块通读笔记汇总成一份结�
 
 逐块笔记（JSON 数组）：
 {chunk_notes}
+""" + _SYNTH_OUTPUT_SPEC
 
-请汇总为如下分节的精读，句级组织。按**对后续工作流的用途**给句子打 tag：
-- "可引用证据"：含具体数字/效应量/可溯源结果，写作可直接取证
-- "可反驳观点"：作者的主张/立场/可质疑处，是写 critique 的靶子
-- "方法论借鉴"：方法/建模思路有方法学借鉴价值
-其余句子 tag 置 null（如纯背景/动机）。
 
-只输出 JSON（不要额外文字）：
-{{
-  "one_line": "一句话说清这篇对研究者的用处（≤30字）",
-  "sections": [
-    {{"heading": "研究问题", "sentences": [{{"text": "…", "tag": null}}]}},
-    {{"heading": "方法与数据", "sentences": [{{"text": "…", "tag": "方法论借鉴"}}]}},
-    {{"heading": "实验方法", "sentences": [{{"text": "…（数据集/划分/超参/评估协议/基线/代码可得性；原文未报告的写「原文未报告：X」）", "tag": "方法论借鉴"}}]}},
-    {{"heading": "结果与效应量", "sentences": [{{"text": "…（保留关键数值）", "tag": "可引用证据"}}]}},
-    {{"heading": "图表与补充材料要点", "sentences": [{{"text": "…", "tag": null}}]}},
-    {{"heading": "局限与可质疑点", "sentences": [{{"text": "…", "tag": "可反驳观点"}}]}},
-    {{"heading": "对我研究的联想", "sentences": [{{"text": "…", "tag": "方法论借鉴"}}]}},
-    {{"heading": "逐节通读要点", "sentences": [{{"text": "…", "tag": null}}]}}
-  ]
-}}"""
+# 分层汇总的 reduce 层专用模板：输入是各分块组已汇总出的分节精读（partials：
+# {"_source_chunks", "one_line", "sections"}），不是逐块笔记。沿用 chunks 模板会要求
+# 模型按「算例归属」处理一个已不存在算例结构的输入——数字归属约束失去基座，
+# 还会让模型误以为这是逐块笔记。两份模板的输出格式段共享 _SYNTH_OUTPUT_SPEC。
+_SYNTH_REDUCE_PROMPT = """你在把一篇论文的**多组分段汇总**合成一份结构化的深度精读，供研究者引用。
+输入不是逐块通读笔记，而是各分块组已经汇总出的分节精读（JSON 数组，每项含 one_line 与 sections）。
+
+研究者的研究主线（**仅用于写「对我研究的联想」一节**）：
+{research_interests}
+
+⚠️ 合成纪律（违反会让札记库长期失真，务必遵守）：
+1. 除「对我研究的联想」外，**其余各节只能复述输入各组确有的内容**，不得引入画像里的术语、
+   框架或方法构想。输入没出现的词（如 {contamination_examples}等）就不许出现在
+   研究问题/方法与数据/结果与效应量/图表要点/局限各节里。
+2. **不要把原文措辞升格**：输入写 "non-random"、"违反 MAR 假设"、"非完全随机缺失"，
+   就照原样写，不要替它归类成 MNAR 或别的理论框架。
+3. **不要把研究者的想法写成论文提出的东西**。「对我研究的联想」里的每一句都要能看出
+   是"我由此想到"，而不是"该文提出"。
+4. **数字与限定语原样保留**：各组结论里的具体数值、单位、条件限定（可能、单中心、
+   尚未外部验证、仅摘要层）不得改写、合并或四舍五入；**不得把 A 组的数字挂到 B 组的
+   结论上**，归属不明的参数句宁可略去。
+5. **组间冲突不裁决**：两组对同一事实的说法不一致时，把两种说法并列并说明各自来自
+   哪个组，不要自行取舍或平均。
+
+代码 / 数据可得性声明（由程序从全文**确定性抽取**的原句片段；非空时「实验方法」节的
+代码/数据可得性**必须以此为准**，不得写「原文未报告」）：
+{availability}
+
+各分组节精读（JSON 数组）：
+{chunk_notes}
+""" + _SYNTH_OUTPUT_SPEC
 
 
 def chunked_prompt_version(label: str) -> str:
-    """分块深读的 prompt 指纹：块通读 + 汇总两份模板一起取 md5（任一改动指纹即变）。"""
-    return prompt_fingerprint(label, _CHUNK_PROMPT, _SYNTH_PROMPT)
+    """分块深读的 prompt 指纹：块通读 + 汇总（chunks/reduce 两份模板）一起取 md5。"""
+    return prompt_fingerprint(label, _CHUNK_PROMPT, _SYNTH_PROMPT, _SYNTH_REDUCE_PROMPT)
 
 
 # 汇总步喂进 synth prompt 的块笔记总预算。与 settings.closeread_max_chars 零和耦合：
@@ -752,10 +788,12 @@ def _pack_chunk_notes(usable: List[Dict[str, Any]], budget: int = _SYNTH_NOTES_B
 
 
 def _synth_prompt(packed: str, research_interests: str,
-                  availability: Optional[List[str]]) -> str:
+                  availability: Optional[List[str]], *,
+                  reduce: bool = False) -> str:
     avail_txt = ("\n".join("- {}".format(a) for a in availability)
                  if availability else "（程序未抓到明确的可得性声明）")
-    return _SYNTH_PROMPT.format(
+    template = _SYNTH_REDUCE_PROMPT if reduce else _SYNTH_PROMPT
+    return template.format(
         research_interests=research_interests or "（未提供）",
         contamination_examples="、".join(get_contamination_example_terms()),
         availability=avail_txt,
@@ -765,13 +803,18 @@ def _synth_prompt(packed: str, research_interests: str,
 def _call_synthesis(packed: str, llm, model: Optional[str], research_interests: str,
                     availability: Optional[List[str]], budget_info: Optional[Dict[str, Any]],
                     *, stage: str = "汇总", trace: Optional[List[Dict[str, Any]]] = None,
-                    source_chunks: Optional[List[Any]] = None):
-    """执行一层汇总并解析。失败原因带层级，绝不在此处裁剪输入。"""
+                    source_chunks: Optional[List[Any]] = None,
+                    input_kind: str = "chunks"):
+    """执行一层汇总并解析。失败原因带层级，绝不在此处裁剪输入。
+
+    input_kind="partials" 时用 reduce 模板：该层输入是上一层的分组结果，不是逐块笔记。
+    """
     if budget_info and budget_info.get("hierarchical") is not None:
         budget_info["hierarchical"]["llm_calls"] += 1
     try:
         resp, meta = call_llm_with_meta(
-            llm, _synth_prompt(packed, research_interests, availability),
+            llm, _synth_prompt(packed, research_interests, availability,
+                                reduce=(input_kind == "partials")),
             model=model, max_tokens=8192, json_mode=True)
     except Exception as e:
         logger.warning("  ⚠️ {} LLM 调用失败: {}".format(stage, e))
@@ -825,17 +868,20 @@ def _partition_synth_notes(notes: List[Dict[str, Any]], budget: int
 def _synthesize_layered(notes: List[Dict[str, Any]], llm, model: Optional[str],
                         research_interests: str, availability: Optional[List[str]],
                         budget_info: Optional[Dict[str, Any]], trace: List[Dict[str, Any]],
-                        *, depth: int = 0):
+                        *, depth: int = 0, input_kind: str = "chunks"):
     """超预算时 map-reduce：每组先看全量原始笔记，再汇总各组结果。
 
     递归输入既可能是原始块笔记，也可能是上一层的 sections；两者都完整序列化，
     不调用 _pack_chunk_notes。这样「超预算」不再等价于「轮转删尾部条目」。
+    input_kind 跟随本层输入：chunks=原始块笔记（用逐块模板），partials=上层分组
+    结果（用 reduce 模板——输入已无算例结构，数字归属约束须落在「组」上）。
     """
     packed = json.dumps(notes, ensure_ascii=False)
     if len(packed) <= _SYNTH_NOTES_BUDGET:
         source_ids = [cid for note in notes for cid in _source_chunk_ids(note)]
         return _call_synthesis(packed, llm, model, research_interests, availability,
-                               budget_info, trace=trace, source_chunks=source_ids)
+                               budget_info, trace=trace, source_chunks=source_ids,
+                               input_kind=input_kind)
     if depth >= 3:
         if budget_info is not None:
             budget_info["synth_error"] = "分层汇总达到 3 层后仍超预算，已停止，未裁剪输入"
@@ -863,7 +909,8 @@ def _synthesize_layered(notes: List[Dict[str, Any]], llm, model: Optional[str],
         cr, one_line, _meta, api_err = _call_synthesis(
             group_packed, llm, model, research_interests, availability, budget_info,
             stage="分层汇总第 {} 层第 {} 组".format(depth + 1, i),
-            trace=trace, source_chunks=[cid for note in group for cid in _source_chunk_ids(note)])
+            trace=trace, source_chunks=[cid for note in group for cid in _source_chunk_ids(note)],
+            input_kind=input_kind)
         if cr is None:
             return None, "", None, api_err
         source_ids = [cid for note in group for cid in _source_chunk_ids(note)]
@@ -880,7 +927,7 @@ def _synthesize_layered(notes: List[Dict[str, Any]], llm, model: Optional[str],
                     depth + 1, len(packed), len(next_packed)))
         return None, "", None, False
     return _synthesize_layered(partials, llm, model, research_interests, availability,
-                               budget_info, trace, depth=depth + 1)
+                                budget_info, trace, depth=depth + 1, input_kind="partials")
 
 
 def synthesize_deep_read(chunk_notes: List[Dict[str, Any]], llm, model: Optional[str],

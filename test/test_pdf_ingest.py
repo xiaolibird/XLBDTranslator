@@ -751,6 +751,13 @@ def test_synthesize_over_budget_uses_hierarchical_groups_without_trimming():
     first_pass = "".join(llm.calls[:2])
     assert all('"_chunk": {}'.format(i) in first_pass for i in range(1, 11))
     assert '"_source_chunks"' in llm.calls[2]
+    # 两层各用对应模板：组内是逐块笔记（算例归属），reduce 是组级 sections
+    #（数字归属落在「组」上、组间冲突不裁决）——不得拿逐块模板喂 partials。
+    assert "逐块通读笔记" in first_pass and "所属算例" in first_pass
+    assert "多组分段汇总" in llm.calls[2] and "组间冲突不裁决" in llm.calls[2]
+    assert "所属算例" not in llm.calls[2]
+    # 两份模板共享同一份输出格式段，防止各改各的造成结构漂移。
+    assert "只输出 JSON（不要额外文字）" in llm.calls[0] and "只输出 JSON（不要额外文字）" in llm.calls[2]
 
 
 def test_synthesize_hierarchical_failure_does_not_fall_back_to_trimming(monkeypatch):

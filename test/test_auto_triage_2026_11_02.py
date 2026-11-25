@@ -226,6 +226,8 @@ def test_monday_missing_digest_alerts_and_exits_nonzero(tmp_path):
 
     assert rc == 1 and len(notified) == 1
     assert "漏跑" in notified[0][0] and "2026-11-09" in notified[0][1]
+    # digest 超 60 分钟仍在跑时这条提醒是误报：文案必须自带「可忽略+明日复核」的出口。
+    assert "仍在运行" in notified[0][1] and "自动复核" in notified[0][1]
 
 
 def test_monday_complete_digest_does_not_alert(tmp_path):
