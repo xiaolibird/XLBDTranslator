@@ -1,0 +1,15 @@
+# 由模型从库内已精读文献原句改写构造（2026-11-25），非人工金标准；用于验证 Phase 1 --role / --level highlight / --book 粒度感知重排效果。
+{"id":"ev-01","type":"paraphrase","level":"highlight","role":"citable","query":"ICU 生理监测传感器流和实验室检验中有多少比例存在缺失观测","gold":["wani2026Comprehensive"]}
+{"id":"ev-02","type":"paraphrase","level":"highlight","role":"citable","query":"低重建误差 RMSE 为什么不代表插补临床安全","gold":["wani2026Comprehensive"]}
+{"id":"ev-03","type":"paraphrase","level":"highlight","role":"citable","query":"推荐复诊间隔解释了幼年型皮肌炎多少评估时间变异","gold":["garrett2025Recommended"]}
+{"id":"ev-04","type":"paraphrase","level":"highlight","role":"citable","query":"极高 BMI 儿童长期追踪时 extended BMIz 与传统 CDC BMIz 的 ICC 对比","gold":["freedman2021Longitudinal"]}
+{"id":"ev-05","type":"paraphrase","level":"highlight","role":"refutable","query":"前瞻性获取无需做心电图儿童数据困难导致的选择偏倚局限","gold":["chen2024Congenital"]}
+{"id":"ev-06","type":"paraphrase","level":"highlight","role":"refutable","query":"LLM 把不同 RCT 拼成摘要与人类专家层次化综合证据的本质差异","gold":["li2025Benchmarking"]}
+{"id":"ev-07","type":"paraphrase","level":"highlight","role":"refutable","query":"SITAR 假设所有个体共享单一潜在生长曲线不适用不规则轨迹","gold":["shyr2026Ehrbased"]}
+{"id":"ev-08","type":"paraphrase","level":"highlight","role":"refutable","query":"两波固定 MRI 队列 33% 随访流失纯完整案例剔除未做覆盖校准","gold":["kafadar2026Perinatal"]}
+{"id":"ev-09","type":"paraphrase","level":"highlight","role":"method","query":"把变量观测指示符和距上次观测时间间隔作为一等输入特征防止混淆实测与插补","gold":["wani2026Comprehensive"]}
+{"id":"ev-10","type":"paraphrase","level":"highlight","role":"method","query":"窗内不倾斜而窗外按病情恶化增量做指数倾斜全局敏感性分析","gold":["garrett2025Recommended"]}
+{"id":"ev-11","type":"paraphrase","level":"auto","book":"guyatt2015users","query":"起点的预后均衡随机化隐蔽与全程维持的预后均衡盲法","gold":["walsh2015Therapy"]}
+{"id":"ev-12","type":"paraphrase","level":"auto","book":"guyatt2015users","query":"为什么随机对照试验 RCT 不足以回答药物危害与不良反应问题","gold":["levine2015Harm"]}
+{"id":"ev-13","type":"paraphrase","level":"auto","book":"guyatt2015users","query":"预后估计需要分入预后同质组并评估随访完整性和结局客观性","gold":["randolph2015Prognosis"]}
+{"id":"ev-14","type":"paraphrase","level":"auto","book":"guyatt2015users","query":"把偏倚风险 risk of bias 和估计可信度 confidence in estimates 区分开","gold":["murad2015Understanding"]}

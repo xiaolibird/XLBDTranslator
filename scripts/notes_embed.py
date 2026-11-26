@@ -115,6 +115,7 @@ def main() -> int:
     ap.add_argument("--full", action="store_true", help="全量重建（忽略库内已有内容）")
     ap.add_argument("--dry-run", action="store_true", help="只打印同步计划，不连 Ollama、不动库")
     ap.add_argument("--stats", action="store_true", help="只读库报告统计，不连 Ollama")
+    ap.add_argument("--synthesis", action="store_true", help="同步二阶合成小向量库（topics/ 与 topics/qa/）")
     args = ap.parse_args()
 
     cfg = repo_path(args.config)
@@ -128,6 +129,24 @@ def main() -> int:
 
     if args.stats:
         return _print_stats(db_path, index_path)
+
+    if args.synthesis:
+        from src.scholar.synthesis_store import sync_synthesis_store
+        client = EmbeddingClient(
+            base_url=resolve_embedding_base_url(settings.llm),
+            model=settings.llm.embedding_model,
+        )
+        try:
+            client.probe()
+            res = sync_synthesis_store(notes_dir, client, full=args.full)
+        except EmbeddingError as e:
+            print("❌ Ollama embedding 不可用：{}".format(e), file=sys.stderr)
+            return 3
+        finally:
+            client.close()
+        print("✅ 二阶合成向量库同步完成：{} 页（新嵌 {}，删除 {}）".format(
+            res["total"], res["embedded"], res["deleted"]))
+        return 0
 
     index = _load_index(index_path)
     if index is None:

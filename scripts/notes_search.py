@@ -53,11 +53,15 @@ import numpy as np  # noqa: E402
 
 from src.scholar.paths import repo_path                                   # noqa: E402
 from src.scholar.settings import load_scholar_settings                    # noqa: E402
-from src.scholar.thresholds import NOTES_SEARCH_MIN_SCORE                 # noqa: E402
+from src.scholar.thresholds import NOTES_SEARCH_MIN_SCORE, TOPICS_MIN_SIM  # noqa: E402
 from src.scholar.embeddings import (                                      # noqa: E402
     EmbeddingClient, EmbeddingError, resolve_embedding_base_url,
 )
-from src.scholar.embed_store import DB_NAME, INDEX_NAME, VectorStore, VectorStoreError, model_matches  # noqa: E402
+from src.scholar.embed_store import (                                      # noqa: E402
+    DB_NAME, INDEX_NAME, VectorStore, VectorStoreError, model_matches, read_index_generated_at,
+)
+from src.scholar.bm25_index import BM25_CACHE_NAME, BM25Index, bm25_tokenize  # noqa: E402
+from src.scholar.synthesis_store import SYNTHESIS_DB_NAME, SynthesisStore  # noqa: E402
 from src.scholar.vault import tokenize                                    # noqa: E402
 from src.scholar import reranker                                          # noqa: E402
 
@@ -73,42 +77,6 @@ TOP_K_PER_LEVEL = 200  # RRF 只融合列表内名次；截断越小越易漏掉
 RERANK_CAP = 100       # 展示集超过它时只重排前 100 条（--limit 0 或大 limit 都会触发，其余保持原序拼在后面）；每对 ~30ms，100 条 ~3s 是上限
 
 
-_TWO_LETTER = re.compile(r"(?<![A-Za-z])([A-Za-z]{2})(?![A-Za-z])")
-
-
-def bm25_tokenize(text: str) -> List[str]:
-    """BM25 专用分词 = vault.tokenize + 补回所有独立的两字母词（小写归一）。
-
-    vault.tokenize 的英文正则是 `[a-z]{3,}`，恰好两字母的 EM/MI/IV/RR 被整个丢掉，
-    而它们正是本库里 IDF 最高、BM25 本该最出力的术语（真库：含独立 EM/MI/IV 的
-    chunk 各 47/113/538 条）。丢掉的后果不是少一个词——`EM algorithm` 退化成只查
-    `algorithm`，BM25 top10 全成了算法选择类文献，与 dense 侧 top5 零交集，再经
-    RRF 把这批泛词命中送进 hybrid 默认结果（实测 2026-08-23，见
-    docs/decisions/oss_alignment_audit_2026-08.md ⚠️-2）。
-
-    **不论大小写全收，让 IDF 去决定权重**——这条是 R1 复审改过来的，初版只补大写
-    (`[A-Z]{2}`)，两个方向都被实测打脸（同日，见该报告 R1-C/R1-D）：
-      - 小写查询整条失效：`em algorithm` 的 hybrid top5 原封不动还是修复前的病态
-        结果（Algorithm Selection 那批泛词命中），修复只对按了 shift 的用户生效；
-      - 更隐蔽的是 df 畸变。`of` 只在全大写标题里才被收，df 被压到 12 → IDF 7.50
-        比 `em` 的 6.16 还高，摇身变成假阳性源：`MODELS OF CARE` 比 `models of
-        care` 凭空多召回一篇靠 `of` 命中的无关文献。
-    全收后 IDF 自动归位：`of` 7.50→2.02、`on` 9.62→2.77 被压平，而真缩写几乎不动
-    （`em` 6.16→6.12、`iv` 3.74→3.73），doc_len 仅 +3.3%（60.7→62.7）。硬删虚词
-    反而要维护一张黑名单，而真库里 OR/US/AS/AT/IS/IF/AN 恰恰都是真缩写
-    （odds ratio、adversarial training、homomorphic encryption…），删了就是丢信号。
-
-    仍只补**恰好两个**字母：单字母噪音太大；三字母及以上（EHR/MNAR）本就被
-    `[a-z]{3,}` 收着，再补一份等于给它们双倍词频。小写后不与任何既有 token 撞车
-    ——`[a-z]{3,}` 产不出两字母词，中文 2-gram 只产汉字对，_STOP 里也没有两字母词。
-
-    刻意不改 vault.tokenize 本体：那里还供着近邻图与 qa 词面查重，动它等于同时改掉
-    两处已标定的相似度分布。文档侧与查询侧必须共用本函数，否则 query 有 `em` 而
-    文档没有，等于白补。
-    """
-    return tokenize(text) + [m.lower() for m in _TWO_LETTER.findall(text)]
-
-
 def _split_paper_text(text: str):
     """paper 级 (p:) chunk 文本恒为两段：title\\none_line（one_line 空则仅 title）。
     回填摘要在独立的 ab: chunk 里（embed_store.chunks_from_index 一篇双向量方案），
@@ -120,10 +88,11 @@ def _split_paper_text(text: str):
 
 
 def _build_mask(store: VectorStore, args) -> np.ndarray:
-    """元数据布尔掩码：role/tier/month(前缀)/series/full-text-only/book。
-    role 只对 highlight 级 chunk 有意义——paper 级 chunk 的 role 恒为 None，
-    传了 --role 时它们自然被滤掉，不需要单独分支。"""
+    """元数据布尔掩码：role/tier/month(前缀)/series/full-text-only/book。"""
     n = len(store.records)
+    book = getattr(args, "book", None)
+    if not (args.role or args.tier or args.month or args.series or args.full_text_only or book):
+        return np.ones(n, dtype=bool)
     mask = np.ones(n, dtype=bool)
     for i, r in enumerate(store.records):
         if args.role and r.get("role") != args.role:
@@ -141,23 +110,38 @@ def _build_mask(store: VectorStore, args) -> np.ndarray:
         if args.full_text_only and not r.get("has_full_text"):
             mask[i] = False
             continue
-        if getattr(args, "book", None):
-            # 专著：citekey 本身即书键；编著：各章的 book_key 指向所属书。两者都收，
-            # 否则「--book guyatt2015users」查不到那本书的任何一章（章的 citekey 是章键）。
-            if args.book not in (r.get("book_key"), r.get("citekey")):
-                mask[i] = False
-                continue
+        if book and book not in (r.get("book_key"), r.get("citekey")):
+            mask[i] = False
+            continue
     return mask
 
 
-def _bm25_search(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
-                  top_k: int = TOP_K_PER_LEVEL, k1: float = BM25_K1, b: float = BM25_B
-                  ) -> List[Tuple[int, float]]:
-    """纯 Python BM25，仅在掩码后的候选集上建倒排（10k 文档量级，无需缓存）。
+_BM25_CACHE: Dict[int, Optional[BM25Index]] = {}
 
-    只统计 query 词在候选文档里的词频（tf_per_doc 只存 query 词），不是全量倒排——
-    候选集与 query 词表都小，没必要为一次性检索建完整倒排索引。
-    """
+
+def _get_bm25_index(store: VectorStore, db_path: Optional[Path] = None) -> Optional[BM25Index]:
+    key = id(store)
+    if key in _BM25_CACHE:
+        return _BM25_CACHE[key]
+    cv = (store.meta.get("content_version") or "").strip() if hasattr(store, "meta") else ""
+    if not cv:
+        _BM25_CACHE[key] = None
+        return None
+    cache_path = (db_path.parent / BM25_CACHE_NAME) if db_path else None
+    n = len(store.records)
+    idx = BM25Index.try_load(cache_path, cv, n) if cache_path else None
+    if idx is None:
+        idx = BM25Index.build([r.get("text") or "" for r in store.records], content_version=cv)
+        if cache_path is not None:
+            idx.save(cache_path)
+    _BM25_CACHE[key] = idx
+    return idx
+
+
+def _bm25_search_slow(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
+                      top_k: int = TOP_K_PER_LEVEL, k1: float = BM25_K1, b: float = BM25_B
+                      ) -> List[Tuple[int, float]]:
+    """纯 Python BM25（无缓存或测试打桩时的兜底慢路径）。"""
     if not mask.any() or not query_tokens:
         return []
     idxs = np.nonzero(mask)[0]
@@ -200,6 +184,14 @@ def _bm25_search(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
     return result
 
 
+def _bm25_search(store: VectorStore, mask: np.ndarray, query_tokens: List[str],
+                 top_k: int = TOP_K_PER_LEVEL, k1: float = BM25_K1, b: float = BM25_B,
+                 bm25_idx: Optional[BM25Index] = None) -> List[Tuple[int, float]]:
+    if bm25_idx is not None:
+        return bm25_idx.search(mask, query_tokens, top_k=top_k, k1=k1, b=b)
+    return _bm25_search_slow(store, mask, query_tokens, top_k=top_k, k1=k1, b=b)
+
+
 def _gate_sparse(hits: List[Tuple[int, float]], all_cos: Optional[np.ndarray],
                  min_score: float) -> List[Tuple[int, float]]:
     """BM25 单路命中同受 --min-score 约束（hybrid 专用）。
@@ -221,7 +213,8 @@ def _gate_sparse(hits: List[Tuple[int, float]], all_cos: Optional[np.ndarray],
 def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
                  query_vec: Optional[np.ndarray], query_tokens: List[str],
                  min_score: float, top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K,
-                 all_cos: Optional[np.ndarray] = None
+                 all_cos: Optional[np.ndarray] = None,
+                 bm25_idx: Optional[BM25Index] = None
                  ) -> List[Tuple[int, float, str, float]]:
     """按 mode 检索一个 level（paper 或 highlight），返回 (idx, score, kind, sort_score)。
 
@@ -240,7 +233,7 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
         return [(idx, s, "cosine", s) for idx, s in hits if s >= min_score]
 
     if mode == "sparse":
-        hits = _bm25_search(store, mask, query_tokens, top_k=top_k)
+        hits = _bm25_search(store, mask, query_tokens, top_k=top_k, bm25_idx=bm25_idx)
         return [(idx, s, "bm25", s) for idx, s in hits]
 
     # hybrid
@@ -248,7 +241,7 @@ def _level_hits(store: VectorStore, mask: np.ndarray, mode: str,
     if mask.any():
         dense_hits = [(idx, s) for idx, s in store.search(query_vec, mask=mask, top_k=top_k)
                       if s >= min_score]
-    sparse_hits = _gate_sparse(_bm25_search(store, mask, query_tokens, top_k=top_k),
+    sparse_hits = _gate_sparse(_bm25_search(store, mask, query_tokens, top_k=top_k, bm25_idx=bm25_idx),
                                all_cos, min_score)
     dense_rank = {idx: r for r, (idx, _s) in enumerate(dense_hits, start=1)}
     sparse_rank = {idx: r for r, (idx, _s) in enumerate(sparse_hits, start=1)}
@@ -273,7 +266,8 @@ def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.nd
                      mode: str, query_vec, query_tokens: List[str], min_score: float,
                      top_k: int = TOP_K_PER_LEVEL, rrf_k: int = RRF_K,
                      lanes: str = "both",
-                     all_cos: Optional[np.ndarray] = None
+                     all_cos: Optional[np.ndarray] = None,
+                     bm25_idx: Optional[BM25Index] = None
                      ) -> List[Tuple[int, float, str, float]]:
     """paper 侧检索：瘦 chunk（p:）与厚 chunk（ab:）dense 各一路 + BM25（合并掩码）一路。
     hybrid 下三路按 rank RRF 融合。返回形状与 _level_hits 一致：(idx, score, kind, sort_score)。
@@ -295,7 +289,7 @@ def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.nd
     merged_mask = thin_mask | thick_mask
 
     if mode == "sparse":
-        hits = _bm25_search(store, merged_mask, query_tokens, top_k=top_k)
+        hits = _bm25_search(store, merged_mask, query_tokens, top_k=top_k, bm25_idx=bm25_idx)
         return [(idx, s, "bm25", s) for idx, s in hits]
 
     dense_lists = []
@@ -319,7 +313,7 @@ def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.nd
         return out
 
     # hybrid：瘦 dense + 厚 dense + BM25 三路 RRF
-    sparse_hits = _gate_sparse(_bm25_search(store, merged_mask, query_tokens, top_k=top_k),
+    sparse_hits = _gate_sparse(_bm25_search(store, merged_mask, query_tokens, top_k=top_k, bm25_idx=bm25_idx),
                                all_cos, min_score)
     lists = dense_lists + [sparse_hits]
     rank_maps = [{idx: r for r, (idx, _s) in enumerate(lst, start=1)} for lst in lists]
@@ -337,6 +331,29 @@ def _paper_side_hits(store: VectorStore, base_mask: np.ndarray, level_arr: np.nd
     return out
 
 
+def _rerank_doc(row: dict, args, abstract_texts: Dict[str, str],
+                paper_meta: Dict[str, dict]) -> str:
+    """粒度感知重排文档构造：
+    - 默认（--level auto 且无 --role/--book）的论文级/混合检索保持喂 ab:/p:，
+      严格保护 87-case 存量标定；
+    - 显式 --level highlight / --role / --book，或无摘要的书籍命中时，改喂
+      title + top-2 命中句，让交叉编码器直接对句级/书章证据打分。
+    """
+    ck = row["citekey"]
+    meta_rec = paper_meta[ck]
+    evidence_mode = bool(
+        getattr(args, "level", "auto") == "highlight"
+        or getattr(args, "role", None)
+        or getattr(args, "book", None)
+    )
+    if (evidence_mode or (ck not in abstract_texts and meta_rec.get("series") == "book")) and row["hits"]:
+        title, _ = _split_paper_text(meta_rec["text"])
+        sents = [r["text"] for _s, _k, _ss, r in row["hits"][:2] if r.get("text")]
+        if sents:
+            return (title + "\n" + "\n".join(sents)) if title else "\n".join(sents)
+    return abstract_texts.get(ck) or meta_rec["text"]
+
+
 def _load_store(db_path: Path, expected_model: str):
     """load 校验：库缺失/损坏 -> (None, 提示)；model 与配置不一致 -> (None, 提示)。"""
     try:
@@ -352,20 +369,179 @@ def _load_store(db_path: Path, expected_model: str):
 
 
 def _freshness_hint(store: VectorStore, notes_dir: Path):
-    """best-effort：新鲜度告警不该因索引读取失败而炸检索本身。"""
+    """best-effort：仅读索引文件头 8KB，避免整份解析 27MB JSON。"""
     try:
         index_path = notes_dir / INDEX_NAME
         if not index_path.exists():
             return None
-        data = json.loads(index_path.read_text(encoding="utf-8"))
-        return store.freshness_warning(data.get("generated_at"))
+        return store.freshness_warning(read_index_generated_at(index_path))
     except Exception:
         return None
 
 
+def _load_batch_queries(path: Path) -> List[str]:
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        arr = json.loads(raw)
+        if not isinstance(arr, list):
+            raise ValueError("--batch-queries JSON 文件必须是字符串数组")
+        return [str(x).strip() for x in arr if str(x).strip()]
+    return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _execute_single_query(
+    query: str,
+    store: VectorStore,
+    args,
+    db_path: Path,
+    query_vec: Optional[np.ndarray],
+    base_mask: np.ndarray,
+    level_arr: np.ndarray,
+    bm25_idx: Optional[BM25Index],
+    highlight_citekeys: set,
+    paper_meta: Dict[str, dict],
+    abstract_texts: Dict[str, str],
+    syn_store: Optional[SynthesisStore],
+):
+    query_tokens = bm25_tokenize(query) if args.mode in ("sparse", "hybrid") else []
+    no_query_tokens = args.mode in ("sparse", "hybrid") and not query_tokens
+
+    all_cos = (store.mat @ query_vec.astype(np.float32)) if (
+        args.mode == "hybrid" and query_vec is not None) else None
+    search_paper = args.level in ("auto", "paper")
+    search_highlight = args.level in ("auto", "highlight")
+
+    paper_hits: List[Tuple[int, float, str, float]] = []
+    if search_paper:
+        paper_hits = _paper_side_hits(store, base_mask, level_arr, args.mode,
+                                       query_vec, query_tokens, args.min_score,
+                                       lanes=args.paper_lanes, all_cos=all_cos,
+                                       bm25_idx=bm25_idx)
+    highlight_hits: List[Tuple[int, float, str, float]] = []
+    if search_highlight:
+        highlight_mask = base_mask & (level_arr == "highlight")
+        highlight_hits = _level_hits(store, highlight_mask, args.mode, query_vec, query_tokens,
+                                      args.min_score, all_cos=all_cos, bm25_idx=bm25_idx)
+
+    groups = defaultdict(lambda: {"paper": None, "paper_src": None,
+                                  "paper_cos": None, "hits": []})
+    for idx, score, kind, sort_score in paper_hits:
+        r = store.records[idx]
+        g = groups[r["citekey"]]
+        if g["paper"] is None or sort_score > g["paper"][2]:
+            g["paper"] = (score, kind, sort_score)
+            g["paper_src"] = r["level"]
+        if kind == "cosine" and (g["paper_cos"] is None or score > g["paper_cos"][0]):
+            g["paper_cos"] = (score, r["level"])
+    for idx, score, kind, sort_score in highlight_hits:
+        r = store.records[idx]
+        groups[r["citekey"]]["hits"].append((score, kind, sort_score, r))
+
+    rows = []
+    for ck, g in groups.items():
+        meta = paper_meta.get(ck)
+        if meta is None:
+            continue
+        candidates = ([g["paper"]] if g["paper"] else []) + [
+            (s, k, ss) for s, k, ss, _r in g["hits"]]
+        best_sort = max(t[2] for t in candidates)
+        cosine_cands = ([(g["paper_cos"][0], "paper")] if g["paper_cos"] else []) + \
+                       [(s, "highlight") for s, k, _ss, _r in g["hits"] if k == "cosine"]
+        if cosine_cands:
+            best_score, score_from = max(cosine_cands, key=lambda t: t[0])
+            best_kind = "cosine"
+        else:
+            _b = max(candidates, key=lambda t: t[2])
+            best_score, best_kind = _b[0], _b[1]
+            score_from = "paper" if (g["paper"] and _b is g["paper"]) else "highlight"
+        title, one_line = _split_paper_text(meta["text"])
+        match_level = "highlight" if g["hits"] else "paper"
+        paper_src = (g["paper_cos"][1] if g["paper_cos"] else g.get("paper_src")) or "paper"
+        no_evidence = not g["hits"] and ck not in highlight_citekeys
+        g["hits"].sort(key=lambda t: -t[2])
+        rows.append({
+            "citekey": ck, "score": best_score, "score_kind": best_kind, "_sort": best_sort,
+            "score_from": score_from,
+            "match_level": match_level, "paper_src": paper_src,
+            "year": meta.get("year"), "title": title, "one_line": one_line,
+            "tier": meta.get("tier"), "note_file": meta.get("note_file"),
+            "note_line": meta.get("note_line"), "hits": g["hits"],
+            "no_sentence_evidence": no_evidence,
+        })
+
+    rows.sort(key=lambda row: (-row["_sort"], TIER_ORDER.get(row["tier"], 3), row["citekey"]))
+    shown = rows if args.limit == 0 else rows[:args.limit]
+    truncated = len(rows) - len(shown)
+
+    rerank_on = args.rerank if args.rerank is not None else (args.mode == "hybrid")
+    reranked = False
+    if rerank_on and len(shown) >= 2:
+        head = shown[:RERANK_CAP]
+        docs = [_rerank_doc(row, args, abstract_texts, paper_meta) for row in head]
+        scores = None
+        try:
+            scores = reranker.rerank_scores(query, docs)
+        except reranker.RerankUnavailable as e:
+            print("⚠️ reranker 不可用（{}），按原排序输出；--no-rerank 可关掉本提示"
+                  .format(e), file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            print("⚠️ reranker 打分异常（见上方 traceback），按原排序输出", file=sys.stderr)
+        if scores is not None and not all(math.isfinite(s) for s in scores):
+            print("⚠️ reranker 产出非有限分数（NaN/inf，疑似数值故障），按原排序输出",
+                  file=sys.stderr)
+            scores = None
+        if scores is not None:
+            for row, s in zip(head, scores):
+                row["rerank_score"] = s
+            head.sort(key=lambda row: -row["rerank_score"])
+            shown = head + shown[RERANK_CAP:]
+            reranked = True
+            if len(shown) > RERANK_CAP:
+                print("⚠️ 展示超过 {} 条，仅前 {} 条参与重排（其余保持原序拼在后面）"
+                      .format(RERANK_CAP, RERANK_CAP), file=sys.stderr)
+
+    related_syntheses = (
+        syn_store.search(query_vec, min_sim=TOPICS_MIN_SIM, top_k=2)
+        if (syn_store is not None and query_vec is not None) else []
+    )
+
+    payload = {
+        "total": len(rows), "shown": len(shown), "truncated": truncated,
+        "query": query, "mode": args.mode,
+        "reranked": reranked,
+        "related_syntheses": related_syntheses,
+        "results": [{
+            "citekey": row["citekey"], "score": round(row["score"], 4),
+            "score_kind": row["score_kind"],
+            **({"rerank_score": round(row["rerank_score"], 4)}
+               if "rerank_score" in row else {}),
+            "score_from": row["score_from"],
+            "match_level": row["match_level"],
+            "match_source": ("highlight" if row["hits"]
+                             else ("abstract" if row["paper_src"] == "abstract" else "title")),
+            "no_sentence_evidence": row["no_sentence_evidence"],
+            "year": row["year"],
+            "title": row["title"], "one_line": row["one_line"],
+            "hits": [dict({"text": r["text"], "role": r["role"], "section": r["section"],
+                           "score": round(s, 4), "score_kind": k},
+                          **{k2: r[k2] for k2 in ("chapter", "pages", "book_key")
+                             if r.get(k2)})
+                     for s, k, _ss, r in row["hits"]],
+            "note_file": row["note_file"], "note_line": row["note_line"],
+        } for row in shown],
+    }
+    return payload, shown, rows, truncated, reranked, no_query_tokens, related_syntheses
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="札记库语义检索（hybrid，phase 2）")
-    ap.add_argument("query", nargs="+", help="查询词/短语（拼成一个语义 query，非逐词 AND）")
+    ap.add_argument("query", nargs="*", help="查询词/短语（拼成一个语义 query，非逐词 AND）")
+    ap.add_argument("--batch-queries", default=None, metavar="FILE",
+                    help="批量查询文件（每行一条或 JSON 字符串数组），一次载入模型输出 JSONL")
     ap.add_argument("--role", choices=["citable", "refutable", "method"],
                     help="只看该角色的句子：citable=可引证据 refutable=可反驳 method=方法借鉴")
     ap.add_argument("--tier", choices=["high", "mid", "low"], help="优先级层过滤")
@@ -416,12 +592,21 @@ def main() -> int:
         ap.error("--level paper 与 --role 互斥：paper 级 chunk 无 role，该组合必然 0 命中"
                  "（--role 请配 --level auto 或 highlight）")
 
-    query = " ".join(q.strip() for q in args.query if q and q.strip())
-    if not query:
-        ap.error("查询词为空")
+    if args.batch_queries:
+        batch_path = Path(args.batch_queries)
+        if not batch_path.exists():
+            ap.error("--batch-queries 文件不存在：{}".format(batch_path))
+        queries = _load_batch_queries(batch_path)
+        if not queries:
+            ap.error("--batch-queries 文件为空")
+    else:
+        single_q = " ".join(q.strip() for q in args.query if q and q.strip())
+        if not single_q:
+            ap.error("查询词为空（请传入 query 或 --batch-queries）")
+        queries = [single_q]
 
-    settings = load_scholar_settings(args.config, patch_gemini=False)  # 本脚本不碰 LLM provider
-    notes_dir = settings.processing.notes_dir  # loader 已锚定仓库根
+    settings = load_scholar_settings(args.config, patch_gemini=False)
+    notes_dir = settings.processing.notes_dir
     db_path = notes_dir / DB_NAME
 
     store, err = _load_store(db_path, settings.llm.embedding_model)
@@ -433,18 +618,15 @@ def main() -> int:
     if hint:
         print(hint, file=sys.stderr)
 
-    query_tokens = bm25_tokenize(query) if args.mode in ("sparse", "hybrid") else []
-    # 查询无法分词（单字中文/纯数字/纯符号/全停用词）时，sparse 必然 0 命中——给针对性提示
-    no_query_tokens = args.mode in ("sparse", "hybrid") and not query_tokens
-
-    query_vec = None
+    query_vecs: List[Optional[np.ndarray]] = [None] * len(queries)
     if args.mode in ("dense", "hybrid"):
         client = EmbeddingClient(
             base_url=resolve_embedding_base_url(settings.llm),
             model=settings.llm.embedding_model,
         )
         try:
-            query_vec = client.embed([query])[0]
+            vecs = client.embed(queries)
+            query_vecs = [vecs[i] for i in range(len(queries))]
         except EmbeddingError as e:
             print("❌ query 嵌入失败：{}".format(e), file=sys.stderr)
             return 3
@@ -452,192 +634,39 @@ def main() -> int:
             client.close()
 
     base_mask = _build_mask(store, args)
-    # hybrid 下 BM25 单路命中要能回查自己的余弦才能受 --min-score 约束（见 _gate_sparse）。
-    # 只在 hybrid 算：dense 分支本来就拿得到余弦，sparse 分支压根没有 query 向量。
-    # 成本可忽略——store.search 内部无视 mask 做的就是同一个整矩阵乘法，--level auto 下
-    # 已经做了 3 次，这里是第 4 次（真库 22592×1024 实测 ~1ms，同 query 的 BM25 是 40-185ms）。
-    all_cos = (store.mat @ query_vec.astype(np.float32)) if (
-        args.mode == "hybrid" and query_vec is not None) else None
     level_arr = np.array([r["level"] for r in store.records])
-    search_paper = args.level in ("auto", "paper")
-    search_highlight = args.level in ("auto", "highlight")
-
-    paper_hits: List[Tuple[int, float, str, float]] = []
-    if search_paper:
-        # paper 侧 = 瘦 chunk（p:，title+判词）与厚 chunk（ab:，title+判词+摘要）两路。
-        # 两路余弦分布不可同台比较（短中文文本 vs 长混合文本；2026-08-21 实测中文 query
-        # 下瘦 chunk 系统性占前排、把厚 chunk 的真命中挤出 top-5），所以各自独立排名后
-        # 按 rank 做 RRF 融合，BM25 在合并掩码上单独一路。展示层仍按 citekey 取
-        # paper 级的 title/one_line，摘要不刷屏。
-        paper_hits = _paper_side_hits(store, base_mask, level_arr, args.mode,
-                                       query_vec, query_tokens, args.min_score,
-                                       lanes=args.paper_lanes, all_cos=all_cos)
-    highlight_hits: List[Tuple[int, float, str, float]] = []
-    if search_highlight:
-        highlight_mask = base_mask & (level_arr == "highlight")
-        highlight_hits = _level_hits(store, highlight_mask, args.mode, query_vec, query_tokens,
-                                      args.min_score, all_cos=all_cos)
-
-    # 全库真相：这个 citekey 是否本就有句级证据（与本次查询命中与否无关）
+    bm25_idx = _get_bm25_index(store, db_path) if args.mode in ("sparse", "hybrid") else None
     highlight_citekeys = {r["citekey"] for r in store.records if r["level"] == "highlight"}
     paper_meta = {r["citekey"]: r for r in store.records if r["level"] == "paper"}
+    abstract_texts = {r["citekey"]: r["text"] for r in store.records if r["level"] == "abstract"}
+    syn_store = SynthesisStore.load(notes_dir / SYNTHESIS_DB_NAME)
 
-    # 每条 hit 是 (idx, score, kind, sort_score)：score/kind 是展示值（dense 命中给
-    # 余弦、纯关键词命中给 RRF/BM25 分并标 kind!=cosine）；sort_score 是排序值（hybrid
-    # 下统一用 RRF 分，跟展示值分离——RRF 才是两路真正可比的量纲）
-    # paper     ：排序代表（sort_score 最大者，hybrid 下即 RRF）
-    # paper_cos ：展示代表（paper 侧全部 chunk 的最高余弦 + 它来自哪条泳道）
-    # 两者必须分开存：hybrid 下 RRF 最高的那条未必余弦最高，只留一条会把更高的兄弟
-    # chunk 当场丢掉，下游 cosine_cands 的 max 再也捞不回来——实测 1898/28076 个
-    # (query,citekey) 对被低报、最大低报 0.080，其中 72 例展示 <0.62 而真实 ≥0.62，
-    # 正好落在 skill 判重线两侧；并列时 paper_src 还会由 set 迭代序而非分数决定
-    # （45 个实例分布在 33/75 条 bench query 上）。
-    groups = defaultdict(lambda: {"paper": None, "paper_src": None,
-                                  "paper_cos": None, "hits": []})
-    for idx, score, kind, sort_score in paper_hits:
-        r = store.records[idx]
-        g = groups[r["citekey"]]
-        if g["paper"] is None or sort_score > g["paper"][2]:
-            g["paper"] = (score, kind, sort_score)
-            g["paper_src"] = r["level"]          # "paper"（标题+判词）或 "abstract"（回填摘要）
-        if kind == "cosine" and (g["paper_cos"] is None or score > g["paper_cos"][0]):
-            g["paper_cos"] = (score, r["level"])
-    for idx, score, kind, sort_score in highlight_hits:
-        r = store.records[idx]
-        groups[r["citekey"]]["hits"].append((score, kind, sort_score, r))
+    if args.batch_queries:
+        any_hit = False
+        for q, qv in zip(queries, query_vecs):
+            payload, shown, _r, _t, _rr, _nq, _rs = _execute_single_query(
+                q, store, args, db_path, qv, base_mask, level_arr, bm25_idx,
+                highlight_citekeys, paper_meta, abstract_texts, syn_store,
+            )
+            if shown:
+                any_hit = True
+            print(json.dumps(payload, ensure_ascii=False))
+        return 0 if any_hit else 1
 
-    rows = []
-    for ck, g in groups.items():
-        meta = paper_meta.get(ck)
-        if meta is None:
-            continue  # 元数据过滤把它的 paper 级记录也滤掉了（理论上不该发生，容错跳过）
-        candidates = ([g["paper"]] if g["paper"] else []) + [
-            (s, k, ss) for s, k, ss, _r in g["hits"]]
-        # 展示分优先 dense 余弦命中（有则给真实余弦分），纯关键词命中才给 RRF 分并标 [关键词]。
-        # 跨篇排序与展示解耦：_sort 恒取全篇最优 sort_score（RRF），保证位次可比。
-        best_sort = max(t[2] for t in candidates)
-        # 展示候选 = paper 侧**最高余弦**（paper_cos，而非排序代表 g["paper"]）+ 句级余弦命中。
-        # 同时记账它来自哪一侧：score_from 不能靠"与 paper_cos 比大小"反推——纯关键词命中的
-        # paper 行 paper_cos 恒为 None，反推会一律落到 "highlight"，给一条 hits 为空的行打上
-        # 「句」标记，与同一条目下紧跟着的"该篇无精读句级证据"直接打架。
-        cosine_cands = ([(g["paper_cos"][0], "paper")] if g["paper_cos"] else []) + \
-                       [(s, "highlight") for s, k, _ss, _r in g["hits"] if k == "cosine"]
-        if cosine_cands:
-            best_score, score_from = max(cosine_cands, key=lambda t: t[0])
-            best_kind = "cosine"
-        else:
-            _b = max(candidates, key=lambda t: t[2])
-            best_score, best_kind = _b[0], _b[1]
-            score_from = "paper" if (g["paper"] and _b is g["paper"]) else "highlight"
-        # 这个展示分**未必是篇级分**：--level auto 下候选里混着句级命中，某篇标题/摘要
-        # 根本没过 min_score、只有一条精读句命中 0.71 时，展示分就是那 0.71。而
-        # scholar-search skill 教的是"≥0.62 判库内疑似同篇"——那条判据只对篇级分成立，
-        # 不标出来就会被当成篇级分读，把"库里有一句相关证据"误报成"库里已有这篇"。
-        title, one_line = _split_paper_text(meta["text"])
-        match_level = "highlight" if g["hits"] else "paper"
-        # paper_src 跟**展示分实际取自哪条 chunk**，不再跟 RRF 排序代表（并列时由 set
-        # 迭代序决定，等于掷硬币）。没有余弦命中时退回排序代表的泳道。
-        paper_src = (g["paper_cos"][1] if g["paper_cos"] else g.get("paper_src")) or "paper"
-        no_evidence = not g["hits"] and ck not in highlight_citekeys
-        g["hits"].sort(key=lambda t: -t[2])
-        rows.append({
-            "citekey": ck, "score": best_score, "score_kind": best_kind, "_sort": best_sort,
-            "score_from": score_from,
-            "match_level": match_level, "paper_src": paper_src,
-            "year": meta.get("year"), "title": title, "one_line": one_line,
-            "tier": meta.get("tier"), "note_file": meta.get("note_file"),
-            "note_line": meta.get("note_line"), "hits": g["hits"],
-            "no_sentence_evidence": no_evidence,
-        })
-
-    rows.sort(key=lambda row: (-row["_sort"], TIER_ORDER.get(row["tier"], 3), row["citekey"]))
-    shown = rows if args.limit == 0 else rows[:args.limit]
-    truncated = len(rows) - len(shown)
-
-    # ---- post-retrieval 重排（纯重排：不改集合成员、不动余弦展示分/门槛语义）----
-    # 默认 auto：hybrid 开（试验 66→75@1）、dense/sparse 关（dense 保「按分数看排名」契约，
-    # sparse 未做过 bench 验证）。doc 文本优先厚 chunk（ab:，title+判词+摘要），无摘要篇
-    # 退瘦文本——与试验口径一致。
-    rerank_on = args.rerank if args.rerank is not None else (args.mode == "hybrid")
-    reranked = False
-    if rerank_on and len(shown) >= 2:
-        abstract_texts = {r["citekey"]: r["text"]
-                          for r in store.records if r["level"] == "abstract"}
-        head = shown[:RERANK_CAP]
-        docs = [abstract_texts.get(row["citekey"]) or paper_meta[row["citekey"]]["text"]
-                for row in head]
-        scores = None
-        try:
-            scores = reranker.rerank_scores(query, docs)
-        except reranker.RerankUnavailable as e:
-            print("⚠️ reranker 不可用（{}），按原排序输出；--no-rerank 可关掉本提示"
-                  .format(e), file=sys.stderr)
-        except Exception:  # noqa: BLE001 —— 铁律：reranker 任何失败都不得挡住检索主路径
-            # 打分期异常（MPS 数值故障/OOM/tokenizer 炸）≠ 程序错误：检索本身已成功，
-            # exit 4 会把到手的结果全丢，还会连坐杀死 rag_bench 整轮（它把 4 当崩溃）。
-            # traceback 打全保可视性，然后降级——可视性与主路径不二选一。
-            import traceback
-            traceback.print_exc()
-            print("⚠️ reranker 打分异常（见上方 traceback），按原排序输出", file=sys.stderr)
-        if scores is not None and not all(math.isfinite(s) for s in scores):
-            print("⚠️ reranker 产出非有限分数（NaN/inf，疑似数值故障），按原排序输出",
-                  file=sys.stderr)
-            scores = None
-        if scores is not None:
-            for row, s in zip(head, scores):
-                row["rerank_score"] = s
-            # 并列分极多是本库常态（08-22 回测：47 篇里 33 篇并列）——rerank 分并列时
-            # 保原序（sort 稳定），不引入新的迭代序随机性
-            head.sort(key=lambda row: -row["rerank_score"])
-            shown = head + shown[RERANK_CAP:]
-            reranked = True
-            if len(shown) > RERANK_CAP:
-                print("⚠️ 展示超过 {} 条，仅前 {} 条参与重排（其余保持原序拼在后面）"
-                      .format(RERANK_CAP, RERANK_CAP), file=sys.stderr)
+    query = queries[0]
+    payload, shown, rows, truncated, reranked, no_query_tokens, related_syntheses = _execute_single_query(
+        query, store, args, db_path, query_vecs[0], base_mask, level_arr, bm25_idx,
+        highlight_citekeys, paper_meta, abstract_texts, syn_store,
+    )
 
     if args.as_json:
-        print(json.dumps({
-            "total": len(rows), "shown": len(shown), "truncated": truncated,
-            "query": query, "mode": args.mode,
-            # reranked=true 时 results 按 rerank 分排序，score（余弦）不再单调递减；
-            # 判重等按分数的流程读 score 字段即可，与顺序无关
-            "reranked": reranked,
-            "results": [{
-                "citekey": row["citekey"], "score": round(row["score"], 4),
-                "score_kind": row["score_kind"],
-                # rerank 分是交叉编码器 logit，仅用于排序，与 score/min_sim 不可比
-                **({"rerank_score": round(row["rerank_score"], 4)}
-                   if "rerank_score" in row else {}),
-                # 展示分取自篇级还是句级。skill 的「≥0.62 判库内疑似同篇」判据**只对
-                # score_from=="paper" 成立**；match_source 回答的是另一个问题（这篇有没有
-                # 句级命中），两者不可互相替代：paper 0.71+句级 0.55 与 paper 0.55+句级 0.71
-                # 的 score 都是 0.71、match_source 都是 "highlight"，JSON 消费方无从区分。
-                # 人读模式有「句」标记兜着，而 skill 推荐的正是 --json。
-                "score_from": row["score_from"],
-                "match_level": row["match_level"],
-                "match_source": ("highlight" if row["hits"]
-                                 else ("abstract" if row["paper_src"] == "abstract" else "title")),
-                "no_sentence_evidence": row["no_sentence_evidence"],
-                "year": row["year"],
-                "title": row["title"], "one_line": row["one_line"],
-                "hits": [dict({"text": r["text"], "role": r["role"], "section": r["section"],
-                               "score": round(s, 4), "score_kind": k},
-                              # 书籍链路：章节定位与原书页码。文章命中不带这两个键，
-                              # 消费方（scholar-write）据 pages 产出 [@key, p. N] 定位符。
-                              **{k2: r[k2] for k2 in ("chapter", "pages", "book_key")
-                                 if r.get(k2)})
-                         for s, k, _ss, r in row["hits"]],
-                "note_file": row["note_file"], "note_line": row["note_line"],
-            } for row in shown],
-        }, ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if shown else 1
 
     if args.cite:
         if not shown:
             print("无命中", file=sys.stderr)
             return 1
-        # 书籍命中带页码定位符：[@little2020rubin, p. 247]。pandoc 的 citeproc 认这个
-        # 语法，而一本 460 页的书不带定位符的引用等于没标出处。
         def _cite_one(row):
             pages = next((r.get("pages") for _s, _k, _ss, r in row["hits"] if r.get("pages")),
                          None)
@@ -648,6 +677,10 @@ def main() -> int:
             print("⚠️ 共 {} 条命中，仅输出前 {} 条（--limit 调整，0=不限）".format(
                 len(rows), len(shown)), file=sys.stderr)
         return 0
+
+    if related_syntheses:
+        syn_str = " · ".join("{} ({:.2f})".format(s["path"], s["score"]) for s in related_syntheses)
+        print("📎 库内已有相关概念页/问答：{}\n".format(syn_str))
 
     if not shown:
         if no_query_tokens:
@@ -666,11 +699,6 @@ def main() -> int:
         " · 已重排(bge-reranker，余弦分不再单调)" if reranked else ""))
     for row in shown:
         row_kw = "[关键词] " if row["score_kind"] != "cosine" else ""
-        # 篇级分数必须打出来：句级命中行一直带分，篇级此前只有标题——判"库里是否已有
-        # 类似文献"恰恰看的是篇级分（0.62 是 paper 级强近邻的标定线，见 thresholds.py），
-        # 不显示就只能靠 --json 反查，实测让调用方把弱相关误报成"库内已有"。
-        # 分数来自句级时打 `句` 标记：0.62 那条判据只对篇级分成立，不标出来会把
-        # "库里有一句相关证据"读成"库里已有这篇"（--level auto 下才会出现）。
         row_sfx = "句" if row.get("score_from") == "highlight" else ""
         print("[@{}] ({}) {} {}{:.2f}{} {}".format(
             row["citekey"], row["year"] or "?", TIER_EMOJI.get(row["tier"], ""),
@@ -681,8 +709,6 @@ def main() -> int:
             print("    （语义命中标题/一句话用处，该篇无精读句级证据）")
         for s, k, _ss, r in row["hits"][:MAX_SHOWN_HITS]:
             hit_kw = "[关键词] " if k != "cosine" else ""
-            # 书籍命中优先显示「章 · 页」而不是精读分节名：分节名（方法与数据…）
-            # 对书没有定位价值，读者要的是「第几章第几页」。
             where = r.get("chapter") or r["section"]
             page_sfx = " ⟨p.{}⟩".format(r["pages"]) if r.get("pages") else ""
             print("    [{}·{}] {}{:.2f} {}{}".format(

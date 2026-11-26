@@ -69,21 +69,33 @@ from ..utils.logger import get_logger
 from .embeddings import EmbeddingError
 from .notes_index import write_if_changed
 from . import page_shots
-from .topics import (
-    DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, Evidence, DEFAULT_USER_ZONE, GEN_BEGIN,
-    GEN_END, TOPICS_DIRNAME, TopicError, TopicSpec, ValidationReport, _CITE_RE,
-    _EVIDENCE_ROW_RE, _INLINE_REF_RE, _check_grounding, _clean_text, _render_frontmatter,
-    _resolve_refs, backtranslate_inline_refs,
+from .synthesis_common import (
+    DEFAULT_USER_ZONE,
+    Evidence,
+    GEN_BEGIN,
+    ROLE_EMOJI,
+    ValidationReport,
+    _CITE_RE,
+    _EVIDENCE_ROW_RE,
+    _INLINE_REF_RE,
+    _check_grounding,
+    _clean_text,
+    _render_frontmatter,
+    _resolve_refs,
+    backtranslate_inline_refs,
     flatten_linebreaks,
-    parse_synthesis, read_existing, render_evidence_block, retrieve_evidence,
-    _prior_page_sources,
-    select_evidence, to_wiki_links,
+    render_evidence_block,
+    to_wiki_links,
+)
+from .topics import (
+    DEFAULT_EXCLUDE_SECTIONS, DEFAULT_MIN_SIM, TOPICS_DIRNAME, TopicError, TopicSpec,
+    _prior_page_sources, parse_synthesis, read_existing, retrieve_evidence, select_evidence,
 )
 from .grounding import build_pool, check_numbers
 from .thresholds import QA_GAP_EVIDENCE_MIN_SIM, QA_MIN_INDEPENDENT_SOURCES
 from . import coverage as cov
 from .vault import (
-    GEN_BEGIN_RE, ROLE_LABEL, _gen_hash, extract_user_zone,
+    GEN_BEGIN_RE, GEN_END, ROLE_LABEL, _gen_hash, extract_user_zone,
     generated_block_tampered, split_frontmatter, tokenize,
 )
 

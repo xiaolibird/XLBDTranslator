@@ -11,9 +11,11 @@
 """
 import hashlib
 import os
+import pickle
 import re
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -499,12 +501,14 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     "拒绝 --full 替换，避免好库被缩水。确认无误请手动处理。".format(
                         len(chunks), old_count))
         existing_meta: Dict[str, Tuple] = {}
+        existing_content_version = ""
         if db_exists and not full:
             # connect() 在 try 外：它自己抛错时直接向上传播，不存在 close 未定义对象的问题
             conn = sqlite3.connect(str(db_path))
             try:
                 _ensure_schema(conn)
                 meta = _read_meta_dict(conn)
+                existing_content_version = (meta.get("content_version") or "").strip()
                 # schema 版本闸。_ensure_schema 只 CREATE IF NOT EXISTS、从不看版本，而
                 # 收尾的 _write_meta 无条件写当前 SCHEMA_VERSION——于是一次增量同步就把
                 # 旧版库**静默盖章**成新版：库行仍是旧语义（v1 的 highlight id 不含
@@ -736,6 +740,13 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                 row = cur.execute("SELECT LENGTH(vec) FROM chunks LIMIT 1").fetchone()
                 dim = (row[0] // 4) if row and row[0] else 0
 
+            data_changed = bool(full or to_embed_ids or meta_update_ids or to_delete_ids)
+            content_version = (
+                uuid.uuid4().hex
+                if (data_changed or not existing_content_version)
+                else existing_content_version
+            )
+
             _write_meta(conn, {
                 "schema_version": str(SCHEMA_VERSION),
                 "model": model,
@@ -743,6 +754,7 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                 "normalized": "l2",
                 "built_at": datetime.now().isoformat(),
                 "source_generated_at": index.get("generated_at") or "",
+                "content_version": content_version,
             })
             if not full:
                 # 已知窗口（接受）：反向时序——增量先 COMMIT、--full 用更早的索引快照后
@@ -793,6 +805,15 @@ def sync_store(db_path, index: dict, client, *, full: bool = False,
                     os.unlink(str(db_path) + sfx)
                 except OSError:
                     pass
+
+        # 仅在数据实际变动或缓存尚不存在时刷新 sidecar 加速缓存（best-effort）
+        try:
+            vec_cache, rec_cache = _cache_paths(db_path)
+            if data_changed or not (vec_cache.exists() and rec_cache.exists()):
+                store = VectorStore._load_from_sqlite(db_path)
+                _write_cache_best_effort(db_path, store)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("sync_store 刷新向量缓存跳过：{}", e)
 
         return stats
     finally:
@@ -863,41 +884,154 @@ def read_store_meta(db_path) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# 内存检索
+# 内存检索 + Sidecar 零损加速缓存（float32 mmap + records pickle）
 # ---------------------------------------------------------------------------
 
-class VectorStore:
-    """整表读进内存：~1 万条 × 1024 维 float32 ≈ 41MB，暴力余弦（matmul）足够快，
-    不值得为这个量级引 faiss/chromadb。"""
+_RECORDS_CACHE_VERSION = 1
 
-    MAX_IN_MEMORY_CHUNKS = 50000
+
+def _cache_paths(db_path: Path) -> Tuple[Path, Path]:
+    db_path = Path(db_path)
+    return (
+        db_path.with_name(db_path.stem + ".vec.npy"),
+        db_path.with_name(db_path.stem + ".records.pkl"),
+    )
+
+
+def _try_load_cache(
+    db_path: Path, meta: Dict[str, str], row_count: int
+) -> Optional[Tuple[List[dict], np.ndarray]]:
+    cv = (meta.get("content_version") or "").strip()
+    if not cv:
+        return None
+    vec_path, rec_path = _cache_paths(db_path)
+    if not (vec_path.exists() and rec_path.exists()):
+        return None
+    dim = int(meta.get("dim") or 0)
+    model = meta.get("model", "")
+    schema_version = int(meta.get("schema_version") or 0)
+    try:
+        with open(str(rec_path), "rb") as fh:
+            payload = pickle.load(fh)
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != _RECORDS_CACHE_VERSION:
+            return None
+        if payload.get("content_version") != cv:
+            return None
+        if payload.get("schema_version") != schema_version:
+            return None
+        if payload.get("model") != model or payload.get("dim") != dim:
+            return None
+        if payload.get("n") != row_count:
+            return None
+        records = payload.get("records")
+        if not isinstance(records, list) or len(records) != row_count:
+            return None
+        if dim and row_count:
+            mat = np.load(str(vec_path), mmap_mode="r")
+            if mat.shape != (row_count, dim) or mat.dtype != np.float32:
+                return None
+        else:
+            mat = np.zeros((row_count, 0), dtype=np.float32)
+        return records, mat
+    except Exception as e:  # noqa: BLE001 —— 缓存失效/损坏一律静默退回 SQLite
+        logger.debug("读取向量 sidecar 缓存失败，退回 SQLite：{}", e)
+        return None
+
+
+def _write_cache_best_effort(db_path: Path, store: "VectorStore") -> None:
+    cv = (store.meta.get("content_version") or "").strip()
+    if not cv:
+        return
+    vec_path, rec_path = _cache_paths(db_path)
+    pid = os.getpid()
+    tmp_vec = vec_path.with_name(vec_path.name + ".tmp-{}.npy".format(pid))
+    tmp_rec = rec_path.with_name(rec_path.name + ".tmp-{}".format(pid))
+    try:
+        mat = np.ascontiguousarray(store.mat, dtype=np.float32)
+        with open(str(tmp_vec), "wb") as fh:
+            np.save(fh, mat, allow_pickle=False)
+        payload = {
+            "version": _RECORDS_CACHE_VERSION,
+            "content_version": cv,
+            "schema_version": int(store.meta.get("schema_version") or 0),
+            "model": store.model,
+            "dim": store.dim,
+            "n": len(store.records),
+            "records": store.records,
+        }
+        with open(str(tmp_rec), "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(str(tmp_vec), str(vec_path))
+        os.replace(str(tmp_rec), str(rec_path))
+    except Exception as e:  # noqa: BLE001 —— 只读目录或磁盘异常绝不阻塞加载
+        logger.debug("写入向量 sidecar 缓存跳过：{}", e)
+        for p in (tmp_vec, tmp_rec):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+
+class VectorStore:
+    """整表精确检索：支持 float32 mmap + records pickle 旁挂缓存，25 万行内 matmul <60ms。"""
+
+    MAX_IN_MEMORY_CHUNKS = 250000
 
     def __init__(self, meta: Dict[str, str], records: List[dict], mat: np.ndarray):
         self.meta = meta
         self.records = records          # 与 mat 行一一对应的 dict 列表
-        self.mat = mat                  # (n, dim) float32，已 L2 归一
+        self.mat = mat                  # (n, dim) float32，已 L2 归一（可为 mmap 只读）
         self.model = meta.get("model", "")
         self.dim = int(meta.get("dim") or 0)
+        self._col_cache: Optional[dict] = None
 
     @classmethod
-    def load(cls, db_path) -> "VectorStore":
-        db_path = Path(db_path)
-        if not db_path.exists():
-            raise VectorStoreError(
-                "向量库不存在：{}\n先跑：PYTHONPATH=. python scripts/notes_embed.py".format(db_path))
+    def _read_meta_and_count(cls, db_path: Path) -> Tuple[Dict[str, str], int]:
         conn = sqlite3.connect(str(db_path))
         try:
-            # 包进读事务：meta 与 rows 两次读取必须在同一事务里（一致快照），否则并发写者
-            # commit 会撕裂（读到旧 meta + 新 rows，spurious dim-mismatch）。WAL 下读事务
-            # 不阻塞写者，纯快照。
             conn.execute("BEGIN")
             try:
                 meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
             except sqlite3.OperationalError as e:
                 if "no such table" in str(e):
-                    meta = {}  # 真·未初始化
+                    meta = {}
                 else:
-                    raise  # database is locked / 磁盘错误 → 交给外层"稍后重试"分支，别误报成"未初始化"
+                    raise
+            if not meta:
+                raise VectorStoreError(
+                    "向量库为空/未初始化：{}\n跑：PYTHONPATH=. python scripts/notes_embed.py --full".format(
+                        db_path))
+            schema_version = int(meta.get("schema_version") or 0)
+            if schema_version != SCHEMA_VERSION:
+                raise VectorStoreError(
+                    "向量库 schema 版本不兼容（库={}，代码期望={}），需要 --full 重建".format(
+                        schema_version, SCHEMA_VERSION))
+            row_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            conn.execute("COMMIT")
+            return meta, int(row_count)
+        except sqlite3.OperationalError as e:
+            raise VectorStoreError(
+                "读取向量库失败（可能正被并发写/磁盘异常）：{}\n稍后重试或 `--full` 重建".format(e)
+            ) from e
+        finally:
+            conn.close()
+
+    @classmethod
+    def _load_from_sqlite(cls, db_path: Path) -> "VectorStore":
+        db_path = Path(db_path)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("BEGIN")
+            try:
+                meta = {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e):
+                    meta = {}
+                else:
+                    raise
             if not meta:
                 raise VectorStoreError(
                     "向量库为空/未初始化：{}\n跑：PYTHONPATH=. python scripts/notes_embed.py --full".format(
@@ -908,16 +1042,12 @@ class VectorStore:
                     "向量库 schema 版本不兼容（库={}，代码期望={}），需要 --full 重建".format(
                         schema_version, SCHEMA_VERSION))
             dim = int(meta.get("dim") or 0)
-            # 先 COUNT 预警，超过阈值再 fetchall 加载全表（避免静默 OOM）
             row_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
             if row_count > cls.MAX_IN_MEMORY_CHUNKS:
                 logger.warning(
-                    "向量库行数 {} 超过内存阈值 {}，建议迁移到 faiss 或分批加载；"
+                    "向量库行数 {} 超过内存阈值 {}，建议评估分片；"
                     "当前仍全量加载，若 OOM 请先清理旧库或缩小索引范围",
                     row_count, cls.MAX_IN_MEMORY_CHUNKS)
-            # 由 _CHUNK_COLUMNS 生成（去掉 text_hash，检索侧用不上）。此前是**第五处**
-            # 手写列名清单，加书籍三列后 records 里就是没有 pages/book_key——检索能召回、
-            # 元数据却凭空消失，比报错更难发现。
             cols = tuple(c for c in _CHUNK_COLUMNS if c != "text_hash")
             rows = conn.execute("SELECT {} FROM chunks".format(", ".join(cols))).fetchall()
             conn.execute("COMMIT")
@@ -950,6 +1080,26 @@ class VectorStore:
             rec["has_full_text"] = bool(rec.get("has_full_text"))
             records.append(rec)
         return cls(meta=meta, records=records, mat=mat)
+
+    @classmethod
+    def load(cls, db_path) -> "VectorStore":
+        db_path = Path(db_path)
+        if not db_path.exists():
+            raise VectorStoreError(
+                "向量库不存在：{}\n先跑：PYTHONPATH=. python scripts/notes_embed.py".format(db_path))
+        meta, row_count = cls._read_meta_and_count(db_path)
+        if row_count > cls.MAX_IN_MEMORY_CHUNKS:
+            logger.warning(
+                "向量库行数 {} 超过内存阈值 {}，建议评估分片；"
+                "当前仍全量加载，若 OOM 请先清理旧库或缩小索引范围",
+                row_count, cls.MAX_IN_MEMORY_CHUNKS)
+        fast = _try_load_cache(db_path, meta, row_count)
+        if fast is not None:
+            records, mat = fast
+            return cls(meta=meta, records=records, mat=mat)
+        store = cls._load_from_sqlite(db_path)
+        _write_cache_best_effort(db_path, store)
+        return store
 
     def __len__(self) -> int:
         return len(self.records)

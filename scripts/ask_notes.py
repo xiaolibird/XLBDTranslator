@@ -974,6 +974,8 @@ def main() -> int:
         idx = qa_dir / "INDEX.md"
         write_if_changed(idx, Q.render_qa_index(qa_dir))
         print("📇 问答目录：{}".format(idx))
+        from src.scholar.synthesis_store import sync_synthesis_best_effort
+        sync_synthesis_best_effort(notes_dir, settings)
     if any(o.status in ("new", "merged", "insufficient") for o in outcomes):
         # B3 后续：vault job 的 WatchPaths 已补上 `topics/` 与 `topics/qa/`（W5 完整
         # 修复），归档落盘会在节流窗口（约 2 分钟）后自动同步进 Obsidian——原来这里

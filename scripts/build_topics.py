@@ -466,6 +466,8 @@ def main() -> int:
         from src.scholar.notes_index import write_if_changed
         write_if_changed(idx_path, T.render_topics_index(topics_dir, all_specs))
         print("\n📇 概念页索引：{}".format(idx_path))
+        from src.scholar.synthesis_store import sync_synthesis_best_effort
+        sync_synthesis_best_effort(notes_dir, settings)
 
     print("\n{}".format("─" * 60))
     for r in results:

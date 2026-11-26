@@ -94,12 +94,16 @@ def load_cases(path: Path):
 
 
 def run_one(query: str, mode: str, level: str, limit: int, lanes: str = "both",
-            rerank: str = "auto"):
+            rerank: str = "auto", role: str = "", book: str = ""):
     """跑一条 query，返回 (rank(1-based，未命中 None 用于 gold 判定的候选列表), error)。"""
     cmd = [sys.executable, str(SEARCH_SCRIPT), query,
            "--json", "--mode", mode, "--limit", str(limit), "--paper-lanes", lanes]
     if level != "auto":
         cmd += ["--level", level]
+    if role:
+        cmd += ["--role", role]
+    if book:
+        cmd += ["--book", book]
     if rerank == "on":
         cmd += ["--rerank"]
     elif rerank == "off":
@@ -165,8 +169,10 @@ def main() -> int:
     results = []
     try:
         for c in cases:
-            ranked, err = run_one(c["query"], args.mode, args.level, args.limit,
-                                  lanes=args.paper_lanes, rerank=args.rerank)
+            eff_level = c.get("level") or args.level
+            ranked, err = run_one(c["query"], args.mode, eff_level, args.limit,
+                                  lanes=args.paper_lanes, rerank=args.rerank,
+                                  role=c.get("role", ""), book=c.get("book", ""))
             if ranked is None:
                 results.append({**c, "rank": None, "error": err})
                 continue

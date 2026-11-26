@@ -54,6 +54,34 @@ from .vault import (
     ROLE_LABEL, extract_user_zone, generated_block_tampered, split_frontmatter,
     _gen_hash, GEN_END, _SAFE_KEY, _YAML_WORDS, _y,
 )
+from .synthesis_common import (  # noqa: F401 —— 下沉共享原语并保留原名 re-export
+    DEFAULT_USER_ZONE,
+    Evidence,
+    GEN_BEGIN,
+    ROLE_EMOJI,
+    USER_HEADING,
+    ValidationReport,
+    _BARE_CITE_ONLY_RE,
+    _BARE_CITE_RE,
+    _BRACKET_CITE_RE,
+    _CITE_LOCATOR_RE,
+    _CITE_RE,
+    _EVIDENCE_ROW_RE,
+    _INLINE_REF_RE,
+    _REF_RE,
+    _SCHEMA_TERM_RE,
+    _check_grounding,
+    _clean_text,
+    _flatten_optional_locator,
+    _json_safe,
+    _render_frontmatter,
+    _resolve_refs,
+    _scrub_schema_terms,
+    backtranslate_inline_refs,
+    flatten_linebreaks,
+    render_evidence_block,
+    to_wiki_links,
+)
 
 logger = get_logger(__name__)
 
@@ -91,52 +119,10 @@ DEFAULT_BUCKET_BONUS = 0.03
 DEFAULT_RELATIVE_ALPHA = TOPICS_RELATIVE_ALPHA
 
 # 默认排除的精读分节：这不是文献内容，是精读者自己的推测性批注，混进证据池会被综述
-# 当成"已验证结论"引用（2026-08-16 审计实测：missingness-causal.md 把「对我研究的联想」
-# 里"可为跨中心MNAR缺失图学习提供隐私保障"这句主观联想写成了论文证明过的能力）。
-# 可按页在 topics.yaml 显式覆盖（填 [] 即不排除任何 section）。
 DEFAULT_EXCLUDE_SECTIONS = ["对我研究的联想"]
 
-GEN_BEGIN = ("<!-- BEGIN GENERATED v{} h={} · 由 {} 生成 · "
-             "此块会被重建覆盖，请写在下面的「我的批注」里 -->")
-# GEN_END 直接从 vault 导入（不在这里重新声明字面量）：此前两边各自维护一份逐字符相同
-# 的字符串，纯靠人工保持一致、没有测试强制——任何一边单改措辞，extract_user_zone/
-# generated_block_tampered（本模块从 vault 导入的那两个函数，内部认的是 vault 自己那份
-# 常量）就会在另一边生成的页面上找不到哨兵，返回 None，导致每次重建都误判成 conflict
-# （G6）。GEN_BEGIN 因文案里写了各自的生成脚本名，继续独立声明，但格式必须仍能被
-# vault.GEN_BEGIN_RE 认出，见 test_topics.py 对应回归测试。
-USER_HEADING = "## 我的批注"
-DEFAULT_USER_ZONE = "\n{}\n\n".format(USER_HEADING)
-
-ROLE_EMOJI = {"citable": "🟪", "refutable": "🟦", "method": "🟩"}
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-_REF_RE = re.compile(r"^[Ee](\d+)$")
-
-# 论断正文里模型自己写的引用标记：pandoc-citeproc 会把它当真引用去挂书目，是唯一能
-# 绕开编号校验的编造通道。两种合法 pandoc 引用语法都要挡：
-#   - 带方括号 `[@key]`（含 `[@k1; @k2]` 紧凑多键写法，`[^\]]+` 本就会整段吃掉）；
-#   - 不带方括号的裸 `@key`（作者年份型行文引用，如"如 @smith2020 所述"）——G1 实测：
-#     此前只挡了方括号形式，模型确实会用裸写法漏网，逃过剥离/死键检测/wiki 链接转换
-#     三道防线，`--verify` 照样全绿。
-# _BRACKET_CITE_RE 单独留一份（而不是只留组合后的 _BARE_CITE_RE）：audit_topic_pages
-# 扫描已生成页面里的"残留裸引用"时，要先挖掉合法的方括号引用，剩下的才是真正裸引用——
-# 否则 `[@k1; @k2]` 这种紧凑写法里的第二个 `@k2` 会被误判成一条裸引用（它明明在合法
-# 方括号内部）。
-_BRACKET_CITE_RE = re.compile(r"\[@[^\]]+\]")
-# 裸 @key。两侧都必须按 **ASCII** 界定，两次踩坑都出在这里（2026-08-17 实测）：
-#
-# 后顾断言排除邮箱形式 a@b.com（@ 前紧邻 ASCII 字母/数字/下划线/./- 判为邮箱局部，
-# 不剥离——没理由误伤用户批注区里真写的联系方式）。**不能写成 `(?<![\w.\-])`**：
-# Python 3 的 `\w` 按 Unicode 匹配、汉字也算单词字符（`re.match(r'\w','究')` 为真），
-# 于是「研究表明@sneaky2020Ghost能降低误差」这种中文行文里最自然的紧贴写法会被判成
-# 邮箱局部整条放行，audit 的 bare_cites 一并看不见、`--verify` 全绿——比没有防线更
-# 危险，它制造错误的安全感。
-#
-# 匹配体同理限定在 citekey 的合法字符集（ASCII 字母数字与 `_.-:`）内，**不能写成
-# "排除空白与中文标点"的宽字符类**：citekey 不可能包含汉字，宽字符类会一路吃到句末
-# 标点，把 `@key` 后面的正文（"能降低误差"）连带剥掉，页面上留下半句话。
-_BARE_CITE_ONLY_RE = re.compile(r"(?<![A-Za-z0-9_.\-])@[A-Za-z0-9][A-Za-z0-9_.\-:]*")
-_BARE_CITE_RE = re.compile(_BRACKET_CITE_RE.pattern + "|" + _BARE_CITE_ONLY_RE.pattern)
 
 
 class TopicError(RuntimeError):
@@ -232,40 +218,19 @@ def load_topic_specs(config_path) -> List[TopicSpec]:
 # 证据召回
 # ---------------------------------------------------------------------------
 
-@dataclass
-class Evidence:
-    """一条候选证据：向量库里的一个 highlight chunk + 它的出处。"""
-    ref: str                      # "E1"（select_evidence 定稿后才赋值）
-    citekey: str
-    text: str
-    role: Optional[str]
-    section: Optional[str]
-    note_file: Optional[str]
-    note_line: Optional[int]
-    score: float
-    year: Optional[int] = None
-    tier: Optional[str] = None
-    title: Optional[str] = None
-    # 书籍链路（2026-09-17）：句级页码定位符与章节定位，直接透传自
-    # embed_store.Chunk 同名字段（见 store.records 的 _CHUNK_COLUMNS）。论文证据
-    # 恒为 None——完全向后兼容，凡是不读这两个字段的旧代码路径行为不变。
-    # pages 例：单页 "247"、区间 "241-259"（`h.get("pages")` 原样透传，不做拆分/校验）；
-    # chapter 例："Ch.7 · pp.241-259 · Nonignorable models"（章节定位，供展示用）。
-    pages: Optional[str] = None
-    chapter: Optional[str] = None
-    # bucket 命中的加分（DEFAULT_BUCKET_BONUS），只用于 select_evidence 内部排序。
-    # score 字段本身永远是原始余弦相似度——展示、以及任何要跟 min_sim 比较的地方，
-    # 都不该被这个加成污染。
-    bucket_boost: float = 0.0
-
 
 def select_evidence(candidates: Sequence[Evidence], max_evidence: int,
-                    per_paper_cap: int = DEFAULT_PER_PAPER_CAP) -> List[Evidence]:
+                    per_paper_cap: int = DEFAULT_PER_PAPER_CAP,
+                    manual_tiebreak: float = 0.0) -> List[Evidence]:
     """按分数降序取证，同篇论文超过 per_paper_cap 条的丢弃，最后重编 E1..En。
 
     排序键是 score + bucket_boost（软加权，见 DEFAULT_BUCKET_BONUS）；重编号后的
     Evidence.score 仍是原始余弦，加成只体现在名次上，不回写进 score——否则展示的
     "相似度"会失真，日后想核对 min_sim 判定是否合理也没了可比的原始值。
+
+    manual_tiebreak（默认 0.0 = 关闭）：实验性参数，大于 0 时仅在微弱分差区间
+    （按 manual_tiebreak 量化分桶）内优先手动精读（series=='manual'）或带页码锚
+    （pages 非空）的证据。
 
     配额是"轮次制"而不是"先到先得"：先给每篇取第 1 条，再给每篇取第 2 条……
     这样即使某篇论文霸占了分数榜前 20 名，其它论文仍能进入前排。直接按分数截断
@@ -274,15 +239,19 @@ def select_evidence(candidates: Sequence[Evidence], max_evidence: int,
     if max_evidence <= 0:
         return []
 
-    def _sort_key(e: Evidence) -> float:
-        return e.score + e.bucket_boost
+    def _sort_key(e: Evidence) -> Tuple:
+        raw = e.score + e.bucket_boost
+        if manual_tiebreak > 0.0:
+            is_manual = 1 if (e.series == "manual" or bool(e.pages)) else 0
+            return (round(raw / manual_tiebreak), is_manual, raw)
+        return (raw,)
 
     by_paper: Dict[str, List[Evidence]] = {}
-    for c in sorted(candidates, key=lambda e: -_sort_key(e)):
+    for c in sorted(candidates, key=_sort_key, reverse=True):
         by_paper.setdefault(c.citekey, []).append(c)
 
     # 论文之间按其最高分排序，保证轮次内也是强证据优先
-    papers = sorted(by_paper, key=lambda k: -_sort_key(by_paper[k][0]))
+    papers = sorted(by_paper, key=lambda k: _sort_key(by_paper[k][0]), reverse=True)
     picked: List[Evidence] = []
     for rank in range(max(1, per_paper_cap)):
         for ck in papers:
@@ -291,7 +260,7 @@ def select_evidence(candidates: Sequence[Evidence], max_evidence: int,
                 picked.append(group[rank])
         if len(picked) >= max_evidence:
             break
-    picked.sort(key=lambda e: -_sort_key(e))
+    picked.sort(key=_sort_key, reverse=True)
     picked = picked[:max_evidence]
     out: List[Evidence] = []
     for i, e in enumerate(picked, 1):
@@ -299,7 +268,7 @@ def select_evidence(candidates: Sequence[Evidence], max_evidence: int,
             ref="E{}".format(i), citekey=e.citekey, text=e.text, role=e.role,
             section=e.section, note_file=e.note_file, note_line=e.note_line,
             score=e.score, year=e.year, tier=e.tier, title=e.title,
-            pages=e.pages, chapter=e.chapter,
+            pages=e.pages, chapter=e.chapter, series=e.series,
             bucket_boost=e.bucket_boost,
         ))
     return out
@@ -389,6 +358,7 @@ def retrieve_evidence(spec: TopicSpec, store, embed_client, *,
                 # 正则）匹配不到，这条证据从 --verify 统计里静默消失。
                 pages=_flatten_optional_locator(r.get("pages")),
                 chapter=_flatten_optional_locator(r.get("chapter")),
+                series=r.get("series"),
             )
     return select_evidence(list(best.values()), spec.max_evidence, per_paper_cap)
 
@@ -751,25 +721,6 @@ def attach_titles(evidences: Sequence[Evidence], index: dict) -> None:
 # prompt 组装
 # ---------------------------------------------------------------------------
 
-def render_evidence_block(evidences: Sequence[Evidence]) -> str:
-    """喂给 LLM 的证据块。**只给编号，不给 citekey**——模型看不到 citekey 就写不出
-    citekey，编号回译才是唯一的引用通道（见模块 docstring）。"""
-    lines = []
-    for e in evidences:
-        meta = []
-        if e.role:
-            meta.append(ROLE_LABEL.get(e.role, e.role))
-        if e.section:
-            meta.append(e.section)
-        if e.year:
-            meta.append(str(e.year))
-        head = "[{}]".format(e.ref)
-        if meta:
-            head += "（{}）".format(" · ".join(meta))
-        lines.append("{} {}".format(head, e.text.strip()))
-    return "\n".join(lines)
-
-
 def build_prompt(spec: TopicSpec, evidences: Sequence[Evidence], template: str,
                  research_interests: str = "", previous_page: str = "") -> str:
     """填充 prompt 模板。previous_page 为空时明确写「无」，避免模型把占位符当内容。"""
@@ -821,231 +772,6 @@ def parse_synthesis(raw: str) -> dict:
     if not isinstance(data, dict):
         raise TopicError("LLM 输出的顶层不是 JSON 对象")
     return data
-
-
-@dataclass
-class ValidationReport:
-    """校验战果。落进页面 frontmatter，异常值一眼可见（invalid_refs 突然变大 =
-    模型开始编号乱编，该换模型或改 prompt 了）。"""
-    kept_claims: int = 0
-    dropped_claims: int = 0        # 证据编号全部无效 -> 整条丢弃
-    invalid_refs: int = 0          # 越界/格式非法的编号
-    stripped_cites: int = 0        # 正文里被剥掉的引用标记（[@key] 与不带方括号的裸 @key）
-    dropped_disputes: int = 0
-    used_refs: int = 0             # 实际被引用到的证据条数（覆盖率分子）
-    # --- 数字接地（P1 第一层，2026-08-27） -------------------------------
-    # 编号校验只保证"引的文献存在"，保证不了"转述没失真"。这三个字段补的是后者里
-    # 可确定性检验的那一半：论断里的数字能不能在它所引证据里找到。
-    # 抓不了措辞失真/立场反转/因果方向倒置——那是第二层（LLM 蕴含）的活。
-    numbers_checked: int = 0       # 检出的数字总数（含派生量）
-    numbers_derived: int = 0       # 论断自己算出的比值/百分点差，不计入失分
-    ungrounded_numbers: int = 0    # 找不到出处的数字 —— **非零就该去看**
-    ungrounded_claims: int = 0     # 含未接地数字的论断条数
-    # 周度人读增量摘要要指出「先回查哪里」，不能只给一个全页计数。
-    # 仅本轮内存使用，不进 frontmatter；误报语义与 ungrounded_numbers 相同。
-    ungrounded_details: List[Dict[str, Any]] = field(default_factory=list)
-
-
-def _clean_text(s: Any, report: ValidationReport) -> str:
-    """正文清洗：剥掉模型自写的引用标记（[@key] 与裸 @key，见 _BARE_CITE_RE 顶部注释），
-    这是唯一能绕开编号校验的编造通道。"""
-    text = str(s or "").strip()
-    if not text:
-        return ""
-    cleaned, n = _BARE_CITE_RE.subn("", text)
-    if n:
-        report.stripped_cites += n
-    # ⚠️ 换行必须先归一成空格（2026-08-27 对抗审核抓出）：只压缩 `\s{2,}` 会让
-    # **单个** \n 原样留在论断里，渲染成 `- 前半句\n后半句 [@key]` 两个物理行。
-    # 而 page_parse 收论断的判据是「以 `- ` 开头**且**行内含 [@key]」——第一行没
-    # 引用、第二行没前缀，**两行都被跳过，整条论断从两个审计器里消失**。实测生产
-    # 侧正确抓到了那条的失真，事后审计却解析出 0 条论断，还顺带制造一条假 mismatch。
-    # 口径与渲染证据表、构造 Evidence 两处共用 flatten_linebreaks，不许各写一套。
-    cleaned = flatten_linebreaks(cleaned)
-    # 剥引用后可能留下 "……方法 ，" 之类的空档
-    return re.sub(r"\s{2,}", " ", cleaned).strip().rstrip("，,、 ")
-
-
-def _resolve_refs(refs: Any, ev_map: Dict[str, Evidence],
-                  report: ValidationReport) -> List[str]:
-    """编号列表 -> 去重后的合法编号列表。越界/格式非法的计入 invalid_refs 并剔除。"""
-    if isinstance(refs, str):
-        refs = [refs]
-    if not isinstance(refs, (list, tuple)):
-        return []
-    out: List[str] = []
-    for r in refs:
-        key = str(r).strip()
-        m = _REF_RE.match(key)
-        if m:
-            key = "E{}".format(int(m.group(1)))    # e3 / E03 -> E3
-        if key in ev_map:
-            if key not in out:
-                out.append(key)
-        else:
-            report.invalid_refs += 1
-    return out
-
-
-def flatten_linebreaks(s: str) -> str:
-    """把一切会被 `str.splitlines()` 断行的字符归一成空格。
-
-    只 `.replace("\\n", " ")` 是不够的——`splitlines()` 还认 `\\r`、`\\x0b`、`\\x0c`、
-    `\\u2028`、`\\u2029`。任何一个漏网，落盘页面里那条就会被 `page_parse` 拦腰截断：
-    证据原句尾段（连同它携带的数字）从匹配池里消失，制造假失真 + 假 mismatch。
-    渲染证据表、构造 Evidence、清洗论断三处必须用同一个口径。
-    """
-    # re 支持 \uXXXX 转义；这里**必须**写转义而不是裸字符——把 U+2028/U+2029
-    # 直接敲进源码，编辑这个文件的工具自己就会在那里断行（改这段注释时实际踩过）。
-    return re.sub(r"[\r\n\x0b\x0c\u2028\u2029]+", " ", s or "")
-
-
-def _flatten_optional_locator(v):
-    """`flatten_linebreaks` 的 `Optional` 版本，给 `pages`/`chapter` 这类"可选
-    定位符字段"用（MINOR-6，2026-09-17 R2 对抗审核）。
-
-    `flatten_linebreaks` 本身对 `None`/空值已安全（内部 `s or ""`），但会把
-    它们**规范成空字符串**返回——那对 `text`/论断这类"总是要有值"的字段是对的
-    （模块 docstring 那条"三处必须用同一个口径"说的就是它们），但
-    `Evidence.pages`/`.chapter` 类型是 `Optional[str] = None`，下游一律用
-    `if e.pages:`/`elif e.chapter:` 判断"有没有"——保持 `None` 比引入一个
-    "看起来有值、实际是空串"的中间态更干净，调用处不用记住两种"空"的写法。
-
-    真实后果（这条修复要堵的）：书籍精读把 `chapter` 写成跨行的长描述（PDF
-    抽文/人工换行都可能带出内嵌换行）时，若不做这层归一化，证据表那一行
-    `- ● **E1** ... · Ch.7 · ...` 会被硬生生断成两个物理行，`_EVIDENCE_ROW_RE`
-    （单行正则）匹配不到，这条证据从 `--verify`/`audit_topic_pages` 的统计里
-    **静默消失**——citekey 依然在页面上、pandoc 依然能渲染，看起来一切正常，
-    只是这一条再也不会被任何自检发现。
-    """
-    return flatten_linebreaks(str(v)) if v else None
-
-
-def _check_grounding(text: str, refs: Sequence[str], ev_map: Dict[str, Evidence],
-                     report: ValidationReport, n_evidence: int,
-                     where: str = "") -> None:
-    """数字接地检查：论断里的数字必须能在它所引证据里找到。
-
-    只记账不拦截——**先观察一轮再决定要不要收紧**。理由是这一层的误报代价很实在：
-    一旦开始拒绝落盘，规则里任何一个没想到的合法写法（专名里的数字、论断自己算的
-    比值、页面元信息）都会静默吃掉真论断。当前基线 538/542 接地、3 条报警且都
-    已判读，样本仍不够支撑"直接拦"这个决定。
-
-    匹配池只有 **原句 + 标题**（口径见 grounding.build_pool）——曾并入 citekey /
-    年份 / 出处，实测对接地贡献为 0 而假接地可测，已删。
-    """
-    if not text or not refs:
-        return
-    # 池只放证据原句与标题——citekey / 年份 / 出处实测贡献 0 个接地数字，
-    # 却制造可测的假接地。口径与 page_parse.EvidenceRow.pool 一致。
-    pool = build_pool(*(
-        part for r in refs for part in (ev_map[r].text, ev_map[r].title)
-    ))
-    # 元数字豁免："这 60 条证据中仅一条……"说的是本页证据条数，来源是页面元信息
-    chk = check_numbers(text, pool, exempt=[n_evidence])
-    report.numbers_checked += chk.total
-    report.numbers_derived += len(chk.derived)
-    if chk.ungrounded:
-        report.ungrounded_numbers += len(chk.ungrounded)
-        report.ungrounded_claims += 1
-        report.ungrounded_details.append({
-            "where": where, "numbers": list(chk.ungrounded), "text": text,
-        })
-        logger.warning(
-            "  ⚠️ 数字未接地{}：{} · 引用 {} · {}",
-            "（{}）".format(where) if where else "",
-            "、".join(chk.ungrounded),
-            " ".join(ev_map[r].citekey for r in refs[:4]),
-            text[:90],
-        )
-
-
-# 2026-10-07 从 qa.py 下沉到这里：概念页的分歧/缺口区同样会漏出 E 编号（实测 8 页里
-# 7 页有），两条链路共用这一份实现；qa 从这里导入，`Q.backtranslate_inline_refs` 照旧可用。
-# 正文里模型顺手写出的证据编号（"E1 的流程图明确写……"、"E31 描述的算法"）。
-#
-# **左侧后顾断言是真防线**：它保证 `AE1`、`MICE1` 这类词尾不被误当成编号。用的是显式
-# ASCII 字符类而不是 `\b`——`\b` 与 `\w` 按 Unicode 判定、汉字算单词字符，中文行文里
-# 「见E31描述」这种紧贴写法会判不到边界而整条漏过（lint.py 那三次教训的直接应用：
-# `\w` → `\b` → 矫枉过正成 ASCII-only）。
-#
-# **右侧的 `(?![0-9])` 是冗余的**，写出来只为把意图摆明：`\d+` 本身贪婪，`E312` 一定
-# 整体匹配成 `E312`（越界 → 剔除），不可能被截成 `E31` 再错误回译到第 31 条证据上。
-# 变异测试实测把这个前瞻删掉行为完全不变——记在这里，免得后人以为它在挡什么。
-#
-# `\[?` / `\]?` 在匹配体里（后顾断言仍在最前，不受影响）：喂给模型的证据块首字段
-# 就是 `[E1]（可引用证据 · 实验方法 · 2024）`，模仿这个形状的概率不低。不吃掉那对
-# 方括号就会得到 `[[@a2024X]]`，再过 `to_wiki_links` 变成 `[[[a2024X|a2024X]]]`——
-# 不是死链，但多一对字面方括号，粘进 pandoc 也多一层。
-_INLINE_REF_RE = re.compile(r"(?<![A-Za-z0-9])\[?[Ee](\d+)\]?(?![0-9])")
-
-
-def backtranslate_inline_refs(text: str, ev_map: Dict[str, Any],
-                              report: ValidationReport,
-                              used: Optional[set] = None) -> str:
-    """把正文里模型顺手写的证据编号回译成 `[@citekey]`，越界的直接剔除。
-
-    实测（首次真实运行，2026-08-17）模型确实会这么写：
-    「E1 的流程图明确写 NMAR 确认需要外部数据」「E31 描述的条件独立检验搜索父集合的算法」。
-    这些编号**不经过 `evidence` 字段的校验**——它们是自由文本的一部分。放着不管有两种坏法：
-
-      1. 编号越界（模型写 E99 而只召回 40 条）→ 页面上留下一个指向不存在证据的交叉引用，
-         而读者会以为自己没找到；
-      2. 编号有效但页面被摘去写稿后，`E31` 脱离了本页的证据表就完全失去意义——
-         它是**本次召回的内部编号**，不是任何持久标识。
-
-    回译成 `[@citekey]` 一次解决两者：越界的剔除（计入 `invalid_refs`，与 `_resolve_refs`
-    同一个计数口径），有效的变成真正可追溯、可粘进 pandoc 的引用。这不是新的防线，
-    是把已有的编号回译防线**补到自由文本这条此前没盖住的通道上**——同 `_clean_text`
-    之于模型自写的 citekey。
-
-    `used` 给了就把**本次成功回译的编号**塞进去（出参而不是改返回类型：调用点全都在
-    拿字符串用）。没有它的话，只在 `answer` 或 `gaps` 里被提到的那条证据会在证据表里
-    标 ○，而表头写着"未被引用的证据标 ○"——页面上明明有 `[@key]`，两个数字互相自洽
-    却都与页面事实不符，CLI 的"引用率"也跟着少算。
-
-    ## 已知局限（记账不修，2026-09-17 R2 对抗审核）
-
-    - **MINOR-3**：模型有时会在自由文本里复述证据原句已经带的页码（如某条
-      highlight 原文本身写着"(p.3)"，模型转述成"E7 在第 3 页显示……"）；若 E7
-      恰好是带 `pages` 定位符的书籍证据，回译后会读成"`[@key, p. 3]` 在第 3
-      页显示……"——页码信息视觉上重复了一次。这是内容层面的措辞冗余，不是引用
-      本身出错（citekey 与页码都仍然准确、可追溯），修它要么在模型自由文本里
-      做页码字符串匹配再删除（容易连累正常叙述），要么放弃给自由文本回译加
-      定位符（倒退回本轮之前的行为）——两个方向代价都不小，记账不修。
-    - **NIT-2**：`_INLINE_REF_RE` 逐个匹配 `E\\d+`，模型写"E1-E3 均支持"这种
-      range 语法时，中间的连字符不属于任何一个匹配，回译后变成
-      `[@a]-[@c]`——两个引用都对，只是连着它们的连字符成了一个孤立字符，
-      读起来略怪。这是本模块一直就有的既有行为（不是本轮改动引入的），
-      记账不修。
-    """
-    def _sub(m):
-        ref = "E{}".format(int(m.group(1)))
-        ev = ev_map.get(ref)
-        if ev is None:
-            report.invalid_refs += 1
-            return ""
-        if used is not None:
-            used.add(ref)
-        # 书籍证据带页码定位符（同 topics._cite_str/qa._cite_str 的既有格式）：
-        # 自由文本里模型随手提到的证据编号一样可能指向一条书籍句级证据，回译时
-        # 不能只给 citekey——那会让这句话与证据表里同一条证据的引用形态不一致。
-        pages = getattr(ev, "pages", None)
-        return "[@{}, p. {}]".format(ev.citekey, pages) if pages else "[@{}]".format(ev.citekey)
-
-    out = _INLINE_REF_RE.sub(_sub, text)
-    # 剔除越界编号后可能留下 "……（ 的流程图" 之类的空档
-    return re.sub(r"\s{2,}", " ", out).strip()
-
-
-# 模型在自由文本里会顺手提到输出 schema 的字段名（实测 missingness-fairness 页：
-# 「二者比较条件不同：position_a 的差距出现在……」）。页面上分歧两侧渲染成「一方/另一方」，
-# 字段名对读者毫无意义，按同一口径换掉。只换整词，不碰 `evidence_ab` 之类的别的标识。
-_SCHEMA_TERM_RE = re.compile(r"(?<![A-Za-z0-9_])(position|evidence)_([ab])(?![A-Za-z0-9_])")
-
-
-def _scrub_schema_terms(text: str) -> str:
-    return _SCHEMA_TERM_RE.sub(lambda m: "一方" if m.group(2) == "a" else "另一方", text)
 
 
 def validate_synthesis(data: dict, evidences: Sequence[Evidence]
@@ -1296,108 +1022,6 @@ def render_generated_block(spec: TopicSpec, synthesis: dict,
         if e.title:
             lines.append("  <small>{}</small>".format(e.title))
         lines.append("  > {}".format(flatten_linebreaks(e.text.strip())))
-    return "\n".join(lines)
-
-
-def _json_safe(v, _depth: int = 0):
-    """把用户 frontmatter 里 yaml 解析出的任意嵌套结构变成 json.dumps 必然可序列化：
-    dict 键一律转 str（None 键保留为 None——JSON 原生支持），list/tuple 递归，
-    非 JSON 原生标量（date/Decimal 等）转 str 保值。只服务 _render_frontmatter 的
-    dict 分支，受管键从不产出这类结构。
-
-    _depth 上限 32：yaml.safe_load 对锚点别名（`a: &x {b: *x}`）会构造出**自引用**
-    结构，无界递归直接 RecursionError；超限降级 str(v)——Python 的 repr 对循环
-    结构是安全的（打印成 {...}），保住不炸。
-
-    键统一转成 **JSON 文本形态**（int 1 → "1"、True → "true"、None → "null"——与
-    json.dumps 对非 str 键的隐式转换逐字节一致，输出不变）：这样 date 键 vs 同形
-    字符串键、int 1 vs "1" 这类「Python 层不同、JSON 文本层同形」的碰撞在这里就能
-    数出来并告警，而不是静默丢失或推迟到下次 yaml 回读时被吞（第 2 轮对抗审计）。
-    碰撞仍是后写覆盖先写（有损，但此前是整个函数 TypeError 崩掉）；>512 字符的
-    嵌套键与顶层同策略跳过——flow-style 超长键同样触发 PyYAML 的 simple key
-    扫描上限、整页解析失败。"""
-    if _depth > 32:
-        return str(v)
-    if isinstance(v, dict):
-        out = {}
-        n_coll = n_long = 0
-        for k, x in v.items():
-            if isinstance(k, str):
-                jk = k
-            elif k is None or isinstance(k, (int, float, bool)):
-                jk = json.dumps(k)          # "1" / "1.5" / "true" / "null"
-            else:
-                jk = str(k)
-            if len(jk) > 512:
-                n_long += 1
-                continue
-            if jk in out:
-                n_coll += 1
-            out[jk] = _json_safe(x, _depth + 1)
-        if n_coll:
-            logger.warning("frontmatter 嵌套键净化后发生 {} 处同形碰撞（如日期键与同形字符串键"
-                           "并存），后写的覆盖先写的", n_coll)
-        if n_long:
-            logger.warning("frontmatter 嵌套键过长（>512 字符）{} 个，已跳过（超长键会让整页"
-                           "YAML 解析失败）", n_long)
-        return out
-    if isinstance(v, (list, tuple)):
-        return [_json_safe(x, _depth + 1) for x in v]
-    if v is None or isinstance(v, (str, int, float, bool)):
-        return v
-    return str(v)
-
-
-def _render_frontmatter(items: Dict[str, Any]) -> str:
-    """把有序字典渲染成 YAML frontmatter 文本（`---` 包裹）。
-
-    G4：`build_frontmatter` 与 `sync_topics_to_vault` 此前各自维护一份几乎相同的
-    序列化实现，都用 `"{}: {}".format(k, ...)` 裸拼键名——两份拷贝已经在值的序列化上
-    演化出了行为差异（一份对 list 元素调 `json.dumps(x)`，另一份多包一层 `str(x)`），
-    键名侧则共享同一个洞：受管键是硬编码字面量、天然合法，但用户在 Obsidian 属性面板
-    或文本编辑器里自加的键（经 `preserved` 混进来）是任意字符串——含 `: ` `#` 或空串的
-    键裸拼会写出**语法错误的 YAML**，下次 `split_frontmatter` 解析失败、该页永久卡在
-    conflict（审计实测：用户加了个 `备注: 待复核` 这种键就踩上）。
-
-    统一走这一个函数，键名一律用 vault.py 那套 `_SAFE_KEY`/`_YAML_WORDS` 防护判断是否
-    要加引号（管理键套上是零成本 no-op，用户键套上才是真正需要的防护），不在本模块
-    重新发明；值的序列化也统一成一套逻辑，两处调用方不再各自演化出分歧。
-    """
-    lines = ["---"]
-    for k, v in items.items():
-        ks = str(k)
-        if len(ks) > 512:
-            # PyYAML 对 block mapping 的 simple key 有约 1024 字符的扫描器硬限制
-            # （加引号也算 simple key，同样受限）：写出去必然让 split_frontmatter
-            # 解析失败、整页永久卡 conflict——正是本函数 docstring 点名要防的后果。
-            # 这样的键只可能来自极端病态的用户 frontmatter，保真无路可走，跳过+出声。
-            logger.warning("frontmatter 键过长（{} 字符 > 512），YAML 简单键无法安全序列化，"
-                           "已跳过该键（值一并丢弃）", len(ks))
-            continue
-        key = ks if (_SAFE_KEY.match(ks) and ks.lower() not in _YAML_WORDS) else _y(ks)
-        if isinstance(v, list):
-            if not v:
-                # 空列表必须写成 flow-style `key: []`，不能只写 `key:` 空着——那样
-                # YAML 会把它解析成 `None` 而不是 `[]`（2026-09-17 加 qa 页 ask_query/
-                # ask_role 两个可能为空的列表字段时实测踩到：往返一趟，空列表变成了
-                # None，reask 的「旧页无存档参数」判定被这个 None 污染成假阳性）。
-                lines.append("{}: []".format(key))
-            else:
-                lines.append("{}:".format(key))
-                lines += ["  - {}".format(_y(x)) for x in v]
-        elif isinstance(v, dict):
-            # 受管键从不产出 dict；只有用户手写的嵌套 YAML 才可能走到这里。
-            # json.dumps 的转义集合是 YAML 双引号标量/流式对象的子集，天然合法。
-            # _json_safe：yaml.safe_load 会把用户手写的裸日期解析成 datetime.date——
-            # 出现在**值**位直接 TypeError（json.dumps default= 可救），出现在**键**位
-            # （`custom:\n  2024-01-01: 备注`）default= 救不了（skipkeys 只丢不转）。
-            # 两侧都递归转 str 保值不炸；炸点原在昂贵的 LLM 合成**之后**（build_topic/
-            # write_qa_page 都不兜这层），ask_notes 直接裸栈崩到顶。与 vault.py 那层
-            # try/except 互补。
-            lines.append("{}: {}".format(key, json.dumps(_json_safe(v), ensure_ascii=False)))
-        else:
-            lines.append("{}: {}".format(key, _y(v)))
-    lines.append("---")
     return "\n".join(lines)
 
 
@@ -2223,11 +1847,6 @@ def trigger_topic_refresh(notes_dir, *, note_md=None, citekeys=None,
 # 自检：页面上的每个引用都还追得回去吗
 # ---------------------------------------------------------------------------
 
-# 证据表条目：`- ● **E1** \`[@key]\` …` + 可选 <small>标题</small> + `  > 原句`
-_EVIDENCE_ROW_RE = re.compile(
-    r"^- ([●○]) \*\*(E\d+)\*\* `\[@([^\]]+)\]`.*?\n(?:  <small>.*?</small>\n)?  > (.*)$",
-    re.M)
-
 
 @dataclass
 class PageAudit:
@@ -2316,48 +1935,6 @@ def audit_topic_pages(topics_dir: Path, index: dict) -> List[PageAudit]:
 # ---------------------------------------------------------------------------
 
 VAULT_TOPICS_DIR = "02-主题"
-
-# `[@citekey]` 或 `[@citekey, <定位符>]`（书籍证据的 pandoc 页码定位符，见
-# `_cite_str`）。**只暴露一个捕获组**（citekey 本身）——全仓其余调用点
-# （`audit_topic_pages`/`lint_checks.cited_by_page`/`cited_citekeys`/
-# `parse_page_claims`/`grounding.check_numbers`/`page_parse.parse_page`……）
-# 全部用 `.findall()`/`.sub()` 取"纯 citekey 列表"或"整段抹掉"，两个捕获组会让
-# `.findall()` 处处退化成 `(key, locator)` 元组，逐一改调用点的风险远大于给
-# `to_wiki_links`（唯一需要保留定位符文本的一处）单独开一条正则
-# （见下面的 `_CITE_LOCATOR_RE`）。定位符本身用非捕获组 `(?:,[^\]]*)?` 吃掉——
-# `,` 之后到 `]` 之前的任意内容（含空格），不关心它具体长什么样。
-_CITE_RE = re.compile(r"\[@([^\],\s]+)(?:,[^\]]*)?\]")
-
-# `to_wiki_links` 专用：比 `_CITE_RE` 多一个捕获组，把定位符（含开头的逗号，
-# 没有定位符时是空串）单独取出来，好在转成 wiki 链接时原样拼回显示文本——
-# 否则 `[@little2020rubin, p. 247]` 转完会变成 `[[little2020rubin|little2020rubin]]`，
-# 页码锚在 Obsidian 里凭空消失。
-_CITE_LOCATOR_RE = re.compile(r"\[@([^\],\s]+)((?:,[^\]]*)?)\]")
-
-
-def to_wiki_links(text: str, filenames: Dict[str, str]) -> str:
-    """`[@citekey]` -> `[[文件名|citekey]]`，让概念页连进 Obsidian 关系图。
-
-    这是概念页进 vault 的主要增值：概念与论文之间生出真实的边，per-paper 笔记
-    自动获得「哪些概念页引用了我」的反向链接。
-
-    不在 filenames 里的 citekey **保持 `[@key]` 原样**——那是"论文在库里但没进
-    vault"（如只有摘要没精读的条目），转成 wiki 链接只会得到一个点开是空白的死链。
-
-    书籍证据带的页码定位符（`[@key, p. 247]`）**保留在链接显示文本里**
-    （`[[文件名|key, p. 247]]`）：这不是合法的 pandoc 引用语法（vault 侧本来就
-    不经 pandoc 渲染），但页码是读者在 Obsidian 里核对原句时最想要的那条信息，
-    丢掉比留着更糟——Obsidian 的 wiki 链接显示文本可以是任意字符串，`, p. 247`
-    不含 `]]` 或 `|`，不会破坏链接语法。
-    """
-    def _sub(m):
-        key, loc = m.group(1), m.group(2)
-        fname = filenames.get(key)
-        if not fname:
-            return m.group(0)
-        display = key + loc
-        return "[[{}|{}]]".format(fname, display) if fname != display else "[[{}]]".format(key)
-    return _CITE_LOCATOR_RE.sub(_sub, text)
 
 
 def sync_topics_to_vault(notes_dir: Path, vault_dir: Path, filenames: Dict[str, str],
